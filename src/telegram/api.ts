@@ -2,9 +2,17 @@
  * Minimal Telegram Bot API client. Only the methods we actually use.
  */
 
+export interface TelegramCallbackQuery {
+  id: string;
+  from: { id: number; first_name: string; username?: string; is_bot: boolean };
+  message?: TelegramMessage;
+  data?: string;
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 }
 
 export interface TelegramMessage {
@@ -37,9 +45,10 @@ export class TelegramApi {
     return json.result;
   }
 
-  async sendMessage(chatId: number | string, text: string, opts?: { reply_to_message_id?: number }): Promise<number> {
+  async sendMessage(chatId: number | string, text: string, opts?: { reply_to_message_id?: number; reply_markup?: unknown }): Promise<number> {
     const body: Record<string, unknown> = { chat_id: chatId, text };
     if (opts?.reply_to_message_id) body.reply_to_message_id = opts.reply_to_message_id;
+    if (opts?.reply_markup) body.reply_markup = opts.reply_markup;
     const res = await fetch(`${this.base}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -99,13 +108,26 @@ export class TelegramApi {
     if (!res.ok) throw new Error(`setMessageReaction ${res.status}: ${await res.text()}`);
   }
 
-  async editMessageText(chatId: number | string, messageId: number, text: string): Promise<void> {
+  async editMessageText(chatId: number | string, messageId: number, text: string, opts?: { reply_markup?: unknown }): Promise<void> {
+    const body: Record<string, unknown> = { chat_id: chatId, message_id: messageId, text };
+    if (opts?.reply_markup) body.reply_markup = opts.reply_markup;
     const res = await fetch(`${this.base}/editMessageText`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, message_id: messageId, text }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`editMessageText ${res.status}: ${await res.text()}`);
+  }
+
+  async answerCallbackQuery(callbackQueryId: string, opts?: { text?: string }): Promise<void> {
+    const body: Record<string, unknown> = { callback_query_id: callbackQueryId };
+    if (opts?.text) body.text = opts.text;
+    const res = await fetch(`${this.base}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`answerCallbackQuery ${res.status}: ${await res.text()}`);
   }
 
   async getFile(fileId: string): Promise<{ file_path: string }> {

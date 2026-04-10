@@ -11,7 +11,7 @@
  * Default port: 1941 (PARACHUTE_CHANNEL_PORT env).
  */
 
-import { TelegramApi, type TelegramMessage, type TelegramUpdate } from "./telegram/api.ts";
+import { TelegramApi, type TelegramMessage, type TelegramCallbackQuery, type TelegramUpdate } from "./telegram/api.ts";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -117,7 +117,9 @@ async function pollLoop(): Promise<void> {
       const updates = await api.getUpdates(offset, 30);
       for (const update of updates) {
         offset = update.update_id + 1;
-        if (update.message) {
+        if (update.callback_query) {
+          await handleCallbackQuery(update.callback_query);
+        } else if (update.message) {
           await handleMessage(update.message);
         }
       }
@@ -133,6 +135,37 @@ async function pollLoop(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
+const CALLBACK_DATA_RE = /^perm_(allow|deny)_([a-km-z]{5})$/;
+
+async function handleCallbackQuery(cq: TelegramCallbackQuery): Promise<void> {
+  const userId = cq.from.id;
+  if (!isAllowed(userId)) {
+    await api.answerCallbackQuery(cq.id).catch(() => {});
+    return;
+  }
+
+  const data = cq.data ?? "";
+  const match = CALLBACK_DATA_RE.exec(data);
+  if (!match) {
+    await api.answerCallbackQuery(cq.id).catch(() => {});
+    return;
+  }
+
+  const behavior = match[1] as "allow" | "deny";
+  const requestId = match[2];
+  broadcastEvent("permission_verdict", { request_id: requestId, behavior });
+
+  // Answer the callback query (stops button loading spinner)
+  const label = behavior === "allow" ? "✅ Allowed" : "❌ Denied";
+  await api.answerCallbackQuery(cq.id, { text: label }).catch(() => {});
+
+  // Edit the original message to show the outcome and remove buttons
+  if (cq.message) {
+    const chatId = String(cq.message.chat.id);
+    const originalText = cq.message.text ?? "";
+    await api.editMessageText(chatId, cq.message.message_id, `${label}\n\n${originalText}`).catch(() => {});
+  }
+}
 
 async function handleMessage(msg: TelegramMessage): Promise<void> {
   const userId = msg.from?.id;
@@ -368,12 +401,17 @@ const server = Bun.serve({
         const text =
           `🔐 Permission: ${body.tool_name}\n\n` +
           `${body.description}\n\n` +
-          `${body.input_preview}\n\n` +
-          `Reply "yes ${body.request_id}" or "no ${body.request_id}"`;
+          `${body.input_preview}`;
+        const replyMarkup = {
+          inline_keyboard: [[
+            { text: "✅ Allow", callback_data: `perm_allow_${body.request_id}` },
+            { text: "❌ Deny", callback_data: `perm_deny_${body.request_id}` },
+          ]],
+        };
         const sent: number[] = [];
         for (const chatId of targets) {
           try {
-            const id = await api.sendMessage(chatId, text);
+            const id = await api.sendMessage(chatId, text, { reply_markup: replyMarkup });
             sent.push(id);
           } catch (err) {
             console.error(`parachute-channel: permission prompt to ${chatId} failed:`, err);

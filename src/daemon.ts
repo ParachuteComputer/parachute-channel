@@ -128,9 +128,32 @@ async function pollLoop(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Permission relay — text-reply intercept
+// ---------------------------------------------------------------------------
+
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
+
 async function handleMessage(msg: TelegramMessage): Promise<void> {
   const userId = msg.from?.id;
   if (!userId || !isAllowed(userId)) return;
+
+  // Permission-reply intercept: if this looks like "yes xxxxx" or "no xxxxx"
+  // for a pending permission request, emit a permission_verdict SSE event
+  // instead of forwarding as a chat message.
+  const text = msg.text ?? "";
+  const permMatch = PERMISSION_REPLY_RE.exec(text);
+  if (permMatch) {
+    const requestId = permMatch[2]!.toLowerCase();
+    const behavior = permMatch[1]!.toLowerCase().startsWith("y") ? "allow" : "deny";
+    broadcastEvent("permission_verdict", { request_id: requestId, behavior });
+    // React to confirm receipt
+    const emoji = behavior === "allow" ? "✅" : "❌";
+    try {
+      await api.setMessageReaction(String(msg.chat.id), msg.message_id, emoji);
+    } catch {}
+    return;
+  }
 
   // Determine attachment info
   let attachmentKind: string | undefined;
@@ -322,6 +345,41 @@ const server = Bun.serve({
         };
         await api.editMessageText(body.chat_id, parseInt(body.message_id), body.text);
         return json({ ok: true });
+      } catch (err) {
+        return json({ error: String(err) }, 500);
+      }
+    }
+
+    // Permission prompt — bridge forwards permission_request here, daemon
+    // sends to all allowlisted Telegram users.
+    if (req.method === "POST" && url.pathname === "/api/permission") {
+      try {
+        const body = (await req.json()) as {
+          request_id: string;
+          tool_name: string;
+          description: string;
+          input_preview: string;
+        };
+        const access = loadAccess();
+        const targets = access.allowFrom;
+        if (targets.length === 0) {
+          return json({ error: "no allowlisted users to send permission prompt to" }, 400);
+        }
+        const text =
+          `🔐 Permission: ${body.tool_name}\n\n` +
+          `${body.description}\n\n` +
+          `${body.input_preview}\n\n` +
+          `Reply "yes ${body.request_id}" or "no ${body.request_id}"`;
+        const sent: number[] = [];
+        for (const chatId of targets) {
+          try {
+            const id = await api.sendMessage(chatId, text);
+            sent.push(id);
+          } catch (err) {
+            console.error(`parachute-channel: permission prompt to ${chatId} failed:`, err);
+          }
+        }
+        return json({ sent });
       } catch (err) {
         return json({ error: String(err) }, 500);
       }

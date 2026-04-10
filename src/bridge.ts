@@ -17,6 +17,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
 const DAEMON_URL = process.env.PARACHUTE_CHANNEL_URL ?? "http://127.0.0.1:1941";
 
@@ -47,6 +48,33 @@ const mcp = new Server(
       "",
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments.',
     ].join("\n"),
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Permission relay — receive permission_request from CC, forward to daemon
+// ---------------------------------------------------------------------------
+
+mcp.setNotificationHandler(
+  z.object({
+    method: z.literal("notifications/claude/channel/permission_request"),
+    params: z.object({
+      request_id: z.string(),
+      tool_name: z.string(),
+      description: z.string(),
+      input_preview: z.string(),
+    }),
+  }),
+  async ({ params }) => {
+    try {
+      await fetch(`${DAEMON_URL}/api/permission`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(params),
+      });
+    } catch (err) {
+      process.stderr.write(`parachute-channel bridge: failed to relay permission request: ${err}\n`);
+    }
   },
 );
 
@@ -229,6 +257,22 @@ async function connectToEvents(): Promise<void> {
                 });
               } catch (err) {
                 process.stderr.write(`parachute-channel bridge: failed to parse/forward event: ${err}\n`);
+              }
+            } else if (currentEvent === "permission_verdict" && currentData) {
+              try {
+                const parsed = JSON.parse(currentData) as {
+                  request_id: string;
+                  behavior: string;
+                };
+                await mcp.notification({
+                  method: "notifications/claude/channel/permission",
+                  params: {
+                    request_id: parsed.request_id,
+                    behavior: parsed.behavior,
+                  },
+                });
+              } catch (err) {
+                process.stderr.write(`parachute-channel bridge: failed to forward permission verdict: ${err}\n`);
               }
             }
             currentEvent = "";

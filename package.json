@@ -1,5 +1,5 @@
 {
-  "name": "parachute-channel",
+  "name": "@openparachute/channel",
   "version": "0.1.0",
   "description": "Messaging gateway for Claude Code — Telegram today, anything tomorrow",
   "license": "AGPL-3.0",

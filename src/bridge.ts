@@ -325,20 +325,27 @@ mcp.oninitialized = () => {
   initReceived = true;
   clearTimeout(warnIfNoInit);
   if (IS_TEST) return;
-  const caps = mcp.getClientCapabilities();
-  const hasChannel = caps?.experimental?.["claude/channel"] !== undefined;
-  if (!hasChannel) {
-    process.stderr.write(
-      [
-        "parachute-channel bridge: WARNING — client did not advertise claude/channel support.",
-        "  Inbound Telegram messages will not reach this session.",
-        "  Did you launch Claude Code with:",
-        "      --dangerously-load-development-channels=server:parachute-channel",
-        "  (See https://github.com/ParachuteComputer/parachute-channel/issues/8)",
-        "",
-      ].join("\n"),
-    );
-  }
+  // The MCP SDK dispatches `notifications/initialized` and the preceding
+  // `initialize` request as separate microtasks; the notification's sync
+  // handler can fire before the request handler populates client
+  // capabilities. Defer the check to a later tick so `_clientCapabilities`
+  // is populated by the time we inspect it.
+  setTimeout(() => {
+    const caps = mcp.getClientCapabilities();
+    const hasChannel = caps?.experimental?.["claude/channel"] !== undefined;
+    if (!hasChannel) {
+      process.stderr.write(
+        [
+          "parachute-channel bridge: WARNING — client did not advertise claude/channel support.",
+          "  Inbound Telegram messages will not reach this session.",
+          "  Did you launch Claude Code with:",
+          "      --dangerously-load-development-channels=server:parachute-channel",
+          "  (See https://github.com/ParachuteComputer/parachute-channel/issues/8)",
+          "",
+        ].join("\n"),
+      );
+    }
+  }, 0);
 };
 
 // ---------------------------------------------------------------------------

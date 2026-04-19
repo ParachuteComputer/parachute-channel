@@ -171,6 +171,9 @@ async function handleMessage(msg: TelegramMessage): Promise<void> {
   const userId = msg.from?.id;
   if (!userId || !isAllowed(userId)) return;
 
+  const userTag = msg.from?.username ? `@${msg.from.username}` : (msg.from?.first_name ?? `user ${userId}`);
+  console.log(`parachute-channel: rx from ${userTag} in chat ${msg.chat.id} (${clients.size} bridge(s))`);
+
   // Permission-reply intercept: if this looks like "yes xxxxx" or "no xxxxx"
   // for a pending permission request, emit a permission_verdict SSE event
   // instead of forwarding as a chat message.

@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# techne-claude — the wrapper every Techne Claude session should go through.
+#
+# Why not just `claude`?
+#   - Claude Code inherits account-level MCP servers from Aaron's claude.ai
+#     account (his personal Parachute vault, Gmail, Drive, etc). The Techne
+#     pod must not see any of those.
+#   - `--strict-mcp-config` tells Claude to use ONLY the servers in the file
+#     we pass, ignoring every other MCP source. Combined with a local JSON
+#     listing just `parachute-vault` and `parachute-channel`, this gives the
+#     Techne agent exactly the two MCPs that belong to the pod and nothing
+#     else.
+#   - `--dangerously-load-development-channels server:parachute-channel`
+#     opts this session into the experimental `claude/channel` capability
+#     for our bridge. Without it, the bridge registers as a regular MCP
+#     (tools only), and Claude Code silently drops the bridge's
+#     `notifications/claude/channel` events on the floor — meaning inbound
+#     Telegram messages never reach the session. The "dangerously" prefix
+#     bypasses Anthropic's curated channel-server allowlist, which our
+#     self-named `parachute-channel` is not on. This flag is hidden from
+#     `claude --help`; discovered via the parachute-channel CLAUDE.md and
+#     confirmed against the 2.1.114 CLI binary.
+#   - The cd into ~/techne puts CLAUDE.md in Claude's auto-discovery path.
+#
+# Config layout:
+#   ~/techne/mcp.json   — the MCP config with vault + channel (holds a
+#                          vault bearer token; file is 0600, volume-persisted)
+#   ~/techne/CLAUDE.md  — the agent identity doc, auto-loaded from CWD
+#
+# If ~/techne/mcp.json is missing, this wrapper fails loudly rather than
+# silently falling back to the account-contaminated default.
+
+set -u
+
+MCP_CONFIG="${HOME}/techne/mcp.json"
+
+if [[ ! -s "${MCP_CONFIG}" ]]; then
+  cat >&2 <<EOF
+techne-claude: ${MCP_CONFIG} missing or empty.
+
+This file is written by the pod's entrypoint on first boot. If you're
+seeing this error, the container may not have finished bootstrapping, or
+the file was deleted. Recreate with:
+
+  parachute vault tokens create   # note the pvt_... token
+  cat > ${MCP_CONFIG} <<'JSON'
+  {
+    "mcpServers": {
+      "parachute-vault": {
+        "type": "http",
+        "url": "http://127.0.0.1:1940/vaults/default/mcp",
+        "headers": { "Authorization": "Bearer <paste token here>" }
+      },
+      "parachute-channel": {
+        "command": "bun",
+        "args": ["/opt/parachute-channel/src/bridge.ts"],
+        "env": { "PARACHUTE_CHANNEL_URL": "http://127.0.0.1:1941" }
+      }
+    }
+  }
+  JSON
+  chmod 600 ${MCP_CONFIG}
+EOF
+  exit 1
+fi
+
+cd "${HOME}/techne"
+# Both of these flags use the `=` binding form, on purpose:
+#   --mcp-config is variadic, so space-separating its value can let the
+#     parser swallow subsequent positional args as extra config paths.
+#   --dangerously-load-development-channels takes the server identifier
+#     (the `server:` prefix is required) as its value. Space-separating
+#     works in `--print` mode — where a following `--print <prompt>` acts
+#     as a natural terminator — but in interactive mode (no trailing
+#     args) the parser can treat `server:parachute-channel` as the
+#     initial-prompt positional, leaving the flag with an empty channels
+#     list. The MCP-server-lookup then fails at runtime with
+#     "no MCP server configured with that name". The `=` form binds the
+#     value unambiguously in every mode.
+# Without the channels flag at all, the session silently drops the
+# bridge's notifications/claude/channel events — inbound Telegram never
+# reaches Claude. See docs/pods/techne.md for the full writeup.
+exec claude \
+  --strict-mcp-config "--mcp-config=${MCP_CONFIG}" \
+  "--dangerously-load-development-channels=server:parachute-channel" \
+  "$@"

@@ -52,13 +52,29 @@ if (!TOKEN) {
 }
 
 // ---------------------------------------------------------------------------
-// Access control — reuse the official plugin's access.json format
+// Access control — reuse the official plugin's access.json format, plus one
+// parachute-channel extension: `allowInChats`.
+//
+// Fields (all inherited from the official plugin except `allowInChats`):
+//   dmPolicy      — "open" short-circuits all gating; anything else requires
+//                   the user to pass `allowFrom`.
+//   allowFrom     — user-ID allowlist. Checked against `msg.from.id` /
+//                   `cq.from.id`.
+//   allowInChats  — OPTIONAL chat-ID allowlist. If present, `msg.chat.id` /
+//                   `cq.message.chat.id` must also be listed. Absent means
+//                   user-allowlist only (backwards-compatible). Empty array
+//                   means FAIL-CLOSED: no chats allowed. Note: a user's DM
+//                   to the bot has `chat.id === user_id` (Telegram
+//                   convention), so to permit DMs while gating groups, list
+//                   the user's own ID in `allowInChats`.
+//   groups, pending — used by the official plugin's pairing flow; read but
+//                     not otherwise acted on here.
 // ---------------------------------------------------------------------------
 
-// Matches the official telegram plugin's access.json format
 interface AccessConfig {
   dmPolicy: "open" | "pairing" | "allowlist";
   allowFrom: string[];
+  allowInChats?: string[];
   groups: Record<string, unknown>;
   pending: Record<string, unknown>;
 }
@@ -71,10 +87,15 @@ function loadAccess(): AccessConfig {
   }
 }
 
-function isAllowed(userId: number): boolean {
+function isAllowed(userId: number, chatId: number | string | undefined): boolean {
   const access = loadAccess();
   if (access.dmPolicy === "open") return true;
-  return access.allowFrom.includes(String(userId));
+  if (!access.allowFrom.includes(String(userId))) return false;
+  if (access.allowInChats !== undefined) {
+    if (chatId === undefined) return false;
+    if (!access.allowInChats.includes(String(chatId))) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +160,7 @@ const CALLBACK_DATA_RE = /^perm_(allow|deny)_([a-km-z]{5})$/;
 
 async function handleCallbackQuery(cq: TelegramCallbackQuery): Promise<void> {
   const userId = cq.from.id;
-  if (!isAllowed(userId)) {
+  if (!isAllowed(userId, cq.message?.chat.id)) {
     await api.answerCallbackQuery(cq.id).catch(() => {});
     return;
   }
@@ -169,7 +190,7 @@ async function handleCallbackQuery(cq: TelegramCallbackQuery): Promise<void> {
 
 async function handleMessage(msg: TelegramMessage): Promise<void> {
   const userId = msg.from?.id;
-  if (!userId || !isAllowed(userId)) return;
+  if (!userId || !isAllowed(userId, msg.chat.id)) return;
 
   const userTag = msg.from?.username ? `@${msg.from.username}` : (msg.from?.first_name ?? `user ${userId}`);
   console.log(`parachute-channel: rx from ${userTag} in chat ${msg.chat.id} (${clients.size} bridge(s))`);

@@ -71,6 +71,35 @@ claude --dangerously-load-development-channels server:parachute-channel
 - `access.json` — allowlist (compatible with the official plugin's format)
 - `inbox/` — downloaded attachments
 
+## Access control (`access.json`)
+
+Schema is compatible with the official Telegram plugin, plus one parachute-channel extension: `allowInChats`.
+
+| Field | Type | Description |
+|---|---|---|
+| `dmPolicy` | `"open" \| "pairing" \| "allowlist"` | `"open"` disables all gating. Anything else requires `allowFrom`. |
+| `allowFrom` | `string[]` | User-ID allowlist. Matches `msg.from.id` / `cq.from.id`. |
+| `allowInChats` | `string[]` (optional) | **Optional** chat-ID allowlist. When present, `msg.chat.id` / `cq.message.chat.id` must also be listed — AND gate with `allowFrom`. |
+| `groups`, `pending` | — | Used by the official plugin's pairing flow; read but not otherwise acted on here. |
+
+### `allowInChats` semantics
+
+- **Absent** → behave as today (user-allowlist only). Backwards-compatible.
+- **Present with entries** → both `allowFrom` and `allowInChats` must pass.
+- **Present but empty (`[]`)** → **fail-closed**: no chats allowed. If you want user-only gating, omit the field rather than setting it to `[]`.
+
+Private DMs to the bot have `chat.id === user_id` (Telegram convention). To permit a user's DM while gating groups, list their user ID in `allowInChats` too:
+
+```json
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["1190596288"],
+  "allowInChats": ["1190596288", "-1003765557903"],
+  "groups": {},
+  "pending": {}
+}
+```
+
 ## MCP tools exposed to Claude
 
 | Tool | Description |

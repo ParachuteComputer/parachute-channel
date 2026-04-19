@@ -92,8 +92,31 @@ else
   echo "[techne] no TELEGRAM_BOT_TOKEN yet — channel will start as soon as one appears at ${CHANNEL_ENV_FILE}"
 fi
 
+# --- Always-on Techne agent in tmux ---
+# A detached tmux session named `techne` runs `techne-claude-loop`, which
+# keeps a Claude session alive 24/7 so inbound Telegram messages reach the
+# agent even when nobody is at the keyboard. Aaron observes/interacts via
+# `docker exec -it techne tmux attach -t techne` and detaches with Ctrl+B,d
+# without killing it.
+#
+# We mirror the pane to a logfile (~/.techne-logs/loop.log) via tmux
+# pipe-pane so there's a tail-able artifact even when no client is attached.
+TECHNE_LOG_DIR="${HOME}/.techne-logs"
+mkdir -p "${TECHNE_LOG_DIR}"
+
+start_agent_tmux() {
+  echo "[techne] starting always-on tmux session 'techne' (techne-claude-loop)"
+  tmux new-session -d -s techne -n agent /usr/local/bin/techne-claude-loop
+  tmux pipe-pane -t techne:agent -o "cat >> ${TECHNE_LOG_DIR}/loop.log"
+}
+
+if ! tmux has-session -t techne 2>/dev/null; then
+  start_agent_tmux
+fi
+
 shutdown() {
   echo "[techne] signal received; shutting down"
+  tmux kill-server 2>/dev/null || true
   [[ -n "${CHANNEL_PID}" ]] && kill "${CHANNEL_PID}" 2>/dev/null || true
   kill "${VAULT_PID}" 2>/dev/null || true
   exit 0
@@ -102,7 +125,9 @@ trap shutdown TERM INT
 
 # Supervisor loop. Vault is the anchor: if it dies, the container exits and
 # Docker's restart policy takes over. Channel is restarted with backoff on
-# its own, and started on demand once a token lands.
+# its own, and started on demand once a token lands. The tmux session is
+# recreated if it disappears (rare; the loop wrapper is what keeps Claude
+# alive, and the loop only exits if it crashes itself).
 while true; do
   if ! kill -0 "${VAULT_PID}" 2>/dev/null; then
     echo "[techne] vault exited — container will exit so Docker restarts us"
@@ -116,6 +141,11 @@ while true; do
     CHANNEL_PID=""
     sleep 10
     if has_token; then start_channel; fi
+  fi
+
+  if ! tmux has-session -t techne 2>/dev/null; then
+    echo "[techne] tmux session 'techne' missing — recreating"
+    start_agent_tmux
   fi
 
   sleep 5

@@ -12,7 +12,7 @@ Image source: [`docker/pods/techne/`](../../docker/pods/techne). This runbook is
 |---|---|
 | Base | `ubuntu:24.04` |
 | Container user | `parachute` (uid 1000), non-root |
-| PID 1 | `tini` → `entrypoint.sh` (supervises vault + channel) |
+| PID 1 | `tini` → `entrypoint.sh` (supervises vault + channel + always-on tmux session) |
 | Vault auto-init | First run of `parachute vault serve` creates a default vault — no `vault init` needed |
 | Channel install | Cloned from GitHub at a pinned commit (build-arg `CHANNEL_COMMIT`) |
 | Ports exposed | None. Vault (1940) and channel (1941) bind inside the container; Telegram is outbound-only |
@@ -54,15 +54,29 @@ docker exec -it techne bash -lc claude
 
 Claude Code prints a URL; paste it into a browser, complete the sign-in, paste the code back into the container. Auth lands in the `techne-claude` volume and survives container restarts and rebuilds.
 
-## Starting a Techne agent session — use `techne-claude`, not `claude`
+## How Techne runs — always-on via tmux
 
-Everyday Techne sessions must go through the wrapper:
+The pod's entrypoint starts a detached `tmux` session named `techne` running `/usr/local/bin/techne-claude-loop`. The loop runs `techne-claude` in a forever-restart loop with backoff, so a crash, rate-limit, network blip, or `/exit` doesn't take the agent offline — it spins back up within seconds. This is what keeps inbound Telegram messages reaching Claude when nobody is at the keyboard.
 
-```bash
-docker exec -it techne techne-claude
-```
+| Action | Command |
+|---|---|
+| Attach to the agent session | `docker exec -it techne tmux attach -t techne` |
+| Detach **without killing it** | `Ctrl+B` then `d` |
+| Kick the loop | `docker exec techne tmux kill-session -t techne` (entrypoint recreates within ~5s) |
+| Tail the agent's pane log | `docker exec techne tail -f /home/parachute/.techne-logs/loop.log` |
+| Daemon health | `docker exec techne curl -s http://127.0.0.1:1941/health` |
 
-The wrapper does four things `claude` alone won't:
+**Don't start a second `techne-claude` outside the tmux session.** Each Claude session spawns its own `bridge.ts`, both bridges subscribe to the daemon's SSE stream, and every inbound message gets handled twice — including double replies. If you need to run something interactively, attach to the existing session.
+
+When you attach, you see the live conversation. Type to talk to the agent — the same as a regular `claude` session. Detach with `Ctrl+B` then `d` when done; the session keeps running. Don't `Ctrl+D` (that exits Claude, the loop will restart it but you've also blown away the conversation context).
+
+Conversation context lives only inside one Claude run. When the loop restarts the session — whether by your `/exit` or a crash — the new run starts with no in-memory history. **The vault is the persistent memory layer.** Anything Techne should remember across restarts has to be written there.
+
+If the loop hits `MAX_FAST_FAILS` consecutive sub-30-second exits in a row (i.e. Claude can't get off the ground), it posts a Telegram message to the pod owner via the channel daemon's `/api/reply`, then sleeps at the cap to avoid spamming. Owner is `TECHNE_OWNER_CHAT_ID` in the loop (defaults to Aaron's UID `1190596288`).
+
+### Wrapper details
+
+`techne-claude` (what the loop runs) does four things `claude` alone won't:
 
 1. `cd ~/techne` so `CLAUDE.md` is auto-loaded from the working directory.
 2. Pass `--strict-mcp-config --mcp-config=~/techne/mcp.json` so the session sees **only** `parachute-vault` and `parachute-channel`. Without this, Claude Code inherits account-level MCP servers from Aaron's `claude.ai` account — including his personal Parachute vault, Gmail, Drive, etc. — which the Techne agent must not have access to.
@@ -70,6 +84,10 @@ The wrapper does four things `claude` alone won't:
 4. Fail loudly if `~/techne/mcp.json` is missing (the pod's entrypoint writes it on first boot by minting a vault token; see "MCP provisioning" below).
 
 `claude` without the wrapper is still useful for `claude mcp add`, `claude doctor`, interactive authentication, and similar admin work — but don't use it for Techne agent sessions.
+
+### First-run order matters
+
+The tmux loop expects Claude to already be authenticated; if `~/.claude` is empty, Claude prints an OAuth URL and waits for you to paste a code. Inside the tmux pane with no client attached, that wait is invisible — the loop appears stuck. Always do the one-time `docker exec -it techne bash -lc claude` *before* relying on the always-on session. Once auth lands in the `techne-claude` volume, the loop's restarts pick it up automatically.
 
 ## MCP provisioning
 
@@ -113,18 +131,33 @@ The entrypoint writes injected tokens to `~/.parachute/channel/.env` on first bo
 2. Add your bot by username, then promote it to admin if you want it to see all messages (Telegram's privacy mode otherwise limits bots to commands + @-mentions).
 3. Send a test message in the group. `docker logs -f techne` should show the daemon receiving it.
 
+## End-to-end smoke test
+
+After a fresh build + run + Claude auth + bot-token + group setup:
+
+1. `docker exec -it techne tmux attach -t techne` — drops you into the live always-on Claude session. You should see the agent's prompt, possibly mid-conversation if anything has come in. Detach immediately with `Ctrl+B` then `d`.
+2. From Telegram, DM the bot (or @-mention it in the group). A `<channel …>` tag should land in the agent's pane within a couple of seconds — *without* you having launched `techne-claude` manually first. The agent's reply should round-trip back into Telegram.
+3. `docker exec techne tail -n 5 /home/parachute/.techne-logs/loop.log` — should show `[techne-loop ...] starting techne-claude (fast-fails: 0)` and nothing alarming.
+
+If step 2 fails: see "How Techne runs" → first-run order. The most common cause is forgetting the one-time `claude` auth step, which leaves the loop blocked at the OAuth prompt.
+
 ## Everyday operations
 
 | Task | Command |
 |---|---|
-| Tail logs | `docker logs -f techne` |
+| Attach to the live agent | `docker exec -it techne tmux attach -t techne` |
+| Detach from agent | `Ctrl+B` then `d` |
+| Tail container logs | `docker logs -f techne` |
+| Tail agent pane log | `docker exec techne tail -f /home/parachute/.techne-logs/loop.log` |
 | Open a shell | `docker exec -it techne bash` |
-| Start a Claude session inside | `docker exec -it techne bash -lc 'cd ~/techne && claude'` |
+| Run an admin Claude session | `docker exec -it techne bash -lc 'cd ~/techne && claude'` (see warning above — don't do this while the always-on session is running) |
 | Restart the container | `docker restart techne` |
 | Stop the container | `docker stop techne` |
 | Start after stop | `docker start techne` |
+| Force the agent loop to restart | `docker exec techne tmux kill-session -t techne` (entrypoint recreates within ~5s) |
 | Rotate the bot token | overwrite `~/.parachute/channel/.env` inside the container, then `docker restart techne` |
 | Inspect vault data | `docker exec -it techne sqlite3 ~/.parachute/vaults/default/vault.db` |
+| Daemon health | `docker exec techne curl -s http://127.0.0.1:1941/health` |
 
 ## Back up the vault
 
@@ -165,17 +198,15 @@ docker exec techne ls /Users
 
 Run this after any image change and paste the output in the relevant PR.
 
-## Future work: always-on Techne
+## Future work
 
-Today, a Techne Claude session is a foreground process started by `docker exec -it techne techne-claude` from Aaron's laptop. Close the terminal and the agent is gone — Telegram messages that arrive with no session attached are broadcast to zero SSE clients and drop on the floor (the daemon has no persistent inbox for text). That's fine for smoke tests and supervised use; it won't do for an agent the cooperative can ping at any hour.
+Always-on now ships (see "How Techne runs" above). Things still parked:
 
-The image ships Bun + Claude Code + the wrapper, but nothing that keeps a session alive across disconnects. Paths to consider when we want always-on:
-
-- **`tmux` inside the container.** Add `tmux` to the Dockerfile, have entrypoint launch `tmux new-session -d -s techne techne-claude`, and `docker exec -it techne tmux attach -t techne` to observe. Cheapest change; the session survives attach/detach and container restarts (via a small "resurrect on boot" hook). Downside: a crashed session silently stays crashed until someone attaches.
-- **Supervisor-managed session.** Extend `entrypoint.sh` to run `techne-claude` as a third supervised process alongside vault + channel, restarting on exit. Clean in Docker terms; harder to attach to for interactive work, and Claude Code's TTY assumptions may fight headless execution.
-- **Daemon-managed session via the Claude Agent SDK.** Skip the CLI entirely for the always-on role and drive a session programmatically (the SDK exposes the same MCP + channels surface). Most invasive, but lines up with how other pods are likely to run.
-
-Parking this here so the next person picking it up has the shape. Don't build any of it until we've run Techne through a real cooperative task or two and learned what "always-on" actually needs to mean.
+- **Periodic restart for context drift.** A long-running Claude session accumulates context window and can drift in personality or recall over days. The loop today restarts only on exit; consider a soft restart every N hours (or every N inbound messages) once we have data on what "too long" looks like in practice.
+- **Drift / health observability beyond pane log.** Today the only liveness signals are `/health` (channel daemon perspective) and tail of the pane log. A periodic synthetic ping ("agent, reply with `pong`") via the channel would prove end-to-end that Claude is processing, not just that the process is alive.
+- **Bounded loop log.** `~/.techne-logs/loop.log` grows unbounded. Rotate or cap it.
+- **Multi-pane tmux** (e.g. one pane for the agent, one for daemon logs) so an attached operator sees both at once. Marginal value, no urgency.
+- **Daemon-managed session via the Claude Agent SDK.** A more invasive alternative to the tmux+CLI stack; probably the right shape if/when we move beyond one pod and want richer programmatic control. Not on the critical path.
 
 ## Future pods
 

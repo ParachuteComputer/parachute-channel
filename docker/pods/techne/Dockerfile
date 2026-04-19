@@ -18,12 +18,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # System packages + Node.js 22 (Claude Code CLI is a Node app; Bun runs vault/channel).
 # tini: PID 1 signal-forwarding so docker stop is clean.
+# tmux: hosts the always-on `techne` session running techne-claude-loop, so
+#       Aaron can attach to observe or talk to the agent without launching a
+#       new session each time. See docs/pods/techne.md → "How Techne runs".
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
         tini \
+        tmux \
         unzip \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
@@ -77,7 +81,8 @@ RUN chmod +x /home/parachute/entrypoint.sh \
 
 USER root
 COPY techne-claude /usr/local/bin/techne-claude
-RUN chmod +x /usr/local/bin/techne-claude
+COPY techne-claude-loop /usr/local/bin/techne-claude-loop
+RUN chmod +x /usr/local/bin/techne-claude /usr/local/bin/techne-claude-loop
 USER parachute
 
 # Persistence (see docs/pods/techne.md):

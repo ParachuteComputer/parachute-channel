@@ -288,6 +288,60 @@ async function connectToEvents(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Missing-subscription warning
+//
+// If Claude Code attaches to this bridge but didn't opt into the
+// experimental `claude/channel` capability (e.g. forgot
+// `--dangerously-load-development-channels=server:<name>`), the MCP tools
+// register fine but every inbound notification the bridge emits is silently
+// dropped. That looks identical to a working setup until a message arrives
+// and nothing lands in the session.
+//
+// Signals, in priority order:
+//   1. On `oninitialized`, read `getClientCapabilities().experimental` — the
+//      canonical MCP hook. If `claude/channel` is missing, warn.
+//   2. If no initialize ever arrives (bridge is running but no client
+//      connected), warn after a grace period so `bun src/bridge.ts` invoked
+//      standalone tells you so.
+//
+// The warning doesn't exit — outbound tool calls still work in degraded mode.
+// Gated on NODE_ENV !== "test" so tests can import this module silently.
+// ---------------------------------------------------------------------------
+
+const SUBSCRIPTION_WARN_MS = 15_000;
+const IS_TEST = process.env.NODE_ENV === "test";
+
+let initReceived = false;
+const warnIfNoInit = setTimeout(() => {
+  if (initReceived || IS_TEST) return;
+  process.stderr.write(
+    "parachute-channel bridge: no MCP initialize received after 15s — " +
+    "the bridge is running but no client has connected.\n",
+  );
+}, SUBSCRIPTION_WARN_MS);
+if (typeof warnIfNoInit.unref === "function") warnIfNoInit.unref();
+
+mcp.oninitialized = () => {
+  initReceived = true;
+  clearTimeout(warnIfNoInit);
+  if (IS_TEST) return;
+  const caps = mcp.getClientCapabilities();
+  const hasChannel = caps?.experimental?.["claude/channel"] !== undefined;
+  if (!hasChannel) {
+    process.stderr.write(
+      [
+        "parachute-channel bridge: WARNING — client did not advertise claude/channel support.",
+        "  Inbound Telegram messages will not reach this session.",
+        "  Did you launch Claude Code with:",
+        "      --dangerously-load-development-channels=server:parachute-channel",
+        "  (See https://github.com/ParachuteComputer/parachute-channel/issues/8)",
+        "",
+      ].join("\n"),
+    );
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 

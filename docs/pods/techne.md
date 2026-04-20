@@ -159,6 +159,10 @@ If step 2 fails: see "How Techne runs" → first-run order. The most common caus
 | Inspect vault data | `docker exec -it techne sqlite3 ~/.parachute/vaults/default/vault.db` |
 | Daemon health | `docker exec techne curl -s http://127.0.0.1:1941/health` |
 
+## Known historical log events
+
+- **2026-04-18 — bot-token rotation during standup.** Around this timestamp you'll see a run of `getUpdates 401: Unauthorized` from `parachute-channel`, followed by `[techne] signal received; shutting down` and a clean restart. Expected: the Telegram token was rotated and the container bounced. Not an incident.
+
 ## Back up the vault
 
 The whole `techne-data` volume is one tar away from a backup:

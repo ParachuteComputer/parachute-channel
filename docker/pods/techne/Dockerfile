@@ -10,7 +10,7 @@
 FROM ubuntu:24.04
 
 # Pin parachute-channel to a known commit. Bump + rebuild to adopt channel changes.
-ARG CHANNEL_COMMIT=6697c3569f370ad0596745cfcc76d99dd6f96896
+ARG CHANNEL_COMMIT=a20e9496203257b2f5678fe05d34329ce5a6e2a9
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \

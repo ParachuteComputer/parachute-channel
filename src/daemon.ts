@@ -253,7 +253,13 @@ async function handleMessage(msg: TelegramMessage): Promise<void> {
     }
   }
 
-  const content = msg.text ?? msg.caption ?? "(voice message)";
+  // Service events (new_chat_members, left_chat_member, pinned_message,
+  // migrate_*, chat-title changes, etc.) arrive as messages with no text,
+  // no caption, and no media. We have no way for the agent to act on them,
+  // and the previous "(voice message)" placeholder caused the agent to
+  // report a nonexistent voice memo on every bot-add. Drop silently.
+  if (!msg.text && !msg.caption && !attachmentKind) return;
+  const content = msg.text ?? msg.caption ?? `(${attachmentKind})`;
   const ts = new Date(msg.date * 1000).toISOString();
 
   // Build the channel notification payload — matches the official plugin's shape

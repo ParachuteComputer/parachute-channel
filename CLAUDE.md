@@ -135,3 +135,13 @@ The daemon + bridge split makes adding new backends straightforward:
 - Custom web frontend: same pattern — the bridge doesn't change
 
 The bridge's MCP contract (`notifications/claude/channel` + tool surface) stays the same regardless of backend.
+
+## Post-merge hygiene
+
+When a PR is merged, locally:
+
+```
+git checkout main && git pull
+```
+
+Channel's steward does this already — captured here so it's durable and matches the convention now documented across every Parachute repo. Caught 2026-04-21 across vault/lens/scribe/cli where it wasn't being done.

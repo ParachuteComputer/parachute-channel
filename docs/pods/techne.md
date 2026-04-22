@@ -184,6 +184,16 @@ docker build -t techne:latest docker/pods/techne
 # Re-run — same `docker run` as above.
 ```
 
+### Known rebuild papercuts (monthly-restart checklist)
+
+The `techne-claude` volume preserves the auth directory, but in practice each rebuild so far has required manual hand-holding. Known items, tracked here so the next rebuild is a better experience than the last:
+
+- **Theme picker fires on every rebuild.** `~/.claude/settings.json` in the volume is `{}` (3 bytes), so the theme preference doesn't persist across Claude Code auto-updates. Workaround today: `docker exec techne tmux send-keys -t techne Enter` to accept the default. **Fix direction:** bake a default `settings.json` (with `"theme": "dark"` and maybe a pinned version preference) into the image at `/home/parachute/.claude/settings.json`, owned by `parachute:parachute`. Would need to merge-not-overwrite on container start so Aaron's customisations survive if he sets them.
+- **Claude OAuth did not survive 2026-04-22 rebuild.** The volume kept `.credentials.json` (471 bytes, same mtime) but the post-rebuild Claude Code asked for login method anyway. Cause not yet pinned down — candidates: Claude Code version bump invalidating the token format, token TTL expiring between OAuth and rebuild, or a missing env var in the new container. **Fix direction:** reproduce on a second rebuild, capture Claude Code's stderr the moment it rejects the existing credentials, and either (a) bake the right env vars into the image or (b) document "re-OAuth is expected after rebuild" clearly so it stops being a surprise.
+- **Unknown-group auto-leave hook.** When someone adds the bot to a chat not listed in `allowInChats`, the daemon drops messages but the bot remains a silent member. Nice-to-have: on `new_chat_members` where the added member is the bot, check the chat_id against `allowInChats` and call `leaveChat` if it's not listed. Not shipped yet — filed here so we revisit post-launch stability.
+
+These aren't blockers, just rough edges. Tackle as a batch when someone has time.
+
 Full reset (destroys vault + Claude auth — Aaron will need to re-auth and the community loses notes):
 
 ```bash

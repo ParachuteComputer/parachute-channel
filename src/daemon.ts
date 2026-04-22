@@ -60,13 +60,17 @@ if (!TOKEN) {
 //                   the user to pass `allowFrom`.
 //   allowFrom     — user-ID allowlist. Checked against `msg.from.id` /
 //                   `cq.from.id`.
-//   allowInChats  — OPTIONAL chat-ID allowlist. If present, `msg.chat.id` /
-//                   `cq.message.chat.id` must also be listed. Absent means
-//                   user-allowlist only (backwards-compatible). Empty array
-//                   means FAIL-CLOSED: no chats allowed. Note: a user's DM
-//                   to the bot has `chat.id === user_id` (Telegram
-//                   convention), so to permit DMs while gating groups, list
-//                   the user's own ID in `allowInChats`.
+//   allowInChats  — OPTIONAL chat-ID allowlist. Two roles:
+//                   (1) For DMs (positive chat_id === user_id), the chat must
+//                       be listed AND the user must pass `allowFrom`.
+//                   (2) For groups (negative chat_id), inclusion grants entry
+//                       to ANY member of that group — `allowFrom` is bypassed.
+//                       This lets the agent participate in shared spaces
+//                       without enumerating every member.
+//                   Absent → user-allowlist only (backwards-compatible, no
+//                   per-chat gating, no group bypass). Empty array → FAIL-
+//                   CLOSED: no chats allowed. To permit a DM while gating
+//                   groups, list the user's own ID in `allowInChats`.
 //   groups, pending — used by the official plugin's pairing flow; read but
 //                     not otherwise acted on here.
 // ---------------------------------------------------------------------------
@@ -90,10 +94,21 @@ function loadAccess(): AccessConfig {
 function isAllowed(userId: number, chatId: number | string | undefined): boolean {
   const access = loadAccess();
   if (access.dmPolicy === "open") return true;
+
+  // Group-chat bypass: if a group chat (negative chat_id, Telegram convention)
+  // is explicitly allowlisted via `allowInChats`, any user who can post in
+  // that group may reach the bot. This lets the agent participate in shared
+  // spaces like Regen Hub working groups without having to enumerate every
+  // member in `allowFrom`. DMs (chat_id === user_id, positive) are NOT
+  // covered by this bypass — they still require `allowFrom`.
+  const chatIdStr = chatId === undefined ? undefined : String(chatId);
+  const isGroup = chatIdStr !== undefined && chatIdStr.startsWith("-");
+  if (isGroup && access.allowInChats?.includes(chatIdStr!)) return true;
+
   if (!access.allowFrom.includes(String(userId))) return false;
   if (access.allowInChats !== undefined) {
-    if (chatId === undefined) return false;
-    if (!access.allowInChats.includes(String(chatId))) return false;
+    if (chatIdStr === undefined) return false;
+    if (!access.allowInChats.includes(chatIdStr)) return false;
   }
   return true;
 }

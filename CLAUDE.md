@@ -85,13 +85,15 @@ Schema is compatible with the official Telegram plugin, plus one parachute-chann
 |---|---|---|
 | `dmPolicy` | `"open" \| "pairing" \| "allowlist"` | `"open"` disables all gating. Anything else requires `allowFrom`. |
 | `allowFrom` | `string[]` | User-ID allowlist. Matches `msg.from.id` / `cq.from.id`. |
-| `allowInChats` | `string[]` (optional) | **Optional** chat-ID allowlist. When present, `msg.chat.id` / `cq.message.chat.id` must also be listed — AND gate with `allowFrom`. |
+| `allowInChats` | `string[]` (optional) | **Optional** chat-ID allowlist. For DMs, it's an AND gate with `allowFrom`. For **groups** (negative chat_id), inclusion grants entry to any group member — `allowFrom` is bypassed so shared spaces don't need every participant enumerated. |
 | `groups`, `pending` | — | Used by the official plugin's pairing flow; read but not otherwise acted on here. |
 
 ### `allowInChats` semantics
 
-- **Absent** → behave as today (user-allowlist only). Backwards-compatible.
-- **Present with entries** → both `allowFrom` and `allowInChats` must pass.
+- **Absent** → behave as today (user-allowlist only, no per-chat gating). Backwards-compatible.
+- **Present with entries** →
+  - **DMs** (positive chat_id, equals user_id): require BOTH `allowFrom` AND `allowInChats` to include the id.
+  - **Groups** (negative chat_id): inclusion in `allowInChats` grants entry to any group member. `allowFrom` is bypassed. This is the intended way to let the bot participate in shared spaces without enumerating every member.
 - **Present but empty (`[]`)** → **fail-closed**: no chats allowed. If you want user-only gating, omit the field rather than setting it to `[]`.
 
 Private DMs to the bot have `chat.id === user_id` (Telegram convention). To permit a user's DM while gating groups, list their user ID in `allowInChats` too:

@@ -61,6 +61,41 @@ If you hit an adjacent issue:
 - The bridge now warns on stderr if the capability isn't registered, so this misconfig surfaces immediately instead of looking like everything is fine until a message arrives — see [#9](https://github.com/ParachuteComputer/parachute-channel/issues/9).
 - A cosmetic `/mcp` display warning may appear even with the correct flag — expected, ignore. See [#10](https://github.com/ParachuteComputer/parachute-channel/issues/10).
 
+## Sessions (launcher scripts)
+
+The module is now a **fabric**: one daemon hosts named channels (each bound to a
+transport — `telegram`, `http-ui`, …), and each Claude Code session runs a bridge
+subscribed to one channel by name (`PARACHUTE_CHANNEL_NAME`). Full design + status:
+[`PLAN.md`](./PLAN.md).
+
+Spin a session up wired to a channel with one command:
+
+```bash
+./scripts/launch-session.sh <name> <channel>   # e.g. aaron aaron
+./scripts/list-sessions.sh                      # running sessions + per-channel client counts
+./scripts/stop-session.sh <name>
+```
+
+`launch-session.sh` is idempotent, writes the session's `.mcp.json` + a reinforcing
+`CLAUDE.md` (so it always replies via the `reply` tool), auto-accepts the first-launch
+prompts (folder-trust + dev-channels), and waits for the bridge to attach. Override the
+daemon with `PARACHUTE_CHANNEL_URL` (default `http://127.0.0.1:1941`). `<name>`/`<channel>`
+must be slugs (alphanumeric/dash/underscore).
+
+**Note:** launched sessions run `claude --dangerously-skip-permissions` — the session has
+full machine access. Acceptable for an owner-operated, trusted-network box today;
+hub-scoped JWT auth (for the UI) and VM/Docker session isolation (for the session itself)
+are the planned hardening steps.
+
+## Hub integration
+
+Channel self-registers into `~/.parachute/services.json` at boot and ships
+`.parachute/module.json`, so hub lists it in the portal and reverse-proxies
+`<expose>/channel/*` → the loopback daemon (`stripPrefix:true`; SSE survives the proxy).
+The built-in chat UI is reachable at `<hub-origin>/channel/ui` over the expose, and at
+`http://127.0.0.1:1941/ui` locally. **Note:** the UI is currently unauthenticated
+(loopback / trusted-network only) — hub-scoped JWT auth is the next priority.
+
 ## Environment variables
 
 | Variable | Default | Description |

@@ -32,7 +32,7 @@ import type { Transport, ReplyArgs } from "./transport.ts";
 // server.notification. We use the exported _registerForTest below.
 // ---------------------------------------------------------------------------
 
-import { _registerSessionForTest } from "./mcp-http.ts";
+import { _registerSessionForTest, _unregisterSessionForTest } from "./mcp-http.ts";
 
 interface FakeServer {
   notes: Array<{ method: string; params: unknown }>;
@@ -106,6 +106,18 @@ describe("per-channel MCP session registry + wake push", () => {
     expect(mcpSessionCount("A")).toBe(1);
     _resetSessionsForTest();
     expect(mcpSessionCount("A")).toBe(0);
+  });
+
+  test("unregister cleans up the session and drops the empty channel set (no leak)", () => {
+    _registerSessionForTest("A", "sid-a1", fakeSession().server as never, ["channel:read"]);
+    _registerSessionForTest("A", "sid-a2", fakeSession().server as never, ["channel:read"]);
+    expect(mcpSessionCount("A")).toBe(2);
+    _unregisterSessionForTest("A", "sid-a1");
+    expect(mcpSessionCount("A")).toBe(1); // the other session survives
+    _unregisterSessionForTest("A", "sid-a2");
+    expect(mcpSessionCount("A")).toBe(0); // empty set removed — no orphaned channel entry
+    // a push to the now-cleaned channel reaches nobody
+    expect(pushToChannel("A", "hi", {})).toBe(0);
   });
 });
 

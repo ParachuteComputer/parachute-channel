@@ -115,6 +115,11 @@ export function _registerSessionForTest(
   registerSession(channel, id, { server, transport: undefined as never, scopes });
 }
 
+/** Test-only: remove a registered session — exercises the empty-set cleanup path. */
+export function _unregisterSessionForTest(channel: string, id: string): void {
+  unregisterSession(channel, id);
+}
+
 // ---------------------------------------------------------------------------
 // The wake — push to a channel's MCP sessions
 // ---------------------------------------------------------------------------
@@ -141,7 +146,9 @@ export function pushToChannel(
       });
       delivered++;
     } catch {
-      // A dead session throws; the transport's onclose handler removes it.
+      // A dead session throws SYNCHRONOUSLY on a closed transport (SDK `send`), so
+      // this catch runs and the count stays honest; the transport's onclose handler
+      // removes the session from the set.
     }
   }
   return delivered;
@@ -261,6 +268,11 @@ const TOOL_DEFS = [
   },
 ];
 
+// Tools that send/mutate on the channel require channel:write. download_attachment
+// is deliberately NOT here: fetching an attachment that was sent *to* this session is
+// read-access — a channel:read session can receive and read its own messages,
+// attachments included. (The legacy stdio-bridge /api/download gates it as write; the
+// MCP path is the principled read. If they ever need to match, relax the bridge, not this.)
 const WRITE_TOOLS = new Set(["reply", "react", "edit_message"]);
 
 /** Fold a top-level chat_id into meta, mirroring the daemon's mergeMeta. */

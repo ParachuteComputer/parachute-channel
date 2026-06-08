@@ -147,10 +147,10 @@ if [ "$ready" != 1 ]; then
   exit 1
 fi
 
-# Best-effort confirm the bridge registered with the daemon on this channel.
+# Best-effort confirm the HTTP MCP session registered with the daemon on this channel.
 connected=0
 for _ in $(seq 1 20); do
-  n="$(curl -fsS "$DAEMON_URL/health" 2>/dev/null | grep -o "\"name\":\"$CHANNEL\"[^}]*\"clients\":[0-9]*" | grep -o '"clients":[0-9]*' | grep -o '[0-9]*' || echo 0)"
+  n="$(curl -fsS "$DAEMON_URL/health" 2>/dev/null | grep -o "\"name\":\"$CHANNEL\"[^}]*\"mcp_sessions\":[0-9]*" | grep -o '"mcp_sessions":[0-9]*' | grep -o '[0-9]*' || echo 0)"
   if [ "${n:-0}" -ge 1 ]; then connected=1; break; fi
   sleep 0.5
 done
@@ -159,7 +159,7 @@ echo "✓ session '$SESSION' ready on channel '$CHANNEL'."
 echo "  connected over HTTP MCP at $MCP_URL (no local bridge file)."
 [ -n "$TOKEN" ] && echo "  authenticated with a hub-issued channel token (channel:read + channel:write)." \
                 || echo "  NOT authenticated (no token minted) — only an unguarded dev daemon will accept it."
-[ "$connected" = 1 ] && echo "  bridge connected to the daemon." || echo "  (bridge connection not yet confirmed via /health — usually a moment behind.)"
+[ "$connected" = 1 ] && echo "  HTTP MCP session registered with the daemon." || echo "  (MCP session not yet confirmed via /health — usually a moment behind.)"
 echo "  chat:    open the channel UI and pick channel '$CHANNEL'"
 echo "  watch:   tmux attach -t $SESSION   (detach: Ctrl-b then d)"
 echo "  stop:    ./scripts/stop-session.sh $NAME"

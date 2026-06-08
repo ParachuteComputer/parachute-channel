@@ -17,6 +17,7 @@ import { homedir } from "os";
 import type { Transport } from "./transport.ts";
 import { TelegramTransport, type TelegramTransportConfig } from "./transports/telegram.ts";
 import { HttpUiTransport, type HttpUiTransportConfig } from "./transports/http-ui.ts";
+import { VaultTransport, type VaultTransportConfig } from "./transports/vault.ts";
 
 export interface ChannelEntry {
   name: string;
@@ -66,10 +67,13 @@ export function instantiateTransport(entry: ChannelEntry): Transport {
     case "http-ui":
       // http-ui needs no secret — just a channel name (taken from ctx at start).
       return new HttpUiTransport((entry.config ?? {}) as HttpUiTransportConfig);
+    case "vault":
+      // vault needs vault name + a write token + the inbound-webhook secret.
+      return new VaultTransport((entry.config ?? {}) as unknown as VaultTransportConfig);
     default:
       throw new Error(
         `registry: unknown transport kind "${entry.transport}" for channel "${entry.name}" ` +
-          `(known: telegram, http-ui)`,
+          `(known: telegram, http-ui, vault)`,
       );
   }
 }

@@ -16,7 +16,9 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { createFetchHandler } from "./daemon.ts";
 import { ClientRegistry } from "./routing.ts";
 import { HttpUiTransport } from "./transports/http-ui.ts";
+import { VaultTransport } from "./transports/vault.ts";
 import type { Channel } from "./registry.ts";
+import type { TransportContext, InboundMessage } from "./transport.ts";
 
 let server: ReturnType<typeof Bun.serve>;
 let base: string;
@@ -283,5 +285,188 @@ describe("Layer 2 — http-ui UI endpoints require a token (401 with none)", () 
     expect(res.status).toBe(401);
     // Must short-circuit before the SSE stream opens.
     expect(res.headers.get("content-type")).toContain("application/json");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Vault inbound webhook: POST /api/vault/inbound. A vault trigger POSTs here on
+// a new inbound #channel-message note; the daemon validates the per-channel
+// shared secret, resolves the channel from note.metadata.channel, and hands the
+// note to the channel's VaultTransport.ingestInbound (which emits → wakes the
+// session). Secret auth, unknown-channel 404, idempotency by note id.
+// ---------------------------------------------------------------------------
+describe("Vault inbound webhook — POST /api/vault/inbound", () => {
+  const SECRET = "s3cret";
+
+  /** Build a daemon over one vault channel + a fake transport ctx recording emits. */
+  function buildVaultServer() {
+    const registry = new ClientRegistry();
+    const transport = new VaultTransport({
+      vault: "default",
+      vaultUrl: "http://127.0.0.1:1940",
+      token: "x",
+      webhookSecret: SECRET,
+    });
+    const emitted: InboundMessage[] = [];
+    const ctx: TransportContext = {
+      channel: "eng",
+      emit(msg) {
+        emitted.push(msg);
+      },
+      emitPermissionVerdict() {},
+    };
+    void transport.start(ctx);
+    const channels = new Map<string, Channel>([
+      ["eng", { name: "eng", transport, entry: { name: "eng", transport: "vault" } }],
+    ]);
+    const srv = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      idleTimeout: 0,
+      fetch: createFetchHandler(channels, registry),
+    });
+    return { srv, base: `http://127.0.0.1:${srv.port}`, emitted };
+  }
+
+  function body(noteId: string, extraMeta: Record<string, unknown> = {}) {
+    return JSON.stringify({
+      trigger: "channel-inbound",
+      event: "created",
+      note: {
+        id: noteId,
+        path: `channel/eng/${noteId}`,
+        content: "wake up session",
+        tags: ["#channel-message"],
+        metadata: { channel: "eng", direction: "inbound", sender: "aaron", ...extraMeta },
+      },
+    });
+  }
+
+  test("wrong secret → 401, no emit", async () => {
+    const { srv, base, emitted } = buildVaultServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound?secret=wrong`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: body("n1"),
+      });
+      expect(res.status).toBe(401);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("missing secret → 401", async () => {
+    const { srv, base, emitted } = buildVaultServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: body("n1"),
+      });
+      expect(res.status).toBe(401);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("unknown channel → 404, no emit", async () => {
+    const { srv, base, emitted } = buildVaultServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          note: { id: "n1", content: "x", metadata: { channel: "nope", direction: "inbound" } },
+        }),
+      });
+      expect(res.status).toBe(404);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("missing note.metadata.channel → 400", async () => {
+    const { srv, base } = buildVaultServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ note: { id: "n1", content: "x", metadata: {} } }),
+      });
+      expect(res.status).toBe(400);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("valid (query secret) → 200 + routes to the channel's transport + emits", async () => {
+    const { srv, base, emitted } = buildVaultServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: body("n-ok"),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.channel).toBe("eng");
+      expect(emitted[0]!.content).toBe("wake up session");
+      expect(emitted[0]!.meta.note_id).toBe("n-ok");
+      expect(emitted[0]!.meta.source).toBe("vault");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("valid via X-Channel-Webhook-Secret header → 200 + emits", async () => {
+    const { srv, base, emitted } = buildVaultServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-channel-webhook-secret": SECRET },
+        body: body("n-hdr"),
+      });
+      expect(res.status).toBe(200);
+      expect(emitted).toHaveLength(1);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("duplicate note id → no double-emit (idempotency)", async () => {
+    const { srv, base, emitted } = buildVaultServer();
+    try {
+      for (let i = 0; i < 2; i++) {
+        const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: body("dup-1"),
+        });
+        expect(res.status).toBe(200); // both ack
+      }
+      expect(emitted).toHaveLength(1); // but only one wake
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("outbound-marked note is ack'd 200 but NOT emitted (belt-and-suspenders)", async () => {
+    const { srv, base, emitted } = buildVaultServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: body("ob-1", { direction: "outbound", outbound: "1" }),
+      });
+      expect(res.status).toBe(200);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
   });
 });

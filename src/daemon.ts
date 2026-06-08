@@ -30,6 +30,7 @@ import type {
 } from "./transport.ts";
 import { ChannelConfigError } from "./transport.ts";
 import { loadRegistry, defaultStateDir, type Channel } from "./registry.ts";
+import { VaultTransport } from "./transports/vault.ts";
 import { ClientRegistry } from "./routing.ts";
 import { requireScope, extractToken, SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
 import { validateHubJwt } from "./hub-jwt.ts";
@@ -486,6 +487,22 @@ export function createFetchHandler(
     );
   }
 
+  // Idempotency for the vault inbound webhook: a small bounded set of recently-
+  // seen note ids so a duplicate trigger delivery doesn't double-wake the
+  // session. Bounded by eviction (oldest-out) so it can't grow unbounded.
+  const seenInboundNoteIds = new Set<string>();
+  const SEEN_INBOUND_CAP = 2048;
+  function markSeen(noteId: string): boolean {
+    if (seenInboundNoteIds.has(noteId)) return false; // already processed
+    seenInboundNoteIds.add(noteId);
+    if (seenInboundNoteIds.size > SEEN_INBOUND_CAP) {
+      // Evict the oldest insertion (Set preserves insertion order).
+      const oldest = seenInboundNoteIds.values().next().value;
+      if (oldest !== undefined) seenInboundNoteIds.delete(oldest);
+    }
+    return true;
+  }
+
   return async function fetch(req) {
     const url = new URL(req.url);
 
@@ -527,7 +544,7 @@ export function createFetchHandler(
                 name: { type: "string", description: "Unique channel name bridges subscribe to." },
                 transport: {
                   type: "string",
-                  enum: ["telegram", "http-ui"],
+                  enum: ["telegram", "http-ui", "vault"],
                   description: "Transport kind backing this channel.",
                 },
                 config: {
@@ -723,6 +740,67 @@ export function createFetchHandler(
       } catch (err) {
         return errResponse(err);
       }
+    }
+
+    // Vault inbound webhook — a vault trigger POSTs here when a new inbound
+    // `#channel-message` note appears. Resolves the target channel from
+    // `note.metadata.channel`, asserts it's a vault-transport channel, and hands
+    // the note to that transport's `ingestInbound`, which `ctx.emit`s it →
+    // wakes the subscribed bridge / MCP session.
+    //
+    // Auth: a shared secret presented as `?secret=` OR `X-Channel-Webhook-Secret`,
+    // validated against the target channel's vault-transport `webhookSecret`.
+    // (Vault's trigger webhook is unauthenticated by default, so the secret rides
+    // in the configured webhook URL; a hub-JWT auth block on the vault trigger is
+    // a follow-up.) The secret is per-channel, so we resolve the channel from the
+    // body FIRST, then check the secret against that channel's transport.
+    if (req.method === "POST" && url.pathname === "/api/vault/inbound") {
+      let body: {
+        trigger?: string;
+        event?: string;
+        note?: { id?: string; path?: string; content?: string; tags?: string[]; metadata?: Record<string, unknown> };
+      };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      const note = body.note;
+      if (!note || typeof note.id !== "string" || !note.id) {
+        return json({ error: "body must include note.id" }, 400);
+      }
+      const channelName =
+        typeof note.metadata?.channel === "string" ? note.metadata.channel : undefined;
+      if (!channelName) {
+        return json({ error: "note.metadata.channel is required to route the message" }, 400);
+      }
+      const channel = channels.get(channelName);
+      if (!channel || !(channel.transport instanceof VaultTransport)) {
+        return json(
+          {
+            error: `no vault channel "${channelName}" — vault channels: ${[...channels.values()]
+              .filter((c) => c.transport instanceof VaultTransport)
+              .map((c) => c.name)
+              .join(", ") || "(none)"}`,
+          },
+          404,
+        );
+      }
+      const vt = channel.transport;
+      // Validate the shared secret against THIS channel's configured secret.
+      const presented =
+        url.searchParams.get("secret") ?? req.headers.get("x-channel-webhook-secret") ?? "";
+      if (!presented || presented !== vt.webhookSecret) {
+        return json({ error: "unauthorized", message: "bad or missing webhook secret" }, 401);
+      }
+      // Idempotency: a duplicate trigger delivery for the same note must not
+      // double-wake. First-seen → process; already-seen → ack without emitting.
+      if (markSeen(note.id)) {
+        vt.ingestInbound({ id: note.id, content: note.content, metadata: note.metadata });
+      }
+      // Never write back to the note — the v1 trigger handles its own
+      // created/rendered_at markers vault-side.
+      return json({ ok: true });
     }
 
     // Built-in chat UI — a global channel-picker page across all http-ui

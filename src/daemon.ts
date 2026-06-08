@@ -1,298 +1,87 @@
 #!/usr/bin/env bun
 /**
- * parachute-channel daemon — the single process that owns messaging platform
- * connections. Telegram today, anything tomorrow.
+ * parachute-channel daemon — the transport-agnostic orchestrator.
  *
- * Runs as a long-lived HTTP server (launchd, systemd, or manual). Bridges
- * connect to it via SSE (/events) to receive inbound messages and via HTTP
- * endpoints to send outbound messages. The daemon is the ONLY process that
- * touches the Telegram API — no races, no multi-consumer conflicts.
+ * Runs as a long-lived HTTP server (launchd, systemd, or manual). It loads a
+ * channel registry (name → transport), starts each transport, and routes
+ * inbound traffic to the bridges subscribed to that channel. Bridges connect
+ * via SSE (`/events?channel=<name>`) for inbound and POST outbound to the HTTP
+ * API with a `channel` field.
+ *
+ * Telegram is one transport behind the registry; the daemon core touches no
+ * platform API directly.
  *
  * Default port: 1941 (PARACHUTE_CHANNEL_PORT env).
  */
 
-import { TelegramApi, type TelegramMessage, type TelegramCallbackQuery, type TelegramUpdate } from "./telegram/api.ts";
-import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "fs";
+import { mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import type {
+  Transport,
+  TransportContext,
+  InboundMessage,
+  ReplyArgs,
+  ReactArgs,
+  EditArgs,
+  PermissionArgs,
+  DownloadArgs,
+} from "./transport.ts";
+import { loadRegistry, defaultStateDir, type Channel } from "./registry.ts";
+import { ClientRegistry } from "./routing.ts";
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-const STATE_DIR = process.env.PARACHUTE_CHANNEL_STATE_DIR ??
-  join(homedir(), ".parachute", "channel");
-const ENV_FILE = join(STATE_DIR, ".env");
-const ACCESS_FILE = join(STATE_DIR, "access.json");
+const STATE_DIR = defaultStateDir();
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const PORT = parseInt(process.env.PARACHUTE_CHANNEL_PORT ?? "1941", 10);
+
+/** Channel a bridge subscribes to when `?channel=` is omitted (back-compat). */
+const DEFAULT_CHANNEL = "telegram";
 
 mkdirSync(STATE_DIR, { recursive: true });
 mkdirSync(INBOX_DIR, { recursive: true });
 
-// Load .env (same pattern as the official plugin)
-try {
-  if (existsSync(ENV_FILE)) {
-    chmodSync(ENV_FILE, 0o600);
-    for (const line of readFileSync(ENV_FILE, "utf8").split("\n")) {
-      const m = line.match(/^(\w+)=(.*)$/);
-      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
-    }
-  }
-} catch {}
+// ---------------------------------------------------------------------------
+// Registry + routing
+// ---------------------------------------------------------------------------
 
-const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-if (!TOKEN) {
+let channels: Map<string, Channel>;
+try {
+  channels = loadRegistry({ stateDir: STATE_DIR });
+} catch (err) {
+  console.error(`parachute-channel: failed to load channel registry: ${err}`);
+  process.exit(1);
+}
+
+if (channels.size === 0) {
   console.error(
-    `parachute-channel: TELEGRAM_BOT_TOKEN required\n` +
-    `  set in ${ENV_FILE} or shell env\n` +
-    `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...`
+    `parachute-channel: no channels configured.\n` +
+      `  Add ${join(STATE_DIR, "channels.json")} or set TELEGRAM_BOT_TOKEN\n` +
+      `  (env or ${join(STATE_DIR, ".env")}) for a default telegram channel.`,
   );
   process.exit(1);
 }
 
-// ---------------------------------------------------------------------------
-// Access control — reuse the official plugin's access.json format, plus one
-// parachute-channel extension: `allowInChats`.
-//
-// Fields (all inherited from the official plugin except `allowInChats`):
-//   dmPolicy      — "open" short-circuits all gating; anything else requires
-//                   the user to pass `allowFrom`.
-//   allowFrom     — user-ID allowlist. Checked against `msg.from.id` /
-//                   `cq.from.id`.
-//   allowInChats  — OPTIONAL chat-ID allowlist. Two roles:
-//                   (1) For DMs (positive chat_id === user_id), the chat must
-//                       be listed AND the user must pass `allowFrom`.
-//                   (2) For groups (negative chat_id), inclusion grants entry
-//                       to ANY member of that group — `allowFrom` is bypassed.
-//                       This lets the agent participate in shared spaces
-//                       without enumerating every member.
-//                   Absent → user-allowlist only (backwards-compatible, no
-//                   per-chat gating, no group bypass). Empty array → FAIL-
-//                   CLOSED: no chats allowed. To permit a DM while gating
-//                   groups, list the user's own ID in `allowInChats`.
-//   groups, pending — used by the official plugin's pairing flow; read but
-//                     not otherwise acted on here.
-// ---------------------------------------------------------------------------
+const registry = new ClientRegistry();
 
-interface AccessConfig {
-  dmPolicy: "open" | "pairing" | "allowlist";
-  allowFrom: string[];
-  allowInChats?: string[];
-  groups: Record<string, unknown>;
-  pending: Record<string, unknown>;
-}
-
-function loadAccess(): AccessConfig {
-  try {
-    return JSON.parse(readFileSync(ACCESS_FILE, "utf8"));
-  } catch {
-    return { dmPolicy: "open", allowFrom: [], groups: {}, pending: {} };
-  }
-}
-
-function isAllowed(userId: number, chatId: number | string | undefined): boolean {
-  const access = loadAccess();
-  if (access.dmPolicy === "open") return true;
-
-  // Group-chat bypass: if a group chat (negative chat_id, Telegram convention)
-  // is explicitly allowlisted via `allowInChats`, any user who can post in
-  // that group may reach the bot. This lets the agent participate in shared
-  // spaces like Regen Hub working groups without having to enumerate every
-  // member in `allowFrom`. DMs (chat_id === user_id, positive) are NOT
-  // covered by this bypass — they still require `allowFrom`.
-  const chatIdStr = chatId === undefined ? undefined : String(chatId);
-  const isGroup = chatIdStr !== undefined && chatIdStr.startsWith("-");
-  if (isGroup && access.allowInChats?.includes(chatIdStr!)) return true;
-
-  if (!access.allowFrom.includes(String(userId))) return false;
-  if (access.allowInChats !== undefined) {
-    if (chatIdStr === undefined) return false;
-    if (!access.allowInChats.includes(chatIdStr)) return false;
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// SSE clients (bridges)
-// ---------------------------------------------------------------------------
-
-type SSEClient = {
-  id: string;
-  controller: ReadableStreamDefaultController<string>;
-  connectedAt: number;
-};
-
-const clients = new Map<string, SSEClient>();
-
-function broadcastEvent(event: string, data: unknown): void {
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const [id, client] of clients) {
-    try {
-      client.controller.enqueue(payload);
-    } catch {
-      clients.delete(id);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Telegram polling
-// ---------------------------------------------------------------------------
-
-const api = new TelegramApi(TOKEN);
-let offset: number | undefined;
-let pollActive = true;
-
-async function pollLoop(): Promise<void> {
-  const me = await api.getMe();
-  console.log(`parachute-channel: polling as @${me.username}`);
-
-  while (pollActive) {
-    try {
-      const updates = await api.getUpdates(offset, 30);
-      for (const update of updates) {
-        offset = update.update_id + 1;
-        if (update.callback_query) {
-          await handleCallbackQuery(update.callback_query);
-        } else if (update.message) {
-          await handleMessage(update.message);
-        }
-      }
-    } catch (err) {
-      console.error("parachute-channel: poll error:", err);
-      await new Promise((r) => setTimeout(r, 5000));
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Permission relay — text-reply intercept
-// ---------------------------------------------------------------------------
-
-const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
-const CALLBACK_DATA_RE = /^perm_(allow|deny)_([a-km-z]{5})$/;
-
-async function handleCallbackQuery(cq: TelegramCallbackQuery): Promise<void> {
-  const userId = cq.from.id;
-  if (!isAllowed(userId, cq.message?.chat.id)) {
-    await api.answerCallbackQuery(cq.id).catch(() => {});
-    return;
-  }
-
-  const data = cq.data ?? "";
-  const match = CALLBACK_DATA_RE.exec(data);
-  if (!match) {
-    await api.answerCallbackQuery(cq.id).catch(() => {});
-    return;
-  }
-
-  const behavior = match[1] as "allow" | "deny";
-  const requestId = match[2];
-  broadcastEvent("permission_verdict", { request_id: requestId, behavior });
-
-  // Answer the callback query (stops button loading spinner)
-  const label = behavior === "allow" ? "✅ Allowed" : "❌ Denied";
-  await api.answerCallbackQuery(cq.id, { text: label }).catch(() => {});
-
-  // Edit the original message to show the outcome and remove buttons
-  if (cq.message) {
-    const chatId = String(cq.message.chat.id);
-    const originalText = cq.message.text ?? "";
-    await api.editMessageText(chatId, cq.message.message_id, `${label}\n\n${originalText}`).catch(() => {});
-  }
-}
-
-async function handleMessage(msg: TelegramMessage): Promise<void> {
-  const userId = msg.from?.id;
-  if (!userId || !isAllowed(userId, msg.chat.id)) return;
-
-  const userTag = msg.from?.username ? `@${msg.from.username}` : (msg.from?.first_name ?? `user ${userId}`);
-  console.log(`parachute-channel: rx from ${userTag} in chat ${msg.chat.id} (${clients.size} bridge(s))`);
-
-  // Permission-reply intercept: if this looks like "yes xxxxx" or "no xxxxx"
-  // for a pending permission request, emit a permission_verdict SSE event
-  // instead of forwarding as a chat message.
-  const text = msg.text ?? "";
-  const permMatch = PERMISSION_REPLY_RE.exec(text);
-  if (permMatch) {
-    const requestId = permMatch[2]!.toLowerCase();
-    const behavior = permMatch[1]!.toLowerCase().startsWith("y") ? "allow" : "deny";
-    broadcastEvent("permission_verdict", { request_id: requestId, behavior });
-    // React to confirm receipt
-    const emoji = behavior === "allow" ? "✅" : "❌";
-    try {
-      await api.setMessageReaction(String(msg.chat.id), msg.message_id, emoji);
-    } catch {}
-    return;
-  }
-
-  // Determine attachment info
-  let attachmentKind: string | undefined;
-  let attachmentFileId: string | undefined;
-  let attachmentSize: number | undefined;
-  let attachmentMime: string | undefined;
-  let imagePath: string | undefined;
-
-  if (msg.voice) {
-    attachmentKind = "voice";
-    attachmentFileId = msg.voice.file_id;
-    attachmentSize = msg.voice.file_size;
-    attachmentMime = msg.voice.mime_type ?? "audio/ogg";
-  } else if (msg.audio) {
-    attachmentKind = "audio";
-    attachmentFileId = msg.audio.file_id;
-    attachmentSize = msg.audio.file_size;
-    attachmentMime = msg.audio.mime_type;
-  } else if (msg.document) {
-    attachmentKind = "document";
-    attachmentFileId = msg.document.file_id;
-    attachmentSize = msg.document.file_size;
-    attachmentMime = msg.document.mime_type;
-  } else if (msg.photo && msg.photo.length > 0) {
-    // Download the largest photo variant and save to inbox
-    const largest = msg.photo[msg.photo.length - 1];
-    attachmentKind = "photo";
-    attachmentFileId = largest.file_id;
-    attachmentSize = largest.file_size;
-    attachmentMime = "image/jpeg";
-    try {
-      const fileInfo = await api.getFile(largest.file_id);
-      const data = await api.downloadFile(fileInfo.file_path);
-      const ext = fileInfo.file_path.split(".").pop() ?? "jpg";
-      const localPath = join(INBOX_DIR, `${Date.now()}-${largest.file_unique_id}.${ext}`);
-      writeFileSync(localPath, data);
-      imagePath = localPath;
-    } catch (err) {
-      console.error("parachute-channel: failed to download photo:", err);
-    }
-  }
-
-  // Service events (new_chat_members, left_chat_member, pinned_message,
-  // migrate_*, chat-title changes, etc.) arrive as messages with no text,
-  // no caption, and no media. We have no way for the agent to act on them,
-  // and the previous "(voice message)" placeholder caused the agent to
-  // report a nonexistent voice memo on every bot-add. Drop silently.
-  if (!msg.text && !msg.caption && !attachmentKind) return;
-  const content = msg.text ?? msg.caption ?? `(${attachmentKind})`;
-  const ts = new Date(msg.date * 1000).toISOString();
-
-  // Build the channel notification payload — matches the official plugin's shape
-  const meta: Record<string, string> = {
-    chat_id: String(msg.chat.id),
-    message_id: String(msg.message_id),
-    user: msg.from?.username ?? msg.from?.first_name ?? "unknown",
-    user_id: String(userId),
-    ts,
+/** Build the per-channel context a transport routes through. */
+function contextFor(channel: string): TransportContext {
+  return {
+    channel,
+    emit(msg: InboundMessage): void {
+      registry.routeToChannel(msg.channel, "message", {
+        content: msg.content,
+        meta: msg.meta,
+        source: msg.source,
+      });
+    },
+    emitPermissionVerdict(v): void {
+      registry.routeToChannel(channel, "permission_verdict", v);
+    },
   };
-  if (attachmentKind) meta.attachment_kind = attachmentKind;
-  if (attachmentFileId) meta.attachment_file_id = attachmentFileId;
-  if (attachmentSize) meta.attachment_size = String(attachmentSize);
-  if (attachmentMime) meta.attachment_mime = attachmentMime;
-  if (imagePath) meta.image_path = imagePath;
-
-  // Broadcast to all connected bridges
-  broadcastEvent("message", { content, meta, source: "telegram" });
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +95,12 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+/** Resolve the transport for a channel from a request body, or null on miss. */
+function transportFor(channel: string | undefined): Transport | null {
+  if (!channel) return null;
+  return channels.get(channel)?.transport ?? null;
+}
+
 const server = Bun.serve({
   port: PORT,
   hostname: "127.0.0.1",
@@ -314,29 +109,81 @@ const server = Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
 
-    // Health check
+    // Health check — per-channel client counts.
     if (url.pathname === "/health") {
       return json({
         status: "ok",
-        clients: clients.size,
-        polling: pollActive,
+        channels: [...channels.values()].map((c) => ({
+          name: c.name,
+          kind: c.transport.kind,
+          clients: registry.countForChannel(c.name),
+        })),
+        total_clients: registry.size,
       });
     }
 
-    // SSE event stream — bridges connect here
+    // Self-describing config (runner pattern) — read-only, no secrets.
+    if (req.method === "GET" && url.pathname === "/.parachute/config") {
+      return json({
+        channels: [...channels.values()].map((c) => ({
+          name: c.name,
+          transport: c.transport.kind,
+        })),
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/.parachute/config/schema") {
+      return json({
+        title: "parachute-channel config",
+        description: "Named channels, each bound to a transport.",
+        type: "object",
+        properties: {
+          channels: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Unique channel name bridges subscribe to." },
+                transport: {
+                  type: "string",
+                  enum: ["telegram"],
+                  description: "Transport kind backing this channel.",
+                },
+                config: {
+                  type: "object",
+                  description: "Transport-specific config (secrets live here, not returned by /config).",
+                },
+              },
+              required: ["name", "transport"],
+            },
+          },
+        },
+        required: ["channels"],
+      });
+    }
+
+    // SSE event stream — bridges subscribe by channel.
     if (req.method === "GET" && url.pathname === "/events") {
+      let channel = url.searchParams.get("channel") ?? undefined;
+      if (!channel) {
+        channel = DEFAULT_CHANNEL;
+        console.warn(
+          `parachute-channel: /events without ?channel= — defaulting to "${DEFAULT_CHANNEL}". ` +
+            `This back-compat default is deprecated; pass ?channel=<name>.`,
+        );
+      }
+      const subscribedChannel = channel;
       const clientId = crypto.randomUUID();
       const stream = new ReadableStream<string>({
         start(controller) {
-          clients.set(clientId, {
-            id: clientId,
-            controller,
-            connectedAt: Date.now(),
+          registry.add(clientId, {
+            channel: subscribedChannel,
+            enqueue: (payload) => controller.enqueue(payload),
           });
           controller.enqueue(": connected\n\n");
         },
         cancel() {
-          clients.delete(clientId);
+          registry.remove(clientId);
         },
       });
       return new Response(stream, {
@@ -352,47 +199,17 @@ const server = Bun.serve({
     if (req.method === "POST" && url.pathname === "/api/reply") {
       try {
         const body = (await req.json()) as {
-          chat_id: string;
+          channel?: string;
+          chat_id?: string;
           text?: string;
           reply_to?: string;
           files?: string[];
+          meta?: Record<string, string>;
         };
-
-        const sentIds: number[] = [];
-
-        // Send text if provided
-        if (body.text) {
-          // Chunk long messages (Telegram 4096 char limit)
-          const chunks = chunkText(body.text, 4096);
-          for (const chunk of chunks) {
-            const id = await api.sendMessage(
-              body.chat_id,
-              chunk,
-              body.reply_to ? { reply_to_message_id: parseInt(body.reply_to) } : undefined,
-            );
-            sentIds.push(id);
-          }
-        }
-
-        // Send files if provided
-        if (body.files) {
-          for (const filePath of body.files) {
-            const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
-            const imageExts = ["jpg", "jpeg", "png", "gif", "webp"];
-            const voiceExts = ["ogg", "oga", "opus"];
-            let id: number;
-            if (imageExts.includes(ext)) {
-              id = await api.sendPhoto(body.chat_id, filePath);
-            } else if (voiceExts.includes(ext)) {
-              id = await api.sendVoice(body.chat_id, filePath);
-            } else {
-              id = await api.sendDocument(body.chat_id, filePath);
-            }
-            sentIds.push(id);
-          }
-        }
-
-        return json({ sent: sentIds });
+        const transport = transportFor(body.channel);
+        if (!transport) return channelError(body.channel);
+        const result = await transport.reply(toReplyArgs(body));
+        return json({ sent: result.sent });
       } catch (err) {
         return json({ error: String(err) }, 500);
       }
@@ -402,11 +219,22 @@ const server = Bun.serve({
     if (req.method === "POST" && url.pathname === "/api/react") {
       try {
         const body = (await req.json()) as {
-          chat_id: string;
+          channel?: string;
+          chat_id?: string;
           message_id: string;
           emoji: string;
+          meta?: Record<string, string>;
         };
-        await api.setMessageReaction(body.chat_id, parseInt(body.message_id), body.emoji);
+        const transport = transportFor(body.channel);
+        if (!transport) return channelError(body.channel);
+        if (!transport.react) return methodMissing(body.channel!, "react");
+        const args: ReactArgs = {
+          channel: body.channel!,
+          message_id: body.message_id,
+          emoji: body.emoji,
+          meta: mergeMeta(body),
+        };
+        await transport.react(args);
         return json({ ok: true });
       } catch (err) {
         return json({ error: String(err) }, 500);
@@ -417,52 +245,50 @@ const server = Bun.serve({
     if (req.method === "POST" && url.pathname === "/api/edit") {
       try {
         const body = (await req.json()) as {
-          chat_id: string;
+          channel?: string;
+          chat_id?: string;
           message_id: string;
           text: string;
+          meta?: Record<string, string>;
         };
-        await api.editMessageText(body.chat_id, parseInt(body.message_id), body.text);
+        const transport = transportFor(body.channel);
+        if (!transport) return channelError(body.channel);
+        if (!transport.edit) return methodMissing(body.channel!, "edit");
+        const args: EditArgs = {
+          channel: body.channel!,
+          message_id: body.message_id,
+          text: body.text,
+          meta: mergeMeta(body),
+        };
+        await transport.edit(args);
         return json({ ok: true });
       } catch (err) {
         return json({ error: String(err) }, 500);
       }
     }
 
-    // Permission prompt — bridge forwards permission_request here, daemon
-    // sends to all allowlisted Telegram users.
+    // Permission prompt — bridge forwards permission_request here.
     if (req.method === "POST" && url.pathname === "/api/permission") {
       try {
         const body = (await req.json()) as {
+          channel?: string;
           request_id: string;
           tool_name: string;
           description: string;
           input_preview: string;
         };
-        const access = loadAccess();
-        const targets = access.allowFrom;
-        if (targets.length === 0) {
-          return json({ error: "no allowlisted users to send permission prompt to" }, 400);
-        }
-        const text =
-          `🔐 Permission: ${body.tool_name}\n\n` +
-          `${body.description}\n\n` +
-          `${body.input_preview}`;
-        const replyMarkup = {
-          inline_keyboard: [[
-            { text: "✅ Allow", callback_data: `perm_allow_${body.request_id}` },
-            { text: "❌ Deny", callback_data: `perm_deny_${body.request_id}` },
-          ]],
+        const transport = transportFor(body.channel);
+        if (!transport) return channelError(body.channel);
+        if (!transport.sendPermission) return methodMissing(body.channel!, "sendPermission");
+        const args: PermissionArgs = {
+          channel: body.channel!,
+          request_id: body.request_id,
+          tool_name: body.tool_name,
+          description: body.description,
+          input_preview: body.input_preview,
         };
-        const sent: number[] = [];
-        for (const chatId of targets) {
-          try {
-            const id = await api.sendMessage(chatId, text, { reply_markup: replyMarkup });
-            sent.push(id);
-          } catch (err) {
-            console.error(`parachute-channel: permission prompt to ${chatId} failed:`, err);
-          }
-        }
-        return json({ sent });
+        const result = await transport.sendPermission(args);
+        return json({ sent: result.sent });
       } catch (err) {
         return json({ error: String(err) }, 500);
       }
@@ -471,13 +297,13 @@ const server = Bun.serve({
     // Download attachment
     if (req.method === "POST" && url.pathname === "/api/download") {
       try {
-        const body = (await req.json()) as { file_id: string };
-        const fileInfo = await api.getFile(body.file_id);
-        const data = await api.downloadFile(fileInfo.file_path);
-        const ext = fileInfo.file_path.split(".").pop() ?? "bin";
-        const localPath = join(INBOX_DIR, `${Date.now()}-${body.file_id.slice(-10)}.${ext}`);
-        writeFileSync(localPath, data);
-        return json({ path: localPath });
+        const body = (await req.json()) as { channel?: string; file_id: string };
+        const transport = transportFor(body.channel);
+        if (!transport) return channelError(body.channel);
+        if (!transport.download) return methodMissing(body.channel!, "download");
+        const args: DownloadArgs = { channel: body.channel!, file_id: body.file_id };
+        const result = await transport.download(args);
+        return json({ path: result.path });
       } catch (err) {
         return json({ error: String(err) }, 500);
       }
@@ -487,38 +313,81 @@ const server = Bun.serve({
   },
 });
 
-function chunkText(text: string, maxLen: number): string[] {
-  if (text.length <= maxLen) return [text];
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
-    }
-    // Try to break at a newline
-    let breakAt = remaining.lastIndexOf("\n", maxLen);
-    if (breakAt < maxLen * 0.5) breakAt = maxLen; // no good newline, hard break
-    chunks.push(remaining.slice(0, breakAt));
-    remaining = remaining.slice(breakAt).replace(/^\n/, "");
+// ---------------------------------------------------------------------------
+// Request helpers
+// ---------------------------------------------------------------------------
+
+function channelError(channel: string | undefined): Response {
+  if (!channel) {
+    return json({ error: "missing 'channel' field in request body" }, 400);
   }
-  return chunks;
+  return json(
+    {
+      error: `unknown channel "${channel}" — known channels: ${[...channels.keys()].join(", ") || "(none)"}`,
+    },
+    400,
+  );
+}
+
+function methodMissing(channel: string, method: string): Response {
+  const kind = channels.get(channel)?.transport.kind ?? "unknown";
+  return json(
+    { error: `transport "${kind}" for channel "${channel}" does not support ${method}` },
+    400,
+  );
+}
+
+/**
+ * Build the meta map for outbound calls. Telegram addressing historically came
+ * in as a top-level `chat_id`; preserve that by folding it into `meta.chat_id`
+ * while letting an explicit `meta` object take precedence/extend.
+ */
+function mergeMeta(body: { chat_id?: string; meta?: Record<string, string> }): Record<string, string> {
+  const meta: Record<string, string> = { ...(body.meta ?? {}) };
+  if (body.chat_id !== undefined && meta.chat_id === undefined) meta.chat_id = body.chat_id;
+  return meta;
+}
+
+function toReplyArgs(body: {
+  channel?: string;
+  chat_id?: string;
+  text?: string;
+  reply_to?: string;
+  files?: string[];
+  meta?: Record<string, string>;
+}): ReplyArgs {
+  return {
+    channel: body.channel!,
+    text: body.text,
+    files: body.files,
+    reply_to: body.reply_to,
+    meta: mergeMeta(body),
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Startup
+// Startup — start every transport
 // ---------------------------------------------------------------------------
 
 console.log(`parachute-channel: daemon listening on http://127.0.0.1:${PORT}`);
 console.log(`parachute-channel: state dir: ${STATE_DIR}`);
-console.log(`parachute-channel: ${clients.size} bridge(s) connected`);
+console.log(
+  `parachute-channel: ${channels.size} channel(s): ${[...channels.values()]
+    .map((c) => `${c.name}→${c.transport.kind}`)
+    .join(", ")}`,
+);
 
-// Graceful shutdown
-process.on("SIGINT", () => { pollActive = false; server.stop(); process.exit(0); });
-process.on("SIGTERM", () => { pollActive = false; server.stop(); process.exit(0); });
+for (const channel of channels.values()) {
+  channel.transport.start(contextFor(channel.name)).catch((err) => {
+    console.error(`parachute-channel: transport "${channel.name}" start failed:`, err);
+  });
+}
 
-// Start polling (runs forever)
-pollLoop().catch((err) => {
-  console.error("parachute-channel: poll loop fatal:", err);
-  process.exit(1);
-});
+// Graceful shutdown — stop all transports.
+async function shutdown(): Promise<void> {
+  await Promise.allSettled([...channels.values()].map((c) => c.transport.stop()));
+  server.stop();
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

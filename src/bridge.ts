@@ -21,6 +21,12 @@ import { z } from "zod";
 
 const DAEMON_URL = process.env.PARACHUTE_CHANNEL_URL ?? "http://127.0.0.1:1941";
 
+// The named channel this bridge subscribes to. Defaults to "telegram" for
+// backwards-compat with single-bot installs. The daemon routes inbound on this
+// channel only to bridges subscribed to it, and every outbound tool call below
+// carries this channel so the daemon dispatches to the right transport.
+const CHANNEL = process.env.PARACHUTE_CHANNEL_NAME ?? "telegram";
+
 // ---------------------------------------------------------------------------
 // MCP server setup
 // ---------------------------------------------------------------------------
@@ -36,12 +42,12 @@ const mcp = new Server(
       tools: {},
     },
     instructions: [
-      "The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
+      "The sender reads this channel, not your transcript. Anything you want them to see must go through the reply tool — your transcript output never reaches them.",
       "",
-      'Messages from Telegram arrive as <channel source="parachute-channel" chat_id="..." message_id="..." user="..." ts="...">.',
-      "Reply with the reply tool — pass chat_id back. Use reply_to (message_id) to thread a specific message; omit it for normal responses.",
+      'Inbound messages arrive as <channel source="parachute-channel" ...> with metadata attributes describing the sender and message.',
+      "Reply with the reply tool — the daemon routes it back out the same channel. Pass back any addressing fields the inbound tag carried (e.g. chat_id). Use reply_to (message_id) to thread a specific message; omit it for normal responses.",
       "",
-      "If the tag has an image_path attribute, Read that file — it is a photo the sender attached.",
+      "If the tag has an image_path attribute, Read that file — it is an attachment the sender sent.",
       "If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path.",
       "",
       "Use react to add emoji reactions. Use edit_message for interim progress updates (edits do not push notifications — send a new reply when a long task completes so the user's device pings).",
@@ -70,7 +76,7 @@ mcp.setNotificationHandler(
       await fetch(`${DAEMON_URL}/api/permission`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(params),
+        body: JSON.stringify({ channel: CHANNEL, ...params }),
       });
     } catch (err) {
       process.stderr.write(`parachute-channel bridge: failed to relay permission request: ${err}\n`);
@@ -144,13 +150,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = req.params.arguments as Record<string, unknown>;
+  // Every outbound call carries the channel so the daemon dispatches to the
+  // right transport. Tool args (chat_id, text, …) ride alongside.
+  const body = { channel: CHANNEL, ...args };
 
   switch (req.params.name) {
     case "reply": {
       const res = await fetch(`${DAEMON_URL}/api/reply`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(args),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const err = await res.text();
@@ -166,7 +175,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const res = await fetch(`${DAEMON_URL}/api/react`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(args),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const err = await res.text();
@@ -179,7 +188,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const res = await fetch(`${DAEMON_URL}/api/edit`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(args),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const err = await res.text();
@@ -192,7 +201,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const res = await fetch(`${DAEMON_URL}/api/download`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(args),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const err = await res.text();
@@ -214,7 +223,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 async function connectToEvents(): Promise<void> {
   while (true) {
     try {
-      const res = await fetch(`${DAEMON_URL}/events`);
+      const res = await fetch(`${DAEMON_URL}/events?channel=${encodeURIComponent(CHANNEL)}`);
       if (!res.ok || !res.body) {
         throw new Error(`SSE connect failed: ${res.status}`);
       }
@@ -353,7 +362,7 @@ mcp.oninitialized = () => {
 // ---------------------------------------------------------------------------
 
 await mcp.connect(new StdioServerTransport());
-process.stderr.write("parachute-channel bridge: connected to Claude Code, connecting to daemon...\n");
+process.stderr.write(`parachute-channel bridge: connected to Claude Code (channel="${CHANNEL}"), connecting to daemon...\n`);
 
 // Start SSE listener (runs forever, reconnects on failure)
 connectToEvents();

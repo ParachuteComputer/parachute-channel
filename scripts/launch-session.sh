@@ -60,8 +60,41 @@ fi
 
 mkdir -p "$WORKDIR"
 
-# Bridge MCP config — the session's only wiring to the channel.
-cat > "$WORKDIR/.mcp.json" <<EOF
+# Mint a hub-issued JWT so the session authenticates to the channel daemon
+# (aud: "channel", scopes channel:read + channel:write). The daemon validates it
+# against the hub's JWKS — the bridge connection is authenticated like a vault
+# MCP client, NOT trusted by loopback. If minting fails (no hub running, or not
+# logged in), warn but continue: a dev daemon may be running unguarded, in which
+# case it accepts an unauthenticated bridge.
+TOKEN="$(parachute auth mint-token --scope "channel:read channel:write" 2>/dev/null || true)"
+if [ -z "$TOKEN" ]; then
+  echo "warning: could not mint a channel token (parachute auth mint-token failed)." >&2
+  echo "         the session will connect WITHOUT auth — fine for an unguarded dev daemon," >&2
+  echo "         but an auth-enabled daemon will reject it (HTTP 401). Ensure the hub is" >&2
+  echo "         running and you're logged in (parachute login) to authenticate the session." >&2
+fi
+
+# Bridge MCP config — the session's only wiring to the channel. The token, when
+# present, is injected into the env block so the bridge presents it on every
+# daemon request.
+if [ -n "$TOKEN" ]; then
+  cat > "$WORKDIR/.mcp.json" <<EOF
+{
+  "mcpServers": {
+    "parachute-channel": {
+      "command": "bun",
+      "args": ["$BRIDGE"],
+      "env": {
+        "PARACHUTE_CHANNEL_URL": "$DAEMON_URL",
+        "PARACHUTE_CHANNEL_NAME": "$CHANNEL",
+        "PARACHUTE_CHANNEL_TOKEN": "$TOKEN"
+      }
+    }
+  }
+}
+EOF
+else
+  cat > "$WORKDIR/.mcp.json" <<EOF
 {
   "mcpServers": {
     "parachute-channel": {
@@ -75,6 +108,7 @@ cat > "$WORKDIR/.mcp.json" <<EOF
   }
 }
 EOF
+fi
 
 # Reinforce the channel contract so the session always answers via the reply tool.
 cat > "$WORKDIR/CLAUDE.md" <<'EOF'
@@ -123,6 +157,8 @@ for _ in $(seq 1 20); do
 done
 
 echo "✓ session '$SESSION' ready on channel '$CHANNEL'."
+[ -n "$TOKEN" ] && echo "  authenticated with a hub-issued channel token (channel:read + channel:write)." \
+                || echo "  NOT authenticated (no token minted) — only an unguarded dev daemon will accept it."
 [ "$connected" = 1 ] && echo "  bridge connected to the daemon." || echo "  (bridge connection not yet confirmed via /health — usually a moment behind.)"
 echo "  chat:    open the channel UI and pick channel '$CHANNEL'"
 echo "  watch:   tmux attach -t $SESSION   (detach: Ctrl-b then d)"

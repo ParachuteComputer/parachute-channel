@@ -42,6 +42,9 @@ const PORT = parseInt(process.env.PARACHUTE_CHANNEL_PORT ?? "1941", 10);
 /** Channel a bridge subscribes to when `?channel=` is omitted (back-compat). */
 const DEFAULT_CHANNEL = "telegram";
 
+/** Absolute path to the bridge a Claude Code session spawns — shown in /ui setup. */
+const BRIDGE_PATH = join(import.meta.dir, "bridge.ts");
+
 mkdirSync(STATE_DIR, { recursive: true });
 mkdirSync(INBOX_DIR, { recursive: true });
 
@@ -153,6 +156,21 @@ const CHAT_UI_HTML = `<!doctype html>
     padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer;
   }
   button:disabled { opacity: .4; cursor: default; }
+  details.setup { border-bottom: 1px solid var(--line); background: var(--panel); }
+  details.setup > summary {
+    cursor: pointer; padding: 8px 16px; color: var(--accent); font-size: 13px; user-select: none;
+  }
+  details.setup .body { padding: 4px 16px 14px; font-size: 13px; color: var(--muted); }
+  details.setup .body p { margin: 8px 0 4px; }
+  details.setup pre {
+    margin: 4px 0; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; overflow-x: auto; color: var(--fg); font-size: 12px; line-height: 1.45;
+  }
+  details.setup code { color: var(--fg); }
+  details.setup .copy {
+    float: right; padding: 1px 8px; font-size: 11px; font-weight: 500; background: var(--them);
+    border: 1px solid var(--line); border-radius: 6px;
+  }
 </style>
 </head>
 <body>
@@ -161,6 +179,16 @@ const CHAT_UI_HTML = `<!doctype html>
     <span id="status">connecting…</span>
     <select id="channel" title="channel"></select>
   </header>
+  <details class="setup">
+    <summary>Connect a Claude Code session ▾</summary>
+    <div class="body">
+      <p>1. In the working directory you'll run Claude Code from, create <code>.mcp.json</code>:</p>
+      <pre><button class="copy" data-copy="mcp">copy</button><code id="snippet-mcp"></code></pre>
+      <p>2. Launch Claude Code from that directory:</p>
+      <pre><button class="copy" data-copy="launch">copy</button><code id="snippet-launch"></code></pre>
+      <p id="setup-note"></p>
+    </div>
+  </details>
   <div id="transcript"></div>
   <form id="composer">
     <textarea id="input" rows="1" placeholder="Type a message… (Enter to send, Shift+Enter for newline)" autocomplete="off"></textarea>
@@ -175,6 +203,36 @@ const CHAT_UI_HTML = `<!doctype html>
   var statusEl = document.getElementById("status");
   var form = document.getElementById("composer");
   var es = null;
+  var BRIDGE_PATH = ${JSON.stringify(BRIDGE_PATH)};
+
+  function updateSetup(ch) {
+    if (!ch) return;
+    var mcp = {
+      mcpServers: {
+        "parachute-channel": {
+          command: "bun",
+          args: [BRIDGE_PATH],
+          env: { PARACHUTE_CHANNEL_URL: window.location.origin, PARACHUTE_CHANNEL_NAME: ch },
+        },
+      },
+    };
+    document.getElementById("snippet-mcp").textContent = JSON.stringify(mcp, null, 2);
+    document.getElementById("snippet-launch").textContent =
+      "claude --dangerously-load-development-channels=server:parachute-channel";
+    document.getElementById("setup-note").textContent =
+      "On first launch, confirm the dev-channels prompt (\\"I am using this for local development\\"). " +
+      "After that, messages you send here inject directly into that idle session, and its replies appear here.";
+  }
+
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.addEventListener("click", function (e) {
+      e.preventDefault();
+      var id = btn.getAttribute("data-copy") === "mcp" ? "snippet-mcp" : "snippet-launch";
+      var txt = document.getElementById(id).textContent;
+      if (navigator.clipboard) navigator.clipboard.writeText(txt);
+      var prev = btn.textContent; btn.textContent = "copied"; setTimeout(function () { btn.textContent = prev; }, 1200);
+    });
+  });
 
   function add(kind, text, files) {
     var el = document.createElement("div");
@@ -201,6 +259,7 @@ const CHAT_UI_HTML = `<!doctype html>
     if (es) { es.close(); es = null; }
     var ch = currentChannel();
     if (!ch) { setStatus("no channel", false); sendBtn.disabled = true; return; }
+    updateSetup(ch);
     setStatus("connecting…", false);
     es = new EventSource("/ui/events?channel=" + encodeURIComponent(ch));
     es.onopen = function () { setStatus("● live · " + ch, true); sendBtn.disabled = false; };

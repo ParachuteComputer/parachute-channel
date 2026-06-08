@@ -114,7 +114,9 @@ async function listenUi(signal: AbortSignal): Promise<void> {
             const p = JSON.parse(data) as { id: string; text: string };
             replies.push({ id: p.id, text: p.text });
             log(`◀ reply received: ${JSON.stringify(p.text).slice(0, 120)}`);
-          } catch {}
+          } catch (e) {
+            log(`SSE reply frame parse error (ignored): ${String(e)} — raw: ${data.slice(0, 120)}`);
+          }
         }
         event = ""; data = "";
       }
@@ -246,6 +248,11 @@ async function main(): Promise<void> {
   log(`✓ LLM judge: PASS — ${verdict.reason}`);
 
   console.log(`\n✅ PASS — full wake→act→reply loop verified end to end (deterministic + LLM-judged).\n`);
+}
+
+// Ctrl-C / kill during a long poll must still clean up the tmux session + daemon.
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => { log(`${sig} — tearing down`); teardown(); process.exit(130); });
 }
 
 main()

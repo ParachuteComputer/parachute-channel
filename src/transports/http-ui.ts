@@ -129,7 +129,8 @@ export class HttpUiTransport implements Transport {
   // -------------------------------------------------------------------------
 
   async ingestHttp(req: Request, url: URL): Promise<Response | null> {
-    const channel = this.channel;
+    const channel = this.channel; // getter throws a clear error if not started
+    const ctx = this.ctx!; // safe: the getter above guarantees ctx is set
 
     // 1. Inbound: POST /api/channels/<channel>/send  body {text}
     if (
@@ -146,7 +147,7 @@ export class HttpUiTransport implements Transport {
       } catch {
         return json({ error: "invalid JSON body" }, 400);
       }
-      this.ctx!.emit({
+      ctx.emit({
         channel,
         content: text,
         meta: { source: "http-ui", ts: new Date().toISOString() },

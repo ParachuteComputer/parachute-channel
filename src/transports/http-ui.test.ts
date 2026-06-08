@@ -309,24 +309,30 @@ describe("HttpUiTransport — through a daemon-shaped server", () => {
     }
   });
 
-  test("channel isolation: a send on A does NOT reach a UI client on B", async () => {
+  test("channel isolation: a send on A reaches A's bridge but NOT a UI client on B", async () => {
     const { server, base } = buildServer([{ name: "A" }, { name: "B" }]);
     try {
+      const bridgeA = await openSse(base, "/events?channel=A");
       const uiB = await openSse(base, "/ui/events?channel=B");
 
-      // Send on channel A, then reply on A — neither should hit B's UI stream.
+      // Send on channel A, then reply on A.
       await fetch(`${base}/api/channels/A/send`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ text: "for-A" }),
       });
+      // Close the loop: A's bridge MUST receive the inbound (not just "B didn't").
+      const bridgeFrame = await bridgeA.read();
+      expect(bridgeFrame).toContain("for-A");
+
       await fetch(`${base}/api/reply`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ channel: "A", text: "reply-to-A" }),
       });
 
-      // Now reply on B so B's stream definitely has a frame, and assert it's B's.
+      // Now reply on B so B's stream definitely has a frame, and assert it's B's
+      // only — none of A's traffic leaked across.
       await fetch(`${base}/api/reply`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -337,6 +343,7 @@ describe("HttpUiTransport — through a daemon-shaped server", () => {
       expect(frame).toContain("reply-to-B");
       expect(frame).not.toContain("reply-to-A");
       expect(frame).not.toContain("for-A");
+      bridgeA.cancel();
       uiB.cancel();
     } finally {
       server.stop(true);

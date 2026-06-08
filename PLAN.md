@@ -81,12 +81,20 @@ Two tiers, mirroring hub's `e2e/` but realizing the deferred Tier 2:
 
 ---
 
-## Stage 0 — foundation check  ·  ☐
+## Stage 0 — foundation check  ·  ✅ PASS (2026-06-07)
 
-- [ ] Confirm idle-session wake works on our Claude Code version via the existing Telegram
-      channel (send to an idle session, verify it wakes). ~30 min. If it fails, that's
-      timing info, not a reason to build workarounds — re-decide with Aaron.
-- [ ] Pin the Claude Code version under test; note it in this file.
+- [x] **Idle-wake confirmed on Claude Code v2.1.166 (Opus 4.8, Max).** Method: an
+      isolated standalone MCP server (no Telegram dependency) declaring the same
+      `claude/channel` capability the real bridge uses, attached to a real interactive
+      `claude` session in tmux launched with `--dangerously-load-development-channels=server:probe`.
+      With the session sitting **idle at the prompt**, an unsolicited
+      `notifications/claude/channel` was fired; the session woke ~6s later, called the
+      ack tool, replied, and returned to idle — zero human input. The `notifications/claude/channel`
+      wake mechanism is the primary path (D4 confirmed); no hook workarounds needed.
+- [x] CC version pinned: **2.1.166**. Note: the client echoes `experimental caps: {}`
+      (does not advertise `claude/channel` back), but the channel banner shows active and
+      delivery works — the empty echo is cosmetic, matching the real bridge's known
+      degrade-warning edge (#9). Watch this if a future CC version changes behavior.
 
 ## Stage 1 — the channel fabric (freestanding, no vault)  ·  ☐
 

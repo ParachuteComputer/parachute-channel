@@ -181,7 +181,14 @@ async function main(): Promise<void> {
   // 2. boot the daemon
   log(`booting daemon on ${BASE} (state ${STATE_DIR})`);
   daemon = Bun.spawn(["bun", join(REPO_ROOT, "src", "daemon.ts")], {
-    env: { ...process.env, PARACHUTE_CHANNEL_STATE_DIR: STATE_DIR, PARACHUTE_CHANNEL_PORT: String(PORT) },
+    // PARACHUTE_HOME sandboxes services.json self-registration into the temp dir
+    // so the e2e never touches the operator's real ~/.parachute/services.json.
+    env: {
+      ...process.env,
+      PARACHUTE_HOME: STATE_DIR,
+      PARACHUTE_CHANNEL_STATE_DIR: STATE_DIR,
+      PARACHUTE_CHANNEL_PORT: String(PORT),
+    },
     stdout: Bun.file(join(STATE_DIR, "daemon.log")),
     stderr: Bun.file(join(STATE_DIR, "daemon.log")),
   });

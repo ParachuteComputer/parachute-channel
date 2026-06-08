@@ -14,9 +14,10 @@
  * Default port: 1941 (PARACHUTE_CHANNEL_PORT env).
  */
 
-import { mkdirSync } from "fs";
+import { mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { upsertService } from "./services-manifest.ts";
 import type {
   Transport,
   TransportContext,
@@ -44,6 +45,20 @@ const DEFAULT_CHANNEL = "telegram";
 
 /** Absolute path to the bridge a Claude Code session spawns — shown in /ui setup. */
 const BRIDGE_PATH = join(import.meta.dir, "bridge.ts");
+
+/** Loopback origin a co-located bridge connects to (shown in /ui setup — the
+ *  bridge talks to this daemon directly, NOT through hub/the expose). */
+const DAEMON_ORIGIN = `http://127.0.0.1:${PORT}`;
+
+/** Package version + install dir, for services.json self-registration. */
+const PKG_VERSION = ((): string => {
+  try {
+    return JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")).version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
+const INSTALL_DIR = join(import.meta.dir, "..");
 
 mkdirSync(STATE_DIR, { recursive: true });
 mkdirSync(INBOX_DIR, { recursive: true });
@@ -204,6 +219,11 @@ const CHAT_UI_HTML = `<!doctype html>
   var form = document.getElementById("composer");
   var es = null;
   var BRIDGE_PATH = ${JSON.stringify(BRIDGE_PATH).replace(/</g, "\\u003c")};
+  // The bridge talks to the daemon directly on loopback (not through hub).
+  var DAEMON_ORIGIN = ${JSON.stringify(DAEMON_ORIGIN)};
+  // Served through hub the page is /channel/ui; locally it's /ui. Derive the
+  // mount prefix so every API/SSE call resolves under the same prefix.
+  var MOUNT = location.pathname.replace(/\\/ui\\/?$/, "");
 
   function updateSetup(ch) {
     if (!ch) return;
@@ -212,7 +232,7 @@ const CHAT_UI_HTML = `<!doctype html>
         "parachute-channel": {
           command: "bun",
           args: [BRIDGE_PATH],
-          env: { PARACHUTE_CHANNEL_URL: window.location.origin, PARACHUTE_CHANNEL_NAME: ch },
+          env: { PARACHUTE_CHANNEL_URL: DAEMON_ORIGIN, PARACHUTE_CHANNEL_NAME: ch },
         },
       },
     };
@@ -261,7 +281,7 @@ const CHAT_UI_HTML = `<!doctype html>
     if (!ch) { setStatus("no channel", false); sendBtn.disabled = true; return; }
     updateSetup(ch);
     setStatus("connecting…", false);
-    es = new EventSource("/ui/events?channel=" + encodeURIComponent(ch));
+    es = new EventSource(MOUNT + "/ui/events?channel=" + encodeURIComponent(ch));
     es.onopen = function () { setStatus("● live · " + ch, true); sendBtn.disabled = false; };
     es.addEventListener("reply", function (e) {
       try { var d = JSON.parse(e.data); add("them", d.text || "", d.files); }
@@ -290,7 +310,7 @@ const CHAT_UI_HTML = `<!doctype html>
     add("you", text);
     input.value = "";
     autosize();
-    fetch("/api/channels/" + encodeURIComponent(ch) + "/send", {
+    fetch(MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/send", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text: text }),
@@ -319,7 +339,7 @@ const CHAT_UI_HTML = `<!doctype html>
     connect();
   });
 
-  fetch("/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
+  fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
     var chans = (cfg.channels || []).filter(function (c) { return c.transport === "http-ui"; });
     if (!chans.length) { setStatus("no http-ui channels configured", false); return; }
     var preselect = new URL(window.location.href).searchParams.get("channel");
@@ -654,6 +674,28 @@ console.log(
     .map((c) => `${c.name}→${c.transport.kind}`)
     .join(", ")}`,
 );
+
+// Self-register into ~/.parachute/services.json so hub lists this module in the
+// portal and reverse-proxies `<expose>/channel/*` → this loopback daemon.
+// Best-effort: a failure must not stop the daemon from serving locally. Honors
+// PARACHUTE_HOME, so sandboxed/e2e daemons never touch the real services.json.
+try {
+  upsertService({
+    name: "parachute-channel",
+    port: PORT,
+    paths: ["/channel"],
+    health: "/health",
+    version: PKG_VERSION,
+    displayName: "Channel",
+    tagline: "Chat with your Claude Code sessions — a channel per session.",
+    installDir: INSTALL_DIR,
+    stripPrefix: true,
+    uiUrl: "/channel/ui", // portal "Open UI" link (also in module.json; written here in case hub reads it from services.json)
+  });
+  console.log(`parachute-channel: self-registered into services.json (port ${PORT}, mount /channel)`);
+} catch (err) {
+  console.error(`parachute-channel: services.json self-registration failed (continuing): ${err}`);
+}
 
 for (const channel of channels.values()) {
   channel.transport.start(contextFor(channel.name)).catch((err) => {

@@ -1,0 +1,15 @@
+{
+  "name": "channel",
+  "manifestName": "parachute-channel",
+  "displayName": "Channel",
+  "tagline": "Chat with your Claude Code sessions — a channel per session.",
+  "port": 1941,
+  "paths": ["/channel"],
+  "health": "/health",
+  "stripPrefix": true,
+  "uiUrl": "/channel/ui",
+  "startCmd": ["parachute-channel"],
+  "scopes": {
+    "defines": ["channel:read", "channel:write", "channel:admin"]
+  }
+}

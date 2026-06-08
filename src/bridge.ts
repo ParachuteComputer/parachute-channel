@@ -92,11 +92,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "reply",
-      description: "Send a message to a Telegram chat. Supports text, file attachments (images sent as photos, .ogg as voice, others as documents), and quote-reply threading.",
+      description: "Send a message back through the channel to the sender. Supports text, file attachments, and quote-reply threading. The daemon routes it out whichever transport the channel uses.",
       inputSchema: {
         type: "object" as const,
         properties: {
-          chat_id: { type: "string", description: "Telegram chat ID to send to" },
           text: { type: "string", description: "Message text (optional if files provided)" },
           reply_to: { type: "string", description: "Message ID to quote-reply (optional)" },
           files: {
@@ -104,34 +103,39 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: "string" },
             description: "Absolute file paths to attach (optional)",
           },
+          chat_id: {
+            type: "string",
+            description:
+              "Addressing field some transports need (e.g. a Telegram chat ID). Include it ONLY if the inbound message tag carried one; omit it otherwise (e.g. for a web/UI channel).",
+          },
         },
-        required: ["chat_id"],
+        required: [],
       },
     },
     {
       name: "react",
-      description: "Add an emoji reaction to a Telegram message. Only Telegram's fixed emoji whitelist is accepted (👍 👎 ❤ 🔥 👀 etc).",
+      description: "Add an emoji reaction to a message, on transports that support reactions (e.g. Telegram's fixed emoji whitelist 👍 👎 ❤ 🔥 👀). Not all channels support this.",
       inputSchema: {
         type: "object" as const,
         properties: {
-          chat_id: { type: "string", description: "Telegram chat ID" },
           message_id: { type: "string", description: "Message ID to react to" },
           emoji: { type: "string", description: "Emoji reaction" },
+          chat_id: { type: "string", description: "Addressing field for transports that need it (e.g. Telegram chat ID); omit otherwise." },
         },
-        required: ["chat_id", "message_id", "emoji"],
+        required: ["message_id", "emoji"],
       },
     },
     {
       name: "edit_message",
-      description: "Edit a message the bot previously sent. Useful for progress updates. Edits don't trigger push notifications.",
+      description: "Edit a message you previously sent. Useful for progress updates. On most transports edits don't push a notification.",
       inputSchema: {
         type: "object" as const,
         properties: {
-          chat_id: { type: "string", description: "Telegram chat ID" },
           message_id: { type: "string", description: "Message ID to edit" },
           text: { type: "string", description: "New text" },
+          chat_id: { type: "string", description: "Addressing field for transports that need it (e.g. Telegram chat ID); omit otherwise." },
         },
-        required: ["chat_id", "message_id", "text"],
+        required: ["message_id", "text"],
       },
     },
     {

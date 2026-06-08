@@ -12,6 +12,7 @@
     "daemon": "bun src/daemon.ts",
     "bridge": "bun src/bridge.ts",
     "test": "bun test src/",
+    "test:e2e": "bun e2e/llm/run.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

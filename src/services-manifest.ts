@@ -11,9 +11,9 @@
  * still serves locally even if registration fails. Honors `PARACHUTE_HOME` so
  * sandboxed/test/e2e daemons never touch the operator's real services.json.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
-import { homedir } from "os";
-import { dirname, join } from "path";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 export interface ServiceEntry {
   name: string;

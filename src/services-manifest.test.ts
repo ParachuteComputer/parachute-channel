@@ -70,5 +70,6 @@ describe("upsertService", () => {
     writeFileSync(path, JSON.stringify({ not_services: true }));
     expect(() => upsertService(CHANNEL, path)).toThrow(/malformed/);
     expect(existsSync(path)).toBe(true); // original left intact
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ not_services: true }); // content untouched
   });
 });

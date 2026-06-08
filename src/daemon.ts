@@ -690,6 +690,7 @@ try {
     tagline: "Chat with your Claude Code sessions — a channel per session.",
     installDir: INSTALL_DIR,
     stripPrefix: true,
+    uiUrl: "/channel/ui", // portal "Open UI" link (also in module.json; written here in case hub reads it from services.json)
   });
   console.log(`parachute-channel: self-registered into services.json (port ${PORT}, mount /channel)`);
 } catch (err) {

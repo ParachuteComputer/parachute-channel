@@ -42,6 +42,9 @@ const PORT = parseInt(process.env.PARACHUTE_CHANNEL_PORT ?? "1941", 10);
 /** Channel a bridge subscribes to when `?channel=` is omitted (back-compat). */
 const DEFAULT_CHANNEL = "telegram";
 
+/** Absolute path to the bridge a Claude Code session spawns — shown in /ui setup. */
+const BRIDGE_PATH = join(import.meta.dir, "bridge.ts");
+
 mkdirSync(STATE_DIR, { recursive: true });
 mkdirSync(INBOX_DIR, { recursive: true });
 
@@ -88,6 +91,250 @@ function contextFor(channel: string): TransportContext {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Built-in chat UI
+// ---------------------------------------------------------------------------
+
+/**
+ * The built-in chat page — a single self-contained HTML document (no framework,
+ * no build step). On load it fetches /.parachute/config, lists the http-ui
+ * channels as a picker, opens an EventSource on /ui/events?channel=<sel>, and
+ * POSTs sends to /api/channels/<sel>/send. This is the surface for verifying
+ * messaging works end to end with no Telegram and no vault.
+ */
+const CHAT_UI_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>parachute-channel · chat</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef;
+    --muted: #8b93a3; --you: #2b5cff; --them: #232936; --accent: #4cc2a0;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header .brand { font-weight: 600; }
+  header .brand small { color: var(--muted); font-weight: 400; }
+  header select {
+    margin-left: auto; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font: inherit;
+  }
+  #status { font-size: 12px; color: var(--muted); }
+  #status.live { color: var(--accent); }
+  #transcript {
+    flex: 1; overflow-y: auto; padding: 16px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .msg { max-width: 78%; padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.you { align-self: flex-end; background: var(--you); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.them { align-self: flex-start; background: var(--them); border-bottom-left-radius: 4px; }
+  .msg.sys { align-self: center; background: transparent; color: var(--muted); font-size: 12px; font-style: italic; max-width: 90%; }
+  .msg.perm { align-self: flex-start; background: #3a2f1a; border: 1px solid #6b5320; color: #ffd98a; max-width: 90%; }
+  .files { margin-top: 4px; font-size: 12px; opacity: .85; }
+  form {
+    display: flex; gap: 8px; padding: 12px 16px;
+    border-top: 1px solid var(--line); background: var(--panel);
+  }
+  #input {
+    flex: 1; resize: none; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font: inherit; max-height: 120px;
+  }
+  button {
+    background: var(--you); color: #fff; border: 0; border-radius: 8px;
+    padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .4; cursor: default; }
+  details.setup { border-bottom: 1px solid var(--line); background: var(--panel); }
+  details.setup > summary {
+    cursor: pointer; padding: 8px 16px; color: var(--accent); font-size: 13px; user-select: none;
+  }
+  details.setup .body { padding: 4px 16px 14px; font-size: 13px; color: var(--muted); }
+  details.setup .body p { margin: 8px 0 4px; }
+  details.setup pre {
+    margin: 4px 0; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; overflow-x: auto; color: var(--fg); font-size: 12px; line-height: 1.45;
+  }
+  details.setup code { color: var(--fg); }
+  details.setup .copy {
+    float: right; padding: 1px 8px; font-size: 11px; font-weight: 500; background: var(--them);
+    border: 1px solid var(--line); border-radius: 6px;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">parachute-channel <small>· chat</small></div>
+    <span id="status">connecting…</span>
+    <select id="channel" title="channel"></select>
+  </header>
+  <details class="setup">
+    <summary>Connect a Claude Code session ▾</summary>
+    <div class="body">
+      <p>1. In the working directory you'll run Claude Code from, create <code>.mcp.json</code>:</p>
+      <pre><button class="copy" data-copy="mcp">copy</button><code id="snippet-mcp"></code></pre>
+      <p>2. Launch Claude Code from that directory:</p>
+      <pre><button class="copy" data-copy="launch">copy</button><code id="snippet-launch"></code></pre>
+      <p id="setup-note"></p>
+    </div>
+  </details>
+  <div id="transcript"></div>
+  <form id="composer">
+    <textarea id="input" rows="1" placeholder="Type a message… (Enter to send, Shift+Enter for newline)" autocomplete="off"></textarea>
+    <button id="send" type="submit" disabled>Send</button>
+  </form>
+<script>
+(function () {
+  var transcript = document.getElementById("transcript");
+  var sel = document.getElementById("channel");
+  var input = document.getElementById("input");
+  var sendBtn = document.getElementById("send");
+  var statusEl = document.getElementById("status");
+  var form = document.getElementById("composer");
+  var es = null;
+  var BRIDGE_PATH = ${JSON.stringify(BRIDGE_PATH).replace(/</g, "\\u003c")};
+
+  function updateSetup(ch) {
+    if (!ch) return;
+    var mcp = {
+      mcpServers: {
+        "parachute-channel": {
+          command: "bun",
+          args: [BRIDGE_PATH],
+          env: { PARACHUTE_CHANNEL_URL: window.location.origin, PARACHUTE_CHANNEL_NAME: ch },
+        },
+      },
+    };
+    document.getElementById("snippet-mcp").textContent = JSON.stringify(mcp, null, 2);
+    document.getElementById("snippet-launch").textContent =
+      "claude --dangerously-load-development-channels=server:parachute-channel";
+    document.getElementById("setup-note").textContent =
+      "On first launch, confirm the dev-channels prompt (\\"I am using this for local development\\"). " +
+      "After that, messages you send here inject directly into that idle session, and its replies appear here.";
+  }
+
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.addEventListener("click", function (e) {
+      e.preventDefault();
+      var id = btn.getAttribute("data-copy") === "mcp" ? "snippet-mcp" : "snippet-launch";
+      var txt = document.getElementById(id).textContent;
+      if (navigator.clipboard) navigator.clipboard.writeText(txt);
+      var prev = btn.textContent; btn.textContent = "copied"; setTimeout(function () { btn.textContent = prev; }, 1200);
+    });
+  });
+
+  function add(kind, text, files) {
+    var el = document.createElement("div");
+    el.className = "msg " + kind;
+    el.textContent = text;
+    if (files && files.length) {
+      var f = document.createElement("div");
+      f.className = "files";
+      f.textContent = "📎 " + files.join(", ");
+      el.appendChild(f);
+    }
+    transcript.appendChild(el);
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  function setStatus(text, live) {
+    statusEl.textContent = text;
+    statusEl.className = live ? "live" : "";
+  }
+
+  function currentChannel() { return sel.value; }
+
+  function connect() {
+    if (es) { es.close(); es = null; }
+    var ch = currentChannel();
+    if (!ch) { setStatus("no channel", false); sendBtn.disabled = true; return; }
+    updateSetup(ch);
+    setStatus("connecting…", false);
+    es = new EventSource("/ui/events?channel=" + encodeURIComponent(ch));
+    es.onopen = function () { setStatus("● live · " + ch, true); sendBtn.disabled = false; };
+    es.addEventListener("reply", function (e) {
+      try { var d = JSON.parse(e.data); add("them", d.text || "", d.files); }
+      catch (_) { add("them", e.data); }
+    });
+    es.addEventListener("edit", function (e) {
+      try { var d = JSON.parse(e.data); add("sys", "(edited) " + (d.text || "")); } catch (_) {}
+    });
+    es.addEventListener("permission", function (e) {
+      try {
+        var d = JSON.parse(e.data);
+        add("perm", "🔐 permission: " + d.tool_name + "\\n" + (d.description || "") + "\\n" + (d.input_preview || ""));
+      } catch (_) {}
+    });
+    es.addEventListener("close", function () { setStatus("closed", false); });
+    es.onerror = function () {
+      // EventSource auto-reconnects; reflect the transient state.
+      setStatus("reconnecting…", false);
+    };
+  }
+
+  function send() {
+    var text = input.value.trim();
+    var ch = currentChannel();
+    if (!text || !ch) return;
+    add("you", text);
+    input.value = "";
+    autosize();
+    fetch("/api/channels/" + encodeURIComponent(ch) + "/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: text }),
+    }).then(function (r) {
+      if (!r.ok) return r.json().catch(function(){return {};}).then(function (j) {
+        add("sys", "send failed: " + (j.error || r.status));
+      });
+    }).catch(function (err) { add("sys", "send failed: " + err); });
+  }
+
+  function autosize() {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 120) + "px";
+  }
+
+  form.addEventListener("submit", function (e) { e.preventDefault(); send(); });
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  input.addEventListener("input", autosize);
+  sel.addEventListener("change", function () {
+    transcript.innerHTML = "";
+    var url = new URL(window.location.href);
+    url.searchParams.set("channel", sel.value);
+    history.replaceState(null, "", url);
+    connect();
+  });
+
+  fetch("/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
+    var chans = (cfg.channels || []).filter(function (c) { return c.transport === "http-ui"; });
+    if (!chans.length) { setStatus("no http-ui channels configured", false); return; }
+    var preselect = new URL(window.location.href).searchParams.get("channel");
+    chans.forEach(function (c) {
+      var opt = document.createElement("option");
+      opt.value = c.name; opt.textContent = c.name;
+      if (c.name === preselect) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    connect();
+  }).catch(function (err) { setStatus("config load failed: " + err, false); });
+})();
+</script>
+</body>
+</html>`;
 
 // ---------------------------------------------------------------------------
 // HTTP server
@@ -151,7 +398,7 @@ const server = Bun.serve({
                 name: { type: "string", description: "Unique channel name bridges subscribe to." },
                 transport: {
                   type: "string",
-                  enum: ["telegram"],
+                  enum: ["telegram", "http-ui"],
                   description: "Transport kind backing this channel.",
                 },
                 config: {
@@ -312,6 +559,23 @@ const server = Bun.serve({
       } catch (err) {
         return errResponse(err);
       }
+    }
+
+    // Built-in chat UI — a global channel-picker page across all http-ui
+    // channels. Served by the daemon (not a transport) because it spans every
+    // http-ui channel; the per-channel send + SSE routes live in the transport.
+    if (req.method === "GET" && url.pathname === "/ui") {
+      return new Response(CHAT_UI_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // Give each transport a chance to handle a route the daemon didn't. Runs
+    // after the daemon's own built-in routes and before the final 404. A
+    // transport returns a Response if it owns the path, or null to pass.
+    for (const ch of channels.values()) {
+      const res = await ch.transport.ingestHttp?.(req, url);
+      if (res) return res;
     }
 
     return json({ error: "not found" }, 404);

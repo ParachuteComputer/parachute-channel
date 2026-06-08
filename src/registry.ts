@@ -16,6 +16,7 @@ import { join } from "path";
 import { homedir } from "os";
 import type { Transport } from "./transport.ts";
 import { TelegramTransport, type TelegramTransportConfig } from "./transports/telegram.ts";
+import { HttpUiTransport, type HttpUiTransportConfig } from "./transports/http-ui.ts";
 
 export interface ChannelEntry {
   name: string;
@@ -62,10 +63,13 @@ export function instantiateTransport(entry: ChannelEntry): Transport {
   switch (entry.transport) {
     case "telegram":
       return new TelegramTransport((entry.config ?? {}) as TelegramTransportConfig);
+    case "http-ui":
+      // http-ui needs no secret — just a channel name (taken from ctx at start).
+      return new HttpUiTransport((entry.config ?? {}) as HttpUiTransportConfig);
     default:
       throw new Error(
         `registry: unknown transport kind "${entry.transport}" for channel "${entry.name}" ` +
-          `(known: telegram)`,
+          `(known: telegram, http-ui)`,
       );
   }
 }

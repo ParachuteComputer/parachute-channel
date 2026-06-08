@@ -95,4 +95,12 @@ export interface Transport {
   sendPermission?(args: PermissionArgs): Promise<{ sent: string[] }>;
   /** Optional: fetch an attachment, returning a local path. */
   download?(args: DownloadArgs): Promise<{ path: string }>;
+  /**
+   * Optional: handle an HTTP request the daemon didn't handle itself. The
+   * daemon owns `Bun.serve`; a transport that needs to contribute routes (e.g.
+   * http-ui's per-channel send + SSE endpoints) implements this. Return a
+   * Response if this transport owns the path, or null to pass it on. Called
+   * after the daemon's built-in routes and before the final 404.
+   */
+  ingestHttp?(req: Request, url: URL): Promise<Response | null>;
 }

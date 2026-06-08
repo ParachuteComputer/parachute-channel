@@ -111,15 +111,20 @@ Two tiers, mirroring hub's `e2e/` but realizing the deferred Tier 2:
       Telegram path unchanged (regression). typecheck + bun test green.
 - [ ] Reviewer subagent.
 
-**PR 1.2 — http-ui transport + built-in chat UI.** ☐
-- [ ] `transports/http-ui.ts`: inbound via `POST /api/channels/<name>/send`; outbound
-      delivered to the UI over SSE (`/ui/events?channel=<name>`).
-- [ ] Minimal built-in chat page served by the daemon (`/ui` or `/ui/<channel>`): channel
-      picker + message box + live transcript. No framework needed; vanilla is fine.
-- [ ] **Tier 2 LLM-run e2e (headline):** boot daemon + real CC session subscribed to a test
-      channel; POST a message; LLM judges the reply. Build the `e2e/llm/` harness here.
-- [ ] Loopback-only; no auth in Stage 1 (named in Decision 3; hub-JWT lands when exposed).
-- [ ] Reviewer subagent.
+**PR 1.2 — http-ui transport + built-in chat UI.** 🔄 (reviewer pending)
+- [x] `transports/http-ui.ts`: inbound via `POST /api/channels/<name>/send`; outbound
+      delivered to the UI over SSE (`/ui/events?channel=<name>`). Daemon gained an optional
+      `Transport.ingestHttp` so transports contribute routes without owning `Bun.serve`.
+- [x] Minimal built-in chat page served by the daemon (`/ui`): channel picker + message box
+      + live transcript, vanilla single-file.
+- [x] Bridge tool surface made transport-neutral — `reply` no longer requires a Telegram
+      `chat_id` (the gap that blocked http-ui replies; caught by the e2e). `download` left
+      Telegram-specific (file_id) as a noted follow-up.
+- [x] **Tier 2 LLM-run e2e (headline) — PASSES.** `e2e/llm/run.ts`: boots daemon + a real
+      interactive CC session in tmux, POSTs a message, verifies the reply deterministically
+      (positive control + sentinel + content) AND via an LLM judge. `bun run test:e2e`.
+- [x] Loopback-only; no auth in Stage 1 (Decision 3).
+- [ ] Reviewer subagent + merge.
 
 **PR 1.3 — session launcher scripts (tmux).** ☐
 - [ ] `scripts/launch-session.sh <name> <channel>`: start `claude` interactive in

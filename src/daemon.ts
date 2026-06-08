@@ -31,7 +31,14 @@ import type {
 import { ChannelConfigError } from "./transport.ts";
 import { loadRegistry, defaultStateDir, type Channel } from "./registry.ts";
 import { ClientRegistry } from "./routing.ts";
-import { requireScope, SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
+import { requireScope, extractToken, SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
+import { validateHubJwt } from "./hub-jwt.ts";
+import {
+  handleMcp,
+  pushToChannel as mcpPushToChannel,
+  pushPermissionVerdict as mcpPushPermissionVerdict,
+  mcpSessionCount,
+} from "./mcp-http.ts";
 
 // Re-export the shared auth surface so existing importers of the daemon module
 // keep working; the canonical home is now `auth.ts` (shared with http-ui.ts).
@@ -83,9 +90,15 @@ function contextFor(registry: ClientRegistry, channel: string): TransportContext
         meta: msg.meta,
         source: msg.source,
       });
+      // ALSO wake any HTTP MCP sessions on this channel — a session connected
+      // over /mcp/<channel> (vs. the stdio bridge over /events) receives the
+      // same inbound as a server-pushed notifications/claude/channel. Additive:
+      // the SSE path above is untouched.
+      mcpPushToChannel(channel, msg.content, msg.meta);
     },
     emitPermissionVerdict(v): void {
       registry.routeToChannel(channel, "permission_verdict", v);
+      mcpPushPermissionVerdict(channel, v);
     },
   };
 }
@@ -487,6 +500,7 @@ export function createFetchHandler(
           name: c.name,
           kind: c.transport.kind,
           clients: registry.countForChannel(c.name),
+          mcp_sessions: mcpSessionCount(c.name),
         })),
         total_clients: registry.size,
       });
@@ -700,6 +714,45 @@ export function createFetchHandler(
       return new Response(CHAT_UI_HTML, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
+    }
+
+    // Stateful HTTP MCP — a session connects directly over HTTP (URL + OAuth,
+    // no stdio bridge): POST/GET/DELETE /mcp/<channel>. Externally this is
+    // `<hub>/channel/mcp/<channel>`; hub's stripPrefix removes `/channel`, so the
+    // daemon sees `/mcp/<channel>`. A session needs `channel:read` to connect +
+    // receive the wake; the reply/react/edit tools additionally require
+    // `channel:write`, enforced inside the tool handlers from the connection's
+    // own scopes. This endpoint is ADDITIVE — the stdio bridge over /events is
+    // unchanged.
+    const mcpMatch = url.pathname.match(/^\/mcp\/([^/]+)$/);
+    if (mcpMatch) {
+      const channel = decodeURIComponent(mcpMatch[1]!);
+      const transport = transportFor(channel);
+      if (!transport) {
+        return json(
+          {
+            error: `unknown channel "${channel}" — known channels: ${[...channels.keys()].join(", ") || "(none)"}`,
+          },
+          404,
+        );
+      }
+      // Gate on channel:read — short-circuits to 401 pre-JWKS when no token is
+      // presented (testable without a live hub, same as the other endpoints).
+      const denied = await requireScope(req, url, SCOPE_READ);
+      if (denied) return denied;
+      // Re-validate to surface the caller's scopes for the write-tool checks.
+      // (requireScope already proved the token valid + carrying channel:read;
+      // this second pass hits the warm JWKS cache.) A token present but missing
+      // here would have been rejected above, so claims must resolve.
+      let scopes: string[] = [];
+      try {
+        const token = extractToken(req, url);
+        if (token) scopes = (await validateHubJwt(token)).scopes;
+      } catch {
+        // Unreachable in practice (requireScope passed); fall back to read-only.
+        scopes = [SCOPE_READ];
+      }
+      return handleMcp(req, channel, transport, scopes);
     }
 
     // Give each transport a chance to handle a route the daemon didn't. Runs

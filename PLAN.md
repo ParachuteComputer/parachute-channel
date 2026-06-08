@@ -126,18 +126,31 @@ Two tiers, mirroring hub's `e2e/` but realizing the deferred Tier 2:
 - [x] Loopback-only; no auth in Stage 1 (Decision 3).
 - [ ] Reviewer subagent + merge.
 
-**PR 1.3 — session launcher scripts (tmux).** ☐
-- [ ] `scripts/launch-session.sh <name> <channel>`: start `claude` interactive in
-      `tmux new-session -d -s <name>-agent`, with the bridge wired to `<channel>` in its
-      `.mcp.json`. Idempotent (don't double-launch; reattach if up).
-- [ ] `scripts/list-sessions.sh` / `stop-session.sh`.
-- [ ] Doc the channel→session mapping flow.
-- [ ] **Tests:** scripted check that a launched session attaches to the right channel and
-      round-trips a message (can reuse the Tier 2 harness with the script as setup).
-- [ ] Reviewer subagent.
+**PR 1.3 — session launcher scripts (tmux).** ✅ (reviewer pending)
+- [x] `scripts/launch-session.sh <name> <channel>`: starts `claude` interactive in
+      `tmux new-session -d -s <name>-agent`, bridge wired to `<channel>`. Idempotent
+      (no-op + attach hint if already running). Auto-handles BOTH first-launch prompts
+      (folder-trust + dev-channels). Drops a reinforcing `CLAUDE.md` in the workdir so the
+      session always replies via the tool. Waits for the channel to attach + confirms the
+      bridge registered with the daemon.
+- [x] `scripts/list-sessions.sh` / `scripts/stop-session.sh`.
+- [x] **Tested:** launched a session via the script against a sandboxed daemon, round-tripped
+      a casual prompt ("capital of Japan?" → "Tokyo 🗼" via the reply tool), verified
+      idempotency + list + stop.
+- [ ] Reviewer subagent + merge.
 
-**Stage 1 done =** launch two sessions in tmux, open two chat pages, type into each, watch
-two different Claude Code sessions answer — binding set by config. Demo + both test tiers green.
+**Stage 1 done =** launch a session in one command, open the chat UI (locally or over the
+hub expose at `/channel/ui`), type a casual message, watch the session answer. Multi-channel
+→ multi-session is config-driven. ✅ Demo achieved; both test tiers green.
+
+### Hub integration (pulled forward from Stage 3 — merged #21)
+- [x] `.parachute/module.json` + boot self-registration into `services.json` (PARACHUTE_HOME-sandboxed).
+- [x] Mount-aware UI (`/channel/ui` behind hub, `/ui` locally). `stripPrefix:true`.
+- [x] Verified live: hub proxies `<expose>/channel/*`, SSE survives the proxy, casual prompts round-trip.
+- [ ] **Channel auth — hub-scoped JWT (HIGH PRIORITY, Aaron):** session has full machine access,
+      so auth matters more than vault's. Gate daemon endpoints on a hub-issued JWT (scope-guard +
+      JWKS); UI obtains a token. NEXT after PR 1.3.
+- [ ] Future: VM/Docker session isolation for the launcher (trust-gradient at the session layer).
 
 ## Stage 2 — vault integration (vault as another transport)  ·  ☐
 

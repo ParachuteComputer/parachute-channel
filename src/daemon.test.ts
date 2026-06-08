@@ -147,14 +147,30 @@ describe("UI-facing + discovery endpoints stay open (no token, 200)", () => {
     expect(res.headers.get("content-type")).toContain("text/html");
   });
 
-  test("POST /api/channels/ui1/send (http-ui ingestHttp) → open, not 401", async () => {
+});
+
+// ---------------------------------------------------------------------------
+// Layer 2 (human↔UI): the http-ui transport's send + SSE routes are gated the
+// same way — a hub JWT (no-token → 401, short-circuits pre-JWKS). The token may
+// arrive as a Bearer header (send) or a ?token= query param (SSE). Asserted here
+// through the REAL daemon fetch handler so we cover the daemon → ingestHttp →
+// requireScope wiring, not just the transport in isolation.
+// ---------------------------------------------------------------------------
+describe("Layer 2 — http-ui UI endpoints require a token (401 with none)", () => {
+  test("POST /api/channels/ui1/send with no token → 401", async () => {
     const res = await fetch(`${base}/api/channels/ui1/send`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text: "from-ui" }),
     });
-    // Open route (UI-facing) — must NOT be gated. Accept any non-401/403.
-    expect(res.status).not.toBe(401);
-    expect(res.status).not.toBe(403);
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: string }).error).toBe("unauthorized");
+  });
+
+  test("GET /ui/events with no ?token= → 401", async () => {
+    const res = await fetch(`${base}/ui/events?channel=ui1`);
+    expect(res.status).toBe(401);
+    // Must short-circuit before the SSE stream opens.
+    expect(res.headers.get("content-type")).toContain("application/json");
   });
 });

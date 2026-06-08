@@ -109,10 +109,16 @@ The daemon **must** have `PARACHUTE_HUB_ORIGIN` set to the hub's *public* origin
 that as the token `iss`); the loopback fallback is dev-only. Hub-as-supervisor sets this when it
 starts the module; a manually-run daemon on an exposed box needs it in the environment.
 
-**Layer 2 — human↔UI (next).** The UI-facing endpoints (`/ui`, `/.parachute/config`,
-`/api/channels/<name>/send`, `/ui/events`) are still open. They'll authenticate the
-hub-management way (like scribe config — hub mints a short-lived token from the portal session;
-SSE takes a `?token=` query param since EventSource can't set headers).
+**Layer 2 — human↔UI (done).** The chat-UI traffic endpoints (`POST /api/channels/<name>/send`
+→ scope `channel:send`; `GET /ui/events` → scope `channel:read`) require a hub-issued JWT,
+validated the same way as Layer 1 (shared `requireScope` in `src/auth.ts`). The token comes from
+a hub endpoint — `GET <hub-origin>/admin/channel-token` (cookie-gated to the logged-in portal
+operator), returning `{ token, expires_at, scopes }` with `aud:channel` + `channel:read channel:send`,
+~10min TTL. The chat page fetches it on load (`credentials: "include"`) and attaches it: a Bearer
+header on the send POST, and a `?token=` query param on the `/ui/events` EventSource (which can't
+set headers). On a 401/SSE-error it re-fetches once and retries. `/ui`, `/health`, and
+`/.parachute/config[/schema]` stay OPEN — the page must load to bootstrap its token fetch, and the
+config listing is non-sensitive.
 
 ## Environment variables
 

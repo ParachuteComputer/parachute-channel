@@ -30,6 +30,7 @@ import type {
   PermissionArgs,
 } from "../transport.ts";
 import { sseFrame } from "../routing.ts";
+import { requireScope, json, SCOPE_SEND, SCOPE_READ } from "../auth.ts";
 
 /** A connected browser SSE client (one per open chat page on this channel). */
 interface UiClient {
@@ -137,6 +138,11 @@ export class HttpUiTransport implements Transport {
       req.method === "POST" &&
       url.pathname === `/api/channels/${channel}/send`
     ) {
+      // Layer 2 (human→UI): a hub-issued token with `channel:send`. The UI
+      // fetches it from the hub's /admin/channel-token (portal-cookie-gated) and
+      // attaches it as a Bearer header. No-token → 401 (short-circuits pre-JWKS).
+      const denied = await requireScope(req, url, SCOPE_SEND);
+      if (denied) return denied;
       let text: string;
       try {
         const body = (await req.json()) as { text?: unknown };
@@ -162,6 +168,12 @@ export class HttpUiTransport implements Transport {
       url.pathname === "/ui/events" &&
       url.searchParams.get("channel") === channel
     ) {
+      // Layer 2: gate on `channel:read`. EventSource can't set headers, so the
+      // token rides in as a `?token=` query param — the ONLY endpoint that opts
+      // into the query-param fallback (allowQueryParam: true). No-token → 401
+      // before the stream opens.
+      const denied = await requireScope(req, url, SCOPE_READ, true);
+      if (denied) return denied;
       const clientId = crypto.randomUUID();
       const clients = this.uiClients;
       const stream = new ReadableStream<string>({
@@ -186,11 +198,4 @@ export class HttpUiTransport implements Transport {
 
     return null;
   }
-}
-
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
 }

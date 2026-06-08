@@ -10,6 +10,6 @@
   "uiUrl": "/channel/ui",
   "startCmd": ["parachute-channel"],
   "scopes": {
-    "defines": ["channel:read", "channel:write", "channel:admin"]
+    "defines": ["channel:read", "channel:write", "channel:send", "channel:admin"]
   }
 }

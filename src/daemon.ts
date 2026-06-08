@@ -31,8 +31,11 @@ import type {
 import { ChannelConfigError } from "./transport.ts";
 import { loadRegistry, defaultStateDir, type Channel } from "./registry.ts";
 import { ClientRegistry } from "./routing.ts";
-import { validateHubJwt, HubJwtError } from "./hub-jwt.ts";
-import { extractBearer } from "@openparachute/scope-guard";
+import { requireScope, SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
+
+// Re-export the shared auth surface so existing importers of the daemon module
+// keep working; the canonical home is now `auth.ts` (shared with http-ui.ts).
+export { requireScope, SCOPE_READ, SCOPE_WRITE, SCOPE_SEND } from "./auth.ts";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -205,6 +208,33 @@ const CHAT_UI_HTML = `<!doctype html>
   // mount prefix so every API/SSE call resolves under the same prefix.
   var MOUNT = location.pathname.replace(/\\/ui\\/?$/, "");
 
+  // ----- Layer 2 auth -----------------------------------------------------
+  // The daemon's send + SSE endpoints require a hub-issued channel JWT
+  // (aud:channel, scopes channel:read channel:send). The hub mints one for the
+  // logged-in portal operator at <hub-origin>/admin/channel-token (cookie-gated,
+  // ~10min TTL). We fetch it from the page origin (same origin as the hub when
+  // served through the expose) and attach it: Bearer header on POST, ?token= on
+  // the EventSource (which can't set headers). A direct-to-daemon / not-logged-in
+  // load just leaves the token unset and surfaces a notice — an unguarded dev
+  // daemon may still accept the calls, so we don't hard-crash.
+  window.__token = null;
+  function fetchToken() {
+    return fetch(window.location.origin + "/admin/channel-token", { credentials: "include" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("token " + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        window.__token = j && j.token ? j.token : null;
+        return window.__token;
+      })
+      .catch(function (err) {
+        window.__token = null;
+        add("sys", "Not authenticated — open this UI through the hub portal (" + err + ")");
+        return null;
+      });
+  }
+
   function updateSetup(ch) {
     if (!ch) return;
     var mcp = {
@@ -255,14 +285,20 @@ const CHAT_UI_HTML = `<!doctype html>
 
   function currentChannel() { return sel.value; }
 
+  // Guard so an SSE error triggers at most one token-refresh+reconnect per
+  // connect cycle (the token is short-lived; a stale one 401s the stream).
+  var sseRetried = false;
+
   function connect() {
     if (es) { es.close(); es = null; }
     var ch = currentChannel();
     if (!ch) { setStatus("no channel", false); sendBtn.disabled = true; return; }
     updateSetup(ch);
     setStatus("connecting…", false);
-    es = new EventSource(MOUNT + "/ui/events?channel=" + encodeURIComponent(ch));
-    es.onopen = function () { setStatus("● live · " + ch, true); sendBtn.disabled = false; };
+    var url = MOUNT + "/ui/events?channel=" + encodeURIComponent(ch);
+    if (window.__token) url += "&token=" + encodeURIComponent(window.__token);
+    es = new EventSource(url);
+    es.onopen = function () { sseRetried = false; setStatus("● live · " + ch, true); sendBtn.disabled = false; };
     es.addEventListener("reply", function (e) {
       try { var d = JSON.parse(e.data); add("them", d.text || "", d.files); }
       catch (_) { add("them", e.data); }
@@ -278,9 +314,27 @@ const CHAT_UI_HTML = `<!doctype html>
     });
     es.addEventListener("close", function () { setStatus("closed", false); });
     es.onerror = function () {
-      // EventSource auto-reconnects; reflect the transient state.
+      // A stale/short-lived token 401s the stream. Refresh the token once and
+      // reconnect; otherwise let EventSource auto-reconnect (transient network).
+      if (!sseRetried && window.__token) {
+        sseRetried = true;
+        setStatus("re-authenticating…", false);
+        if (es) { es.close(); es = null; }
+        fetchToken().then(function () { connect(); });
+        return;
+      }
       setStatus("reconnecting…", false);
     };
+  }
+
+  function postSend(ch, text) {
+    var headers = { "content-type": "application/json" };
+    if (window.__token) headers.authorization = "Bearer " + window.__token;
+    return fetch(MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/send", {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify({ text: text }),
+    });
   }
 
   function send() {
@@ -290,12 +344,20 @@ const CHAT_UI_HTML = `<!doctype html>
     add("you", text);
     input.value = "";
     autosize();
-    fetch(MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/send", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: text }),
-    }).then(function (r) {
-      if (!r.ok) return r.json().catch(function(){return {};}).then(function (j) {
+    postSend(ch, text).then(function (r) {
+      if (r.ok) return;
+      // The token is short-lived; on a 401 refresh it once and retry the send.
+      if (r.status === 401) {
+        return fetchToken().then(function (tok) {
+          if (!tok) { add("sys", "send failed: not authenticated"); return; }
+          return postSend(ch, text).then(function (r2) {
+            if (!r2.ok) return r2.json().catch(function(){return {};}).then(function (j) {
+              add("sys", "send failed: " + (j.error || r2.status));
+            });
+          });
+        });
+      }
+      return r.json().catch(function(){return {};}).then(function (j) {
         add("sys", "send failed: " + (j.error || r.status));
       });
     }).catch(function (err) { add("sys", "send failed: " + err); });
@@ -319,18 +381,25 @@ const CHAT_UI_HTML = `<!doctype html>
     connect();
   });
 
-  fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
-    var chans = (cfg.channels || []).filter(function (c) { return c.transport === "http-ui"; });
-    if (!chans.length) { setStatus("no http-ui channels configured", false); return; }
-    var preselect = new URL(window.location.href).searchParams.get("channel");
-    chans.forEach(function (c) {
-      var opt = document.createElement("option");
-      opt.value = c.name; opt.textContent = c.name;
-      if (c.name === preselect) opt.selected = true;
-      sel.appendChild(opt);
-    });
-    connect();
-  }).catch(function (err) { setStatus("config load failed: " + err, false); });
+  function loadChannelsAndConnect() {
+    return fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
+      var chans = (cfg.channels || []).filter(function (c) { return c.transport === "http-ui"; });
+      if (!chans.length) { setStatus("no http-ui channels configured", false); return; }
+      var preselect = new URL(window.location.href).searchParams.get("channel");
+      chans.forEach(function (c) {
+        var opt = document.createElement("option");
+        opt.value = c.name; opt.textContent = c.name;
+        if (c.name === preselect) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      connect();
+    }).catch(function (err) { setStatus("config load failed: " + err, false); });
+  }
+
+  // Fetch a hub token first (so SSE + send go out authenticated), then list the
+  // channels and connect. A token failure still proceeds — an unguarded dev
+  // daemon may accept the calls, and the failure already surfaced a notice.
+  fetchToken().then(loadChannelsAndConnect);
 })();
 </script>
 </body>
@@ -348,55 +417,28 @@ function json(data: unknown, status = 200): Response {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge-facing auth (Layer 1)
+// Auth gates
 //
-// The session↔channel connection (the bridge) is authenticated with hub-issued
-// JWTs, exactly like a vault MCP client. A launched session has full machine
-// access, so we do NOT rely on loopback trust — any session on any machine
-// presents a hub token (`aud: "channel"`, scopes `channel:read`/`channel:write`)
-// and the daemon validates it against the hub's JWKS via scope-guard.
+// Both layers share `requireScope` from `auth.ts` (validate a hub-issued JWT
+// against the hub's JWKS via scope-guard, assert a scope). It accepts the token
+// from an `Authorization: Bearer` header OR a `?token=` query param.
 //
-// Scope split: subscribing to inbound events is `channel:read`; sending
-// anything out (reply/react/edit/permission/download) is `channel:write`.
+// Layer 1 — bridge / session↔channel. The session↔channel connection is
+// authenticated with hub-issued JWTs, exactly like a vault MCP client. A
+// launched session has full machine access, so we do NOT rely on loopback trust
+// — any session on any machine presents a hub token (`aud: "channel"`, scopes
+// `channel:read`/`channel:write`) as a Bearer header and the daemon validates
+// it against the hub's JWKS. Scope split: subscribing to inbound events is
+// `channel:read`; sending anything out (reply/react/edit/permission/download)
+// is `channel:write`.
 //
-// UI-facing + discovery routes (/health, /.parachute/config[/schema], /ui, and
-// the http-ui transport's ingestHttp send/SSE routes) are deliberately left
-// OPEN here — UI auth is a separate, later PR.
+// Layer 2 — human / chat UI — gates the http-ui transport's `send` (POST,
+// `channel:send`) + `/ui/events` SSE (`?token=` query, `channel:read`) inside
+// `http-ui.ts`'s ingestHttp using the same `requireScope`.
+//
+// Discovery + the page itself (/health, /.parachute/config[/schema], /ui) stay
+// OPEN — non-sensitive, and /ui must load to bootstrap its token fetch.
 // ---------------------------------------------------------------------------
-
-export const SCOPE_READ = "channel:read" as const;
-export const SCOPE_WRITE = "channel:write" as const;
-
-/**
- * Guard a bridge-facing endpoint on a hub-issued JWT carrying `scope`.
- * Returns `null` when the request is authorized (caller proceeds), or a
- * `Response` (401/403) the caller must return as-is.
- *
- * The no-token path short-circuits before any JWKS fetch, so it's unit-testable
- * without a live hub. Real signature/issuer/audience validation is scope-guard's
- * own tested surface.
- */
-export async function requireScope(req: Request, scope: string): Promise<Response | null> {
-  const token = extractBearer(req.headers.get("authorization"));
-  if (!token) {
-    return json({ error: "unauthorized", message: "Bearer token required" }, 401);
-  }
-  try {
-    const claims = await validateHubJwt(token);
-    if (!claims.scopes.includes(scope)) {
-      return json(
-        { error: "insufficient_scope", message: `requires ${scope}`, granted: claims.scopes },
-        403,
-      );
-    }
-    return null;
-  } catch (err) {
-    return json(
-      { error: "unauthorized", message: err instanceof HubJwtError ? err.message : "invalid token" },
-      401,
-    );
-  }
-}
 
 /**
  * Build the daemon's HTTP fetch handler over a channel registry + client
@@ -493,7 +535,7 @@ export function createFetchHandler(
     // SSE event stream — bridges subscribe by channel. Bridge-facing: requires
     // a hub JWT with `channel:read`.
     if (req.method === "GET" && url.pathname === "/events") {
-      const denied = await requireScope(req, SCOPE_READ);
+      const denied = await requireScope(req, url, SCOPE_READ);
       if (denied) return denied;
       let channel = url.searchParams.get("channel") ?? undefined;
       if (!channel) {
@@ -528,7 +570,7 @@ export function createFetchHandler(
 
     // Reply — bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/reply") {
-      const denied = await requireScope(req, SCOPE_WRITE);
+      const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
       try {
         const body = (await req.json()) as {
@@ -550,7 +592,7 @@ export function createFetchHandler(
 
     // React — bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/react") {
-      const denied = await requireScope(req, SCOPE_WRITE);
+      const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
       try {
         const body = (await req.json()) as {
@@ -578,7 +620,7 @@ export function createFetchHandler(
 
     // Edit message — bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/edit") {
-      const denied = await requireScope(req, SCOPE_WRITE);
+      const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
       try {
         const body = (await req.json()) as {
@@ -607,7 +649,7 @@ export function createFetchHandler(
     // Permission prompt — bridge forwards permission_request here.
     // Bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/permission") {
-      const denied = await requireScope(req, SCOPE_WRITE);
+      const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
       try {
         const body = (await req.json()) as {
@@ -636,7 +678,7 @@ export function createFetchHandler(
 
     // Download attachment — bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/download") {
-      const denied = await requireScope(req, SCOPE_WRITE);
+      const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
       try {
         const body = (await req.json()) as { channel?: string; file_id: string };

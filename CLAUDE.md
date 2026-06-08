@@ -155,6 +155,52 @@ set headers). On a 401/SSE-error it re-fetches once and retries. `/ui`, `/health
 `/.parachute/config[/schema]` stay OPEN — the page must load to bootstrap its token fetch, and the
 config listing is non-sensitive.
 
+## Vault integration (Stage 2) — channels backed by `#channel-message` notes
+
+A `vault` transport backs a channel with notes in a Parachute vault, so messages
+are durable, queryable, and a vault surface can render them. Multiple channels per
+vault: the note's `channel` metadata routes it.
+
+**Note shape** — tag `#channel-message`, content = the message text, metadata:
+`{ channel, direction: "inbound"|"outbound", sender, outbound: "1" (outbound only — the loop-avoidance marker), in_reply_to (outbound), ts }`.
+
+**Flow.** INBOUND (human→session): a new inbound note → a vault **trigger** POSTs a
+webhook → the channel daemon's `POST /api/vault/inbound` → routes by `note.metadata.channel`
+→ `ctx.emit` wakes the session (fans to SSE bridges + HTTP-MCP sessions alike).
+OUTBOUND (session→human): the session's `reply` writes an outbound note via the vault
+REST API (`POST <vaultUrl>/vault/<vault>/api/notes`, Bearer `vault:<name>:write`).
+
+**channels.json** (the channel side):
+```json
+{ "name": "eng", "transport": "vault",
+  "config": { "vault": "default", "vaultUrl": "http://127.0.0.1:1940",
+              "token": "<vault:default:write JWT>", "webhookSecret": "<shared secret>" } }
+```
+
+**Vault side** (operator config — activates the inbound trigger):
+1. (Optional, for indexed queries) declare the `#channel-message` tag schema with
+   indexed `channel`/`direction`/`sender` fields (`update-tag`).
+2. Add a trigger to the vault's `config.yaml` that fires on new inbound notes and
+   webhooks the channel daemon. Loop avoidance: the vault predicate can only match
+   key *presence* (not `direction == "inbound"`), so it excludes the `outbound`
+   marker via `missing_metadata`:
+   ```yaml
+   triggers:
+     - name: channel_inbound
+       events: ["created"]
+       when:
+         tags: ["#channel-message"]
+         has_metadata: ["channel"]
+         missing_metadata: ["outbound", "channel_inbound_rendered_at"]
+       action:
+         webhook: "http://127.0.0.1:1941/api/vault/inbound?secret=<shared secret>"
+         send: "json"
+   ```
+   The shared secret rides in the URL — vault doesn't sign webhooks yet; a hub-JWT
+   auth block on the trigger is a follow-up. The daemon defends in depth too:
+   `ingestInbound` drops any note marked `outbound`, so a reply can never wake its
+   own session.
+
 ## Environment variables
 
 | Variable | Default | Description |

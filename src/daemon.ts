@@ -17,7 +17,16 @@
 import { mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { timingSafeEqual } from "node:crypto";
 import { upsertService } from "./services-manifest.ts";
+
+/** Constant-time webhook-secret compare. Length check first (a length mismatch
+ *  is never equal); timingSafeEqual on equal-length buffers avoids the
+ *  short-circuit timing leak of `===`. Empty configured/presented → never match. */
+function webhookSecretMatches(presented: string, configured: string): boolean {
+  if (!presented || !configured || presented.length !== configured.length) return false;
+  return timingSafeEqual(Buffer.from(presented), Buffer.from(configured));
+}
 import type {
   Transport,
   TransportContext,
@@ -774,24 +783,16 @@ export function createFetchHandler(
       if (!channelName) {
         return json({ error: "note.metadata.channel is required to route the message" }, 400);
       }
-      const channel = channels.get(channelName);
-      if (!channel || !(channel.transport instanceof VaultTransport)) {
-        return json(
-          {
-            error: `no vault channel "${channelName}" — vault channels: ${[...channels.values()]
-              .filter((c) => c.transport instanceof VaultTransport)
-              .map((c) => c.name)
-              .join(", ") || "(none)"}`,
-          },
-          404,
-        );
-      }
-      const vt = channel.transport;
-      // Validate the shared secret against THIS channel's configured secret.
       const presented =
         url.searchParams.get("secret") ?? req.headers.get("x-channel-webhook-secret") ?? "";
-      if (!presented || presented !== vt.webhookSecret) {
-        return json({ error: "unauthorized", message: "bad or missing webhook secret" }, 401);
+      const ch = channels.get(channelName);
+      const vt = ch?.transport instanceof VaultTransport ? ch.transport : undefined;
+      // Uniform 401 for an unknown vault channel OR a bad secret — never reveal
+      // which, so this (tailnet-reachable) endpoint can't be used to enumerate
+      // channel names. The secret is per-channel, so the lookup happens first,
+      // but both failure modes return the identical response. Constant-time compare.
+      if (!vt || !webhookSecretMatches(presented, vt.webhookSecret)) {
+        return json({ error: "unauthorized" }, 401);
       }
       // Idempotency: a duplicate trigger delivery for the same note must not
       // double-wake. First-seen → process; already-seen → ack without emitting.

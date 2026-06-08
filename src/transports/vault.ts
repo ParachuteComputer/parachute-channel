@@ -109,7 +109,11 @@ export class VaultTransport implements Transport {
     const channel = this.channel;
     const ts = new Date().toISOString();
     const id = crypto.randomUUID();
-    const path = `${this.pathPrefix}/${channel}/${id}`;
+    // Sanitize the channel segment so an operator-configured name with a slash
+    // can't reshape the vault path hierarchy (the channel/prefix are operator
+    // config, not external input, but keep the path a flat, predictable slug).
+    const safeChannel = channel.replace(/[^a-zA-Z0-9_-]/g, "-");
+    const path = `${this.pathPrefix}/${safeChannel}/${id}`;
 
     const metadata: Record<string, string> = {
       channel,

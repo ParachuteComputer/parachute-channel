@@ -372,7 +372,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
     }
   });
 
-  test("unknown channel → 404, no emit", async () => {
+  test("unknown channel → 401 (uniform with bad-secret, no channel enumeration), no emit", async () => {
     const { srv, base, emitted } = buildVaultServer();
     try {
       const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
@@ -382,8 +382,35 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
           note: { id: "n1", content: "x", metadata: { channel: "nope", direction: "inbound" } },
         }),
       });
-      expect(res.status).toBe(404);
+      expect(res.status).toBe(401);
       expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("channel-spoofing: a webhook for channel B presenting channel A's secret → 401, no emit", async () => {
+    const registry = new ClientRegistry();
+    const eng = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "x", webhookSecret: "eng-secret" });
+    const ops = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "x", webhookSecret: "ops-secret" });
+    const engEmits: InboundMessage[] = [];
+    const opsEmits: InboundMessage[] = [];
+    void eng.start({ channel: "eng", emit: (m) => engEmits.push(m), emitPermissionVerdict() {} });
+    void ops.start({ channel: "ops", emit: (m) => opsEmits.push(m), emitPermissionVerdict() {} });
+    const channels = new Map<string, Channel>([
+      ["eng", { name: "eng", transport: eng, entry: { name: "eng", transport: "vault" } }],
+      ["ops", { name: "ops", transport: ops, entry: { name: "ops", transport: "vault" } }],
+    ]);
+    const srv = Bun.serve({ port: 0, hostname: "127.0.0.1", idleTimeout: 0, fetch: createFetchHandler(channels, registry) });
+    try {
+      const res = await fetch(`http://127.0.0.1:${srv.port}/api/vault/inbound?secret=eng-secret`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ note: { id: "spoof1", content: "x", metadata: { channel: "ops", direction: "inbound" } } }),
+      });
+      expect(res.status).toBe(401); // eng's secret can't authorize a write to ops
+      expect(opsEmits).toHaveLength(0);
+      expect(engEmits).toHaveLength(0);
     } finally {
       srv.stop(true);
     }

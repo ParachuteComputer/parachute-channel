@@ -70,6 +70,14 @@ export interface TransportContext {
   emitPermissionVerdict(v: { request_id: string; behavior: string }): void;
 }
 
+/**
+ * Thrown by a transport for an operator-configuration problem (a 4xx-class
+ * fault: e.g. no allowlisted users to prompt), as opposed to a runtime failure.
+ * The daemon maps this to HTTP 400 so callers can distinguish "fix your config"
+ * from "the server broke".
+ */
+export class ChannelConfigError extends Error {}
+
 export interface Transport {
   /** Stable identifier for the transport kind, e.g. "telegram". */
   readonly kind: string;

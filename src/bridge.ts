@@ -165,7 +165,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const err = await res.text();
         return { content: [{ type: "text", text: `reply failed: ${err}` }], isError: true };
       }
-      const data = (await res.json()) as { sent: number[] };
+      const data = (await res.json()) as { sent: string[] };
       const ids = data.sent;
       const parts = ids.length === 1 ? `(id: ${ids[0]})` : `(ids: ${ids.join(", ")})`;
       return { content: [{ type: "text", text: `sent ${ids.length} part${ids.length > 1 ? "s" : ""} ${parts}` }] };

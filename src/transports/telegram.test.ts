@@ -5,6 +5,7 @@ import {
   TelegramTransport,
   type AccessConfig,
 } from "./telegram.ts";
+import { ChannelConfigError } from "../transport.ts";
 
 // ---------------------------------------------------------------------------
 // Access control — these cases moved here from the daemon. The policy is now a
@@ -112,5 +113,19 @@ describe("TelegramTransport", () => {
   test("reply without a chat_id in meta errors clearly", async () => {
     const t = new TelegramTransport({ token: "tok", stateDir: "/tmp/parachute-channel-test-telegram" });
     await expect(t.reply({ channel: "telegram", text: "hi" })).rejects.toThrow(/chat_id is required/);
+  });
+
+  test("sendPermission with no allowlisted users throws ChannelConfigError (→ 400, not 500)", async () => {
+    // Fresh state dir → no access.json → default access has empty allowFrom.
+    const t = new TelegramTransport({ token: "tok", stateDir: "/tmp/parachute-channel-test-noperm" });
+    await expect(
+      t.sendPermission({
+        channel: "telegram",
+        request_id: "abcde",
+        tool_name: "Bash",
+        description: "run a command",
+        input_preview: "ls",
+      }),
+    ).rejects.toBeInstanceOf(ChannelConfigError);
   });
 });

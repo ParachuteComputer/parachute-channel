@@ -22,6 +22,7 @@ import type {
   PermissionArgs,
   DownloadArgs,
 } from "../transport.ts";
+import { ChannelConfigError } from "../transport.ts";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -368,7 +369,7 @@ export class TelegramTransport implements Transport {
     const access = loadAccess(this.accessFile);
     const targets = access.allowFrom;
     if (targets.length === 0) {
-      throw new Error("no allowlisted users to send permission prompt to");
+      throw new ChannelConfigError("no allowlisted users to send permission prompt to");
     }
     const text =
       `🔐 Permission: ${args.tool_name}\n\n` +

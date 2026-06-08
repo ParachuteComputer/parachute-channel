@@ -27,6 +27,7 @@ import type {
   PermissionArgs,
   DownloadArgs,
 } from "./transport.ts";
+import { ChannelConfigError } from "./transport.ts";
 import { loadRegistry, defaultStateDir, type Channel } from "./registry.ts";
 import { ClientRegistry } from "./routing.ts";
 
@@ -72,7 +73,11 @@ function contextFor(channel: string): TransportContext {
   return {
     channel,
     emit(msg: InboundMessage): void {
-      registry.routeToChannel(msg.channel, "message", {
+      // Route on the bound `channel`, NOT msg.channel — the transport's own
+      // channel is authoritative. This makes it impossible for a transport to
+      // emit onto another channel (closing a silent cross-channel-leak footgun)
+      // even if a future transport sets msg.channel incorrectly.
+      registry.routeToChannel(channel, "message", {
         content: msg.content,
         meta: msg.meta,
         source: msg.source,
@@ -211,7 +216,7 @@ const server = Bun.serve({
         const result = await transport.reply(toReplyArgs(body));
         return json({ sent: result.sent });
       } catch (err) {
-        return json({ error: String(err) }, 500);
+        return errResponse(err);
       }
     }
 
@@ -237,7 +242,7 @@ const server = Bun.serve({
         await transport.react(args);
         return json({ ok: true });
       } catch (err) {
-        return json({ error: String(err) }, 500);
+        return errResponse(err);
       }
     }
 
@@ -263,7 +268,7 @@ const server = Bun.serve({
         await transport.edit(args);
         return json({ ok: true });
       } catch (err) {
-        return json({ error: String(err) }, 500);
+        return errResponse(err);
       }
     }
 
@@ -290,7 +295,7 @@ const server = Bun.serve({
         const result = await transport.sendPermission(args);
         return json({ sent: result.sent });
       } catch (err) {
-        return json({ error: String(err) }, 500);
+        return errResponse(err);
       }
     }
 
@@ -305,7 +310,7 @@ const server = Bun.serve({
         const result = await transport.download(args);
         return json({ path: result.path });
       } catch (err) {
-        return json({ error: String(err) }, 500);
+        return errResponse(err);
       }
     }
 
@@ -316,6 +321,15 @@ const server = Bun.serve({
 // ---------------------------------------------------------------------------
 // Request helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Map a thrown error to a response: ChannelConfigError → 400 (operator must fix
+ * config), anything else → 500 (runtime fault). Lets callers distinguish the two.
+ */
+function errResponse(err: unknown): Response {
+  if (err instanceof ChannelConfigError) return json({ error: err.message }, 400);
+  return json({ error: String(err) }, 500);
+}
 
 function channelError(channel: string | undefined): Response {
   if (!channel) {

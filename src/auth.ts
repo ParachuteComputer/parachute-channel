@@ -38,17 +38,25 @@ export function json(data: unknown, status = 200): Response {
  * (the SSE case — `EventSource` can't set headers). Returns null if neither is
  * present.
  */
-export function extractToken(req: Request, url: URL): string | null {
+export function extractToken(req: Request, url: URL, allowQueryParam = false): string | null {
   const bearer = extractBearer(req.headers.get("authorization"));
   if (bearer) return bearer;
-  const q = url.searchParams.get("token");
-  if (q && q.length > 0) return q;
+  // `?token=` is opt-in (the SSE case only). The bridge + the UI POST present a
+  // Bearer header, so they never enable it — keeps query-param tokens off every
+  // endpoint that doesn't strictly need them (and out of those access logs).
+  if (allowQueryParam) {
+    const q = url.searchParams.get("token");
+    if (q && q.length > 0) return q;
+  }
   return null;
 }
 
 /**
- * Guard an HTTP endpoint on a hub-issued JWT carrying `scope`. The token may
- * arrive in the `Authorization: Bearer` header OR a `?token=` query param.
+ * Guard an HTTP endpoint on a hub-issued JWT carrying `scope`. The token arrives
+ * as an `Authorization: Bearer` header; pass `allowQueryParam: true` to also
+ * accept a `?token=` query param (the SSE case only — `EventSource` can't set
+ * headers). Bridge + UI-POST callers leave it false, so query-param tokens are
+ * confined to the one endpoint that needs them.
  *
  * Returns `null` when the request is authorized (caller proceeds), or a
  * `Response` (401/403) the caller must return as-is.
@@ -61,8 +69,9 @@ export async function requireScope(
   req: Request,
   url: URL,
   scope: string,
+  allowQueryParam = false,
 ): Promise<Response | null> {
-  const token = extractToken(req, url);
+  const token = extractToken(req, url, allowQueryParam);
   if (!token) {
     return json({ error: "unauthorized", message: "Bearer token required" }, 401);
   }

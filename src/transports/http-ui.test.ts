@@ -23,18 +23,34 @@ import { describe, test, expect, mock } from "bun:test";
 // any other token) still hits the real no-token / shape-first reject. This keeps
 // the round-trip coverage genuine while staying hub-free.
 const VALID_TOKEN = "test-valid-token";
+// A token carrying ONLY channel:write (a session/bridge token) — must be
+// REJECTED on the UI send endpoint, which requires channel:send. Locks the
+// privilege separation (a session token can't post as a human).
+const WRITE_ONLY_TOKEN = "test-write-only-token";
 mock.module("../hub-jwt.ts", () => ({
   CHANNEL_AUDIENCE: "channel",
   async validateHubJwt(token: string) {
-    if (token !== VALID_TOKEN) throw new HubJwtError("invalid token");
-    return {
-      sub: "test",
-      scopes: ["channel:read", "channel:send", "channel:write"],
-      aud: "channel",
-      jti: undefined,
-      clientId: undefined,
-      vaultScope: undefined,
-    };
+    if (token === VALID_TOKEN) {
+      return {
+        sub: "test",
+        scopes: ["channel:read", "channel:send", "channel:write"],
+        aud: "channel",
+        jti: undefined,
+        clientId: undefined,
+        vaultScope: undefined,
+      };
+    }
+    if (token === WRITE_ONLY_TOKEN) {
+      return {
+        sub: "test",
+        scopes: ["channel:write"],
+        aud: "channel",
+        jti: undefined,
+        clientId: undefined,
+        vaultScope: undefined,
+      };
+    }
+    throw new HubJwtError("invalid token");
   },
   HubJwtError: class HubJwtError extends Error {},
   looksLikeJwt: (t: string) => t.split(".").length === 3,
@@ -126,6 +142,23 @@ describe("HttpUiTransport — direct", () => {
     const res = await t.ingestHttp(req, new URL(req.url));
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
+    expect(ctx.emitted).toHaveLength(0);
+  });
+
+  test("ingestHttp send with a channel:write-only (session) token → 403, no emit", async () => {
+    // Privilege separation: a session/bridge token (channel:write) must NOT be
+    // usable to post a human message through the UI send endpoint (channel:send).
+    const t = new HttpUiTransport();
+    const ctx = fakeCtx("dev");
+    await t.start(ctx);
+    const req = new Request("http://x/api/channels/dev/send", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer " + WRITE_ONLY_TOKEN },
+      body: JSON.stringify({ text: "trying to send as a session" }),
+    });
+    const res = await t.ingestHttp(req, new URL(req.url));
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(403);
     expect(ctx.emitted).toHaveLength(0);
   });
 

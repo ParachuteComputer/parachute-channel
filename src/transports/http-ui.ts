@@ -169,9 +169,10 @@ export class HttpUiTransport implements Transport {
       url.searchParams.get("channel") === channel
     ) {
       // Layer 2: gate on `channel:read`. EventSource can't set headers, so the
-      // token rides in as a `?token=` query param (requireScope falls back to
-      // it). No-token → 401 before the stream opens.
-      const denied = await requireScope(req, url, SCOPE_READ);
+      // token rides in as a `?token=` query param — the ONLY endpoint that opts
+      // into the query-param fallback (allowQueryParam: true). No-token → 401
+      // before the stream opens.
+      const denied = await requireScope(req, url, SCOPE_READ, true);
       if (denied) return denied;
       const clientId = crypto.randomUUID();
       const clients = this.uiClients;

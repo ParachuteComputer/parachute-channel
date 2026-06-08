@@ -35,7 +35,7 @@ import { requireScope, SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
 
 // Re-export the shared auth surface so existing importers of the daemon module
 // keep working; the canonical home is now `auth.ts` (shared with http-ui.ts).
-export { requireScope, SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
+export { requireScope, SCOPE_READ, SCOPE_WRITE, SCOPE_SEND } from "./auth.ts";
 
 // ---------------------------------------------------------------------------
 // Config

@@ -93,8 +93,26 @@ Channel self-registers into `~/.parachute/services.json` at boot and ships
 `.parachute/module.json`, so hub lists it in the portal and reverse-proxies
 `<expose>/channel/*` → the loopback daemon (`stripPrefix:true`; SSE survives the proxy).
 The built-in chat UI is reachable at `<hub-origin>/channel/ui` over the expose, and at
-`http://127.0.0.1:1941/ui` locally. **Note:** the UI is currently unauthenticated
-(loopback / trusted-network only) — hub-scoped JWT auth is the next priority.
+`http://127.0.0.1:1941/ui` locally.
+
+## Auth
+
+**Layer 1 — session↔channel (done).** The bridge-facing daemon endpoints (`GET /events`,
+`POST /api/{reply,react,edit,permission,download}`) require a hub-issued JWT (`aud: channel`,
+scope `channel:read`/`channel:write`), validated via `@openparachute/scope-guard` against the
+hub's JWKS — exactly like a vault MCP client. The launcher mints the token
+(`parachute auth mint-token --scope "channel:read channel:write"`) and injects it as
+`PARACHUTE_CHANNEL_TOKEN`; the bridge presents it as a Bearer. Any session on any machine
+connects this way — no loopback trust.
+
+The daemon **must** have `PARACHUTE_HUB_ORIGIN` set to the hub's *public* origin (the hub stamps
+that as the token `iss`); the loopback fallback is dev-only. Hub-as-supervisor sets this when it
+starts the module; a manually-run daemon on an exposed box needs it in the environment.
+
+**Layer 2 — human↔UI (next).** The UI-facing endpoints (`/ui`, `/.parachute/config`,
+`/api/channels/<name>/send`, `/ui/events`) are still open. They'll authenticate the
+hub-management way (like scribe config — hub mints a short-lived token from the portal session;
+SSE takes a `?token=` query param since EventSource can't set headers).
 
 ## Environment variables
 
@@ -104,6 +122,8 @@ The built-in chat UI is reachable at `<hub-origin>/channel/ui` over the expose, 
 | `PARACHUTE_CHANNEL_PORT` | `1941` | Daemon HTTP port |
 | `PARACHUTE_CHANNEL_URL` | `http://127.0.0.1:1941` | Bridge → daemon URL |
 | `PARACHUTE_CHANNEL_STATE_DIR` | `~/.parachute/channel` | Token, access config, inbox |
+| `PARACHUTE_HUB_ORIGIN` | `http://127.0.0.1:1939` | **Daemon:** hub's public origin for JWT `iss` validation. Required on an exposed deployment (the loopback default is dev-only); hub-as-supervisor sets it. |
+| `PARACHUTE_CHANNEL_TOKEN` | (none) | **Bridge:** hub-issued channel JWT presented as Bearer. The launcher mints + injects it; unset = no auth header (dev only). Default mint TTL is the hub's non-ephemeral default (~90d); re-launch re-mints. |
 
 ## State directory
 

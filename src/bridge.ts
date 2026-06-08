@@ -21,6 +21,18 @@ import { z } from "zod";
 
 const DAEMON_URL = process.env.PARACHUTE_CHANNEL_URL ?? "http://127.0.0.1:1941";
 
+// Hub-issued JWT (aud: "channel", scopes channel:read + channel:write) the
+// session presents to the daemon on every request. Minted by launch-session.sh
+// via `parachute auth mint-token` and passed through .mcp.json. When unset, the
+// bridge sends no Authorization header — back-compat for an unguarded/dev daemon
+// (a daemon with auth on will then 401, surfaced below).
+const TOKEN = process.env.PARACHUTE_CHANNEL_TOKEN;
+
+/** Headers for an outbound daemon request, adding the bearer when a token is set. */
+function daemonHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return TOKEN ? { ...extra, authorization: `Bearer ${TOKEN}` } : { ...extra };
+}
+
 // The named channel this bridge subscribes to. Defaults to "telegram" for
 // backwards-compat with single-bot installs. The daemon routes inbound on this
 // channel only to bridges subscribed to it, and every outbound tool call below
@@ -76,7 +88,7 @@ mcp.setNotificationHandler(
     try {
       await fetch(`${DAEMON_URL}/api/permission`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: daemonHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ channel: CHANNEL, ...params }),
       });
     } catch (err) {
@@ -163,7 +175,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "reply": {
       const res = await fetch(`${DAEMON_URL}/api/reply`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: daemonHeaders({ "content-type": "application/json" }),
         body: JSON.stringify(body),
       });
       if (!res.ok) {
@@ -179,7 +191,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "react": {
       const res = await fetch(`${DAEMON_URL}/api/react`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: daemonHeaders({ "content-type": "application/json" }),
         body: JSON.stringify(body),
       });
       if (!res.ok) {
@@ -192,7 +204,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "edit_message": {
       const res = await fetch(`${DAEMON_URL}/api/edit`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: daemonHeaders({ "content-type": "application/json" }),
         body: JSON.stringify(body),
       });
       if (!res.ok) {
@@ -205,7 +217,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "download_attachment": {
       const res = await fetch(`${DAEMON_URL}/api/download`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: daemonHeaders({ "content-type": "application/json" }),
         body: JSON.stringify(body),
       });
       if (!res.ok) {
@@ -228,7 +240,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 async function connectToEvents(): Promise<void> {
   while (true) {
     try {
-      const res = await fetch(`${DAEMON_URL}/events?channel=${encodeURIComponent(CHANNEL)}`);
+      const res = await fetch(`${DAEMON_URL}/events?channel=${encodeURIComponent(CHANNEL)}`, {
+        headers: daemonHeaders(),
+      });
+      if (res.status === 401 || res.status === 403) {
+        // The daemon has auth on and rejected our token (or we sent none).
+        // Surface the operator-facing cause clearly before the reconnect loop
+        // retries — otherwise this looks like a generic connectivity failure.
+        process.stderr.write(
+          `parachute-channel bridge: daemon rejected the channel connection (HTTP ${res.status}). ` +
+            (TOKEN
+              ? "The PARACHUTE_CHANNEL_TOKEN is invalid/expired or lacks channel:read — re-mint it " +
+                "(parachute auth mint-token --scope \"channel:read channel:write\") and relaunch the session.\n"
+              : "No PARACHUTE_CHANNEL_TOKEN was provided but the daemon requires one — relaunch the " +
+                "session via launch-session.sh so it mints + passes a hub token.\n"),
+        );
+        throw new Error(`SSE connect rejected: ${res.status}`);
+      }
       if (!res.ok || !res.body) {
         throw new Error(`SSE connect failed: ${res.status}`);
       }

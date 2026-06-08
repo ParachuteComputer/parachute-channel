@@ -31,6 +31,8 @@ import type {
 import { ChannelConfigError } from "./transport.ts";
 import { loadRegistry, defaultStateDir, type Channel } from "./registry.ts";
 import { ClientRegistry } from "./routing.ts";
+import { validateHubJwt, HubJwtError } from "./hub-jwt.ts";
+import { extractBearer } from "@openparachute/scope-guard";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -60,34 +62,12 @@ const PKG_VERSION = ((): string => {
 })();
 const INSTALL_DIR = join(import.meta.dir, "..");
 
-mkdirSync(STATE_DIR, { recursive: true });
-mkdirSync(INBOX_DIR, { recursive: true });
-
 // ---------------------------------------------------------------------------
 // Registry + routing
 // ---------------------------------------------------------------------------
 
-let channels: Map<string, Channel>;
-try {
-  channels = loadRegistry({ stateDir: STATE_DIR });
-} catch (err) {
-  console.error(`parachute-channel: failed to load channel registry: ${err}`);
-  process.exit(1);
-}
-
-if (channels.size === 0) {
-  console.error(
-    `parachute-channel: no channels configured.\n` +
-      `  Add ${join(STATE_DIR, "channels.json")} or set TELEGRAM_BOT_TOKEN\n` +
-      `  (env or ${join(STATE_DIR, ".env")}) for a default telegram channel.`,
-  );
-  process.exit(1);
-}
-
-const registry = new ClientRegistry();
-
 /** Build the per-channel context a transport routes through. */
-function contextFor(channel: string): TransportContext {
+function contextFor(registry: ClientRegistry, channel: string): TransportContext {
   return {
     channel,
     emit(msg: InboundMessage): void {
@@ -367,18 +347,94 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-/** Resolve the transport for a channel from a request body, or null on miss. */
-function transportFor(channel: string | undefined): Transport | null {
-  if (!channel) return null;
-  return channels.get(channel)?.transport ?? null;
+// ---------------------------------------------------------------------------
+// Bridge-facing auth (Layer 1)
+//
+// The session↔channel connection (the bridge) is authenticated with hub-issued
+// JWTs, exactly like a vault MCP client. A launched session has full machine
+// access, so we do NOT rely on loopback trust — any session on any machine
+// presents a hub token (`aud: "channel"`, scopes `channel:read`/`channel:write`)
+// and the daemon validates it against the hub's JWKS via scope-guard.
+//
+// Scope split: subscribing to inbound events is `channel:read`; sending
+// anything out (reply/react/edit/permission/download) is `channel:write`.
+//
+// UI-facing + discovery routes (/health, /.parachute/config[/schema], /ui, and
+// the http-ui transport's ingestHttp send/SSE routes) are deliberately left
+// OPEN here — UI auth is a separate, later PR.
+// ---------------------------------------------------------------------------
+
+export const SCOPE_READ = "channel:read" as const;
+export const SCOPE_WRITE = "channel:write" as const;
+
+/**
+ * Guard a bridge-facing endpoint on a hub-issued JWT carrying `scope`.
+ * Returns `null` when the request is authorized (caller proceeds), or a
+ * `Response` (401/403) the caller must return as-is.
+ *
+ * The no-token path short-circuits before any JWKS fetch, so it's unit-testable
+ * without a live hub. Real signature/issuer/audience validation is scope-guard's
+ * own tested surface.
+ */
+export async function requireScope(req: Request, scope: string): Promise<Response | null> {
+  const token = extractBearer(req.headers.get("authorization"));
+  if (!token) {
+    return json({ error: "unauthorized", message: "Bearer token required" }, 401);
+  }
+  try {
+    const claims = await validateHubJwt(token);
+    if (!claims.scopes.includes(scope)) {
+      return json(
+        { error: "insufficient_scope", message: `requires ${scope}`, granted: claims.scopes },
+        403,
+      );
+    }
+    return null;
+  } catch (err) {
+    return json(
+      { error: "unauthorized", message: err instanceof HubJwtError ? err.message : "invalid token" },
+      401,
+    );
+  }
 }
 
-const server = Bun.serve({
-  port: PORT,
-  hostname: "127.0.0.1",
-  idleTimeout: 0,
+/**
+ * Build the daemon's HTTP fetch handler over a channel registry + client
+ * registry. Extracted as a factory so tests can exercise routing + the auth
+ * gate on an ephemeral `Bun.serve` without booting the real daemon (and without
+ * a live hub — the no-token 401 path short-circuits before JWKS).
+ */
+export function createFetchHandler(
+  channels: Map<string, Channel>,
+  registry: ClientRegistry,
+): (req: Request) => Promise<Response> {
+  /** Resolve the transport for a channel name, or null on miss. */
+  function transportFor(channel: string | undefined): Transport | null {
+    if (!channel) return null;
+    return channels.get(channel)?.transport ?? null;
+  }
 
-  async fetch(req) {
+  function channelError(channel: string | undefined): Response {
+    if (!channel) {
+      return json({ error: "missing 'channel' field in request body" }, 400);
+    }
+    return json(
+      {
+        error: `unknown channel "${channel}" — known channels: ${[...channels.keys()].join(", ") || "(none)"}`,
+      },
+      400,
+    );
+  }
+
+  function methodMissing(channel: string, method: string): Response {
+    const kind = channels.get(channel)?.transport.kind ?? "unknown";
+    return json(
+      { error: `transport "${kind}" for channel "${channel}" does not support ${method}` },
+      400,
+    );
+  }
+
+  return async function fetch(req) {
     const url = new URL(req.url);
 
     // Health check — per-channel client counts.
@@ -434,8 +490,11 @@ const server = Bun.serve({
       });
     }
 
-    // SSE event stream — bridges subscribe by channel.
+    // SSE event stream — bridges subscribe by channel. Bridge-facing: requires
+    // a hub JWT with `channel:read`.
     if (req.method === "GET" && url.pathname === "/events") {
+      const denied = await requireScope(req, SCOPE_READ);
+      if (denied) return denied;
       let channel = url.searchParams.get("channel") ?? undefined;
       if (!channel) {
         channel = DEFAULT_CHANNEL;
@@ -467,8 +526,10 @@ const server = Bun.serve({
       });
     }
 
-    // Reply
+    // Reply — bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/reply") {
+      const denied = await requireScope(req, SCOPE_WRITE);
+      if (denied) return denied;
       try {
         const body = (await req.json()) as {
           channel?: string;
@@ -487,8 +548,10 @@ const server = Bun.serve({
       }
     }
 
-    // React
+    // React — bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/react") {
+      const denied = await requireScope(req, SCOPE_WRITE);
+      if (denied) return denied;
       try {
         const body = (await req.json()) as {
           channel?: string;
@@ -513,8 +576,10 @@ const server = Bun.serve({
       }
     }
 
-    // Edit message
+    // Edit message — bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/edit") {
+      const denied = await requireScope(req, SCOPE_WRITE);
+      if (denied) return denied;
       try {
         const body = (await req.json()) as {
           channel?: string;
@@ -540,7 +605,10 @@ const server = Bun.serve({
     }
 
     // Permission prompt — bridge forwards permission_request here.
+    // Bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/permission") {
+      const denied = await requireScope(req, SCOPE_WRITE);
+      if (denied) return denied;
       try {
         const body = (await req.json()) as {
           channel?: string;
@@ -566,8 +634,10 @@ const server = Bun.serve({
       }
     }
 
-    // Download attachment
+    // Download attachment — bridge-facing: requires `channel:write`.
     if (req.method === "POST" && url.pathname === "/api/download") {
+      const denied = await requireScope(req, SCOPE_WRITE);
+      if (denied) return denied;
       try {
         const body = (await req.json()) as { channel?: string; file_id: string };
         const transport = transportFor(body.channel);
@@ -599,11 +669,11 @@ const server = Bun.serve({
     }
 
     return json({ error: "not found" }, 404);
-  },
-});
+  };
+}
 
 // ---------------------------------------------------------------------------
-// Request helpers
+// Request helpers (module-scope; hoisted, referenced from inside the factory)
 // ---------------------------------------------------------------------------
 
 /**
@@ -613,26 +683,6 @@ const server = Bun.serve({
 function errResponse(err: unknown): Response {
   if (err instanceof ChannelConfigError) return json({ error: err.message }, 400);
   return json({ error: String(err) }, 500);
-}
-
-function channelError(channel: string | undefined): Response {
-  if (!channel) {
-    return json({ error: "missing 'channel' field in request body" }, 400);
-  }
-  return json(
-    {
-      error: `unknown channel "${channel}" — known channels: ${[...channels.keys()].join(", ") || "(none)"}`,
-    },
-    400,
-  );
-}
-
-function methodMissing(channel: string, method: string): Response {
-  const kind = channels.get(channel)?.transport.kind ?? "unknown";
-  return json(
-    { error: `transport "${kind}" for channel "${channel}" does not support ${method}` },
-    400,
-  );
 }
 
 /**
@@ -664,50 +714,87 @@ function toReplyArgs(body: {
 }
 
 // ---------------------------------------------------------------------------
-// Startup — start every transport
+// Boot — load the registry, bind Bun.serve, start every transport.
+//
+// Gated on `import.meta.main` so importing this module (e.g. from a test that
+// only wants `createFetchHandler` / `requireScope`) does NOT load the registry,
+// bind a port, or `process.exit` on a missing config.
 // ---------------------------------------------------------------------------
 
-console.log(`parachute-channel: daemon listening on http://127.0.0.1:${PORT}`);
-console.log(`parachute-channel: state dir: ${STATE_DIR}`);
-console.log(
-  `parachute-channel: ${channels.size} channel(s): ${[...channels.values()]
-    .map((c) => `${c.name}→${c.transport.kind}`)
-    .join(", ")}`,
-);
+function main(): void {
+  mkdirSync(STATE_DIR, { recursive: true });
+  mkdirSync(INBOX_DIR, { recursive: true });
 
-// Self-register into ~/.parachute/services.json so hub lists this module in the
-// portal and reverse-proxies `<expose>/channel/*` → this loopback daemon.
-// Best-effort: a failure must not stop the daemon from serving locally. Honors
-// PARACHUTE_HOME, so sandboxed/e2e daemons never touch the real services.json.
-try {
-  upsertService({
-    name: "parachute-channel",
+  let channels: Map<string, Channel>;
+  try {
+    channels = loadRegistry({ stateDir: STATE_DIR });
+  } catch (err) {
+    console.error(`parachute-channel: failed to load channel registry: ${err}`);
+    process.exit(1);
+  }
+
+  if (channels.size === 0) {
+    console.error(
+      `parachute-channel: no channels configured.\n` +
+        `  Add ${join(STATE_DIR, "channels.json")} or set TELEGRAM_BOT_TOKEN\n` +
+        `  (env or ${join(STATE_DIR, ".env")}) for a default telegram channel.`,
+    );
+    process.exit(1);
+  }
+
+  const registry = new ClientRegistry();
+
+  const server = Bun.serve({
     port: PORT,
-    paths: ["/channel"],
-    health: "/health",
-    version: PKG_VERSION,
-    displayName: "Channel",
-    tagline: "Chat with your Claude Code sessions — a channel per session.",
-    installDir: INSTALL_DIR,
-    stripPrefix: true,
-    uiUrl: "/channel/ui", // portal "Open UI" link (also in module.json; written here in case hub reads it from services.json)
+    hostname: "127.0.0.1",
+    idleTimeout: 0,
+    fetch: createFetchHandler(channels, registry),
   });
-  console.log(`parachute-channel: self-registered into services.json (port ${PORT}, mount /channel)`);
-} catch (err) {
-  console.error(`parachute-channel: services.json self-registration failed (continuing): ${err}`);
+
+  console.log(`parachute-channel: daemon listening on http://127.0.0.1:${PORT}`);
+  console.log(`parachute-channel: state dir: ${STATE_DIR}`);
+  console.log(
+    `parachute-channel: ${channels.size} channel(s): ${[...channels.values()]
+      .map((c) => `${c.name}→${c.transport.kind}`)
+      .join(", ")}`,
+  );
+
+  // Self-register into ~/.parachute/services.json so hub lists this module in the
+  // portal and reverse-proxies `<expose>/channel/*` → this loopback daemon.
+  // Best-effort: a failure must not stop the daemon from serving locally. Honors
+  // PARACHUTE_HOME, so sandboxed/e2e daemons never touch the real services.json.
+  try {
+    upsertService({
+      name: "parachute-channel",
+      port: PORT,
+      paths: ["/channel"],
+      health: "/health",
+      version: PKG_VERSION,
+      displayName: "Channel",
+      tagline: "Chat with your Claude Code sessions — a channel per session.",
+      installDir: INSTALL_DIR,
+      stripPrefix: true,
+      uiUrl: "/channel/ui", // portal "Open UI" link (also in module.json; written here in case hub reads it from services.json)
+    });
+    console.log(`parachute-channel: self-registered into services.json (port ${PORT}, mount /channel)`);
+  } catch (err) {
+    console.error(`parachute-channel: services.json self-registration failed (continuing): ${err}`);
+  }
+
+  for (const channel of channels.values()) {
+    channel.transport.start(contextFor(registry, channel.name)).catch((err) => {
+      console.error(`parachute-channel: transport "${channel.name}" start failed:`, err);
+    });
+  }
+
+  // Graceful shutdown — stop all transports.
+  async function shutdown(): Promise<void> {
+    await Promise.allSettled([...channels.values()].map((c) => c.transport.stop()));
+    server.stop();
+    process.exit(0);
+  }
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
-for (const channel of channels.values()) {
-  channel.transport.start(contextFor(channel.name)).catch((err) => {
-    console.error(`parachute-channel: transport "${channel.name}" start failed:`, err);
-  });
-}
-
-// Graceful shutdown — stop all transports.
-async function shutdown(): Promise<void> {
-  await Promise.allSettled([...channels.values()].map((c) => c.transport.stop()));
-  server.stop();
-  process.exit(0);
-}
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+if (import.meta.main) main();

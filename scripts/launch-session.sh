@@ -80,11 +80,15 @@ fi
 # headless/local launch path); a human adding the channel by hand uses
 # `claude mcp add --transport http` and gets prompted for OAuth instead.
 MCP_URL="$DAEMON_URL/mcp/$CHANNEL"
+# MCP server name — `channel-<channel>` so the .mcp.json key, the
+# `--dangerously-load-development-channels=server:<name>` flag, and the daemon's
+# self-reported name all match (no `server:aaron` vs `server:channel` surprise).
+MCP_NAME="channel-$CHANNEL"
 if [ -n "$TOKEN" ]; then
   cat > "$WORKDIR/.mcp.json" <<EOF
 {
   "mcpServers": {
-    "parachute-channel": {
+    "$MCP_NAME": {
       "type": "http",
       "url": "$MCP_URL",
       "headers": {
@@ -98,7 +102,7 @@ else
   cat > "$WORKDIR/.mcp.json" <<EOF
 {
   "mcpServers": {
-    "parachute-channel": {
+    "$MCP_NAME": {
       "type": "http",
       "url": "$MCP_URL"
     }
@@ -124,7 +128,7 @@ EOF
 
 echo "launching session '$SESSION' on channel '$CHANNEL' (daemon $DAEMON_URL)…"
 tmux new-session -d -s "$SESSION" -x 220 -y 50 \
-  "cd '$WORKDIR' && exec claude --dangerously-load-development-channels=server:parachute-channel --dangerously-skip-permissions"
+  "cd '$WORKDIR' && exec claude --dangerously-load-development-channels=server:$MCP_NAME --dangerously-skip-permissions"
 
 # First-launch prompts render a beat after start; accept them, then wait for the
 # channel to attach. The order can vary, so poll for either.

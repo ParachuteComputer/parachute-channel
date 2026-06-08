@@ -291,7 +291,10 @@ function mergeMeta(args: Record<string, unknown>): Record<string, string> {
  */
 function buildServer(channel: string, transport: Transport, session: McpSession): Server {
   const server = new Server(
-    { name: "parachute-channel", version: "0.1.0" },
+    // Per-channel name (`channel-<name>`) so it reads clearly in `/mcp` and lines
+    // up with the `--dangerously-load-development-channels=server:channel-<name>`
+    // flag + the `claude mcp add channel-<name>` name the setup UI/launcher use.
+    { name: `channel-${channel}`, version: "0.1.0" },
     {
       capabilities: {
         experimental: {

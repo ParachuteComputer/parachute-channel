@@ -191,8 +191,11 @@ const CHAT_UI_HTML = `<!doctype html>
   <details class="setup">
     <summary>Connect a Claude Code session ▾</summary>
     <div class="body">
-      <p>Add this channel as an HTTP MCP server — by URL, exactly like adding the vault. Run:</p>
-      <pre><button class="copy" data-copy="add">copy</button><code id="snippet-add"></code></pre>
+      <p>Two steps — add the channel by URL (like the vault), then open a session on it:</p>
+      <p><b>1.</b> Add it (once — prompts for OAuth the first time):</p>
+      <pre><button class="copy" data-copy="snippet-add">copy</button><code id="snippet-add"></code></pre>
+      <p><b>2.</b> Open a session on it (run in any directory):</p>
+      <pre><button class="copy" data-copy="snippet-launch">copy</button><code id="snippet-launch"></code></pre>
       <p id="setup-note"></p>
     </div>
   </details>
@@ -247,20 +250,23 @@ const CHAT_UI_HTML = `<!doctype html>
     // expose, location.origin IS the hub origin and the channel mounts under
     // /channel; served directly off the daemon, it's the loopback origin with
     // no mount prefix. MOUNT (derived from the page path) captures that prefix.
-    var addCmd =
-      "claude mcp add --transport http channel " +
-      window.location.origin + MOUNT + "/mcp/" + ch;
-    document.getElementById("snippet-add").textContent = addCmd;
+    var name = "channel-" + ch;
+    var url = window.location.origin + MOUNT + "/mcp/" + ch;
+    document.getElementById("snippet-add").textContent =
+      "claude mcp add --transport http --scope user " + name + " " + url;
+    document.getElementById("snippet-launch").textContent =
+      "claude --dangerously-load-development-channels=server:" + name + " --dangerously-skip-permissions";
     document.getElementById("setup-note").textContent =
-      "It will prompt for OAuth the first time (just like adding the vault) — no local file, " +
-      "works on any machine that can reach this URL. After it connects, messages you send here " +
-      "inject directly into that idle session, and its replies appear here.";
+      "Step 1 prompts for OAuth the first time (like adding the vault) — no local file, any machine. " +
+      "Step 2 makes that session a live responder for this channel; the flag's name MUST match step 1. " +
+      "--scope user makes it available in any directory — drop it to scope to the current project. " +
+      "Then messages you send here inject into that idle session and its replies appear here.";
   }
 
   document.querySelectorAll(".copy").forEach(function (btn) {
     btn.addEventListener("click", function (e) {
       e.preventDefault();
-      var txt = document.getElementById("snippet-add").textContent;
+      var txt = document.getElementById(btn.getAttribute("data-copy")).textContent;
       if (navigator.clipboard) navigator.clipboard.writeText(txt);
       var prev = btn.textContent; btn.textContent = "copied"; setTimeout(function () { btn.textContent = prev; }, 1200);
     });

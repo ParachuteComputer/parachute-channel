@@ -32,8 +32,6 @@ if printf '%s' "$NAME$CHANNEL" | grep -q '[^a-zA-Z0-9_-]'; then
   exit 2
 fi
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BRIDGE="$REPO/src/bridge.ts"
 DAEMON_URL="${PARACHUTE_CHANNEL_URL:-http://127.0.0.1:1941}"
 STATE_DIR="${PARACHUTE_CHANNEL_STATE_DIR:-$HOME/.parachute/channel}"
 WORKDIR="$STATE_DIR/sessions/$NAME"
@@ -74,20 +72,23 @@ if [ -z "$TOKEN" ]; then
   echo "         running and you're logged in (parachute login) to authenticate the session." >&2
 fi
 
-# Bridge MCP config — the session's only wiring to the channel. The token, when
-# present, is injected into the env block so the bridge presents it on every
-# daemon request.
+# MCP config — the session's only wiring to the channel. This is now an HTTP
+# MCP server (URL + Bearer), NOT a stdio bridge spawned from a local file: the
+# session connects to the daemon's `/mcp/<channel>` endpoint exactly like adding
+# the vault MCP. No `bun src/bridge.ts` path — works on any machine that can
+# reach the daemon URL. The minted token rides as the Authorization header (the
+# headless/local launch path); a human adding the channel by hand uses
+# `claude mcp add --transport http` and gets prompted for OAuth instead.
+MCP_URL="$DAEMON_URL/mcp/$CHANNEL"
 if [ -n "$TOKEN" ]; then
   cat > "$WORKDIR/.mcp.json" <<EOF
 {
   "mcpServers": {
     "parachute-channel": {
-      "command": "bun",
-      "args": ["$BRIDGE"],
-      "env": {
-        "PARACHUTE_CHANNEL_URL": "$DAEMON_URL",
-        "PARACHUTE_CHANNEL_NAME": "$CHANNEL",
-        "PARACHUTE_CHANNEL_TOKEN": "$TOKEN"
+      "type": "http",
+      "url": "$MCP_URL",
+      "headers": {
+        "Authorization": "Bearer $TOKEN"
       }
     }
   }
@@ -98,12 +99,8 @@ else
 {
   "mcpServers": {
     "parachute-channel": {
-      "command": "bun",
-      "args": ["$BRIDGE"],
-      "env": {
-        "PARACHUTE_CHANNEL_URL": "$DAEMON_URL",
-        "PARACHUTE_CHANNEL_NAME": "$CHANNEL"
-      }
+      "type": "http",
+      "url": "$MCP_URL"
     }
   }
 }
@@ -150,18 +147,19 @@ if [ "$ready" != 1 ]; then
   exit 1
 fi
 
-# Best-effort confirm the bridge registered with the daemon on this channel.
+# Best-effort confirm the HTTP MCP session registered with the daemon on this channel.
 connected=0
 for _ in $(seq 1 20); do
-  n="$(curl -fsS "$DAEMON_URL/health" 2>/dev/null | grep -o "\"name\":\"$CHANNEL\"[^}]*\"clients\":[0-9]*" | grep -o '"clients":[0-9]*' | grep -o '[0-9]*' || echo 0)"
+  n="$(curl -fsS "$DAEMON_URL/health" 2>/dev/null | grep -o "\"name\":\"$CHANNEL\"[^}]*\"mcp_sessions\":[0-9]*" | grep -o '"mcp_sessions":[0-9]*' | grep -o '[0-9]*' || echo 0)"
   if [ "${n:-0}" -ge 1 ]; then connected=1; break; fi
   sleep 0.5
 done
 
 echo "✓ session '$SESSION' ready on channel '$CHANNEL'."
+echo "  connected over HTTP MCP at $MCP_URL (no local bridge file)."
 [ -n "$TOKEN" ] && echo "  authenticated with a hub-issued channel token (channel:read + channel:write)." \
                 || echo "  NOT authenticated (no token minted) — only an unguarded dev daemon will accept it."
-[ "$connected" = 1 ] && echo "  bridge connected to the daemon." || echo "  (bridge connection not yet confirmed via /health — usually a moment behind.)"
+[ "$connected" = 1 ] && echo "  HTTP MCP session registered with the daemon." || echo "  (MCP session not yet confirmed via /health — usually a moment behind.)"
 echo "  chat:    open the channel UI and pick channel '$CHANNEL'"
 echo "  watch:   tmux attach -t $SESSION   (detach: Ctrl-b then d)"
 echo "  stop:    ./scripts/stop-session.sh $NAME"

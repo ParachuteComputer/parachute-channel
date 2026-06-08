@@ -150,6 +150,117 @@ describe("UI-facing + discovery endpoints stay open (no token, 200)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// OAuth discovery for the HTTP MCP surface (RFC 9728 + RFC 8414). These are the
+// endpoints a Claude Code HTTP-MCP client probes when adding the channel by URL.
+// Path-insertion form (`.well-known` ABOVE the resource path), mirroring vault.
+// PUBLIC — no token needed (they must be reachable before the client has one).
+// ---------------------------------------------------------------------------
+describe("OAuth discovery (RFC 9728 / RFC 8414) — public, points at the hub", () => {
+  // The hub origin the daemon advertises as the authorization server. Set on the
+  // module's getHubOrigin via PARACHUTE_HUB_ORIGIN; default loopback otherwise.
+  const HUB = process.env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "") || "http://127.0.0.1:1939";
+
+  test("GET /.well-known/oauth-protected-resource/mcp/ui1 → 200, names hub + channel scopes", async () => {
+    const res = await fetch(`${base}/.well-known/oauth-protected-resource/mcp/ui1`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      resource: string;
+      authorization_servers: string[];
+      scopes_supported: string[];
+      bearer_methods_supported: string[];
+    };
+    expect(body.authorization_servers).toEqual([HUB]);
+    expect(body.scopes_supported).toEqual(["channel:read", "channel:write"]);
+    expect(body.bearer_methods_supported).toEqual(["header"]);
+    // No forwarded host → loopback resource URL at /mcp/<channel> (no /channel prefix).
+    expect(body.resource).toBe(`${base}/mcp/ui1`);
+  });
+
+  test("X-Forwarded-Host builds the PUBLIC resource URL (with /channel mount prefix)", async () => {
+    const res = await fetch(`${base}/.well-known/oauth-protected-resource/mcp/ui1`, {
+      headers: { "x-forwarded-host": "parachute.taildf9ce2.ts.net", "x-forwarded-proto": "https" },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { resource: string };
+    expect(body.resource).toBe("https://parachute.taildf9ce2.ts.net/channel/mcp/ui1");
+  });
+
+  test("GET /.well-known/oauth-authorization-server/mcp/ui1 → 200, forwards every endpoint to the hub", async () => {
+    const res = await fetch(`${base}/.well-known/oauth-authorization-server/mcp/ui1`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      issuer: string;
+      authorization_endpoint: string;
+      token_endpoint: string;
+      registration_endpoint: string;
+      jwks_uri: string;
+      scopes_supported: string[];
+    };
+    expect(body.issuer).toBe(HUB);
+    expect(body.authorization_endpoint).toBe(`${HUB}/oauth/authorize`);
+    expect(body.token_endpoint).toBe(`${HUB}/oauth/token`);
+    expect(body.registration_endpoint).toBe(`${HUB}/oauth/register`);
+    expect(body.jwks_uri).toBe(`${HUB}/.well-known/jwks.json`);
+    expect(body.scopes_supported).toEqual(["channel:read", "channel:write"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RFC 9728 WWW-Authenticate challenge on the /mcp/<channel> 401. A plain 401
+// gives a spec OAuth client no way to find the authorization server; the header
+// names the protected-resource metadata document so the client can discover
+// OAuth and start the flow. Only the /mcp path carries it (it's the one that
+// drives a spec client); /events + /api/* stay plain 401.
+// ---------------------------------------------------------------------------
+describe("MCP 401 carries the WWW-Authenticate challenge (RFC 9728)", () => {
+  test("POST /mcp/ui1 with no bearer → 401 + WWW-Authenticate naming the PRM URL", async () => {
+    const res = await fetch(`${base}/mcp/ui1`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    expect(res.status).toBe(401);
+    const header = res.headers.get("WWW-Authenticate");
+    expect(header).toBe(
+      `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp/ui1"`,
+    );
+    // And the URL the header names is a route the daemon actually serves.
+    const prmUrl = header!.match(/resource_metadata="([^"]+)"/)![1]!;
+    const prm = await fetch(prmUrl);
+    expect(prm.status).toBe(200);
+  });
+
+  test("behind the hub (x-forwarded-host) the challenge names the PUBLIC PRM URL", async () => {
+    const res = await fetch(`${base}/mcp/ui1`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-forwarded-host": "parachute.taildf9ce2.ts.net",
+        "x-forwarded-proto": "https",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toBe(
+      'Bearer resource_metadata="https://parachute.taildf9ce2.ts.net/channel/.well-known/oauth-protected-resource/mcp/ui1"',
+    );
+  });
+
+  test("the other bridge endpoints stay plain 401 (no challenge)", async () => {
+    const events = await fetch(`${base}/events?channel=ui1`);
+    expect(events.status).toBe(401);
+    expect(events.headers.get("WWW-Authenticate")).toBeNull();
+    const reply = await fetch(`${base}/api/reply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ channel: "ui1", text: "hi" }),
+    });
+    expect(reply.status).toBe(401);
+    expect(reply.headers.get("WWW-Authenticate")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Layer 2 (human↔UI): the http-ui transport's send + SSE routes are gated the
 // same way — a hub JWT (no-token → 401, short-circuits pre-JWKS). The token may
 // arrive as a Bearer header (send) or a ?token= query param (SSE). Asserted here

@@ -95,6 +95,41 @@ Channel self-registers into `~/.parachute/services.json` at boot and ships
 The built-in chat UI is reachable at `<hub-origin>/channel/ui` over the expose, and at
 `http://127.0.0.1:1941/ui` locally.
 
+## Connecting a session over HTTP MCP (primary)
+
+A Claude Code session connects to a channel as a **pure HTTP MCP server** — by URL +
+OAuth, exactly like adding the vault. No local `.mcp.json` pointing at `bun src/bridge.ts`,
+no machine-local file: the session adds `<hub-origin>/channel/mcp/<channel>` and the daemon
+serves a stateful Streamable-HTTP MCP endpoint (`src/mcp-http.ts`) that pushes the idle-wake
+`notifications/claude/channel` onto the session's SSE stream.
+
+```bash
+claude mcp add --transport http channel <hub-origin>/channel/mcp/<channel>
+```
+
+It prompts for OAuth the first time (like the vault). Discovery is RFC 9728 + RFC 8414, in
+the **path-insertion** form a Claude Code HTTP-MCP client probes (mirrors vault's
+`src/oauth-discovery.ts`), served PUBLIC (no auth) by the daemon:
+
+- `GET /.well-known/oauth-protected-resource/mcp/<channel>` → `resource` (the public MCP
+  URL, built from `X-Forwarded-Host`), `authorization_servers: [<hub-origin>]`,
+  `scopes_supported: ["channel:read","channel:write"]`, `bearer_methods_supported: ["header"]`.
+- `GET /.well-known/oauth-authorization-server/mcp/<channel>` → forwarder pointing
+  `authorization_endpoint` / `token_endpoint` / `registration_endpoint` / `jwks_uri` at the hub.
+- A no/invalid-bearer `POST /mcp/<channel>` returns **401 + `WWW-Authenticate: Bearer
+  resource_metadata="…/.well-known/oauth-protected-resource/mcp/<channel>"`** — the signal a
+  spec OAuth client follows to start the flow. (Only `/mcp/*` carries the challenge; `/events`
+  + `/api/*` stay plain 401.)
+
+The built-in chat UI's "Connect a session" panel now shows this one-liner (computed from
+`window.location.origin` so it's the hub origin over the expose). `scripts/launch-session.sh`
+writes the session's `.mcp.json` as an HTTP server config (`{ "type": "http", "url": …,
+"headers": { "Authorization": "Bearer <minted-token>" } }`) for the headless/local launch —
+the minted token is the header; remote/manual users go through OAuth.
+
+The stdio `bridge.ts` over `/events` + `/api/*` still works (Layer 1 below) — the HTTP MCP
+endpoint is **additive**, and is now the path the UI + launcher steer toward.
+
 ## Auth
 
 **Layer 1 — session↔channel (done).** The bridge-facing daemon endpoints (`GET /events`,

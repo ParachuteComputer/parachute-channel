@@ -18,15 +18,25 @@ describe("renderAdminPage", () => {
     const html = renderAdminPage("");
     expect(html).toContain("<title>Channel — Configuration</title>");
     expect(html).toContain("Manage channels");
-    // The simple add-form offers ONLY the two cross-module-free transports.
-    expect(html).toContain('value="http-ui"');
+    // ONE unified add-form, single transport <select>, with vault as a first-
+    // class option alongside telegram + http-ui (Aaron: vault is just another
+    // transport option, not a separate section).
+    expect(html).toContain('value="vault"');
     expect(html).toContain('value="telegram"');
-    // The simple-add transport <select> never offers a literal vault transport —
-    // vault-backed channels go through the dedicated "Link to a vault" form,
-    // whose vault <select> is populated dynamically (no static value="vault").
-    expect(html).not.toContain('value="vault"');
-    // The vault-link flow is its own section now (modular-UI R2).
-    expect(html).toContain("Link to a vault");
+    expect(html).toContain('value="http-ui"');
+    // http-ui is de-emphasized as the testing / backup transport.
+    expect(html).toContain("for testing / backup");
+  });
+
+  test("vault is the default-selected transport (the expected choice)", () => {
+    const html = renderAdminPage("");
+    // The vault <option> carries `selected` — vault leads the list and is the
+    // default, matching its primary/expected role.
+    expect(html).toContain('<option value="vault" selected>');
+    // The separate "Link to a vault" SECTION is gone — unified into the add-form.
+    expect(html).not.toContain('id="link-vault-section"');
+    expect(html).not.toContain('id="link-form"');
+    expect(html).not.toContain('id="link-btn"');
   });
 
   test("server-side mount appears in the visible chrome links (proxied)", () => {
@@ -85,26 +95,26 @@ describe("renderAdminPage", () => {
   });
 });
 
-describe("link-to-vault flow (modular-UI R2)", () => {
-  test("renders a dedicated Link-to-a-vault section with a vault picker + channel name", () => {
+describe("unified transport select drives fields + submit path", () => {
+  test("the vault transport reveals a vault picker inside the one add-form", () => {
     const html = renderAdminPage("");
-    expect(html).toContain('id="link-vault-section"');
-    expect(html).toContain('id="link-form"');
+    // The vault picker is a (hidden-by-default) field IN the add-form, revealed
+    // when the vault transport is selected — not a separate section.
+    expect(html).toContain('id="field-vault"');
     expect(html).toContain('id="f-vault"');
-    expect(html).toContain('id="f-link-name"');
-    expect(html).toContain('id="link-btn"');
-    // The approval framing is explicit: clicking the button is the approval.
-    expect(html).toContain("clicking the button is your approval");
+    // The telegram transport reveals a per-channel bot-token field.
+    expect(html).toContain('id="field-telegram-token"');
+    expect(html).toContain('id="f-telegram-token"');
+    // applyTransportUI is what shows/hides the per-transport fields.
+    expect(html).toContain("function applyTransportUI");
+    expect(html).toContain('addEventListener("change", applyTransportUI)');
   });
 
-  test("loads the vault list from the hub's public discovery doc (same-origin)", () => {
+  test("the vault submit path POSTs the canonical connection body to the hub", () => {
     const html = renderAdminPage("");
-    expect(html).toContain("function loadVaults");
-    expect(html).toContain("/.well-known/parachute.json");
-  });
-
-  test("submit POSTs the canonical vault-backed-channel body to the hub's Connections engine", () => {
-    const html = renderAdminPage("");
+    // Selecting vault routes addChannel → addVaultChannel → the hub flow.
+    expect(html).toContain('if (transport === "vault") { return addVaultChannel(name); }');
+    expect(html).toContain("function addVaultChannel");
     // POSTs to the HUB origin's /admin/connections (NOT a channel path).
     expect(html).toContain('window.location.origin + "/admin/connections"');
     // Same-origin cookie flows because the page is proxied under /channel.
@@ -115,8 +125,33 @@ describe("link-to-vault flow (modular-UI R2)", () => {
     expect(html).toContain('event: "note.created"');
     expect(html).toContain("#channel-message/inbound");
     expect(html).toContain('action: "message.deliver"');
-    // The chosen channel name rides as the sink action param.
+    // The chosen channel name (the shared #f-name input) rides as the sink param.
     expect(html).toContain("params: { channel: name }");
+    // The approval framing is explicit: clicking Add is the approval.
+    expect(html).toContain("is your approval");
+  });
+
+  test("the telegram submit path sends a per-channel bot token in config.token", () => {
+    const html = renderAdminPage("");
+    // The telegram path reads the bot-token field and only sends a config block
+    // when a token was supplied (blank → env fallback).
+    expect(html).toContain('el("f-telegram-token").value');
+    expect(html).toContain("config = { token: tgToken }");
+    // The POST body carries config when present.
+    expect(html).toContain("if (config) postBody.config = config;");
+    expect(html).toContain('method: "POST"');
+  });
+
+  test("the http-ui transport posts just name + transport (no config)", () => {
+    const html = renderAdminPage("");
+    // The base POST body is name + transport; config is only attached for telegram.
+    expect(html).toContain("var postBody = { name: name, transport: transport };");
+  });
+
+  test("loads the vault list from the hub's public discovery doc (same-origin)", () => {
+    const html = renderAdminPage("");
+    expect(html).toContain("function loadVaults");
+    expect(html).toContain("/.well-known/parachute.json");
   });
 
   test("renders the connect-a-session lines the hub returns on success", () => {
@@ -128,9 +163,29 @@ describe("link-to-vault flow (modular-UI R2)", () => {
 
   test("surfaces a clear actionable message on a 401 from the hub", () => {
     const html = renderAdminPage("");
-    // The link handler distinguishes 401 (not signed in to the hub) from other
-    // failures with a specific, actionable banner.
+    // The vault submit handler distinguishes 401 (not signed in to the hub) from
+    // other failures with a specific, actionable banner.
     expect(html).toContain("Not signed in to the hub");
+  });
+});
+
+describe("telegram per-channel config copy (Aaron's feedback)", () => {
+  test("the misleading 'no extra config / uses the daemon TELEGRAM_BOT_TOKEN' hint is gone", () => {
+    const html = renderAdminPage("");
+    // The old static hint claimed telegram needs no config and shares one daemon
+    // token. That's wrong now — each channel can carry its own bot token.
+    expect(html).not.toContain("No extra config needed");
+  });
+
+  test("the telegram bot-token field explains the per-channel token + env fallback", () => {
+    const html = renderAdminPage("");
+    expect(html).toContain("Bot token");
+    // Accurate copy: per-channel token, env is the legacy fallback.
+    expect(html).toContain("TELEGRAM_BOT_TOKEN");
+    expect(html).toContain("fallback");
+    // The field is a password input (sensitive) and never echoed back.
+    expect(html).toContain('id="f-telegram-token"');
+    expect(html).toContain('type="password"');
   });
 });
 
@@ -139,6 +194,7 @@ describe("add-channel affordance (the unusable-add fix)", () => {
     const html = renderAdminPage("");
     // The add-form is reflected as authed/not-authed so the operator never sees
     // an Add button that silently 401s — the core of the 'no way to add' fix.
+    // For telegram/http-ui, applyTransportUI gates the button on __authed.
     expect(html).toContain("function setAddFormAuthState");
     expect(html).toContain("Sign in to the hub to add");
     // It's driven off the channel-list load resolving (authed) or 401 (not).

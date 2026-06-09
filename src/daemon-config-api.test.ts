@@ -438,6 +438,54 @@ describe("B — config-management API (channel:admin)", () => {
     }
   });
 
+  test("telegram channel: POST persists a per-channel bot token in config.token; GET never leaks it", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      const create = await fetch(`${base}/api/channels`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({
+          name: "tg",
+          transport: "telegram",
+          config: { token: "777:SUPER-SECRET-BOT-TOKEN", stateDir },
+        }),
+      });
+      expect(create.status).toBe(200);
+      expect(await create.json()).toMatchObject({ ok: true, name: "tg", transport: "telegram", live: true });
+
+      // The bot token IS persisted to channels.json (chmod 600, holds secrets).
+      const file = channelsFilePath(stateDir);
+      const onDisk = JSON.parse(readFileSync(file, "utf8")) as {
+        channels: Array<{ name: string; transport: string; config?: Record<string, unknown> }>;
+      };
+      const tg = onDisk.channels.find((c) => c.name === "tg")!;
+      expect(tg.transport).toBe("telegram");
+      expect(tg.config!.token).toBe("777:SUPER-SECRET-BOT-TOKEN");
+      const mode = statSync(file).mode & 0o777;
+      expect(mode).toBe(0o600);
+
+      // GET /api/channels must NOT echo the bot token (same redaction posture as
+      // the vault transport's token/webhookSecret).
+      const list = await fetch(`${base}/api/channels`, { headers: { ...adminAuth } });
+      expect(list.status).toBe(200);
+      const body = (await list.json()) as { channels: Array<Record<string, unknown>> };
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("SUPER-SECRET-BOT-TOKEN");
+      expect(serialized).not.toContain("token");
+      // The row still surfaces name + transport.
+      const row = body.channels.find((c) => c.name === "tg")!;
+      expect(row.transport).toBe("telegram");
+
+      // /health likewise doesn't leak the token.
+      const health = await (await fetch(`${base}/health`)).text();
+      expect(health).not.toContain("SUPER-SECRET-BOT-TOKEN");
+    } finally {
+      // Stop the telegram poll loop before tearing the server down.
+      await fetch(`${base}/api/channels/tg`, { method: "DELETE", headers: { ...adminAuth } }).catch(() => {});
+      srv.stop(true);
+    }
+  });
+
   test("GET without channel:admin → 401 (none) / 403 (wrong scope)", async () => {
     const { srv, base } = buildServer([]);
     try {

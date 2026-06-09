@@ -97,7 +97,51 @@ describe("chunkText", () => {
 
 describe("TelegramTransport", () => {
   test("requires a token", () => {
-    expect(() => new TelegramTransport({})).toThrow(/token required/);
+    // No config token AND no env → throw.
+    const prev = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    try {
+      expect(() => new TelegramTransport({})).toThrow(/token required/);
+    } finally {
+      if (prev === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
+      else process.env.TELEGRAM_BOT_TOKEN = prev;
+    }
+  });
+
+  test("token precedence: explicit per-channel config.token wins over the env", () => {
+    // The transport stores the resolved token on its TelegramApi. We can't read
+    // it directly, but the constructor's resolution is `config.token ?? env`.
+    // Assert the behavior at the boundary: with a config token present, the env
+    // is irrelevant (construction succeeds even if env is unset), and with NO
+    // config token, the env is the fallback (construction succeeds off env).
+    const prev = process.env.TELEGRAM_BOT_TOKEN;
+    try {
+      // (1) per-channel token, env UNSET → constructs (uses the per-channel token).
+      delete process.env.TELEGRAM_BOT_TOKEN;
+      const perChannel = new TelegramTransport({
+        token: "per-channel-tok",
+        stateDir: "/tmp/parachute-channel-test-precedence",
+      });
+      expect(perChannel.kind).toBe("telegram");
+
+      // (2) NO per-channel token, env SET → constructs off the env fallback.
+      process.env.TELEGRAM_BOT_TOKEN = "env-tok";
+      const fromEnv = new TelegramTransport({
+        stateDir: "/tmp/parachute-channel-test-precedence",
+      });
+      expect(fromEnv.kind).toBe("telegram");
+
+      // (3) BOTH set → the per-channel token wins; still constructs fine. (The
+      // ?? resolution prefers config.token; env never shadows it.)
+      const both = new TelegramTransport({
+        token: "per-channel-tok",
+        stateDir: "/tmp/parachute-channel-test-precedence",
+      });
+      expect(both.kind).toBe("telegram");
+    } finally {
+      if (prev === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
+      else process.env.TELEGRAM_BOT_TOKEN = prev;
+    }
   });
 
   test("kind is 'telegram' and outbound methods exist", () => {

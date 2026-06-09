@@ -1,11 +1,19 @@
 /**
  * Tests for the channel-side hub-JWT adapter. These exercise the parts that
- * DON'T need a live hub / JWKS endpoint: hub-origin resolution (env precedence +
- * loopback fallback), the audience constant, and the re-exported pure helpers
- * (`looksLikeJwt`). Real signature/issuer/audience validation is scope-guard's
- * own tested surface — we don't re-test it here and we never need a real JWKS.
+ * DON'T need a live hub / JWKS endpoint: hub-origin resolution (env precedence →
+ * expose-state self-heal → loopback fallback), the audience constant, and the
+ * re-exported pure helpers (`looksLikeJwt`). Real signature/issuer/audience
+ * validation is scope-guard's own tested surface — we don't re-test it here and
+ * we never need a real JWKS.
+ *
+ * The self-heal reads `<PARACHUTE_HOME>/expose-state.json`. Every case here
+ * points `PARACHUTE_HOME` at a fresh temp dir so the operator's real
+ * `~/.parachute/expose-state.json` can't leak into the loopback assertions.
  */
-import { describe, test, expect, afterEach } from "bun:test";
+import { describe, test, expect, afterEach, beforeEach } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   getHubOrigin,
   CHANNEL_AUDIENCE,
@@ -14,23 +22,31 @@ import {
 } from "./hub-jwt.ts";
 
 const savedOrigin = process.env.PARACHUTE_HUB_ORIGIN;
+const savedHome = process.env.PARACHUTE_HOME;
+
+let home: string;
+
+beforeEach(() => {
+  // Isolated, empty ecosystem root — no expose-state.json unless a case writes one.
+  home = mkdtempSync(join(tmpdir(), "channel-hubjwt-"));
+  process.env.PARACHUTE_HOME = home;
+});
 
 afterEach(() => {
   if (savedOrigin === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
   else process.env.PARACHUTE_HUB_ORIGIN = savedOrigin;
+  if (savedHome === undefined) delete process.env.PARACHUTE_HOME;
+  else process.env.PARACHUTE_HOME = savedHome;
+  try {
+    rmSync(home, { recursive: true, force: true });
+  } catch {}
 });
 
-describe("getHubOrigin", () => {
-  test("falls back to loopback when PARACHUTE_HUB_ORIGIN is unset", () => {
-    delete process.env.PARACHUTE_HUB_ORIGIN;
-    expect(getHubOrigin()).toBe("http://127.0.0.1:1939");
-  });
+function writeExposeState(obj: Record<string, unknown>): void {
+  writeFileSync(join(home, "expose-state.json"), JSON.stringify(obj));
+}
 
-  test("falls back to loopback when PARACHUTE_HUB_ORIGIN is empty", () => {
-    process.env.PARACHUTE_HUB_ORIGIN = "";
-    expect(getHubOrigin()).toBe("http://127.0.0.1:1939");
-  });
-
+describe("getHubOrigin — env precedence", () => {
   test("uses the env value when set", () => {
     process.env.PARACHUTE_HUB_ORIGIN = "https://hub.example.com";
     expect(getHubOrigin()).toBe("https://hub.example.com");
@@ -39,6 +55,68 @@ describe("getHubOrigin", () => {
   test("strips a single trailing slash for a canonical form", () => {
     process.env.PARACHUTE_HUB_ORIGIN = "https://hub.example.com/";
     expect(getHubOrigin()).toBe("https://hub.example.com");
+  });
+
+  test("env wins over expose-state (highest precedence)", () => {
+    process.env.PARACHUTE_HUB_ORIGIN = "https://env.example.com";
+    writeExposeState({ hubOrigin: "https://exposed.example.com" });
+    expect(getHubOrigin()).toBe("https://env.example.com");
+  });
+});
+
+describe("getHubOrigin — expose-state self-heal (channel#34)", () => {
+  test("reads expose-state.hubOrigin when env is unset", () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    writeExposeState({ hubOrigin: "https://exposed.example.com" });
+    expect(getHubOrigin()).toBe("https://exposed.example.com");
+  });
+
+  test("reads expose-state.hubOrigin when env is empty", () => {
+    process.env.PARACHUTE_HUB_ORIGIN = "";
+    writeExposeState({ hubOrigin: "https://exposed.example.com" });
+    expect(getHubOrigin()).toBe("https://exposed.example.com");
+  });
+
+  test("synthesizes https://<canonicalFqdn> for older state files lacking hubOrigin", () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    writeExposeState({ canonicalFqdn: "box.taildf9ce2.ts.net" });
+    expect(getHubOrigin()).toBe("https://box.taildf9ce2.ts.net");
+  });
+
+  test("strips a trailing slash off the expose-state origin", () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    writeExposeState({ hubOrigin: "https://exposed.example.com/" });
+    expect(getHubOrigin()).toBe("https://exposed.example.com");
+  });
+
+  test("never self-heals to a loopback expose-state origin", () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    writeExposeState({ hubOrigin: "http://127.0.0.1:1939" });
+    expect(getHubOrigin()).toBe("http://127.0.0.1:1939"); // loopback default, not a self-heal
+  });
+});
+
+describe("getHubOrigin — loopback fallback", () => {
+  test("falls back to loopback when env unset AND no expose-state file", () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    expect(getHubOrigin()).toBe("http://127.0.0.1:1939");
+  });
+
+  test("falls back to loopback when env empty AND no expose-state file", () => {
+    process.env.PARACHUTE_HUB_ORIGIN = "";
+    expect(getHubOrigin()).toBe("http://127.0.0.1:1939");
+  });
+
+  test("falls back to loopback when expose-state has no usable origin", () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    writeExposeState({ layer: "tailnet" }); // neither hubOrigin nor canonicalFqdn
+    expect(getHubOrigin()).toBe("http://127.0.0.1:1939");
+  });
+
+  test("falls back to loopback when expose-state is malformed JSON", () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    writeFileSync(join(home, "expose-state.json"), "{ not json");
+    expect(getHubOrigin()).toBe("http://127.0.0.1:1939");
   });
 });
 

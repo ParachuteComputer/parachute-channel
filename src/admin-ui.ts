@@ -57,6 +57,26 @@ const FONT_SANS = `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, san
 const FONT_MONO = `ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace`;
 
 /**
+ * Server-side HTML escape for values interpolated into the rendered document.
+ * Escapes the five HTML-significant characters so a value is safe in both text
+ * content and a double-quoted attribute value (the two contexts `configUrl`
+ * lands in). Mirrors the in-page client-side `escapeHtml` so the two halves of
+ * the document share one discipline.
+ *
+ * Defensive today: `mount` is server-derived (the proxy prefix), never raw user
+ * input — but this keeps the footer from becoming a latent XSS sink if that
+ * provenance ever changes.
+ */
+export function escapeHtml(s: string): string {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
  * Render the admin page. Pure function — returns the HTML string. The page
  * fetches live state on load (the channel list + per-channel health), so the
  * rendered HTML is the same across requests for a given mount.
@@ -141,7 +161,7 @@ export function renderAdminPage(mount = ""): string {
 
       <footer class="card-footer">
         <p class="footer-hint">
-          Live config (resolved, no secrets): <a href="${configUrl}">${configUrl}</a>.
+          Live config (resolved, no secrets): <a href="${escapeHtml(configUrl)}">${escapeHtml(configUrl)}</a>.
           Channels file on disk: <code>~/.parachute/channel/channels.json</code>.
         </p>
       </footer>
@@ -689,7 +709,7 @@ const PAGE_SCRIPT = String.raw`
 
   // --- Remove -------------------------------------------------------------
   function removeChannel(name, btn) {
-    if (!window.confirm("Remove channel \"" + name + "\"? Sessions on it will stop receiving messages.")) return;
+    if (!window.confirm("Remove channel \"" + escapeHtml(name) + "\"? Sessions on it will stop receiving messages.")) return;
     clearBanner();
     if (btn) { btn.disabled = true; btn.textContent = "Removing..."; }
     fetch(API_URL + "/" + encodeURIComponent(name), {

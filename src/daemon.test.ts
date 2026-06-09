@@ -13,7 +13,10 @@
  * no-token reject is wired in front of the guarded handlers.
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { createFetchHandler } from "./daemon.ts";
+import { createFetchHandler, resolveStartCmd } from "./daemon.ts";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ClientRegistry } from "./routing.ts";
 import { HttpUiTransport } from "./transports/http-ui.ts";
 import { VaultTransport } from "./transports/vault.ts";
@@ -22,8 +25,23 @@ import type { TransportContext, InboundMessage } from "./transport.ts";
 
 let server: ReturnType<typeof Bun.serve>;
 let base: string;
+let envHome: string | undefined;
+let envHubOrigin: string | undefined;
+let homeDir: string;
 
 beforeAll(async () => {
+  // Pin PARACHUTE_HOME at an empty temp dir + clear PARACHUTE_HUB_ORIGIN so
+  // `getHubOrigin()` resolves deterministically to loopback. Without this the
+  // OAuth-discovery assertions below (which expect the loopback hub origin) flake
+  // on any box that has a real `~/.parachute/expose-state.json` — `getHubOrigin`
+  // now self-heals from expose-state's `hubOrigin` (channel#34), so a tailnet /
+  // public state file would otherwise leak the exposed origin into the doc.
+  envHome = process.env.PARACHUTE_HOME;
+  envHubOrigin = process.env.PARACHUTE_HUB_ORIGIN;
+  homeDir = mkdtempSync(join(tmpdir(), "channel-daemon-home-"));
+  process.env.PARACHUTE_HOME = homeDir;
+  delete process.env.PARACHUTE_HUB_ORIGIN;
+
   const registry = new ClientRegistry();
   const transport = new HttpUiTransport({ channel: "ui1" });
   const channels = new Map<string, Channel>([
@@ -47,6 +65,13 @@ beforeAll(async () => {
 
 afterAll(() => {
   server.stop(true);
+  if (envHome === undefined) delete process.env.PARACHUTE_HOME;
+  else process.env.PARACHUTE_HOME = envHome;
+  if (envHubOrigin === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
+  else process.env.PARACHUTE_HUB_ORIGIN = envHubOrigin;
+  try {
+    rmSync(homeDir, { recursive: true, force: true });
+  } catch {}
 });
 
 describe("bridge-facing endpoints require a bearer token (401 with none)", () => {
@@ -507,5 +532,73 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
     } finally {
       srv.stop(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// startCmd resolution for hub supervision (channel#34)
+// ---------------------------------------------------------------------------
+
+describe("resolveStartCmd (hub-supervisor start command)", () => {
+  function tmpInstallDir(): string {
+    return mkdtempSync(join(tmpdir(), "channel-startcmd-"));
+  }
+
+  test("reads startCmd from <installDir>/.parachute/module.json", () => {
+    const dir = tmpInstallDir();
+    try {
+      mkdirSync(join(dir, ".parachute"), { recursive: true });
+      writeFileSync(
+        join(dir, ".parachute", "module.json"),
+        JSON.stringify({ startCmd: ["parachute-channel"] }),
+      );
+      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a multi-arg module.json startCmd verbatim", () => {
+    const dir = tmpInstallDir();
+    try {
+      mkdirSync(join(dir, ".parachute"), { recursive: true });
+      writeFileSync(
+        join(dir, ".parachute", "module.json"),
+        JSON.stringify({ startCmd: ["parachute-channel", "daemon"] }),
+      );
+      expect(resolveStartCmd(dir)).toEqual(["parachute-channel", "daemon"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("falls back to the bin name when module.json is absent", () => {
+    const dir = tmpInstallDir();
+    try {
+      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("falls back to the bin name when module.json startCmd is missing/empty/non-string", () => {
+    const dir = tmpInstallDir();
+    try {
+      mkdirSync(join(dir, ".parachute"), { recursive: true });
+      writeFileSync(join(dir, ".parachute", "module.json"), JSON.stringify({ startCmd: [] }));
+      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
+      writeFileSync(join(dir, ".parachute", "module.json"), JSON.stringify({ name: "channel" }));
+      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
+      writeFileSync(join(dir, ".parachute", "module.json"), JSON.stringify({ startCmd: [123] }));
+      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the repo's own .parachute/module.json carries a usable startCmd", () => {
+    // INSTALL_DIR at runtime is the repo root; src/.. is that root in this checkout.
+    const repoRoot = join(import.meta.dir, "..");
+    expect(resolveStartCmd(repoRoot)).toEqual(["parachute-channel"]);
   });
 });

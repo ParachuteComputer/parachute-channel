@@ -38,6 +38,13 @@ describe("upsertService", () => {
     expect(m.services[0].stripPrefix).toBe(true);
   });
 
+  test("carries startCmd so the hub supervisor can start/restart/adopt the module (channel#34)", () => {
+    const path = tmp();
+    upsertService({ ...CHANNEL, startCmd: ["parachute-channel"] }, path);
+    const m = JSON.parse(readFileSync(path, "utf8"));
+    expect(m.services[0].startCmd).toEqual(["parachute-channel"]);
+  });
+
   test("is idempotent — re-registering the same name does not duplicate", () => {
     const path = tmp();
     upsertService(CHANNEL, path);

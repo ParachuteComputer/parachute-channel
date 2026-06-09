@@ -11,7 +11,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { renderAdminPage } from "./admin-ui.ts";
+import { renderAdminPage, escapeHtml } from "./admin-ui.ts";
 
 describe("renderAdminPage", () => {
   test("renders the channel config chrome", () => {
@@ -79,6 +79,41 @@ describe("renderAdminPage", () => {
   test("renders the same HTML for a given mount (pure function)", () => {
     expect(renderAdminPage("/channel")).toBe(renderAdminPage("/channel"));
     expect(renderAdminPage("")).toBe(renderAdminPage(""));
+  });
+});
+
+describe("escape hardening (channel#37)", () => {
+  test("escapeHtml neutralizes the five HTML metacharacters", () => {
+    expect(escapeHtml(`<script>alert("x&y")</script>'`)).toBe(
+      "&lt;script&gt;alert(&quot;x&amp;y&quot;)&lt;/script&gt;&#39;",
+    );
+  });
+
+  test("the footer configUrl interpolation is escaped, not raw", () => {
+    // A mount carrying HTML metacharacters must render escaped in BOTH the href
+    // attribute and the link text of the footer "live config" link — so it can
+    // never break out into markup at that interpolation site (channel#37).
+    const html = renderAdminPage('"><img src=x onerror=alert(1)>');
+    // Isolate the footer link the interpolation builds.
+    const footer = html.slice(html.indexOf("Live config"), html.indexOf("</a>") + 4);
+    // The raw markup-breakout never appears in the footer link.
+    expect(footer).not.toContain("<img src=x onerror=alert(1)>");
+    expect(footer).not.toContain('"><img');
+    // The escaped form is what lands instead, in both href and text.
+    expect(footer).toContain(escapeHtml('"><img src=x onerror=alert(1)>/.parachute/config'));
+  });
+
+  test("a normal mount still renders a clean, working footer link", () => {
+    const html = renderAdminPage("/channel");
+    expect(html).toContain('href="/channel/.parachute/config"');
+  });
+
+  test("the remove-confirm interpolates the channel name through escapeHtml", () => {
+    // The confirm() string is built from the channel name (a runtime value); the
+    // page-script must route it through escapeHtml so a name with HTML
+    // metacharacters renders escaped rather than as a latent sink.
+    const html = renderAdminPage("");
+    expect(html).toContain('window.confirm("Remove channel \\"" + escapeHtml(name) + "\\"?');
   });
 });
 

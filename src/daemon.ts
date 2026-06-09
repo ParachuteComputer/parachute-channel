@@ -96,6 +96,40 @@ const PKG_VERSION = ((): string => {
 })();
 const INSTALL_DIR = join(import.meta.dir, "..");
 
+/**
+ * The argv the hub supervisor should spawn to (re)start this module — written
+ * into our services.json row so `parachute restart channel` / reboot-survival /
+ * adopt all have a command to run. Without it the supervisor knows the port but
+ * not how to start the process, so a manually-run `bun src/daemon.ts` daemon
+ * can't be supervised (channel#34).
+ *
+ * Sourced from our own `.parachute/module.json` `startCmd` (the canonical
+ * declaration the hub already prefers when it can read the install dir),
+ * falling back to the package.json `bin` name when the manifest is unreadable.
+ * The bin (`parachute-channel` → `src/daemon.ts`) runs the daemon directly and
+ * ignores extra argv, so the literal command is stable regardless of any
+ * subcommand the hub's first-party fallback might carry.
+ */
+export function resolveStartCmd(installDir: string): string[] {
+  try {
+    const manifest = JSON.parse(
+      readFileSync(join(installDir, ".parachute", "module.json"), "utf8"),
+    ) as { startCmd?: unknown };
+    if (
+      Array.isArray(manifest.startCmd) &&
+      manifest.startCmd.length > 0 &&
+      manifest.startCmd.every((a) => typeof a === "string")
+    ) {
+      return manifest.startCmd as string[];
+    }
+  } catch {
+    // fall through to the bin-name default
+  }
+  return ["parachute-channel"];
+}
+
+const START_CMD: string[] = resolveStartCmd(INSTALL_DIR);
+
 // ---------------------------------------------------------------------------
 // Registry + routing
 // ---------------------------------------------------------------------------
@@ -1217,6 +1251,10 @@ function main(): void {
       displayName: "Channel",
       tagline: "Chat with your Claude Code sessions — a channel per session.",
       installDir: INSTALL_DIR,
+      // The command the hub supervisor spawns to start/restart/adopt us. Without
+      // this the supervisor knows our port but not how to launch the process, so
+      // `parachute restart channel` 404s and we don't survive reboot (channel#34).
+      startCmd: START_CMD,
       stripPrefix: true,
       uiUrl: "/channel/ui", // portal "Open UI" link (also in module.json; written here in case hub reads it from services.json)
       configUiUrl: "/channel/admin", // module-owned config surface (modular-UI P4); hub frames/links it. Also in module.json.

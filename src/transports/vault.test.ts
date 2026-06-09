@@ -14,7 +14,7 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { VaultTransport } from "./vault.ts";
+import { VaultTransport, CHANNEL_VAULT_TAG_SCHEMA } from "./vault.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
 
@@ -61,8 +61,10 @@ describe("VaultTransport — reply (outbound note write)", () => {
     const result = await t.reply({ channel: "eng", text: "the reply text" });
 
     expect(result.sent).toEqual(["note-created-1"]);
-    expect(calls).toHaveLength(1);
-    const call = calls[0]!;
+    // start() also fires ensureSchema() (PUT .../api/tags/*); isolate the note POST.
+    const noteCalls = calls.filter((c) => c.url.endsWith("/api/notes"));
+    expect(noteCalls).toHaveLength(1);
+    const call = noteCalls[0]!;
     expect(call.url).toBe("http://127.0.0.1:1940/vault/default/api/notes");
     expect(call.init.method).toBe("POST");
     const headers = call.init.headers as Record<string, string>;
@@ -94,9 +96,12 @@ describe("VaultTransport — reply (outbound note write)", () => {
 
   test("reply() threads in_reply_to from args.meta", async () => {
     let captured: Record<string, string> | undefined;
-    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string> };
-      captured = body.metadata;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      // Ignore the ensureSchema PUTs fired by start(); only the note POST carries metadata.
+      if (String(url).endsWith("/api/notes")) {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string> };
+        captured = body.metadata;
+      }
       return new Response(JSON.stringify({ id: "n2" }), { status: 201 });
     }) as typeof fetch;
 
@@ -171,6 +176,127 @@ describe("VaultTransport — ingestInbound", () => {
       metadata: { channel: "eng", direction: "outbound" },
     });
     expect(ctx.emitted).toHaveLength(0);
+  });
+});
+
+describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", () => {
+  /** Drain microtasks so a fire-and-forget `void this.ensureSchema()` from
+   *  start() has issued its fetches before we assert. */
+  const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  test("PUTs each CHANNEL_VAULT_TAG_SCHEMA entry with the right URL encoding, Bearer, and body", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.ensureSchema();
+
+    expect(calls).toHaveLength(CHANNEL_VAULT_TAG_SCHEMA.length);
+
+    // Parent — no parent_names, just a description. Plain `#` → `%23`.
+    const parent = calls[0]!;
+    expect(parent.url).toBe(
+      "http://127.0.0.1:1940/vault/default/api/tags/%23channel-message",
+    );
+    expect(parent.init.method).toBe("PUT");
+    expect((parent.init.headers as Record<string, string>).authorization).toBe(
+      "Bearer write-token-xyz",
+    );
+    const parentBody = JSON.parse(String(parent.init.body)) as {
+      description?: string;
+      parent_names?: string[];
+    };
+    expect(parentBody.description).toBe(
+      "A message in a Parachute channel (parent of /inbound + /outbound).",
+    );
+    expect("parent_names" in parentBody).toBe(false);
+
+    // Inbound child — name carries BOTH `#` and `/`. The vault route matches a
+    // single path segment (`[^/]+`) then decodeURIComponent's it, so the `/` MUST
+    // be encoded as `%2F` (a bare slash would fail the single-segment match → 404).
+    const inbound = calls[1]!;
+    expect(inbound.url).toBe(
+      "http://127.0.0.1:1940/vault/default/api/tags/%23channel-message%2Finbound",
+    );
+    // Confirm the encoding decodes back to the literal tag name the vault stores.
+    const encodedSegment = inbound.url.split("/api/tags/")[1]!;
+    expect(decodeURIComponent(encodedSegment)).toBe("#channel-message/inbound");
+    const inboundBody = JSON.parse(String(inbound.init.body)) as {
+      description?: string;
+      parent_names?: string[];
+    };
+    expect(inboundBody.parent_names).toEqual(["#channel-message"]);
+    expect(inboundBody.description).toBe(
+      "Human→session message; the vault trigger fires on this.",
+    );
+
+    // Outbound child — same encoding, parent declared.
+    const outbound = calls[2]!;
+    expect(outbound.url).toBe(
+      "http://127.0.0.1:1940/vault/default/api/tags/%23channel-message%2Foutbound",
+    );
+    expect(decodeURIComponent(outbound.url.split("/api/tags/")[1]!)).toBe(
+      "#channel-message/outbound",
+    );
+    const outboundBody = JSON.parse(String(outbound.init.body)) as { parent_names?: string[] };
+    expect(outboundBody.parent_names).toEqual(["#channel-message"]);
+  });
+
+  test("schema is sourced from CHANNEL_VAULT_TAG_SCHEMA — declares exactly its entries", async () => {
+    const declared: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      declared.push(decodeURIComponent(String(url).split("/api/tags/")[1]!));
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.ensureSchema();
+
+    expect(declared).toEqual(CHANNEL_VAULT_TAG_SCHEMA.map((e) => e.name));
+  });
+
+  test("best-effort: a rejecting fetch does NOT throw out of ensureSchema", async () => {
+    globalThis.fetch = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    // Must resolve, not reject.
+    await expect(t.ensureSchema()).resolves.toBeUndefined();
+  });
+
+  test("best-effort: a 500 response does NOT throw out of ensureSchema", async () => {
+    globalThis.fetch = (async () =>
+      new Response("boom", { status: 500 })) as unknown as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await expect(t.ensureSchema()).resolves.toBeUndefined();
+  });
+
+  test("start() stays non-fatal + the transport still works when schema-ensure fails", async () => {
+    // A fetch that fails the PUT (schema) but the test asserts start() resolves
+    // and ingestInbound still emits — the transport is fully functional regardless.
+    globalThis.fetch = (async () => {
+      throw new Error("vault unreachable");
+    }) as unknown as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    const ctx = fakeCtx("eng");
+    await expect(t.start(ctx)).resolves.toBeUndefined();
+    await flush(); // let the fire-and-forget ensureSchema settle (it must not reject globally)
+
+    // Transport still delivers inbound after a failed schema declaration.
+    t.ingestInbound({
+      id: "n1",
+      content: "still works",
+      tags: ["#channel-message", "#channel-message/inbound"],
+      metadata: { channel: "eng", direction: "inbound", sender: "aaron" },
+    });
+    expect(ctx.emitted).toHaveLength(1);
+    expect(ctx.emitted[0]!.content).toBe("still works");
   });
 });
 

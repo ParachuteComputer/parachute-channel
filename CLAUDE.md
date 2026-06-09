@@ -161,20 +161,33 @@ A `vault` transport backs a channel with notes in a Parachute vault, so messages
 are durable, queryable, and a vault surface can render them. Multiple channels per
 vault: the note's `channel` metadata routes it.
 
-**Note shape** — hierarchical tags off the `#channel-message` parent:
-`#channel-message/inbound` (human→session) and `#channel-message/outbound` (session reply).
+**Note shape** — TWO tags per note, carried literally (two orthogonal axes):
+- the parent `#channel-message` — the QUERYABLE membership tag. A UI lists a channel's
+  whole transcript (both directions) with one `tag: "#channel-message"` + `metadata.channel`
+  query, because the parent is literally on every note.
+- a directional child — the trigger DISCRIMINATOR: `#channel-message/inbound` (human→session)
+  or `#channel-message/outbound` (session reply).
+
+**The slash is a namespace, NOT query inheritance.** In a Parachute vault a slash in a tag
+NAME is a namespace convention only — `query-notes { tag: "#channel-message" }` matches
+descendants by the `tags.parent_names` graph (declared via `update-tag`), NOT by name-prefix.
+A note tagged ONLY `#channel-message/inbound` is INVISIBLE to a `tag: "#channel-message"`
+query unless that inheritance was separately declared — so we tag BOTH the parent and the
+child and don't depend on per-vault schema setup.
+
 Content = the message text; metadata: `{ channel, direction: "inbound"|"outbound", sender,
 in_reply_to (outbound), ts }`. Loop avoidance lives in the TAG, not metadata: the trigger
-fires on the inbound child tag only (exact match — no descendant expansion), so a reply never
-wakes its own session. A UI querying the parent `#channel-message` still sees BOTH directions,
-because the query engine DOES inherit descendants. Inbound notes MUST be written with the
-`#channel-message/inbound` tag and the channel name in `metadata.channel`.
+fires on the inbound child tag only (exact match), which an outbound note never carries, so a
+reply never wakes its own session. **Inbound notes MUST carry BOTH `#channel-message` (parent,
+makes it queryable) AND `#channel-message/inbound` (child, fires the trigger), with the channel
+name in `metadata.channel`.** Outbound notes carry `#channel-message` + `#channel-message/outbound`.
 
-**Flow.** INBOUND (human→session): a new `#channel-message/inbound` note → a vault **trigger**
-POSTs a webhook → the channel daemon's `POST /api/vault/inbound` → routes by `note.metadata.channel`
-→ `ctx.emit` wakes the session (fans to SSE bridges + HTTP-MCP sessions alike).
-OUTBOUND (session→human): the session's `reply` writes a `#channel-message/outbound` note via the
-vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`, Bearer `vault:<name>:write`).
+**Flow.** INBOUND (human→session): a new `#channel-message` + `#channel-message/inbound` note →
+a vault **trigger** POSTs a webhook → the channel daemon's `POST /api/vault/inbound` → routes by
+`note.metadata.channel` → `ctx.emit` wakes the session (fans to SSE bridges + HTTP-MCP sessions
+alike). OUTBOUND (session→human): the session's `reply` writes a `#channel-message` +
+`#channel-message/outbound` note via the vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`,
+Bearer `vault:<name>:write`).
 
 **channels.json** (the channel side):
 ```json
@@ -187,10 +200,11 @@ vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`, Bearer `vault:<name>:
 1. (Optional, for indexed queries) declare the `#channel-message` tag schema with
    indexed `channel`/`direction`/`sender` fields (`update-tag`).
 2. Add a trigger to the vault's `config.yaml` that fires on new inbound notes and
-   webhooks the channel daemon. Loop avoidance is by hierarchical tag: the vault
-   predicate does EXACT tag membership (no descendant expansion), so firing on the
-   inbound child tag never matches an outbound (reply) note — no `missing_metadata`
-   clause needed:
+   webhooks the channel daemon. Loop avoidance is by tag: the vault predicate does
+   EXACT tag membership, so firing on the inbound CHILD tag (`#channel-message/inbound`)
+   never matches an outbound (reply) note — which carries `#channel-message/outbound`,
+   not the inbound child — so no `missing_metadata` clause is needed. (Both directions
+   also carry the parent `#channel-message`, but the trigger keys on the child only.)
    ```yaml
    triggers:
      - name: channel_inbound

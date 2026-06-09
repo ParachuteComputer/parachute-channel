@@ -261,6 +261,149 @@ describe("escape hardening (channel#37)", () => {
   });
 });
 
+describe("vault-backed delete composes hub connection teardown (boundary C2)", () => {
+  // Lifecycle symmetry (hub-module-boundary charter; migration Phase C2):
+  // deleting a vault-backed channel must cascade the hub-side identity
+  // artifacts the link flow provisioned — the registered vault trigger + the
+  // long-lived minted tokens, both held on the hub connection record. The page
+  // composes hub teardown FIRST, then the daemon mechanics. Same string-pin
+  // harness as the rest of this file: assert the served page-script's shape.
+  const html = renderAdminPage("");
+
+  test("remove branches on transport: vault routes through the composed teardown", () => {
+    expect(html).toContain(
+      'if (channel && channel.transport === "vault") { removeVaultChannel(name, btn); return; }',
+    );
+    expect(html).toContain("function removeVaultChannel");
+    // The row's Remove button hands over the whole channel record (the list
+    // payload carries name + transport + vault), so the branch can see the
+    // transport.
+    expect(html).toContain("removeChannel(c, rm)");
+  });
+
+  test("drives connections-list → connections-DELETE → daemon-DELETE, in that order", () => {
+    // (a) The list read lives in removeVaultChannel: cookie-gated, same-origin
+    // (credentials:"include" — the same-origin fetch carries a matching Origin
+    // header, so the hub's C1 CSRF belt passes automatically).
+    const vaultFn = html.slice(
+      html.indexOf("function removeVaultChannel"),
+      html.indexOf("function teardownConnections"),
+    );
+    expect(vaultFn).toContain('window.location.origin + "/admin/connections"');
+    expect(vaultFn).toContain('credentials: "include"');
+    // The hub teardown gates the daemon mechanics: finishMechanics only runs
+    // from teardownConnections' completion callback (or the no-record branch).
+    expect(vaultFn).toContain("teardownConnections(matches, 0, [], function (failedDetail, warnings)");
+    expect(vaultFn).toContain("finishMechanics(name, btn, { tornDown: matches, warnings: warnings })");
+    // (b) The item DELETE lives in teardownConnections, credentials included.
+    const tdFn = html.slice(
+      html.indexOf("function teardownConnections"),
+      html.indexOf("function askProceedMechanicsOnly"),
+    );
+    expect(tdFn).toContain('window.location.origin + "/admin/connections/" + encodeURIComponent(rec.id)');
+    expect(tdFn).toContain('method: "DELETE"');
+    expect(tdFn).toContain('credentials: "include"');
+    // (c) The daemon mechanics run in finishMechanics, AFTER the hub side —
+    // through the same DELETE /api/channels path as before (channel:admin
+    // Bearer), tolerating already-gone (the hub's channel-sink step may have
+    // removed the entry first).
+    const fmFn = html.slice(
+      html.indexOf("function finishMechanics"),
+      html.indexOf("document.addEventListener"),
+    );
+    expect(fmFn).toContain("deleteChannelConfig(name, { treat404AsGone: true })");
+  });
+
+  test("identifies the channel's record by its sink, with the hub's id fallback", () => {
+    // Match: sink.module === "channel" && sink.params.channel === name; when
+    // params.channel is absent, fall back to record-id-as-channel-name — the
+    // exact fallback the hub's own teardownConnection applies, so the page
+    // tears down precisely what the hub would.
+    expect(html).toContain("function connectionMatchesChannel");
+    expect(html).toContain('c.sink.module !== "channel"');
+    expect(html).toContain("p.channel === name");
+    expect(html).toContain("return c.id === name");
+  });
+
+  test("hub-teardown failure surfaces the explicit two-step state (no silent fallthrough)", () => {
+    expect(html).toContain("function askProceedMechanicsOnly");
+    // The ask is an explicit confirm with both outcomes spelled out…
+    expect(html).toContain("OK = remove config only. Cancel = keep the channel.");
+    // …Cancel keeps the channel and says so…
+    expect(html).toContain("Removal cancelled.");
+    expect(html).toContain("was left intact.");
+    // …OK marks the state so the final banner says the hub side did NOT run.
+    expect(html).toContain("finishMechanics(name, btn, { hubFailed: detail, warnings: [] })");
+    expect(html).toContain("hub teardown did NOT run.");
+    // Every hub-side failure routes through the ask: list 401 / list non-OK /
+    // list parse failure / network error, and a per-connection DELETE failure.
+    expect(html).toContain("not signed in to the hub (the connections list returned 401)");
+    expect(html).toContain('"the hub connections list returned HTTP " + res.status');
+    expect(html).toContain("could not parse the hub connections list");
+    expect(html).toContain("network error reaching the hub: ");
+    expect(html).toContain(
+      "if (failedDetail !== null) { askProceedMechanicsOnly(name, btn, failedDetail); return; }",
+    );
+    // The ask's confirm routes its runtime values through escapeHtml — one
+    // escaping discipline page-wide, matching the first remove confirm.
+    expect(html).toContain(
+      '"Hub teardown failed for channel \\"" + escapeHtml(name) + "\\":\\n" + escapeHtml(detail) +',
+    );
+  });
+
+  test("daemon 401 after hub teardown keeps the partial-state context", () => {
+    // If the daemon DELETE 401s AFTER the hub teardown already ran, the page
+    // must not show only the generic no-auth banner — the operator is in a
+    // partially-torn-down state (hub side done, channel entry still on disk)
+    // and needs to know that, plus the remediation: sign in, retry the remove.
+    const fmFn = html.slice(
+      html.indexOf("function finishMechanics"),
+      html.indexOf("document.addEventListener"),
+    );
+    expect(fmFn).toContain("if (state.tornDown && state.tornDown.length)");
+    expect(fmFn).toContain("The hub connection teardown already completed");
+    expect(fmFn).toContain("The channel entry remains");
+    expect(fmFn).toContain("and retry the remove.");
+    // The plain 401 with no hub context still gets the generic banner.
+    expect(fmFn).toContain("noAuthBanner()");
+  });
+
+  test("legacy vault channel with no hub record: mechanics-only + informational note", () => {
+    // No record found (linked pre-Connections-era, or via the legacy
+    // /admin/channels path) → proceed with the daemon delete and show the
+    // manual-cleanup note instead of pretending a full teardown happened.
+    expect(html).toContain("finishMechanics(name, btn, { legacyNote: true, warnings: [] })");
+    expect(html).toContain("No hub connection record was found");
+    // Era-relative phrasing ("before the Connections engine existed"), not a
+    // calendar date — it ages better (reviewer nit on #46).
+    expect(html).toContain("the Connections engine existed");
+    expect(html).toContain("hub admin");
+    // Accurate cross-reference: the hub's DELETE /vaults cascade scans
+    // channel's list and reports such channels as orphaned_channels.
+    expect(html).toContain("orphaned_channels");
+  });
+
+  test("non-vault delete keeps the simple daemon-only path", () => {
+    // The non-vault branch goes straight to the daemon mechanics — no
+    // treat404AsGone, no hub calls — with the same success banner as before.
+    expect(html).toContain("deleteChannelConfig(name, {}).then(function (out)");
+    expect(html).toContain("</code> is gone.");
+    // The daemon DELETE still targets <mount>/api/channels/<name> with the
+    // channel:admin Bearer (authHeaders), exactly as today.
+    expect(html).toContain('API_URL + "/" + encodeURIComponent(name)');
+    expect(html).toContain("headers: authHeaders()");
+  });
+
+  test("hub partial teardown (207) and legacy-mint records surface as warnings, not failures", () => {
+    // A 207 from the hub = record removed, some steps failed — carried into
+    // the final banner as notes; rec.legacy = pre-B0 unregistered mints that
+    // ride to expiry, surfaced honestly rather than claiming revocation.
+    expect(html).toContain("payload.partial && Array.isArray(payload.errors)");
+    expect(html).toContain("Partial-teardown notes: ");
+    expect(html).toContain("ride to their original expiry");
+  });
+});
+
 describe("module.json — modular-UI (P4) declaration", () => {
   // The manifest sits at <repo>/.parachute/module.json; this test file is in
   // <repo>/src, so go up one.

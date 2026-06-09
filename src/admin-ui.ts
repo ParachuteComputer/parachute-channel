@@ -29,7 +29,20 @@
  *                       with `{ name, transport:"telegram", config:{ token } }`.
  *        - `http-ui`  → no extra fields → `POST <mount>/api/channels` with
  *                       `{ name, transport:"http-ui" }`.
- *   5. A remove button (with confirm) → `DELETE <mount>/api/channels/:name`.
+ *   5. A remove button (with confirm). Non-vault channels (telegram/http-ui)
+ *      delete daemon-only: `DELETE <mount>/api/channels/:name`. VAULT-BACKED
+ *      channels compose BOTH sides (lifecycle symmetry — hub-module-boundary
+ *      charter, migration Phase C2): first find + tear down the channel's hub
+ *      connection record(s) (`GET /admin/connections` → `DELETE
+ *      /admin/connections/<id>`, cookie-gated, `credentials: "include"` — the
+ *      hub deregisters the vault trigger + revokes the registered token
+ *      mints), THEN the daemon mechanics `DELETE <mount>/api/channels/:name`.
+ *      Hub teardown runs first, while the channel config still exists for the
+ *      hub's channel-sink step to read. A hub-side failure surfaces an
+ *      explicit two-step ask (proceed mechanics-only / keep the channel) —
+ *      never a silent fallthrough. A vault-backed channel with NO hub record
+ *      (linked pre-Connections-era) deletes mechanics-only with an
+ *      informational manual-cleanup note.
  *
  * Auth posture (mirrors scribe's stateless design):
  *   - When loaded through the hub's reverse proxy to a logged-in operator, the
@@ -759,7 +772,9 @@ const PAGE_SCRIPT = String.raw`
       rm.type = "button";
       rm.className = "btn-remove";
       rm.textContent = "Remove";
-      rm.addEventListener("click", function () { removeChannel(c.name, rm); });
+      // Pass the whole channel record -- removeChannel branches on transport
+      // (vault-backed channels compose the hub connection teardown, C2).
+      rm.addEventListener("click", function () { removeChannel(c, rm); });
       li.appendChild(rm);
 
       list.appendChild(li);
@@ -886,26 +901,259 @@ const PAGE_SCRIPT = String.raw`
   }
 
   // --- Remove -------------------------------------------------------------
-  function removeChannel(name, btn) {
-    if (!window.confirm("Remove channel \"" + escapeHtml(name) + "\"? Sessions on it will stop receiving messages.")) return;
-    clearBanner();
-    if (btn) { btn.disabled = true; btn.textContent = "Removing..."; }
-    fetch(API_URL + "/" + encodeURIComponent(name), {
+  // Channel delete is LIFECYCLE-SYMMETRIC for vault-backed channels (the
+  // hub-module-boundary charter's lifecycle-symmetry rule; boundary migration
+  // Phase C2). Linking a vault provisioned hub-side identity artifacts -- a
+  // registered vault trigger + long-lived minted tokens, recorded as a hub
+  // connection -- so deleting the channel must cascade them. The page composes
+  // BOTH sides, hub teardown FIRST (while the channel config still exists for
+  // the hub's channel-sink step to read), then the daemon mechanics:
+  //
+  //   (a) GET <origin>/admin/connections (cookie-gated; same-origin under the
+  //       proxy, credentials:"include") -- find the record(s) whose SINK
+  //       delivers to this channel;
+  //   (b) DELETE <origin>/admin/connections/<id> -- the hub deregisters the
+  //       vault trigger + revokes the registered token mints (post-B0);
+  //   (c) DELETE <mount>/api/channels/<name> (Bearer channel:admin) -- the
+  //       daemon mechanics, as today.
+  //
+  // A hub-side failure surfaces an explicit two-step ask (proceed with the
+  // mechanics only, or keep the channel) -- never a silent fallthrough.
+  // Non-vault channels (telegram / http-ui) provision no hub-side identity
+  // artifacts and keep the simple daemon-only delete.
+
+  function restoreRemoveBtn(btn) {
+    if (btn) { btn.disabled = false; btn.textContent = "Remove"; }
+  }
+
+  // The daemon mechanics: DELETE <mount>/api/channels/<name> (channel:admin
+  // Bearer via authHeaders). Promise-shaped, never rejects -- resolves
+  // { ok:true } | { ok:false, auth:true } | { ok:false, error }. The daemon's
+  // DELETE is idempotent (a missing channel still 200s with removed:false);
+  // treat404AsGone is a belt for the vault path, where the hub teardown's
+  // channel-sink step may already have removed the entry.
+  function deleteChannelConfig(name, opts) {
+    opts = opts || {};
+    return fetch(API_URL + "/" + encodeURIComponent(name), {
       method: "DELETE",
       headers: authHeaders(),
     }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (payload) {
-        if (res.status === 401 || res.status === 403) { noAuthBanner(); return; }
-        if (!res.ok) {
-          setBanner("error", "<strong>Remove failed.</strong> " + escapeHtml((payload && payload.error) || ("HTTP " + res.status)));
-          return;
-        }
-        setBanner("success", "<strong>Channel removed.</strong> <code>" + escapeHtml(name) + "</code> is gone.");
-        loadChannels();
+        if (res.status === 401 || res.status === 403) return { ok: false, auth: true };
+        if (res.status === 404 && opts.treat404AsGone) return { ok: true };
+        if (!res.ok) return { ok: false, error: (payload && payload.error) || ("HTTP " + res.status) };
+        return { ok: true };
       });
     }).catch(function (err) {
-      setBanner("error", "<strong>Network error.</strong> " + escapeHtml(err && err.message ? err.message : String(err)));
-      if (btn) { btn.disabled = false; btn.textContent = "Remove"; }
+      return { ok: false, error: "network error: " + (err && err.message ? err.message : String(err)) };
+    });
+  }
+
+  function removeChannel(channel, btn) {
+    var name = channel && channel.name ? channel.name : "";
+    if (!window.confirm("Remove channel \"" + escapeHtml(name) + "\"? Sessions on it will stop receiving messages.")) return;
+    clearBanner();
+    if (btn) { btn.disabled = true; btn.textContent = "Removing..."; }
+    // Vault-backed channels compose the hub connection teardown first (C2).
+    if (channel && channel.transport === "vault") { removeVaultChannel(name, btn); return; }
+    // telegram / http-ui: the simple daemon-only delete, unchanged.
+    deleteChannelConfig(name, {}).then(function (out) {
+      if (out.auth) { noAuthBanner(); restoreRemoveBtn(btn); return; }
+      if (!out.ok) {
+        setBanner("error", "<strong>Remove failed.</strong> " + escapeHtml(out.error || ""));
+        restoreRemoveBtn(btn);
+        return;
+      }
+      setBanner("success", "<strong>Channel removed.</strong> <code>" + escapeHtml(name) + "</code> is gone.");
+      loadChannels();
+    });
+  }
+
+  // A hub connection record belongs to this channel when its SINK delivers to
+  // it: sink.module === "channel" with sink.params.channel === name. The hub's
+  // own teardown falls back to the record id as the channel name when
+  // params.channel is absent -- mirror that fallback so this match agrees with
+  // what the hub would tear down.
+  function connectionMatchesChannel(c, name) {
+    if (!c || !c.sink || c.sink.module !== "channel") return false;
+    var p = c.sink.params;
+    if (p && typeof p.channel === "string") return p.channel === name;
+    return c.id === name;
+  }
+
+  // (a)+(b) of the composed delete: find + tear down the channel's hub
+  // connection record(s), then hand off to the daemon mechanics. Same-origin
+  // under the /channel proxy, so the operator's hub session cookie flows with
+  // credentials:"include" and the fetch carries a matching Origin header --
+  // the hub's CSRF Origin check on /admin/* mutations (C1) passes
+  // automatically; no token dance needed. Mirrors the link-vault flow above.
+  function removeVaultChannel(name, btn) {
+    fetch(window.location.origin + "/admin/connections", {
+      credentials: "include",
+      headers: { accept: "application/json" },
+    }).then(function (res) {
+      if (res.status === 401) {
+        askProceedMechanicsOnly(name, btn, "not signed in to the hub (the connections list returned 401); sign in to the hub portal and retry for a full teardown");
+        return;
+      }
+      if (!res.ok) {
+        askProceedMechanicsOnly(name, btn, "the hub connections list returned HTTP " + res.status);
+        return;
+      }
+      res.json().catch(function () { return null; }).then(function (payload) {
+        if (payload === null) {
+          askProceedMechanicsOnly(name, btn, "could not parse the hub connections list");
+          return;
+        }
+        var records = (payload && Array.isArray(payload.connections)) ? payload.connections : [];
+        var matches = records.filter(function (c) { return connectionMatchesChannel(c, name); });
+        if (!matches.length) {
+          // Legacy/edge: a vault-backed channel with NO hub connection record
+          // (linked pre-Connections-era, or via the legacy /admin/channels
+          // path). Proceed mechanics-only; finishMechanics shows the
+          // informational manual-cleanup note.
+          finishMechanics(name, btn, { legacyNote: true, warnings: [] });
+          return;
+        }
+        teardownConnections(matches, 0, [], function (failedDetail, warnings) {
+          if (failedDetail !== null) { askProceedMechanicsOnly(name, btn, failedDetail); return; }
+          finishMechanics(name, btn, { tornDown: matches, warnings: warnings });
+        });
+      });
+    }).catch(function (err) {
+      askProceedMechanicsOnly(name, btn, "network error reaching the hub: " + (err && err.message ? err.message : String(err)));
+    });
+  }
+
+  // DELETE each matching hub connection, sequentially. The hub deregisters the
+  // vault trigger + revokes the registered jtis; its channel-sink step may
+  // also remove the daemon's config entry (our mechanics pass is idempotent,
+  // so that's fine). A 404 means already-gone: skip. A 207 is a PARTIAL
+  // teardown (record removed, some steps failed) -- carried as a warning, not
+  // a hard failure, because the hub removes the record + revokes what it can
+  // either way. Calls done(failedDetail-or-null, warnings).
+  function teardownConnections(matches, i, warnings, done) {
+    if (i >= matches.length) { done(null, warnings); return; }
+    var rec = matches[i];
+    fetch(window.location.origin + "/admin/connections/" + encodeURIComponent(rec.id), {
+      method: "DELETE",
+      credentials: "include",
+      headers: { accept: "application/json" },
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (payload) {
+        if (res.status === 404) { teardownConnections(matches, i + 1, warnings, done); return; }
+        if (res.status === 401) { done("not signed in to the hub (the connection teardown returned 401)", warnings); return; }
+        if (!res.ok) {
+          done("hub teardown of connection " + rec.id + " failed: " + ((payload && (payload.error_description || payload.error)) || ("HTTP " + res.status)), warnings);
+          return;
+        }
+        if (payload && payload.partial && Array.isArray(payload.errors)) {
+          payload.errors.forEach(function (e) {
+            warnings.push("connection " + rec.id + ", step " + (e && e.step ? e.step : "?") + ": " + (e && e.detail ? e.detail : ""));
+          });
+        }
+        if (rec.legacy) {
+          // The hub flags records provisioned before the registered-mint rule
+          // (B0): their long-lived tokens were never registered, so the
+          // teardown can't revoke them -- they ride to their original expiry.
+          warnings.push("connection " + rec.id + " predates registered token mints; its minted tokens ride to their original expiry");
+        }
+        teardownConnections(matches, i + 1, warnings, done);
+      });
+    }).catch(function (err) {
+      done("network error tearing down connection " + rec.id + ": " + (err && err.message ? err.message : String(err)), warnings);
+    });
+  }
+
+  // The hub teardown failed (or its records were unreadable): a CLEAR two-step
+  // state. Surface the failure, then ASK whether to proceed mechanics-only --
+  // OK removes the channel config (leaving the hub-side trigger/tokens for
+  // manual cleanup), Cancel keeps the channel intact. Never a silent
+  // fallthrough into a delete that LOOKS complete but isn't.
+  function askProceedMechanicsOnly(name, btn, detail) {
+    // confirm() is text-context (no HTML sink), but route the runtime values
+    // through escapeHtml anyway -- one escaping discipline page-wide, matching
+    // the first remove confirm.
+    var proceed = window.confirm(
+      "Hub teardown failed for channel \"" + escapeHtml(name) + "\":\n" + escapeHtml(detail) +
+      "\n\nRemove the channel config anyway (mechanics only)? Its vault trigger and minted tokens may stay live until cleaned up in hub admin -> Connections." +
+      "\n\nOK = remove config only. Cancel = keep the channel."
+    );
+    if (!proceed) {
+      setBanner(
+        "warn",
+        "<strong>Removal cancelled.</strong> Channel <code>" + escapeHtml(name) +
+          "</code> was left intact. Hub teardown failed: " + escapeHtml(detail) +
+          ". Fix the hub side (or sign in) and retry for a full teardown."
+      );
+      restoreRemoveBtn(btn);
+      return;
+    }
+    finishMechanics(name, btn, { hubFailed: detail, warnings: [] });
+  }
+
+  // (c) The daemon mechanics, after the hub side resolved. The state arg says
+  // how the hub side went -- { tornDown?: matched-records, legacyNote?: true,
+  // hubFailed?: detail, warnings: [] } -- and the final banner reflects it, so
+  // the operator always knows which half ran.
+  function finishMechanics(name, btn, state) {
+    deleteChannelConfig(name, { treat404AsGone: true }).then(function (out) {
+      if (out.auth) {
+        // A daemon 401 AFTER the hub teardown already ran is a partially-
+        // torn-down state: hub side done, channel entry still on disk. Say
+        // so, with the remediation, instead of only the generic no-auth
+        // banner (which would hide that half the delete already happened).
+        if (state.tornDown && state.tornDown.length) {
+          setBanner(
+            "warn",
+            "<strong>Not authenticated.</strong> The hub connection teardown already completed " +
+              "(vault trigger deregistered, tokens revoked), but removing the channel entry needs a " +
+              "<code>channel:admin</code> token, minted for the logged-in operator by the hub. " +
+              "The channel entry remains &mdash; open this page through the Parachute hub portal " +
+              "(signed in) and retry the remove."
+          );
+        } else {
+          noAuthBanner();
+        }
+        restoreRemoveBtn(btn);
+        return;
+      }
+      if (!out.ok) {
+        var failHtml = "<strong>Remove failed.</strong> " + escapeHtml(out.error || "");
+        if (state.tornDown && state.tornDown.length) {
+          failHtml += " The hub connection teardown already completed (vault trigger deregistered, tokens revoked); the channel config entry remains &mdash; retry Remove.";
+        }
+        setBanner("error", failHtml);
+        restoreRemoveBtn(btn);
+        return;
+      }
+      if (state.hubFailed) {
+        setBanner(
+          "warn",
+          "<strong>Channel config removed &mdash; hub teardown did NOT run.</strong> <code>" + escapeHtml(name) +
+            "</code> is gone from the daemon, but the hub side failed (" + escapeHtml(state.hubFailed) +
+            "). Its vault trigger and minted tokens may still be live &mdash; clean up in hub admin &rarr; Connections."
+        );
+      } else if (state.legacyNote) {
+        setBanner(
+          "warn",
+          "<strong>Channel removed.</strong> <code>" + escapeHtml(name) + "</code> is gone. " +
+            "No hub connection record was found for this vault-backed channel &mdash; if it was linked before " +
+            "the Connections engine existed, its vault trigger and tokens may need manual cleanup: see hub admin &rarr; Connections. " +
+            "(Deleting the backing vault from the hub also reports such channels as <code>orphaned_channels</code>.)"
+        );
+      } else {
+        var ids = (state.tornDown || []).map(function (r) { return r.id; });
+        var okHtml = "<strong>Channel removed.</strong> <code>" + escapeHtml(name) + "</code> is gone. " +
+          "Hub connection" + (ids.length === 1 ? "" : "s") + " <code>" + escapeHtml(ids.join(", ")) +
+          "</code> torn down &mdash; vault trigger deregistered, minted tokens revoked.";
+        if (state.warnings && state.warnings.length) {
+          setBanner("warn", okHtml + " Partial-teardown notes: " + escapeHtml(state.warnings.join("; ")) + ".");
+        } else {
+          setBanner("success", okHtml);
+        }
+      }
+      loadChannels();
     });
   }
 

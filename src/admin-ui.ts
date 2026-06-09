@@ -188,9 +188,8 @@ export function renderAdminPage(mount = ""): string {
             <span class="field-label">Bot token</span>
             <input type="password" name="telegramToken" id="f-telegram-token" placeholder="123456:ABC-..." autocomplete="off" />
             <span class="field-hint">
-              From BotFather, for this channel's bot. Stored server-side (never echoed back). If left
-              blank, the daemon's <code>TELEGRAM_BOT_TOKEN</code> env is used as a fallback (legacy
-              single-bot setup).
+              From BotFather, for this channel's bot. Required &mdash; each telegram channel carries its
+              own token. Stored server-side (never echoed back).
             </span>
           </label>
 
@@ -414,6 +413,11 @@ const STYLES = `
 
   .add-form { display: flex; flex-direction: column; gap: 1rem; }
   .field { display: flex; flex-direction: column; gap: 0.3rem; }
+  /* The author \`display:flex\` above outranks the UA \`[hidden]{display:none}\`
+     rule, so a per-transport field with the \`hidden\` attribute would still
+     render. Re-assert the hide at matching specificity so applyTransportUI's
+     \`field.hidden = …\` toggling actually shows/hides the field. */
+  .field[hidden] { display: none; }
   .field-label { font-size: 0.85rem; font-weight: 500; color: ${PALETTE.fgMuted}; letter-spacing: 0.01em; }
   .field-hint { font-size: 0.8rem; color: ${PALETTE.fgDim}; }
   .field-error { font-size: 0.8rem; color: ${PALETTE.danger}; font-weight: 500; }
@@ -630,9 +634,18 @@ const PAGE_SCRIPT = String.raw`
     var transport = el("f-transport").value;
     var vaultField = el("field-vault");
     var tgField = el("field-telegram-token");
+    var tgInput = el("f-telegram-token");
     var hint = el("transport-hint");
+    // Reveal exactly the fields the selected transport needs. Each branch is
+    // explicit for ALL THREE transports so no field leaks across a selection:
+    //   vault    → show the vault picker, hide the telegram token field.
+    //   telegram → show the telegram token field, hide the vault picker.
+    //   http-ui  → hide both (no extra config).
     if (vaultField) vaultField.hidden = transport !== "vault";
     if (tgField) tgField.hidden = transport !== "telegram";
+    // Gate HTML5 \`required\` on visibility: a hidden-but-required field can't be
+    // filled and would block submit. Only require the bot token while it's shown.
+    if (tgInput) tgInput.required = transport === "telegram";
     // The connect-a-session result is vault-specific; hide it when switching to
     // a non-vault transport so a prior vault success doesn't linger under an
     // unrelated form.
@@ -816,15 +829,17 @@ const PAGE_SCRIPT = String.raw`
     if (transport === "vault") { return addVaultChannel(name); }
 
     // telegram + http-ui POST straight to the channel daemon. http-ui is fully
-    // self-contained (no config). telegram takes a per-channel bot token in
-    // config.token; when blank, the transport falls back to the daemon's
-    // TELEGRAM_BOT_TOKEN env (legacy single-bot back-compat).
+    // self-contained (no config). telegram REQUIRES a per-channel bot token in
+    // config.token -- there is no daemon-global env fallback anymore, so a blank
+    // token can't succeed. Block the submit with a clear field error.
     var config;
     if (transport === "telegram") {
       var tgToken = el("f-telegram-token").value.trim();
-      // Only send a config block when a token was supplied -- an empty/omitted
-      // config means "use the env fallback", which the transport resolves.
-      if (tgToken) config = { token: tgToken };
+      if (!tgToken) {
+        setFieldError("f-telegram-token", "Required — each telegram channel needs its own bot token.");
+        return;
+      }
+      config = { token: tgToken };
     }
     var btn = el("add-btn");
     btn.disabled = true;

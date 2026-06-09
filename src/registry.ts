@@ -5,10 +5,9 @@
  * instantiates a Transport per entry. A channel is a name bound to a transport
  * kind plus optional transport config.
  *
- * Backwards-compat: if `channels.json` is absent but a Telegram bot token is
- * available (TELEGRAM_BOT_TOKEN env, set directly or loaded from the state-dir
- * `.env`), a single default channel `{ name: "telegram", transport: "telegram" }`
- * is synthesized so existing single-bot installs keep working with zero config.
+ * Every channel is explicit: with no `channels.json` the daemon resolves to
+ * zero channels. There is NO daemon-global TELEGRAM_BOT_TOKEN synthesis — each
+ * telegram channel carries its own per-channel bot token in its config.
  */
 
 import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync } from "fs";
@@ -43,8 +42,10 @@ export function defaultStateDir(): string {
 }
 
 /**
- * Load TELEGRAM_BOT_TOKEN (and any other vars) from the state dir's `.env` into
- * process.env if not already set. Mirrors the original daemon's behavior.
+ * Load the state dir's `.env` into process.env if not already set. Generic —
+ * an operator may keep arbitrary vars there (e.g. PARACHUTE_HUB_ORIGIN). The
+ * daemon no longer consumes TELEGRAM_BOT_TOKEN; telegram tokens live per-channel
+ * in channels.json. Mirrors the original daemon's `.env` loading behavior.
  */
 export function loadEnvFile(stateDir: string): void {
   const envFile = join(stateDir, ".env");
@@ -63,7 +64,11 @@ export function loadEnvFile(stateDir: string): void {
 export function instantiateTransport(entry: ChannelEntry): Transport {
   switch (entry.transport) {
     case "telegram":
-      return new TelegramTransport((entry.config ?? {}) as TelegramTransportConfig);
+      // Thread the channel name in so a missing-token error names the channel.
+      return new TelegramTransport({
+        ...(entry.config ?? {}),
+        name: entry.name,
+      } as TelegramTransportConfig);
     case "http-ui":
       // http-ui needs no secret — just a channel name (taken from ctx at start).
       return new HttpUiTransport((entry.config ?? {}) as HttpUiTransportConfig);
@@ -80,10 +85,11 @@ export function instantiateTransport(entry: ChannelEntry): Transport {
 
 /**
  * Resolve the channel entries for this install. Reads channels.json if present;
- * otherwise synthesizes a default telegram channel when a token is available.
+ * otherwise resolves to `[]` (no channels) — explicit per-channel config is
+ * required, there is no env-token synthesis.
  *
- * `loadEnv` (default true) loads the state-dir `.env` so the token fallback can
- * see a `.env`-only token. Tests pass `loadEnv: false` to stay hermetic.
+ * `loadEnv` (default true) still loads the state-dir `.env` for any generic vars
+ * an operator keeps there. Tests pass `loadEnv: false` to stay hermetic.
  */
 export function resolveChannelEntries(opts: {
   stateDir?: string;
@@ -108,12 +114,10 @@ export function resolveChannelEntries(opts: {
     return parsed.channels;
   }
 
-  // Backwards-compat: no channels.json → synthesize a default telegram channel
-  // when a bot token is available.
-  if (process.env.TELEGRAM_BOT_TOKEN) {
-    return [{ name: "telegram", transport: "telegram" }];
-  }
-
+  // No channels.json → no channels. Explicit per-channel config is now
+  // required; there is no daemon-global TELEGRAM_BOT_TOKEN synthesis. Each
+  // telegram channel carries its OWN bot token in channels.json (created via
+  // the admin UI), so the daemon never depends on a global env token.
   return [];
 }
 

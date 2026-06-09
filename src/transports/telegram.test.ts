@@ -96,27 +96,32 @@ describe("chunkText", () => {
 // ---------------------------------------------------------------------------
 
 describe("TelegramTransport", () => {
-  test("requires a token", () => {
-    // No config token AND no env → throw.
+  test("throws ChannelConfigError when no config.token (no env fallback)", () => {
+    // The daemon-global TELEGRAM_BOT_TOKEN fallback is gone — a telegram channel
+    // MUST carry its own per-channel token. Even with the env var set, a config
+    // without a token throws: the env is never read as a token source.
     const prev = process.env.TELEGRAM_BOT_TOKEN;
-    delete process.env.TELEGRAM_BOT_TOKEN;
     try {
-      expect(() => new TelegramTransport({})).toThrow(/token required/);
+      // (1) no config token, env UNSET → throws.
+      delete process.env.TELEGRAM_BOT_TOKEN;
+      expect(() => new TelegramTransport({ name: "tele-x" })).toThrow(ChannelConfigError);
+      expect(() => new TelegramTransport({ name: "tele-x" })).toThrow(
+        /telegram channel tele-x requires a per-channel bot token/,
+      );
+
+      // (2) no config token, env SET → STILL throws (env is not a token source).
+      process.env.TELEGRAM_BOT_TOKEN = "env-tok";
+      expect(() => new TelegramTransport({ name: "tele-x" })).toThrow(ChannelConfigError);
     } finally {
       if (prev === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
       else process.env.TELEGRAM_BOT_TOKEN = prev;
     }
   });
 
-  test("token precedence: explicit per-channel config.token wins over the env", () => {
-    // The transport stores the resolved token on its TelegramApi. We can't read
-    // it directly, but the constructor's resolution is `config.token ?? env`.
-    // Assert the behavior at the boundary: with a config token present, the env
-    // is irrelevant (construction succeeds even if env is unset), and with NO
-    // config token, the env is the fallback (construction succeeds off env).
+  test("a per-channel config.token constructs, regardless of the env", () => {
     const prev = process.env.TELEGRAM_BOT_TOKEN;
     try {
-      // (1) per-channel token, env UNSET → constructs (uses the per-channel token).
+      // env UNSET → constructs off the per-channel token.
       delete process.env.TELEGRAM_BOT_TOKEN;
       const perChannel = new TelegramTransport({
         token: "per-channel-tok",
@@ -124,20 +129,14 @@ describe("TelegramTransport", () => {
       });
       expect(perChannel.kind).toBe("telegram");
 
-      // (2) NO per-channel token, env SET → constructs off the env fallback.
+      // env SET to a DIFFERENT value → the per-channel token is what's used; the
+      // env is irrelevant, construction still succeeds with the config token.
       process.env.TELEGRAM_BOT_TOKEN = "env-tok";
-      const fromEnv = new TelegramTransport({
-        stateDir: "/tmp/parachute-channel-test-precedence",
-      });
-      expect(fromEnv.kind).toBe("telegram");
-
-      // (3) BOTH set → the per-channel token wins; still constructs fine. (The
-      // ?? resolution prefers config.token; env never shadows it.)
-      const both = new TelegramTransport({
+      const withEnvNoise = new TelegramTransport({
         token: "per-channel-tok",
         stateDir: "/tmp/parachute-channel-test-precedence",
       });
-      expect(both.kind).toBe("telegram");
+      expect(withEnvNoise.kind).toBe("telegram");
     } finally {
       if (prev === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
       else process.env.TELEGRAM_BOT_TOKEN = prev;

@@ -101,10 +101,12 @@ const CALLBACK_DATA_RE = /^perm_(allow|deny)_([a-km-z]{5})$/;
 
 /** Config for a Telegram transport instance. */
 export interface TelegramTransportConfig {
-  /** Bot token. Falls back to TELEGRAM_BOT_TOKEN env when omitted. */
+  /** Per-channel bot token from BotFather. REQUIRED — there is no env fallback. */
   token?: string;
   /** Directory holding access.json + inbox/. Defaults to the channel state dir. */
   stateDir?: string;
+  /** Channel name, used only to make the missing-token error message clear. */
+  name?: string;
 }
 
 export class TelegramTransport implements Transport {
@@ -118,10 +120,12 @@ export class TelegramTransport implements Transport {
   private pollTask: Promise<void> | undefined;
 
   constructor(config: TelegramTransportConfig = {}) {
-    const token = config.token ?? process.env.TELEGRAM_BOT_TOKEN;
+    // Per-channel token is REQUIRED — no daemon-global env fallback. Every
+    // telegram channel carries its own bot token in its channels.json config.
+    const token = config.token;
     if (!token) {
-      throw new Error(
-        "TelegramTransport: bot token required (config.token or TELEGRAM_BOT_TOKEN)",
+      throw new ChannelConfigError(
+        `telegram channel ${config.name ?? "(unnamed)"} requires a per-channel bot token in its config`,
       );
     }
     const stateDir =

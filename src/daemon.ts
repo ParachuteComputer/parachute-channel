@@ -1254,8 +1254,8 @@ function main(): void {
   if (channels.size === 0) {
     console.error(
       `parachute-channel: no channels configured.\n` +
-        `  Add ${join(STATE_DIR, "channels.json")} or set TELEGRAM_BOT_TOKEN\n` +
-        `  (env or ${join(STATE_DIR, ".env")}) for a default telegram channel.`,
+        `  Add ${join(STATE_DIR, "channels.json")} (or use the admin UI at /channel/admin)\n` +
+        `  to define a channel. Telegram channels carry a per-channel bot token in config.`,
     );
     process.exit(1);
   }

@@ -131,12 +131,13 @@ describe("unified transport select drives fields + submit path", () => {
     expect(html).toContain("is your approval");
   });
 
-  test("the telegram submit path sends a per-channel bot token in config.token", () => {
+  test("the telegram submit path REQUIRES a per-channel bot token in config.token", () => {
     const html = renderAdminPage("");
-    // The telegram path reads the bot-token field and only sends a config block
-    // when a token was supplied (blank → env fallback).
+    // The telegram path reads the bot-token field; a blank token is now a hard
+    // error (no env fallback), so submit is blocked with a field error.
     expect(html).toContain('el("f-telegram-token").value');
     expect(html).toContain("config = { token: tgToken }");
+    expect(html).toContain('setFieldError("f-telegram-token"');
     // The POST body carries config when present.
     expect(html).toContain("if (config) postBody.config = config;");
     expect(html).toContain('method: "POST"');
@@ -177,15 +178,34 @@ describe("telegram per-channel config copy (Aaron's feedback)", () => {
     expect(html).not.toContain("No extra config needed");
   });
 
-  test("the telegram bot-token field explains the per-channel token + env fallback", () => {
+  test("the telegram bot-token field explains the REQUIRED per-channel token", () => {
     const html = renderAdminPage("");
     expect(html).toContain("Bot token");
-    // Accurate copy: per-channel token, env is the legacy fallback.
-    expect(html).toContain("TELEGRAM_BOT_TOKEN");
-    expect(html).toContain("fallback");
+    // Accurate copy: each telegram channel carries its OWN token; required.
+    expect(html).toContain("each telegram channel carries its");
+    expect(html).toContain("Required");
+    // The misleading env-fallback claim is gone — the daemon no longer reads
+    // a global TELEGRAM_BOT_TOKEN, so the field hint must not advertise one.
+    expect(html).not.toContain("env is used as a fallback");
     // The field is a password input (sensitive) and never echoed back.
     expect(html).toContain('id="f-telegram-token"');
     expect(html).toContain('type="password"');
+  });
+
+  test("per-transport fields hide via .field[hidden] (CSS specificity fix)", () => {
+    const html = renderAdminPage("");
+    // .field declares display:flex, which outranks the UA [hidden] rule — so the
+    // hidden attribute alone wouldn't hide the telegram token field on the
+    // default (vault) selection. This rule re-asserts the hide at matching
+    // specificity. Without it, the bot-token field shows when telegram isn't
+    // selected (Aaron's bug 1).
+    expect(html).toContain(".field[hidden] { display: none; }");
+  });
+
+  test("applyTransportUI gates the bot-token's HTML5 required on visibility", () => {
+    const html = renderAdminPage("");
+    // A hidden-but-required field blocks submit; only require it while shown.
+    expect(html).toContain('tgInput.required = transport === "telegram"');
   });
 });
 

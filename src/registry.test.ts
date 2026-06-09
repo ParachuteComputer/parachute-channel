@@ -23,18 +23,19 @@ afterEach(() => {
   else process.env.TELEGRAM_BOT_TOKEN = savedToken;
 });
 
-describe("default-channel synthesis (back-compat)", () => {
-  test("no channels.json + TELEGRAM_BOT_TOKEN set → single default telegram channel", () => {
+describe("no env synthesis — channels are always explicit", () => {
+  test("no channels.json + TELEGRAM_BOT_TOKEN set → [] (env is NOT a token source)", () => {
     process.env.TELEGRAM_BOT_TOKEN = "dummy-token";
     const entries = resolveChannelEntries({ stateDir: dir, loadEnv: false });
-    expect(entries).toEqual([{ name: "telegram", transport: "telegram" }]);
+    expect(entries).toEqual([]);
   });
 
-  test("no channels.json + token only in state-dir .env → synthesized after loadEnv", () => {
+  test("no channels.json + token only in state-dir .env → still [] after loadEnv", () => {
+    // .env is still loaded (generic vars may live there), but a TELEGRAM_BOT_TOKEN
+    // there no longer synthesizes a channel — per-channel config is required.
     writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=from-env-file\n");
     const entries = resolveChannelEntries({ stateDir: dir, loadEnv: true });
-    expect(entries).toEqual([{ name: "telegram", transport: "telegram" }]);
-    expect(process.env.TELEGRAM_BOT_TOKEN).toBe("from-env-file");
+    expect(entries).toEqual([]);
   });
 
   test("no channels.json + no token → empty list (caller decides to error)", () => {
@@ -91,9 +92,11 @@ describe("instantiateTransport", () => {
     expect(() => instantiateTransport(entry)).toThrow(/unknown transport kind "carrier-pigeon"/);
   });
 
-  test("telegram entry with no token errors clearly", () => {
+  test("telegram entry with no token errors clearly (names the channel)", () => {
     const entry: ChannelEntry = { name: "t", transport: "telegram" };
-    expect(() => instantiateTransport(entry)).toThrow(/token required/);
+    expect(() => instantiateTransport(entry)).toThrow(
+      /telegram channel t requires a per-channel bot token/,
+    );
   });
 });
 

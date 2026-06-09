@@ -33,7 +33,7 @@ bun src/daemon.ts
 # or via launchd — see below
 ```
 
-Requires `TELEGRAM_BOT_TOKEN` in env or `~/.parachute/channel/.env`.
+Telegram channels carry a per-channel bot token in `channels.json` config — the daemon does NOT read a global `TELEGRAM_BOT_TOKEN`. Define channels via the admin UI at `/channel/admin` (or by writing `~/.parachute/channel/channels.json` directly).
 
 ### Bridge (registered in .mcp.json, Claude Code spawns it)
 
@@ -226,7 +226,6 @@ Bearer `vault:<name>:write`).
 
 | Variable | Default | Description |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | (required) | Telegram bot token from BotFather |
 | `PORT` | (unset) | **Highest-priority port input** — the hub supervisor injects this from the module's services.json `entry.port` (the canonical pattern vault/scribe follow). The daemon binds AND self-registers this port, so the supervisor's readiness probe + `/channel/*` proxy target agree (channel#41). Empty/non-numeric falls through. |
 | `PARACHUTE_CHANNEL_PORT` | `1941` | Daemon HTTP port — back-compat override for a daemon run *outside* the supervisor. Used only when `PORT` is unset. |
 | `PARACHUTE_CHANNEL_URL` | `http://127.0.0.1:1941` | Bridge → daemon URL |
@@ -237,7 +236,8 @@ Bearer `vault:<name>:write`).
 ## State directory
 
 `~/.parachute/channel/`:
-- `.env` — `TELEGRAM_BOT_TOKEN=...`
+- `channels.json` — the channel registry. Each telegram channel carries its own bot token in `config.token` (created via the admin UI or written directly).
+- `.env` — optional generic env vars (e.g. `PARACHUTE_HUB_ORIGIN`). The daemon no longer consumes `TELEGRAM_BOT_TOKEN` here.
 - `access.json` — allowlist (compatible with the official plugin's format)
 - `inbox/` — downloaded attachments
 

@@ -23,6 +23,8 @@ import { extractBearer } from "@openparachute/scope-guard";
 export const SCOPE_READ = "channel:read" as const;
 export const SCOPE_WRITE = "channel:write" as const;
 export const SCOPE_SEND = "channel:send" as const;
+/** Config-management scope: create/list/delete channels (hub-orchestrated setup). */
+export const SCOPE_ADMIN = "channel:admin" as const;
 
 /** JSON Response helper (shared spelling for the auth error bodies). */
 export function json(data: unknown, status = 200): Response {

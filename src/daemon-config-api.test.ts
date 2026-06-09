@@ -1,0 +1,513 @@
+/**
+ * PR 2 of the frictionless-channel-setup arc — config-management API + webhook
+ * JWT auth + the prescribed trigger template.
+ *
+ * These cover the THREE new surfaces, all on the real daemon fetch handler:
+ *
+ *  A. Webhook JWT auth on POST /api/vault/inbound — a hub JWT (aud:channel,
+ *     scope channel:send) is accepted and routes the note; the DEPRECATED
+ *     ?secret= fallback still works; neither → 401; an insufficient scope → 401.
+ *  B. Config-management API (channel:admin) — POST writes channels.json (600
+ *     perms) + hot-adds the channel live (a subsequent inbound routes without a
+ *     restart); GET never leaks token/secret; DELETE removes from file + stops
+ *     routing; other scopes → 403.
+ *  C. CHANNEL_VAULT_TRIGGER_TEMPLATE is exposed via /.parachute/config.
+ *
+ * The hub JWT validator is stubbed (sentinel tokens → fixed scope sets) so the
+ * accept paths run without a live hub/JWKS. The no-token reject still hits the
+ * real short-circuit. This mirrors the http-ui Layer-2 test's approach.
+ */
+import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, rmSync, existsSync, readFileSync, statSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+// Re-export the REAL error class + shape helper from scope-guard in the mock
+// below, so this `mock.module` (which Bun applies process-wide) doesn't break
+// hub-jwt.test.ts's assertions on the genuine HubJwtError(code, message) shape.
+import { HubJwtError, looksLikeJwt } from "@openparachute/scope-guard";
+
+const SEND_TOKEN = "test-send-token"; // channel:send (the trigger token)
+const ADMIN_TOKEN = "test-admin-token"; // channel:admin (config-mgmt)
+const READ_TOKEN = "test-read-token"; // channel:read only (insufficient)
+mock.module("./hub-jwt.ts", () => ({
+  CHANNEL_AUDIENCE: "channel",
+  async validateHubJwt(token: string) {
+    const base = { sub: "test", aud: "channel", jti: undefined, clientId: undefined, vaultScope: undefined };
+    if (token === SEND_TOKEN) return { ...base, scopes: ["channel:send"] };
+    if (token === ADMIN_TOKEN) return { ...base, scopes: ["channel:admin"] };
+    if (token === READ_TOKEN) return { ...base, scopes: ["channel:read"] };
+    throw new HubJwtError("issuer", "invalid token");
+  },
+  HubJwtError,
+  looksLikeJwt,
+  resetJwksCache() {},
+  resetRevocationCache() {},
+}));
+
+import { createFetchHandler } from "./daemon.ts";
+import { ClientRegistry } from "./routing.ts";
+import { VaultTransport, CHANNEL_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
+import { channelsFilePath } from "./registry.ts";
+import type { Channel } from "./registry.ts";
+import type { TransportContext, InboundMessage } from "./transport.ts";
+
+const sendAuth = { authorization: "Bearer " + SEND_TOKEN } as const;
+const adminAuth = { authorization: "Bearer " + ADMIN_TOKEN } as const;
+const readAuth = { authorization: "Bearer " + READ_TOKEN } as const;
+
+let stateDir: string;
+
+beforeEach(() => {
+  // Sandbox channels.json under a throwaway state dir — the config API resolves
+  // STATE_DIR from PARACHUTE_CHANNEL_STATE_DIR (read once at daemon module load),
+  // so set it BEFORE importing... but the module is already imported. Instead the
+  // daemon's STATE_DIR is captured at module init; we set the env to a temp dir
+  // and the tests that touch the file assert under that path. Re-resolve per test.
+  stateDir = mkdtempSync(join(tmpdir(), "channel-cfg-"));
+  process.env.PARACHUTE_CHANNEL_STATE_DIR = stateDir;
+});
+
+afterEach(() => {
+  try {
+    rmSync(stateDir, { recursive: true, force: true });
+  } catch {}
+});
+
+// ---------------------------------------------------------------------------
+// A vault channel + a recording ctx, wired through the real fetch handler.
+// ---------------------------------------------------------------------------
+// `secret`: a string → that shared secret; `null` → a JWT-only channel with NO
+// webhookSecret configured; omitted → defaults to "s3cret".
+function buildServer(initial: Array<{ name: string; secret?: string | null }> = [{ name: "eng", secret: "s3cret" }]) {
+  const registry = new ClientRegistry();
+  const channels = new Map<string, Channel>();
+  const emitted: InboundMessage[] = [];
+  for (const { name, secret } of initial) {
+    const transport = new VaultTransport({
+      vault: "default",
+      vaultUrl: "http://127.0.0.1:1940",
+      token: "x",
+      // null → omit (JWT-only channel); undefined → default "s3cret".
+      ...(secret === null ? {} : { webhookSecret: secret ?? "s3cret" }),
+    });
+    const ctx: TransportContext = {
+      channel: name,
+      emit(msg) {
+        emitted.push(msg);
+      },
+      emitPermissionVerdict() {},
+    };
+    void transport.start(ctx);
+    channels.set(name, { name, transport, entry: { name, transport: "vault", config: { vault: "default" } } });
+  }
+  const srv = Bun.serve({ port: 0, hostname: "127.0.0.1", idleTimeout: 0, fetch: createFetchHandler(channels, registry) });
+  return { srv, base: `http://127.0.0.1:${srv.port}`, emitted, channels };
+}
+
+function inboundBody(noteId: string, channel = "eng") {
+  return JSON.stringify({
+    trigger: "channel-inbound",
+    event: "created",
+    note: {
+      id: noteId,
+      path: `channel/${channel}/${noteId}`,
+      content: "wake up session",
+      tags: ["#channel-message", "#channel-message/inbound"],
+      metadata: { channel, direction: "inbound", sender: "aaron" },
+    },
+  });
+}
+
+// ===========================================================================
+// A. Webhook JWT auth on POST /api/vault/inbound
+// ===========================================================================
+describe("A — webhook hub-JWT auth (channel:send), secret fallback retained", () => {
+  test("valid channel:send JWT → 200 + routes the note (emits)", async () => {
+    const { srv, base, emitted } = buildServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...sendAuth },
+        body: inboundBody("jwt-1"),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.channel).toBe("eng");
+      expect(emitted[0]!.meta.note_id).toBe("jwt-1");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("a channel:read-only JWT → 401 (uniform on the webhook — no scope/channel probing), no emit", async () => {
+    // The webhook collapses insufficient-scope to a uniform 401 (unlike the
+    // operator-facing config API, which returns 403). This tailnet-reachable
+    // endpoint stays opaque to scope/channel enumeration.
+    const { srv, base, emitted } = buildServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...readAuth },
+        body: inboundBody("jwt-ro"),
+      });
+      expect(res.status).toBe(401);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("a bad/garbage Bearer → 401, no emit", async () => {
+    const { srv, base, emitted } = buildServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer nope" },
+        body: inboundBody("jwt-bad"),
+      });
+      expect(res.status).toBe(401);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("no Bearer AND no secret → 401, no emit", async () => {
+    const { srv, base, emitted } = buildServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: inboundBody("none"),
+      });
+      expect(res.status).toBe(401);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("M1 — whitespace-only `Authorization: Bearer ` + a VALID ?secret= → 401 (no fallthrough to the secret path)", async () => {
+    // An Authorization header present-but-empty must take the JWT path and fail
+    // hard — it must NOT fall through to the deprecated ?secret= path even though
+    // the secret is correct. Branching on header PRESENCE (not token truthiness)
+    // is what closes this auth-confusion.
+    const { srv, base, emitted } = buildServer([{ name: "eng", secret: "s3cret" }]);
+    try {
+      const res = await fetch(`${base}/api/vault/inbound?secret=s3cret`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer    " },
+        body: inboundBody("ws-1"),
+      });
+      expect(res.status).toBe(401);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("M2 — a JWT-only channel (NO webhookSecret) accepts a valid channel:send JWT → 200 + emits", async () => {
+    const { srv, base, emitted } = buildServer([{ name: "eng", secret: null }]);
+    try {
+      const res = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...sendAuth },
+        body: inboundBody("jwtonly-1"),
+      });
+      expect(res.status).toBe(200);
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.channel).toBe("eng");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("M2 — a JWT-only channel (NO webhookSecret) 401s a no-auth request (nothing to validate against)", async () => {
+    const { srv, base, emitted } = buildServer([{ name: "eng", secret: null }]);
+    try {
+      // No Authorization header → ?secret= fallback. The channel has no configured
+      // secret, so an empty/any `?secret=` can never match → 401 (no "undefined ===
+      // undefined" passing). Also assert an explicit empty ?secret= stays 401.
+      const noAuth = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: inboundBody("jwtonly-noauth"),
+      });
+      expect(noAuth.status).toBe(401);
+      const emptySecret = await fetch(`${base}/api/vault/inbound?secret=`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: inboundBody("jwtonly-emptysecret"),
+      });
+      expect(emptySecret.status).toBe(401);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("DEPRECATED ?secret= fallback still works (200 + emits + logs a warning)", async () => {
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    const { srv, base, emitted } = buildServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound?secret=s3cret`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: inboundBody("sec-1"),
+      });
+      expect(res.status).toBe(200);
+      expect(emitted).toHaveLength(1);
+      expect(warnings.some((w) => w.includes("DEPRECATED") && w.includes("eng"))).toBe(true);
+    } finally {
+      console.warn = origWarn;
+      srv.stop(true);
+    }
+  });
+
+  test("valid JWT but unknown channel → uniform 401 (no enumeration), no emit", async () => {
+    const { srv, base, emitted } = buildServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...sendAuth },
+        body: inboundBody("ghost", "nope"),
+      });
+      expect(res.status).toBe(401);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+});
+
+// ===========================================================================
+// B. Config-management API (channel:admin)
+// ===========================================================================
+describe("B — config-management API (channel:admin)", () => {
+  test("POST without channel:admin → 403 (other scope) / 401 (none)", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      const none = await fetch(`${base}/api/channels`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "x", transport: "http-ui" }),
+      });
+      expect(none.status).toBe(401);
+
+      const wrong = await fetch(`${base}/api/channels`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...sendAuth },
+        body: JSON.stringify({ name: "x", transport: "http-ui" }),
+      });
+      expect(wrong.status).toBe(403);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("POST writes channels.json (600 perms) + hot-adds the channel LIVE (inbound routes, no restart)", async () => {
+    const { srv, base } = buildServer([]); // start with NO channels
+    try {
+      const create = await fetch(`${base}/api/channels`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({
+          name: "eng",
+          transport: "vault",
+          config: { vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "vault-jwt", webhookSecret: "sek" },
+        }),
+      });
+      expect(create.status).toBe(200);
+      expect(await create.json()).toMatchObject({ ok: true, name: "eng", transport: "vault", live: true });
+
+      // channels.json written, with the token, at 0600.
+      const file = channelsFilePath(stateDir);
+      expect(existsSync(file)).toBe(true);
+      const onDisk = JSON.parse(readFileSync(file, "utf8")) as { channels: Array<{ name: string; config?: Record<string, unknown> }> };
+      expect(onDisk.channels.map((c) => c.name)).toContain("eng");
+      const engEntry = onDisk.channels.find((c) => c.name === "eng")!;
+      expect(engEntry.config!.token).toBe("vault-jwt"); // the file DOES hold the token
+      const mode = statSync(file).mode & 0o777;
+      expect(mode).toBe(0o600);
+
+      // HOT-ADD proof #1: the new channel is in the LIVE registry — /health lists it.
+      const health = (await (await fetch(`${base}/health`)).json()) as { channels: Array<{ name: string; kind: string }> };
+      expect(health.channels.map((c) => c.name)).toContain("eng");
+      expect(health.channels.find((c) => c.name === "eng")!.kind).toBe("vault");
+
+      // HOT-ADD proof #2: a subsequent inbound for the new channel ROUTES (200 →
+      // the channel is live + the secret authorizes) WITHOUT a restart. An unknown
+      // channel would 401; routing to its transport's ingestInbound is what makes
+      // this 200. (The hot-added transport emits into the real ClientRegistry, not
+      // this test's recorder, so we assert on the routed 200 + health, not `emitted`.)
+      const inbound = await fetch(`${base}/api/vault/inbound?secret=sek`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: inboundBody("hot-1", "eng"),
+      });
+      expect(inbound.status).toBe(200);
+
+      // HOT-ADD proof #3 (nit): a JWT-authenticated inbound (channel:send) also
+      // routes on the freshly hot-added channel — the JWT path is live too, not
+      // just the secret fallback.
+      const jwtInbound = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...sendAuth },
+        body: inboundBody("hot-jwt-1", "eng"),
+      });
+      expect(jwtInbound.status).toBe(200);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("POST replaces an existing channel (stops the old transport, new config wins)", async () => {
+    const { srv, base } = buildServer([{ name: "eng", secret: "old" }]);
+    try {
+      const res = await fetch(`${base}/api/channels`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({
+          name: "eng",
+          transport: "vault",
+          config: { vault: "default", token: "x", webhookSecret: "new" },
+        }),
+      });
+      expect(res.status).toBe(200);
+      // New secret takes effect; old one no longer authorizes.
+      const oldSecret = await fetch(`${base}/api/vault/inbound?secret=old`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: inboundBody("r-old", "eng"),
+      });
+      expect(oldSecret.status).toBe(401);
+      const newSecret = await fetch(`${base}/api/vault/inbound?secret=new`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: inboundBody("r-new", "eng"),
+      });
+      expect(newSecret.status).toBe(200);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("POST with an invalid config (vault channel, no token) → 400, nothing persisted", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      const res = await fetch(`${base}/api/channels`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ name: "bad", transport: "vault", config: { vault: "default" } }),
+      });
+      expect(res.status).toBe(400);
+      // channels.json must not have been created with the broken entry.
+      const file = channelsFilePath(stateDir);
+      if (existsSync(file)) {
+        const onDisk = JSON.parse(readFileSync(file, "utf8")) as { channels: Array<{ name: string }> };
+        expect(onDisk.channels.map((c) => c.name)).not.toContain("bad");
+      }
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("GET lists channels (name + transport + vault) — NEVER token/secret", async () => {
+    const { srv, base } = buildServer([{ name: "eng", secret: "s3cret" }]);
+    try {
+      const res = await fetch(`${base}/api/channels`, { headers: { ...adminAuth } });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { channels: Array<Record<string, unknown>> };
+      expect(body.channels).toHaveLength(1);
+      const eng = body.channels[0]!;
+      expect(eng.name).toBe("eng");
+      expect(eng.transport).toBe("vault");
+      expect(eng.vault).toBe("default");
+      // No credential fields leak.
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("s3cret");
+      expect(serialized).not.toContain("token");
+      expect(serialized).not.toContain("webhookSecret");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("GET without channel:admin → 401 (none) / 403 (wrong scope)", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      expect((await fetch(`${base}/api/channels`)).status).toBe(401);
+      expect((await fetch(`${base}/api/channels`, { headers: { ...readAuth } })).status).toBe(403);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("DELETE removes the channel from channels.json + stops routing", async () => {
+    const { srv, base, emitted } = buildServer([]);
+    try {
+      // Add it via the API so it's both on disk and live.
+      await fetch(`${base}/api/channels`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ name: "eng", transport: "vault", config: { vault: "default", token: "x", webhookSecret: "sek" } }),
+      });
+      const file = channelsFilePath(stateDir);
+      expect((JSON.parse(readFileSync(file, "utf8")) as { channels: unknown[] }).channels).toHaveLength(1);
+
+      const del = await fetch(`${base}/api/channels/eng`, { method: "DELETE", headers: { ...adminAuth } });
+      expect(del.status).toBe(200);
+      expect(await del.json()).toMatchObject({ ok: true, name: "eng", removed: true });
+
+      // Gone from disk.
+      expect((JSON.parse(readFileSync(file, "utf8")) as { channels: unknown[] }).channels).toHaveLength(0);
+      // Routing stopped — an inbound for the deleted channel is now an unknown
+      // channel → uniform 401, no emit.
+      const inbound = await fetch(`${base}/api/vault/inbound?secret=sek`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: inboundBody("after-del", "eng"),
+      });
+      expect(inbound.status).toBe(401);
+      expect(emitted).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("DELETE without channel:admin → 401/403", async () => {
+    const { srv, base } = buildServer([{ name: "eng" }]);
+    try {
+      expect((await fetch(`${base}/api/channels/eng`, { method: "DELETE" })).status).toBe(401);
+      expect((await fetch(`${base}/api/channels/eng`, { method: "DELETE", headers: { ...readAuth } })).status).toBe(403);
+    } finally {
+      srv.stop(true);
+    }
+  });
+});
+
+// ===========================================================================
+// C. Prescribed trigger template exposed via /.parachute/config
+// ===========================================================================
+describe("C — CHANNEL_VAULT_TRIGGER_TEMPLATE exposed via /.parachute/config", () => {
+  test("GET /.parachute/config carries triggerTemplate (the module-owned trigger shape)", async () => {
+    const { srv, base } = buildServer([{ name: "eng" }]);
+    try {
+      const res = await fetch(`${base}/.parachute/config`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { channels: unknown[]; triggerTemplate: typeof CHANNEL_VAULT_TRIGGER_TEMPLATE };
+      expect(body.triggerTemplate).toEqual(CHANNEL_VAULT_TRIGGER_TEMPLATE);
+      // Sanity on the shape the hub depends on (placeholders + webhook path).
+      expect(body.triggerTemplate.name).toBe("channel_inbound_<channel>");
+      expect(body.triggerTemplate.when.tags).toEqual(["#channel-message/inbound"]);
+      expect(body.triggerTemplate.action.webhook).toBe("<hub-origin>/channel/api/vault/inbound");
+    } finally {
+      srv.stop(true);
+    }
+  });
+});

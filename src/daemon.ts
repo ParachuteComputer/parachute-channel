@@ -38,10 +38,25 @@ import type {
   DownloadArgs,
 } from "./transport.ts";
 import { ChannelConfigError } from "./transport.ts";
-import { loadRegistry, defaultStateDir, type Channel } from "./registry.ts";
-import { VaultTransport } from "./transports/vault.ts";
+import {
+  loadRegistry,
+  instantiateTransport,
+  upsertChannelEntry,
+  removeChannelEntry,
+  defaultStateDir,
+  type Channel,
+  type ChannelEntry,
+} from "./registry.ts";
+import { VaultTransport, CHANNEL_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 import { ClientRegistry } from "./routing.ts";
-import { requireScope, extractToken, SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
+import {
+  requireScope,
+  extractToken,
+  SCOPE_READ,
+  SCOPE_WRITE,
+  SCOPE_SEND,
+  SCOPE_ADMIN,
+} from "./auth.ts";
 import { validateHubJwt } from "./hub-jwt.ts";
 import {
   handleProtectedResource,
@@ -109,6 +124,61 @@ function contextFor(registry: ClientRegistry, channel: string): TransportContext
       mcpPushPermissionVerdict(channel, v);
     },
   };
+}
+
+/**
+ * Instantiate one channel entry, start its transport, and register it in the
+ * LIVE channels map — the single per-channel "bring a channel up" path. Boot
+ * (`main`) and the config-management hot-add both go through here so they can't
+ * drift. If a channel with the same name is already live, its old transport is
+ * stopped first (config-API replace semantics).
+ *
+ * `start()` is awaited so a hot-add only reports success once the transport is
+ * actually receiving (e.g. the vault transport has fired its schema upsert). At
+ * boot a throw is logged per-channel and doesn't abort the others; the config
+ * API surfaces the throw to the caller as a 500.
+ */
+async function addChannelLive(
+  channels: Map<string, Channel>,
+  registry: ClientRegistry,
+  entry: ChannelEntry,
+): Promise<Channel> {
+  const existing = channels.get(entry.name);
+  if (existing) {
+    // Replace: stop the old transport before swapping it out so it releases any
+    // resources (pollers, SSE clients) before the new one starts.
+    try {
+      await existing.transport.stop();
+    } catch (err) {
+      console.error(`parachute-channel: stopping old transport for "${entry.name}" failed (continuing):`, err);
+    }
+    channels.delete(entry.name);
+  }
+  const transport = instantiateTransport(entry);
+  const channel: Channel = { name: entry.name, transport, entry };
+  channels.set(entry.name, channel);
+  await transport.start(contextFor(registry, entry.name));
+  return channel;
+}
+
+/**
+ * Stop a live channel's transport and remove it from the map. Idempotent — a
+ * missing name is a no-op returning false. The transport's `stop()` is awaited
+ * so it releases resources before we drop the reference.
+ */
+async function removeChannelLive(
+  channels: Map<string, Channel>,
+  name: string,
+): Promise<boolean> {
+  const channel = channels.get(name);
+  if (!channel) return false;
+  try {
+    await channel.transport.stop();
+  } catch (err) {
+    console.error(`parachute-channel: stopping transport for "${name}" failed (continuing):`, err);
+  }
+  channels.delete(name);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -530,12 +600,20 @@ export function createFetchHandler(
     }
 
     // Self-describing config (runner pattern) — read-only, no secrets.
+    //
+    // `triggerTemplate` is MODULE-OWNED DATA: the prescribed vault trigger this
+    // channel needs the hub to register on its behalf (PR 3). The hub GETs this,
+    // substitutes the channel name into the `<channel>` placeholders, fills the
+    // `<hub-origin>` in `action.webhook`, and injects `action.auth.bearer` (a
+    // minted channel:send JWT) — so the channel owns its own trigger shape rather
+    // than the hub hardcoding it.
     if (req.method === "GET" && url.pathname === "/.parachute/config") {
       return json({
         channels: [...channels.values()].map((c) => ({
           name: c.name,
           transport: c.transport.kind,
         })),
+        triggerTemplate: CHANNEL_VAULT_TRIGGER_TEMPLATE,
       });
     }
 
@@ -567,6 +645,117 @@ export function createFetchHandler(
         },
         required: ["channels"],
       });
+    }
+
+    // ---------------------------------------------------------------------
+    // Channel config-management API — the hub writes channels.json + hot-adds
+    // the channel to the LIVE daemon, so a frictionless setup never hand-edits a
+    // file or restarts the daemon. Gated on a hub JWT with `channel:admin`.
+    //
+    //   POST   /api/channels        { name, transport, config } → write + hot-add
+    //   GET    /api/channels        → list (name + transport + vault; NO secrets)
+    //   DELETE /api/channels/:name  → stop + unregister + remove from channels.json
+    //
+    // Externally hub strips `/channel`, so these are `<hub>/channel/api/channels`.
+    // ---------------------------------------------------------------------
+    if (url.pathname === "/api/channels" && (req.method === "GET" || req.method === "POST")) {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+
+      if (req.method === "GET") {
+        // List configured channels — surface ONLY name + transport + vault (for a
+        // vault transport). NEVER the token/secret: this is an admin read, but the
+        // file holds credentials we don't echo back.
+        return json({
+          channels: [...channels.values()].map((c) => {
+            const out: { name: string; transport: string; vault?: string } = {
+              name: c.name,
+              transport: c.transport.kind,
+            };
+            const v = (c.entry.config as { vault?: unknown } | undefined)?.vault;
+            if (typeof v === "string") out.vault = v;
+            return out;
+          }),
+        });
+      }
+
+      // POST — create/replace a channel.
+      let cfgBody: { name?: unknown; transport?: unknown; config?: unknown };
+      try {
+        cfgBody = (await req.json()) as typeof cfgBody;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      if (typeof cfgBody.name !== "string" || cfgBody.name.length === 0) {
+        return json({ error: "body.name (string) is required" }, 400);
+      }
+      if (typeof cfgBody.transport !== "string" || cfgBody.transport.length === 0) {
+        return json({ error: "body.transport (string) is required" }, 400);
+      }
+      const entry: ChannelEntry = {
+        name: cfgBody.name,
+        transport: cfgBody.transport,
+        config:
+          cfgBody.config && typeof cfgBody.config === "object"
+            ? (cfgBody.config as Record<string, unknown>)
+            : undefined,
+      };
+      // Validate the entry by instantiating it FIRST (constructor throws on a
+      // missing required field — e.g. a vault channel with no token). We do this
+      // before writing channels.json so a bad request never persists a broken
+      // entry. `addChannelLive` re-instantiates; the throwaway here is the gate.
+      try {
+        instantiateTransport(entry);
+      } catch (err) {
+        return json({ error: `invalid channel config: ${(err as Error).message}` }, 400);
+      }
+      // Persist FIRST (chmod 600 — holds a token), then hot-add to the live
+      // daemon. If the hot-add throws, the file is already written, so a daemon
+      // restart would still pick it up; we surface the error AND a restart hint.
+      try {
+        // Resolve the state dir at request time (defaultStateDir reads the env)
+        // so the persisted file always lands where the daemon would next read it,
+        // even if the env was set after module load (and so it's testable).
+        upsertChannelEntry(entry, defaultStateDir());
+      } catch (err) {
+        return json({ error: `failed to write channels.json: ${(err as Error).message}` }, 500);
+      }
+      try {
+        await addChannelLive(channels, registry, entry);
+      } catch (err) {
+        return json(
+          {
+            ok: true,
+            name: entry.name,
+            transport: entry.transport,
+            live: false,
+            restart_needed: true,
+            error: `channel persisted but hot-add failed: ${(err as Error).message}`,
+          },
+          200,
+        );
+      }
+      return json({ ok: true, name: entry.name, transport: entry.transport, live: true });
+    }
+
+    const delMatch = url.pathname.match(/^\/api\/channels\/([^/]+)$/);
+    if (delMatch && req.method === "DELETE") {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+      const name = decodeURIComponent(delMatch[1]!);
+      const wasLive = await removeChannelLive(channels, name);
+      // Always rewrite channels.json (idempotent) so the file matches the live
+      // state even if the channel was only on disk (added before a restart).
+      try {
+        removeChannelEntry(name, defaultStateDir());
+      } catch (err) {
+        return json({ error: `failed to update channels.json: ${(err as Error).message}` }, 500);
+      }
+      if (!wasLive) {
+        // Not in the live map. Either never live, or removed from disk only.
+        return json({ ok: true, name, removed: false }, 200);
+      }
+      return json({ ok: true, name, removed: true });
     }
 
     // ---------------------------------------------------------------------
@@ -757,12 +946,18 @@ export function createFetchHandler(
     // the note to that transport's `ingestInbound`, which `ctx.emit`s it →
     // wakes the subscribed bridge / MCP session.
     //
-    // Auth: a shared secret presented as `?secret=` OR `X-Channel-Webhook-Secret`,
-    // validated against the target channel's vault-transport `webhookSecret`.
-    // (Vault's trigger webhook is unauthenticated by default, so the secret rides
-    // in the configured webhook URL; a hub-JWT auth block on the vault trigger is
-    // a follow-up.) The secret is per-channel, so we resolve the channel from the
-    // body FIRST, then check the secret against that channel's transport.
+    // Auth — two paths, in order:
+    //   1. PREFERRED: `Authorization: Bearer <hub JWT>` (aud:channel, scope
+    //      `channel:send` — the trigger is effectively "posting an inbound
+    //      message"). The hub registers the trigger with `action.auth.bearer`
+    //      set to a minted channel:send token, so a fresh setup never touches a
+    //      shared secret. Validated via the same scope-guard path as the bridge.
+    //   2. DEPRECATED back-compat: a shared `?secret=` (or `X-Channel-Webhook-Secret`)
+    //      validated against the target channel's vault-transport `webhookSecret`,
+    //      for existing manual setups whose triggers still ride the secret in the
+    //      URL. Logs a one-line deprecation warning when used.
+    // A request with NEITHER → 401. We keep the uniform-401 (no channel
+    // enumeration) behavior on both paths.
     if (req.method === "POST" && url.pathname === "/api/vault/inbound") {
       let body: {
         trigger?: string;
@@ -783,16 +978,47 @@ export function createFetchHandler(
       if (!channelName) {
         return json({ error: "note.metadata.channel is required to route the message" }, 400);
       }
-      const presented =
-        url.searchParams.get("secret") ?? req.headers.get("x-channel-webhook-secret") ?? "";
       const ch = channels.get(channelName);
       const vt = ch?.transport instanceof VaultTransport ? ch.transport : undefined;
-      // Uniform 401 for an unknown vault channel OR a bad secret — never reveal
-      // which, so this (tailnet-reachable) endpoint can't be used to enumerate
-      // channel names. The secret is per-channel, so the lookup happens first,
-      // but both failure modes return the identical response. Constant-time compare.
-      if (!vt || !webhookSecretMatches(presented, vt.webhookSecret)) {
-        return json({ error: "unauthorized" }, 401);
+
+      // Branch on Authorization-header PRESENCE, not token truthiness. A
+      // whitespace-only `Authorization: Bearer   ` (which extractBearer trims to
+      // empty/falsy) must NOT fall through to the `?secret=` path — that would let
+      // a caller who knows the secret but lacks a valid JWT force the secret path.
+      // Any Authorization header at all → JWT path, full stop; a malformed/empty
+      // token fails hard via requireScope's 401. The deprecated `?secret=`
+      // fallback runs ONLY when there is no Authorization header.
+      const authHeader = req.headers.get("authorization");
+      if (authHeader !== null) {
+        // JWT path — validate the hub token, require channel:send. This is a
+        // tailnet-reachable webhook, so we keep it uniform-401: any auth failure
+        // (missing/malformed/expired token OR insufficient scope OR unknown
+        // channel) collapses to the SAME 401, so it can't be probed for valid
+        // scopes or channel names. (requireScope would otherwise distinguish 401
+        // vs 403 — fine for the operator-facing config API, but this endpoint
+        // stays opaque.)
+        const denied = await requireScope(req, url, SCOPE_SEND);
+        if (denied || !vt) {
+          return json({ error: "unauthorized" }, 401);
+        }
+      } else {
+        // DEPRECATED shared-secret fallback — only reachable with NO Authorization
+        // header. The secret is per-channel, so resolve the channel first, then
+        // constant-time compare. Uniform 401 for an unknown vault channel, a
+        // channel with no configured secret (nothing to validate against), OR a
+        // bad secret — never reveal which (no channel enumeration on this
+        // tailnet-reachable endpoint). webhookSecretMatches treats an empty/absent
+        // configured secret as never-matching, so a JWT-only channel (no secret)
+        // can't be opened by a `?secret=` request.
+        const presented =
+          url.searchParams.get("secret") ?? req.headers.get("x-channel-webhook-secret") ?? "";
+        if (!vt || !webhookSecretMatches(presented, vt.webhookSecret ?? "")) {
+          return json({ error: "unauthorized" }, 401);
+        }
+        console.warn(
+          `parachute-channel: /api/vault/inbound authenticated via DEPRECATED ?secret= shared secret ` +
+            `for channel "${channelName}". Migrate to a hub-JWT trigger (action.auth.bearer, scope channel:send).`,
+        );
       }
       // Idempotency: a duplicate trigger delivery for the same note must not
       // double-wake. First-seen → process; already-seen → ack without emitting.
@@ -985,8 +1211,14 @@ function main(): void {
     console.error(`parachute-channel: services.json self-registration failed (continuing): ${err}`);
   }
 
-  for (const channel of channels.values()) {
-    channel.transport.start(contextFor(registry, channel.name)).catch((err) => {
+  // Start each channel via the same single-channel add path the config API uses
+  // (`addChannelLive`), so boot and hot-add can't drift. The map already holds
+  // the channels (from `loadRegistry`); addChannelLive replaces-in-place, which
+  // for a freshly-instantiated boot transport means stop()→re-instantiate→start.
+  // Per-channel failures are logged and don't abort the others; the daemon must
+  // still serve the channels that did come up.
+  for (const channel of [...channels.values()]) {
+    addChannelLive(channels, registry, channel.entry).catch((err) => {
       console.error(`parachute-channel: transport "${channel.name}" start failed:`, err);
     });
   }

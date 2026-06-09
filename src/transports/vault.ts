@@ -55,8 +55,15 @@ export interface VaultTransportConfig {
   vaultUrl?: string;
   /** A `vault:<name>:write` hub JWT, presented as Bearer when writing replies. */
   token: string;
-  /** Shared secret the inbound webhook must present (validated by the daemon). */
-  webhookSecret: string;
+  /**
+   * Shared secret the inbound webhook must present (validated by the daemon),
+   * for the DEPRECATED `?secret=` back-compat path. OPTIONAL — a JWT-only channel
+   * (the frictionless-setup default, provisioned by the hub with NO shared
+   * secret) configures none, and the webhook handler authenticates it via the
+   * hub-JWT path instead. When absent, the `?secret=` fallback can never succeed
+   * for this channel (nothing to validate against → 401).
+   */
+  webhookSecret?: string;
   /** Optional path prefix for written notes. Default `channel`. */
   notePathPrefix?: string;
 }
@@ -122,6 +129,41 @@ export const CHANNEL_VAULT_TAG_SCHEMA: ReadonlyArray<{
   },
 ];
 
+/**
+ * The vault trigger the hub registers to wake this channel on inbound notes.
+ *
+ * This is MODULE-OWNED DATA: the channel owns the shape of the trigger it needs,
+ * rather than the hub hardcoding it. The hub fetches this template (via
+ * `GET /.parachute/config` → `triggerTemplate`), substitutes the channel name
+ * into the placeholders, fills the webhook origin + the `action.auth.bearer`
+ * (a `channel:send` hub JWT, per the keystone vault PR's `action.auth.bearer`
+ * support), and registers it through the vault's runtime trigger-registration API.
+ *
+ * Placeholders the hub substitutes:
+ *  - `<channel>` in `name` → the channel name (e.g. `channel_inbound_eng`);
+ *  - `<hub-origin>` in `action.webhook` → the hub's public origin.
+ * The hub also injects `action.auth.bearer` (not in the template — it's a secret
+ * the hub mints).
+ *
+ * The predicate matches a NEW inbound note (`#channel-message/inbound`) that
+ * carries a `channel` metadata field and hasn't been rendered yet. Loop avoidance
+ * is by the inbound CHILD tag: an outbound (reply) note carries
+ * `#channel-message/outbound`, never the inbound child, so it never fires this.
+ */
+export const CHANNEL_VAULT_TRIGGER_TEMPLATE = {
+  name: "channel_inbound_<channel>", // hub substitutes the channel name
+  events: ["created"],
+  when: {
+    tags: ["#channel-message/inbound"],
+    has_metadata: ["channel"],
+    missing_metadata: ["channel_inbound_rendered_at"],
+  },
+  action: {
+    webhook: "<hub-origin>/channel/api/vault/inbound", // hub fills origin + the auth.bearer
+    send: "json",
+  },
+} as const;
+
 export class VaultTransport implements Transport {
   readonly kind = "vault";
 
@@ -129,8 +171,14 @@ export class VaultTransport implements Transport {
   private readonly vault: string;
   private readonly vaultUrl: string;
   private readonly token: string;
-  /** Shared secret the daemon validates on the inbound webhook (read by the daemon). */
-  readonly webhookSecret: string;
+  /**
+   * Shared secret the daemon validates on the inbound webhook (read by the
+   * daemon), for the DEPRECATED `?secret=` path only. Optional — absent on a
+   * JWT-only channel, in which case the `?secret=` fallback can never authorize
+   * this channel (the daemon treats an absent/empty configured secret as
+   * never-matching). The hub-JWT path doesn't read it at all.
+   */
+  readonly webhookSecret?: string;
   private readonly pathPrefix: string;
 
   constructor(config: VaultTransportConfig) {
@@ -140,9 +188,9 @@ export class VaultTransport implements Transport {
     if (!config.token) {
       throw new Error("VaultTransport: config.token (vault:<name>:write JWT) is required");
     }
-    if (!config.webhookSecret) {
-      throw new Error("VaultTransport: config.webhookSecret is required");
-    }
+    // webhookSecret is OPTIONAL — a JWT-only channel (the frictionless-setup
+    // default) needs none. The webhook is authenticated via the hub-JWT path;
+    // the `?secret=` fallback simply can't succeed for a channel with no secret.
     this.vault = config.vault;
     this.vaultUrl = (config.vaultUrl ?? DEFAULT_VAULT_URL).replace(/\/$/, "");
     this.token = config.token;

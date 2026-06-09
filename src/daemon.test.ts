@@ -331,7 +331,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
   function body(
     noteId: string,
     extraMeta: Record<string, unknown> = {},
-    tags: string[] = ["#channel-message/inbound"],
+    tags: string[] = ["#channel-message", "#channel-message/inbound"],
   ) {
     return JSON.stringify({
       trigger: "channel-inbound",
@@ -492,7 +492,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
       const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: body("ob-1", { direction: "outbound" }, ["#channel-message/outbound"]),
+        body: body("ob-1", { direction: "outbound" }, ["#channel-message", "#channel-message/outbound"]),
       });
       expect(res.status).toBe(200);
       expect(emitted).toHaveLength(0);

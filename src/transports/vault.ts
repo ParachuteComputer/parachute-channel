@@ -17,18 +17,26 @@
  *    transport's `reply()`, which writes a `#channel-message/outbound` note via
  *    the vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`).
  *
- * Loop avoidance (load-bearing) — via hierarchical tags. An outbound reply is
- * itself a `#channel-message` note; if the trigger fired on it, the session would
- * wake on its own reply forever. The vault trigger predicate does EXACT tag
- * membership (no descendant expansion), so we split the parent tag into two
- * children and key the trigger off the inbound child only:
- *  - inbound notes carry `#channel-message/inbound`;
- *  - outbound (reply) notes carry `#channel-message/outbound`;
- *  - the trigger fires on `tags: ["#channel-message/inbound"]` — an exact match
- *    that never matches an outbound note, so a reply can't wake its own session.
- * A UI querying the parent `#channel-message` still sees BOTH directions, because
- * the query engine DOES inherit descendants. As belt-and-suspenders over the
- * trigger predicate, `ingestInbound` also drops any note tagged
+ * Tagging model — two ORTHOGONAL axes (this was a footgun; read carefully).
+ * In a Parachute vault a slash in a tag NAME is a namespace convention only —
+ * it implies NOTHING about query inheritance. `query-notes { tag: "X" }` matches
+ * descendants by the `tags.parent_names` graph, which is declared explicitly via
+ * `update-tag`, NOT inferred from the name. So a note tagged ONLY
+ * `#channel-message/inbound` is INVISIBLE to a `tag: "#channel-message"` query
+ * unless that inheritance was separately declared. We don't want to depend on
+ * per-vault schema setup, so every note carries BOTH tags literally:
+ *  - the parent `#channel-message` — the QUERYABLE membership tag (a UI lists a
+ *    channel's whole transcript, both directions, with one `tag: "#channel-message"`
+ *    + `metadata.channel` query, because the parent is literally present);
+ *  - a directional child — the trigger DISCRIMINATOR (`#channel-message/inbound`
+ *    on inbound, `#channel-message/outbound` on outbound).
+ *
+ * Loop avoidance (load-bearing). An outbound reply is itself a `#channel-message`
+ * note; if the trigger fired on it the session would wake on its own reply forever.
+ * The vault trigger predicate does EXACT tag membership, so it's keyed on the
+ * inbound child only — `tags: ["#channel-message/inbound"]` — which an outbound
+ * note (parent + `/outbound`) never carries, so a reply can't wake its own session.
+ * As belt-and-suspenders, `ingestInbound` also drops any note tagged
  * `#channel-message/outbound` (or `direction: "outbound"`) — so even a mis-wired
  * trigger can never wake us on our own reply.
  */
@@ -64,7 +72,8 @@ export interface InboundNote {
 
 const DEFAULT_VAULT_URL = "http://127.0.0.1:1940";
 const DEFAULT_PATH_PREFIX = "channel";
-/** Parent tag — query this (descendants inherit) to see BOTH directions of a channel. */
+/** Parent tag — carried LITERALLY on every note; query this + metadata.channel to
+ *  see BOTH directions of a channel (the slash children are namespace, not inheritance). */
 const CHANNEL_MESSAGE_TAG = "#channel-message";
 /** Inbound child — the vault trigger fires on this exact tag (never matches outbound → no loop). */
 const CHANNEL_MESSAGE_INBOUND_TAG = "#channel-message/inbound";
@@ -149,7 +158,9 @@ export class VaultTransport implements Transport {
       body: JSON.stringify({
         content: args.text ?? "",
         path,
-        tags: [CHANNEL_MESSAGE_OUTBOUND_TAG],
+        // Parent (queryable membership) + directional child (trigger discriminator).
+        // Both literal — the slash child is NOT queryable under the parent on its own.
+        tags: [CHANNEL_MESSAGE_TAG, CHANNEL_MESSAGE_OUTBOUND_TAG],
         metadata,
       }),
     });

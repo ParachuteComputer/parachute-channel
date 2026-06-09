@@ -80,6 +80,48 @@ const CHANNEL_MESSAGE_INBOUND_TAG = "#channel-message/inbound";
 /** Outbound child — replies carry this; the trigger's exact-match predicate excludes it. */
 const CHANNEL_MESSAGE_OUTBOUND_TAG = "#channel-message/outbound";
 
+/**
+ * The tag schema this module manages in any vault it's connected to.
+ *
+ * This is the declarative complement to the "tag both parent + child" fail-safe
+ * in `reply()` / inbound writes. A slash in a Parachute tag NAME is namespace-only
+ * — it carries NO query inheritance. Inheritance is the `parent_names` graph,
+ * declared via the vault's tag-schema API. By DECLARING that
+ * `#channel-message/{inbound,outbound}` have parent `#channel-message`, a default
+ * `tag:#channel-message` query expands to include the children semantically — so
+ * a UI listing a channel's transcript works off the parent even for notes that
+ * only carry the child tag.
+ *
+ * This matches the vault's "clients bring their own tag schema" principle: the
+ * WRITING module provisions its own tag schema at connect-time. It's MODULE-OWNED
+ * DATA (not inline calls) so it's the seam for a future module-protocol
+ * "tag schemas this module manages" declaration — changing this constant changes
+ * exactly what `ensureSchema()` provisions.
+ *
+ * `ensureSchema()` upserts each entry; the "tag both" floor in the note writes
+ * stays as the fail-safe so the channel works even if this declaration never lands.
+ */
+export const CHANNEL_VAULT_TAG_SCHEMA: ReadonlyArray<{
+  name: string;
+  description?: string;
+  parent_names?: string[];
+}> = [
+  {
+    name: CHANNEL_MESSAGE_TAG,
+    description: "A message in a Parachute channel (parent of /inbound + /outbound).",
+  },
+  {
+    name: CHANNEL_MESSAGE_INBOUND_TAG,
+    parent_names: [CHANNEL_MESSAGE_TAG],
+    description: "Human→session message; the vault trigger fires on this.",
+  },
+  {
+    name: CHANNEL_MESSAGE_OUTBOUND_TAG,
+    parent_names: [CHANNEL_MESSAGE_TAG],
+    description: "Session→human reply.",
+  },
+];
+
 export class VaultTransport implements Transport {
   readonly kind = "vault";
 
@@ -110,6 +152,67 @@ export class VaultTransport implements Transport {
 
   async start(ctx: TransportContext): Promise<void> {
     this.ctx = ctx;
+    // Declare the tag schema this module manages in the connected vault. Strictly
+    // best-effort: `ensureSchema` swallows all of its own errors, so an unreachable
+    // vault or a failing PUT can NEVER block (or reject out of) `start()`. The
+    // "tag both parent + child" floor in the note writes is the fail-safe, so the
+    // channel works even if this declaration never lands. Fire-and-forget — no
+    // reason to delay the channel coming up on a schema upsert.
+    void this.ensureSchema();
+  }
+
+  // -------------------------------------------------------------------------
+  // Schema declaration — provision this module's tag inheritance at connect-time.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Idempotently upsert `CHANNEL_VAULT_TAG_SCHEMA` into the connected vault via
+   * the vault's tag-schema REST API. The vault route is
+   *   PUT /vault/<vault>/api/tags/:name
+   * where `:name` is matched by `subpath.match(/^\/([^/]+)$/)` then
+   * `decodeURIComponent`'d (parachute-vault `src/routes.ts` handleTags, the
+   * "Routes with tag name" block + `routing.ts` `apiPath.startsWith("/tags")`).
+   * Because the route matches a SINGLE path segment (`[^/]+`, no literal slash)
+   * and decodes it, the tag name — which contains BOTH `#` and `/`
+   * (`#channel-message/inbound`) — must be `encodeURIComponent`'d so the `#`
+   * becomes `%23` and the `/` becomes `%2F`; the route then decodes that back to
+   * the literal name. A bare `/` in the URL would fail the `[^/]+` match → 404,
+   * silently dropping the declaration. The PUT body is `{ description?, parent_names? }`.
+   *
+   * Best-effort + non-fatal by contract: every failure is caught and `console.warn`'d,
+   * never thrown — the tag-both write floor is the fallback.
+   */
+  async ensureSchema(): Promise<void> {
+    for (const entry of CHANNEL_VAULT_TAG_SCHEMA) {
+      try {
+        // Single-segment, percent-encoded name: `#channel-message/inbound` →
+        // `%23channel-message%2Finbound`. The vault decodes it back to the literal.
+        const url = `${this.vaultUrl}/vault/${this.vault}/api/tags/${encodeURIComponent(entry.name)}`;
+        const body: { description?: string; parent_names?: string[] } = {};
+        if (entry.description !== undefined) body.description = entry.description;
+        if (entry.parent_names !== undefined) body.parent_names = entry.parent_names;
+
+        const res = await fetch(url, {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.token}`,
+          },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const detail = await res.text().catch(() => "");
+          console.warn(
+            `vault transport: tag-schema upsert for ${entry.name} failed (${res.status}) ${detail}`.trim(),
+          );
+        }
+      } catch (err) {
+        // Vault unreachable / fetch rejected — non-fatal, the tag-both floor covers us.
+        console.warn(
+          `vault transport: tag-schema upsert for ${entry.name} errored: ${(err as Error).message}`,
+        );
+      }
+    }
   }
 
   async stop(): Promise<void> {

@@ -8,8 +8,25 @@
   "health": "/health",
   "stripPrefix": true,
   "uiUrl": "/channel/ui",
+  "configUiUrl": "/channel/admin",
+  "focus": "experimental",
+  "adminCapabilities": ["config"],
   "startCmd": ["parachute-channel"],
   "scopes": {
     "defines": ["channel:read", "channel:write", "channel:send", "channel:admin"]
-  }
+  },
+  "events": [
+    { "key": "message.received", "title": "A message arrived on a channel" },
+    { "key": "message.sent", "title": "A session replied on a channel" }
+  ],
+  "actions": [
+    {
+      "key": "message.deliver",
+      "title": "Deliver an inbound message (wakes the session)",
+      "provision": {
+        "type": "vault-trigger",
+        "note": "hub registers a vault runtime trigger that webhooks the channel inbound endpoint with a channel:send bearer"
+      }
+    }
+  ]
 }

@@ -69,6 +69,7 @@ import {
   pushPermissionVerdict as mcpPushPermissionVerdict,
   mcpSessionCount,
 } from "./mcp-http.ts";
+import { renderAdminPage } from "./admin-ui.ts";
 
 // Re-export the shared auth surface so existing importers of the daemon module
 // keep working; the canonical home is now `auth.ts` (shared with http-ui.ts).
@@ -1039,6 +1040,19 @@ export function createFetchHandler(
       });
     }
 
+    // Module-owned config/admin UI (modular-UI P4) — declared as `configUiUrl`
+    // in module.json so the hub frames/links it. The PAGE itself loads OPEN (no
+    // JWT) — like /ui — so it can bootstrap its hub-minted `channel:admin`
+    // token fetch; the page's `/api/channels` calls are what `requireScope`
+    // gates. Server-side mount is "" (the daemon serves the bare path); the page
+    // detects the public `/channel` prefix at runtime from window.location, so
+    // it works at `/admin` direct AND `/channel/admin` proxied.
+    if (req.method === "GET" && url.pathname === "/admin") {
+      return new Response(renderAdminPage(""), {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
     // Stateful HTTP MCP — a session connects directly over HTTP (URL + OAuth,
     // no stdio bridge): POST/GET/DELETE /mcp/<channel>. Externally this is
     // `<hub>/channel/mcp/<channel>`; hub's stripPrefix removes `/channel`, so the
@@ -1205,6 +1219,7 @@ function main(): void {
       installDir: INSTALL_DIR,
       stripPrefix: true,
       uiUrl: "/channel/ui", // portal "Open UI" link (also in module.json; written here in case hub reads it from services.json)
+      configUiUrl: "/channel/admin", // module-owned config surface (modular-UI P4); hub frames/links it. Also in module.json.
     });
     console.log(`parachute-channel: self-registered into services.json (port ${PORT}, mount /channel)`);
   } catch (err) {

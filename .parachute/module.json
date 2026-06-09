@@ -30,5 +30,40 @@
         "note": "hub registers a vault runtime trigger that webhooks the channel inbound endpoint with a channel:send bearer"
       }
     }
+  ],
+  "connectionTemplates": [
+    {
+      "key": "link-to-vault",
+      "title": "Link a channel to a vault",
+      "description": "Back a channel with a Parachute vault: inbound notes wake the session, replies are written back as notes. The operator picks WHICH vault (the parameter) and names the channel; the channel's config UI creates the connection with the operator's approval (the click is the approval).",
+      "requestedBy": "channel",
+      "source": {
+        "module": "vault",
+        "event": "note.created",
+        "filter": {
+          "tags": ["#channel-message/inbound"],
+          "has_metadata": ["channel"],
+          "missing_metadata": ["channel_inbound_rendered_at"]
+        }
+      },
+      "sink": {
+        "module": "channel",
+        "action": "message.deliver"
+      },
+      "parameters": [
+        {
+          "key": "vault",
+          "target": "source.vault",
+          "title": "Vault",
+          "description": "Which vault stores this channel's messages — the operator chooses from the hub's installed vaults."
+        },
+        {
+          "key": "channel",
+          "target": "sink.params.channel",
+          "title": "Channel name",
+          "description": "A unique slug naming the channel the session connects to."
+        }
+      ]
+    }
   ]
 }

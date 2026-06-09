@@ -18,12 +18,15 @@ describe("renderAdminPage", () => {
     const html = renderAdminPage("");
     expect(html).toContain("<title>Channel — Configuration</title>");
     expect(html).toContain("Manage channels");
-    // The add-form offers ONLY the two cross-module-free transports.
+    // The simple add-form offers ONLY the two cross-module-free transports.
     expect(html).toContain('value="http-ui"');
     expect(html).toContain('value="telegram"');
-    // Vault-backed channels are explicitly NOT creatable here.
+    // The simple-add transport <select> never offers a literal vault transport —
+    // vault-backed channels go through the dedicated "Link to a vault" form,
+    // whose vault <select> is populated dynamically (no static value="vault").
     expect(html).not.toContain('value="vault"');
-    expect(html).toContain("hub's Connections view");
+    // The vault-link flow is its own section now (modular-UI R2).
+    expect(html).toContain("Link to a vault");
   });
 
   test("server-side mount appears in the visible chrome links (proxied)", () => {
@@ -82,6 +85,68 @@ describe("renderAdminPage", () => {
   });
 });
 
+describe("link-to-vault flow (modular-UI R2)", () => {
+  test("renders a dedicated Link-to-a-vault section with a vault picker + channel name", () => {
+    const html = renderAdminPage("");
+    expect(html).toContain('id="link-vault-section"');
+    expect(html).toContain('id="link-form"');
+    expect(html).toContain('id="f-vault"');
+    expect(html).toContain('id="f-link-name"');
+    expect(html).toContain('id="link-btn"');
+    // The approval framing is explicit: clicking the button is the approval.
+    expect(html).toContain("clicking the button is your approval");
+  });
+
+  test("loads the vault list from the hub's public discovery doc (same-origin)", () => {
+    const html = renderAdminPage("");
+    expect(html).toContain("function loadVaults");
+    expect(html).toContain("/.well-known/parachute.json");
+  });
+
+  test("submit POSTs the canonical vault-backed-channel body to the hub's Connections engine", () => {
+    const html = renderAdminPage("");
+    // POSTs to the HUB origin's /admin/connections (NOT a channel path).
+    expect(html).toContain('window.location.origin + "/admin/connections"');
+    // Same-origin cookie flows because the page is proxied under /channel.
+    expect(html).toContain('credentials: "include"');
+    // Provenance labels the connection module-initiated.
+    expect(html).toContain('requestedBy: "channel"');
+    // The canonical source/sink: vault.note.created (inbound tag) → channel.message.deliver.
+    expect(html).toContain('event: "note.created"');
+    expect(html).toContain("#channel-message/inbound");
+    expect(html).toContain('action: "message.deliver"');
+    // The chosen channel name rides as the sink action param.
+    expect(html).toContain("params: { channel: name }");
+  });
+
+  test("renders the connect-a-session lines the hub returns on success", () => {
+    const html = renderAdminPage("");
+    expect(html).toContain("function renderConnectResult");
+    expect(html).toContain("payload.connect");
+    expect(html).toContain('id="link-result"');
+  });
+
+  test("surfaces a clear actionable message on a 401 from the hub", () => {
+    const html = renderAdminPage("");
+    // The link handler distinguishes 401 (not signed in to the hub) from other
+    // failures with a specific, actionable banner.
+    expect(html).toContain("Not signed in to the hub");
+  });
+});
+
+describe("add-channel affordance (the unusable-add fix)", () => {
+  test("disables + relabels the Add button when there is no channel:admin token", () => {
+    const html = renderAdminPage("");
+    // The add-form is reflected as authed/not-authed so the operator never sees
+    // an Add button that silently 401s — the core of the 'no way to add' fix.
+    expect(html).toContain("function setAddFormAuthState");
+    expect(html).toContain("Sign in to the hub to add");
+    // It's driven off the channel-list load resolving (authed) or 401 (not).
+    expect(html).toContain("setAddFormAuthState(true)");
+    expect(html).toContain("setAddFormAuthState(false)");
+  });
+});
+
 describe("escape hardening (channel#37)", () => {
   test("escapeHtml neutralizes the five HTML metacharacters", () => {
     expect(escapeHtml(`<script>alert("x&y")</script>'`)).toBe(
@@ -94,8 +159,11 @@ describe("escape hardening (channel#37)", () => {
     // attribute and the link text of the footer "live config" link — so it can
     // never break out into markup at that interpolation site (channel#37).
     const html = renderAdminPage('"><img src=x onerror=alert(1)>');
-    // Isolate the footer link the interpolation builds.
-    const footer = html.slice(html.indexOf("Live config"), html.indexOf("</a>") + 4);
+    // Isolate the footer link the interpolation builds. Slice from "Live config"
+    // to the FIRST `</a>` AFTER it (the page now has earlier anchors, e.g. the
+    // add-section's "Link to a vault" jump link), so the window is the footer.
+    const liveStart = html.indexOf("Live config");
+    const footer = html.slice(liveStart, html.indexOf("</a>", liveStart) + 4);
     // The raw markup-breakout never appears in the footer link.
     expect(footer).not.toContain("<img src=x onerror=alert(1)>");
     expect(footer).not.toContain('"><img');
@@ -161,6 +229,37 @@ describe("module.json — modular-UI (P4) declaration", () => {
     const deliver = (m.actions ?? []).find((a) => a.key === "message.deliver");
     expect(deliver?.endpoint).toBe("/api/vault/inbound");
     expect(deliver?.scope).toBe("channel:send");
+  });
+
+  test("declares a connectionTemplate for the parameterized link-to-vault connection (R2)", async () => {
+    const m = JSON.parse(await Bun.file(manifestPath).text()) as {
+      connectionTemplates?: Array<{
+        key: string;
+        requestedBy?: string;
+        source?: { module?: string; event?: string; filter?: { tags?: string[] } };
+        sink?: { module?: string; action?: string };
+        parameters?: Array<{ key: string; target: string }>;
+      }>;
+    };
+    const tmpl = (m.connectionTemplates ?? []).find((t) => t.key === "link-to-vault");
+    expect(tmpl).toBeDefined();
+    // The module declares WHAT it wants: vault.note.created (inbound tag) →
+    // channel.message.deliver, labeled module-initiated.
+    expect(tmpl?.requestedBy).toBe("channel");
+    expect(tmpl?.source?.module).toBe("vault");
+    expect(tmpl?.source?.event).toBe("note.created");
+    expect(tmpl?.source?.filter?.tags).toContain("#channel-message/inbound");
+    expect(tmpl?.sink?.module).toBe("channel");
+    expect(tmpl?.sink?.action).toBe("message.deliver");
+    // It's PARAMETERIZED — the operator picks the vault + names the channel.
+    const paramKeys = (tmpl?.parameters ?? []).map((p) => p.key);
+    expect(paramKeys).toContain("vault");
+    expect(paramKeys).toContain("channel");
+    // The parameters point at the connection-body targets the UI fills in.
+    const vaultParam = (tmpl?.parameters ?? []).find((p) => p.key === "vault");
+    expect(vaultParam?.target).toBe("source.vault");
+    const channelParam = (tmpl?.parameters ?? []).find((p) => p.key === "channel");
+    expect(channelParam?.target).toBe("sink.params.channel");
   });
 
   test("preserves the existing manifest contract (name, port, scopes)", async () => {

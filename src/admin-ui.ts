@@ -17,6 +17,13 @@
  *   4. An add-form for the two cross-module-free transports (`http-ui`,
  *      `telegram`) → `POST <mount>/api/channels`.
  *   5. A remove button (with confirm) → `DELETE <mount>/api/channels/:name`.
+ *   6. A **Link to a vault** form (modular-UI R2, module-initiated connections):
+ *      pick a vault + name the channel → `POST <hub-origin>/admin/connections`
+ *      (`credentials: "include"` — the operator's hub session cookie flows
+ *      because this page is same-origin under the hub proxy). The operator
+ *      clicking the button IS the approval. The hub mints the cross-module
+ *      tokens + registers the vault trigger and returns the `claude mcp add`
+ *      connect lines, which we render on success.
  *
  * Auth posture (mirrors scribe's stateless design):
  *   - When loaded through the hub's reverse proxy to a logged-in operator, the
@@ -29,9 +36,13 @@
  *     so a token is mandatory for the API calls (the PAGE itself still loads
  *     open so it can bootstrap the token fetch).
  *
- * Vault-backed channels are intentionally NOT creatable here: they need
- * cross-module token minting + a vault trigger, which only the hub's
- * Connections flow can provision. The page says so inline.
+ * Vault-backed channels ARE creatable here now (modular-UI R2): the "Link to a
+ * vault" form calls the hub's `POST /admin/connections` directly. The page is
+ * same-origin under the hub proxy, so the operator's hub session cookie flows
+ * (`credentials: "include"`) and the hub — the only thing with cross-module
+ * authority — mints the tokens + registers the vault trigger on their behalf.
+ * The simple http-ui/telegram add (which needs no cross-module wiring) and the
+ * vault-link flow are visibly distinct on the page.
  */
 
 const PALETTE = {
@@ -131,11 +142,12 @@ export function renderAdminPage(mount = ""): string {
 
       <section class="section" id="add-section">
         <div class="section-head">
-          <h2 class="section-title">Add a channel</h2>
+          <h2 class="section-title">Add a simple channel</h2>
         </div>
         <p class="section-desc">
-          Simple channels only — <code>http-ui</code> (the built-in chat page) and <code>telegram</code>.
-          Vault-backed channels are added from the hub's Connections view (they need cross-module token minting).
+          <code>http-ui</code> (the built-in chat page) and <code>telegram</code> need no cross-module
+          wiring. To back a channel with a <strong>vault</strong> (durable, queryable messages), use
+          <a href="#link-vault-section">Link to a vault</a> below.
         </p>
         <form id="add-form" class="add-form" novalidate>
           <label class="field">
@@ -157,6 +169,39 @@ export function renderAdminPage(mount = ""): string {
             <button type="submit" class="btn btn-primary" id="add-btn">Add channel</button>
           </div>
         </form>
+      </section>
+
+      <section class="section" id="link-vault-section">
+        <div class="section-head">
+          <h2 class="section-title">Link to a vault</h2>
+        </div>
+        <p class="section-desc">
+          Back a channel with a Parachute vault: inbound messages become <code>#channel-message</code>
+          notes, and a session replies by writing notes. Pick a vault, name the channel, and the hub
+          wires the connection — <strong>clicking the button is your approval</strong>. (The hub mints
+          the cross-module tokens and registers the vault trigger; this lives here, not in a separate
+          admin app.)
+        </p>
+        <form id="link-form" class="add-form" novalidate>
+          <label class="field">
+            <span class="field-label">Vault</span>
+            <select name="vault" id="f-vault">
+              <option value="" disabled selected>Loading vaults…</option>
+            </select>
+            <span class="field-hint" id="vault-hint">Which vault stores this channel's messages.</span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Channel name</span>
+            <input type="text" name="linkName" id="f-link-name" placeholder="e.g. eng" autocomplete="off" />
+            <span class="field-hint">A unique slug — letters, numbers, dash, underscore.</span>
+          </label>
+
+          <div class="button-row">
+            <button type="submit" class="btn btn-primary" id="link-btn">Link to vault</button>
+          </div>
+        </form>
+        <div id="link-result" hidden></div>
       </section>
 
       <footer class="card-footer">
@@ -411,6 +456,40 @@ const STYLES = `
   .btn-secondary:hover { color: ${PALETTE.fg}; border-color: ${PALETTE.fgDim}; }
   .button-row { display: flex; gap: 0.6rem; margin-top: 0.25rem; }
 
+  #link-result {
+    margin-top: 0.75rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid ${PALETTE.border};
+    border-radius: 8px;
+    background: ${PALETTE.successSoft};
+  }
+  .link-result-head { margin: 0 0 0.6rem; font-size: 0.9rem; }
+  .connect-label {
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: ${PALETTE.fgMuted};
+    margin: 0.5rem 0 0.2rem;
+  }
+  .connect-line {
+    margin: 0;
+    padding: 0.55rem 0.7rem;
+    background: ${PALETTE.cardBg};
+    border: 1px solid ${PALETTE.border};
+    border-radius: 6px;
+    font-family: ${FONT_MONO};
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: ${PALETTE.fg};
+  }
+  #link-result code {
+    font-family: ${FONT_MONO};
+    font-size: 0.85em;
+    background: ${PALETTE.cardBg};
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+  }
+
   .card-footer {
     margin-top: 1.75rem;
     padding-top: 1.25rem;
@@ -519,8 +598,20 @@ const PAGE_SCRIPT = String.raw`
       "warn",
       "<strong>Not authenticated.</strong> This page needs a <code>channel:admin</code> token, " +
         "minted for the logged-in operator by the hub. Open it through the Parachute hub portal " +
-        "(at <code>/channel/admin</code>) rather than hitting the daemon directly."
+        "(at <code>/channel/admin</code>, signed in) rather than hitting the daemon directly."
     );
+  }
+
+  // Reflect whether we hold a channel:admin token in the add-form's affordance,
+  // so the operator gets a CLEAR actionable state rather than an Add button that
+  // silently 401s. When not authed: disable + relabel the button and explain.
+  // (The "Link to a vault" button uses the hub session cookie, not this token,
+  // so it stays enabled.) Called after the channel list load resolves.
+  function setAddFormAuthState(authed) {
+    var btn = el("add-btn");
+    if (!btn) return;
+    btn.disabled = !authed;
+    btn.textContent = authed ? "Add channel" : "Sign in to the hub to add";
   }
 
   function escapeHtml(s) {
@@ -622,10 +713,12 @@ const PAGE_SCRIPT = String.raw`
       el("channels-loading").hidden = true;
       if (apiRes.status === 401 || apiRes.status === 403) {
         noAuthBanner();
+        setAddFormAuthState(false);
         renderChannels([], null);
         return;
       }
       if (!apiRes.ok) throw new Error("channels fetch failed (" + apiRes.status + ")");
+      setAddFormAuthState(true);
       return apiRes.json().then(function (data) {
         renderChannels((data && data.channels) || [], health);
       });
@@ -731,12 +824,178 @@ const PAGE_SCRIPT = String.raw`
     });
   }
 
+  // --- Link to a vault (modular-UI R2, module-initiated connections) ------
+  // Populate the vault dropdown from the hub's PUBLIC discovery doc. The page
+  // is same-origin with the hub under the /channel proxy, so /.well-known/
+  // parachute.json resolves at the hub origin. No token needed -- it's public.
+  function loadVaults() {
+    return fetch(window.location.origin + "/.well-known/parachute.json", {
+      headers: { accept: "application/json" },
+      credentials: "include",
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (doc) {
+        var sel = el("f-vault");
+        var vaults = (doc && Array.isArray(doc.vaults)) ? doc.vaults : [];
+        sel.innerHTML = "";
+        if (!vaults.length) {
+          var opt = document.createElement("option");
+          opt.value = "";
+          opt.disabled = true;
+          opt.selected = true;
+          opt.textContent = "No vaults found";
+          sel.appendChild(opt);
+          el("link-btn").disabled = true;
+          el("vault-hint").textContent =
+            "No vaults are installed on this hub yet -- create one in the hub portal first.";
+          return;
+        }
+        vaults.forEach(function (v, i) {
+          var opt = document.createElement("option");
+          opt.value = v.name;
+          opt.textContent = v.name;
+          if (i === 0) opt.selected = true;
+          sel.appendChild(opt);
+        });
+        el("link-btn").disabled = false;
+      })
+      .catch(function () {
+        var sel = el("f-vault");
+        sel.innerHTML = "";
+        var opt = document.createElement("option");
+        opt.value = "";
+        opt.disabled = true;
+        opt.selected = true;
+        opt.textContent = "Could not load vaults";
+        sel.appendChild(opt);
+        el("link-btn").disabled = true;
+      });
+  }
+
+  // The connect-a-session lines the hub returns on a successful connection.
+  function renderConnectResult(connection, connect) {
+    var box = el("link-result");
+    box.innerHTML = "";
+    box.hidden = false;
+    var head = document.createElement("p");
+    head.className = "link-result-head";
+    head.innerHTML =
+      "<strong>Linked.</strong> Connection <code>" +
+      escapeHtml(connection && connection.id ? connection.id : "") +
+      "</code> is wired. Connect a session:";
+    box.appendChild(head);
+    if (connect && (connect.mcpAdd || connect.launch)) {
+      [["1 - Register the channel (MCP)", connect.mcpAdd],
+       ["2 - Launch a session on the channel", connect.launch]].forEach(function (pair) {
+        if (!pair[1]) return;
+        var label = document.createElement("div");
+        label.className = "connect-label";
+        label.textContent = pair[0];
+        box.appendChild(label);
+        var pre = document.createElement("pre");
+        pre.className = "connect-line";
+        pre.textContent = pair[1];
+        box.appendChild(pre);
+      });
+      var warn = document.createElement("p");
+      warn.className = "field-hint";
+      warn.textContent =
+        "The launch command runs Claude Code with unrestricted tool access -- run it only on a machine you trust.";
+      box.appendChild(warn);
+    }
+  }
+
+  function linkToVault(ev) {
+    ev.preventDefault();
+    clearBanner();
+    clearFieldErrors();
+    el("link-result").hidden = true;
+    var vault = el("f-vault").value;
+    var name = el("f-link-name").value.trim();
+    if (!vault) { setFieldError("f-vault", "Pick a vault."); return; }
+    if (!name) { setFieldError("f-link-name", "Required."); return; }
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+      setFieldError("f-link-name", "Letters, numbers, dash, underscore only.");
+      return;
+    }
+    var btn = el("link-btn");
+    btn.disabled = true;
+    var prev = btn.textContent;
+    btn.textContent = "Linking...";
+    // POST to the HUB's general Connections engine. The page is same-origin
+    // under the /channel proxy, so the operator's hub session cookie flows with
+    // credentials:"include" -- the click IS the approval. We label provenance
+    // requestedBy:"channel" so the hub's Connections view shows it as
+    // module-initiated. The body is the canonical vault-backed-channel shape:
+    // vault.note.created (filtered to the inbound tag) -> channel.message.deliver.
+    var body = {
+      requestedBy: "channel",
+      source: {
+        module: "vault",
+        vault: vault,
+        event: "note.created",
+        filter: {
+          tags: ["#channel-message/inbound"],
+          has_metadata: ["channel"],
+          missing_metadata: ["channel_inbound_rendered_at"]
+        }
+      },
+      sink: { module: "channel", action: "message.deliver", params: { channel: name } }
+    };
+    fetch(window.location.origin + "/admin/connections", {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (payload) {
+        if (res.status === 401) {
+          setBanner(
+            "warn",
+            "<strong>Not signed in to the hub.</strong> Linking a vault uses your hub admin session. " +
+              "Open this page through the Parachute hub portal (signed in) at <code>/channel/admin</code>, " +
+              "then try again."
+          );
+          return;
+        }
+        if (res.status === 403) {
+          setBanner(
+            "error",
+            "<strong>Not permitted.</strong> Only the hub admin can link a vault. " +
+              escapeHtml((payload && payload.error_description) || "")
+          );
+          return;
+        }
+        if (!res.ok) {
+          setBanner(
+            "error",
+            "<strong>Link failed.</strong> " +
+              escapeHtml((payload && (payload.error_description || payload.error)) || ("HTTP " + res.status))
+          );
+          return;
+        }
+        setBanner("success", "<strong>Vault linked.</strong> Channel <code>" + escapeHtml(name) + "</code> is backed by vault <code>" + escapeHtml(vault) + "</code>.");
+        renderConnectResult(payload && payload.connection, payload && payload.connect);
+        el("f-link-name").value = "";
+        loadChannels();
+      });
+    }).catch(function (err) {
+      setBanner("error", "<strong>Network error.</strong> " + escapeHtml(err && err.message ? err.message : String(err)));
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = prev;
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     el("add-form").addEventListener("submit", addChannel);
+    el("link-form").addEventListener("submit", linkToVault);
     el("reload-btn").addEventListener("click", function () { clearBanner(); loadChannels(); });
     // Fetch the hub token first so the API calls go out authenticated, then
     // list. A token failure still proceeds to loadChannels -- which surfaces the
     // no-auth banner on the resulting 401, so the operator sees one clear notice.
+    // The vault dropdown loads in parallel (public discovery doc, no token).
     fetchToken().then(loadChannels);
+    loadVaults();
   });
 `;

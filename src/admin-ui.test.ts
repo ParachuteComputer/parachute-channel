@@ -344,6 +344,28 @@ describe("vault-backed delete composes hub connection teardown (boundary C2)", (
     expect(html).toContain(
       "if (failedDetail !== null) { askProceedMechanicsOnly(name, btn, failedDetail); return; }",
     );
+    // The ask's confirm routes its runtime values through escapeHtml — one
+    // escaping discipline page-wide, matching the first remove confirm.
+    expect(html).toContain(
+      '"Hub teardown failed for channel \\"" + escapeHtml(name) + "\\":\\n" + escapeHtml(detail) +',
+    );
+  });
+
+  test("daemon 401 after hub teardown keeps the partial-state context", () => {
+    // If the daemon DELETE 401s AFTER the hub teardown already ran, the page
+    // must not show only the generic no-auth banner — the operator is in a
+    // partially-torn-down state (hub side done, channel entry still on disk)
+    // and needs to know that, plus the remediation: sign in, retry the remove.
+    const fmFn = html.slice(
+      html.indexOf("function finishMechanics"),
+      html.indexOf("document.addEventListener"),
+    );
+    expect(fmFn).toContain("if (state.tornDown && state.tornDown.length)");
+    expect(fmFn).toContain("The hub connection teardown already completed");
+    expect(fmFn).toContain("The channel entry remains");
+    expect(fmFn).toContain("and retry the remove.");
+    // The plain 401 with no hub context still gets the generic banner.
+    expect(fmFn).toContain("noAuthBanner()");
   });
 
   test("legacy vault channel with no hub record: mechanics-only + informational note", () => {
@@ -352,7 +374,9 @@ describe("vault-backed delete composes hub connection teardown (boundary C2)", (
     // manual-cleanup note instead of pretending a full teardown happened.
     expect(html).toContain("finishMechanics(name, btn, { legacyNote: true, warnings: [] })");
     expect(html).toContain("No hub connection record was found");
-    expect(html).toContain("pre-2026-06");
+    // Era-relative phrasing ("before the Connections engine existed"), not a
+    // calendar date — it ages better (reviewer nit on #46).
+    expect(html).toContain("the Connections engine existed");
     expect(html).toContain("hub admin");
     // Accurate cross-reference: the hub's DELETE /vaults cascade scans
     // channel's list and reports such channels as orphaned_channels.

@@ -1071,8 +1071,11 @@ const PAGE_SCRIPT = String.raw`
   // manual cleanup), Cancel keeps the channel intact. Never a silent
   // fallthrough into a delete that LOOKS complete but isn't.
   function askProceedMechanicsOnly(name, btn, detail) {
+    // confirm() is text-context (no HTML sink), but route the runtime values
+    // through escapeHtml anyway -- one escaping discipline page-wide, matching
+    // the first remove confirm.
     var proceed = window.confirm(
-      "Hub teardown failed for channel \"" + name + "\":\n" + detail +
+      "Hub teardown failed for channel \"" + escapeHtml(name) + "\":\n" + escapeHtml(detail) +
       "\n\nRemove the channel config anyway (mechanics only)? Its vault trigger and minted tokens may stay live until cleaned up in hub admin -> Connections." +
       "\n\nOK = remove config only. Cancel = keep the channel."
     );
@@ -1095,7 +1098,26 @@ const PAGE_SCRIPT = String.raw`
   // the operator always knows which half ran.
   function finishMechanics(name, btn, state) {
     deleteChannelConfig(name, { treat404AsGone: true }).then(function (out) {
-      if (out.auth) { noAuthBanner(); restoreRemoveBtn(btn); return; }
+      if (out.auth) {
+        // A daemon 401 AFTER the hub teardown already ran is a partially-
+        // torn-down state: hub side done, channel entry still on disk. Say
+        // so, with the remediation, instead of only the generic no-auth
+        // banner (which would hide that half the delete already happened).
+        if (state.tornDown && state.tornDown.length) {
+          setBanner(
+            "warn",
+            "<strong>Not authenticated.</strong> The hub connection teardown already completed " +
+              "(vault trigger deregistered, tokens revoked), but removing the channel entry needs a " +
+              "<code>channel:admin</code> token, minted for the logged-in operator by the hub. " +
+              "The channel entry remains &mdash; open this page through the Parachute hub portal " +
+              "(signed in) and retry the remove."
+          );
+        } else {
+          noAuthBanner();
+        }
+        restoreRemoveBtn(btn);
+        return;
+      }
       if (!out.ok) {
         var failHtml = "<strong>Remove failed.</strong> " + escapeHtml(out.error || "");
         if (state.tornDown && state.tornDown.length) {
@@ -1116,8 +1138,8 @@ const PAGE_SCRIPT = String.raw`
         setBanner(
           "warn",
           "<strong>Channel removed.</strong> <code>" + escapeHtml(name) + "</code> is gone. " +
-            "No hub connection record was found for this vault-backed channel &mdash; if it was linked pre-2026-06 " +
-            "(before the Connections engine), its vault trigger and tokens may need manual cleanup: see hub admin &rarr; Connections. " +
+            "No hub connection record was found for this vault-backed channel &mdash; if it was linked before " +
+            "the Connections engine existed, its vault trigger and tokens may need manual cleanup: see hub admin &rarr; Connections. " +
             "(Deleting the backing vault from the hub also reports such channels as <code>orphaned_channels</code>.)"
         );
       } else {

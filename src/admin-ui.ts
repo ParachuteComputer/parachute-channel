@@ -620,10 +620,12 @@ const PAGE_SCRIPT = String.raw`
   }
 
   // Show only the config fields the selected transport needs, and adjust the
-  // button label. Single-select drives one submit path (see addChannel). Note:
-  // for the vault path the submit goes to the hub's Connections engine (cookie
-  // auth), so we leave the add-button enabled/disabled per the channel:admin
-  // token like the others — the vault submit handles its own hub-session 401.
+  // button label. Single-select drives one submit path (see addChannel). The
+  // add-button's enabled state is per-transport: telegram/http-ui gate on the
+  // channel:admin token (__authed); vault gates on vault-availability
+  // (__vaultsAvailable) instead, because its submit goes to the hub's
+  // Connections engine under the hub SESSION COOKIE (not this token) and
+  // handles its own hub-session 401. (See the inner button block.)
   function applyTransportUI() {
     var transport = el("f-transport").value;
     var vaultField = el("field-vault");
@@ -631,6 +633,11 @@ const PAGE_SCRIPT = String.raw`
     var hint = el("transport-hint");
     if (vaultField) vaultField.hidden = transport !== "vault";
     if (tgField) tgField.hidden = transport !== "telegram";
+    // The connect-a-session result is vault-specific; hide it when switching to
+    // a non-vault transport so a prior vault success doesn't linger under an
+    // unrelated form.
+    var linkResult = el("link-result");
+    if (linkResult && transport !== "vault") linkResult.hidden = true;
     var btn = el("add-btn");
     if (hint) {
       if (transport === "vault") {

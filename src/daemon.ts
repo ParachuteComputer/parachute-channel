@@ -11,7 +11,11 @@
  * Telegram is one transport behind the registry; the daemon core touches no
  * platform API directly.
  *
- * Default port: 1941 (PARACHUTE_CHANNEL_PORT env).
+ * Port resolution (see `resolvePort`): the hub supervisor's injected `PORT`
+ * wins, then the back-compat `PARACHUTE_CHANNEL_PORT` override, then the
+ * compiled-in canonical default 1941. The daemon binds AND self-registers the
+ * resolved port, so the supervisor's probe/proxy and the bound port never
+ * disagree (channel#41).
  */
 
 import { mkdirSync, readFileSync } from "fs";
@@ -81,7 +85,43 @@ export { requireScope, SCOPE_READ, SCOPE_WRITE, SCOPE_SEND } from "./auth.ts";
 
 const STATE_DIR = defaultStateDir();
 const INBOX_DIR = join(STATE_DIR, "inbox");
-const PORT = parseInt(process.env.PARACHUTE_CHANNEL_PORT ?? "1941", 10);
+
+/**
+ * Resolve the HTTP port the daemon binds (and self-registers in services.json),
+ * honoring sources in priority order:
+ *
+ *   1. `PORT` — the hub supervisor injects this from the module's services.json
+ *      `entry.port` (the canonical pattern vault/scribe follow). It is the port
+ *      the supervisor ALSO probes for readiness and proxies `/channel/*` to, so
+ *      the daemon MUST bind it or the supervisor reports `started_but_unbound`
+ *      and the proxy routes to a dead port (channel#41).
+ *   2. `PARACHUTE_CHANNEL_PORT` — back-compat manual override for a daemon run
+ *      outside the supervisor (the pre-#41 env var; still honored).
+ *   3. `1941` — the compiled-in canonical default.
+ *
+ * Pre-#41 the daemon read only `PARACHUTE_CHANNEL_PORT`, so it ignored the
+ * supervisor's `PORT` and bound 1941 regardless — the supervisor's injected
+ * port and the bound port could disagree, stranding the proxy. Honoring `PORT`
+ * first closes that gap.
+ *
+ * Read at call time (not at import) so tests can drive each tier deterministically.
+ *
+ * Uses `||` (not `??`) for the fall-through so an EMPTY-string env value falls
+ * through rather than being treated as "set": `PORT=""` with `??` would yield
+ * `parseInt("")` = NaN and bind port 0 / garbage. `||` skips the empty string
+ * to the next tier — matches vault's defensive `parseInt(...) || ... || DEFAULT`.
+ * The final `"1941"` literal also guards a non-numeric value (`PORT="abc"` →
+ * `parseInt` NaN → falsy → falls through to the default).
+ */
+export function resolvePort(env: NodeJS.ProcessEnv = process.env): number {
+  return (
+    parseInt(env.PORT ?? "", 10) ||
+    parseInt(env.PARACHUTE_CHANNEL_PORT ?? "", 10) ||
+    1941
+  );
+}
+
+const PORT = resolvePort();
 
 /** Channel a bridge subscribes to when `?channel=` is omitted (back-compat). */
 const DEFAULT_CHANNEL = "telegram";

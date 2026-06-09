@@ -227,7 +227,8 @@ Bearer `vault:<name>:write`).
 | Variable | Default | Description |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | (required) | Telegram bot token from BotFather |
-| `PARACHUTE_CHANNEL_PORT` | `1941` | Daemon HTTP port |
+| `PORT` | (unset) | **Highest-priority port input** — the hub supervisor injects this from the module's services.json `entry.port` (the canonical pattern vault/scribe follow). The daemon binds AND self-registers this port, so the supervisor's readiness probe + `/channel/*` proxy target agree (channel#41). Empty/non-numeric falls through. |
+| `PARACHUTE_CHANNEL_PORT` | `1941` | Daemon HTTP port — back-compat override for a daemon run *outside* the supervisor. Used only when `PORT` is unset. |
 | `PARACHUTE_CHANNEL_URL` | `http://127.0.0.1:1941` | Bridge → daemon URL |
 | `PARACHUTE_CHANNEL_STATE_DIR` | `~/.parachute/channel` | Token, access config, inbox |
 | `PARACHUTE_HUB_ORIGIN` | `http://127.0.0.1:1939` | **Daemon:** hub's public origin for JWT `iss` validation. Required on an exposed deployment (the loopback default is dev-only); hub-as-supervisor sets it. |

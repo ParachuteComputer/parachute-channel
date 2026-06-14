@@ -136,21 +136,23 @@ The hub's Bun-native WS bridge (`ws-bridge.ts`) forwards arbitrary binary/text f
 
 Use **Bun's native pty** (`Bun.spawn({ terminal })` + `Bun.Terminal` with write/resize/setRawMode) rather than node-pty-under-Bun. **Attach to the existing TMUX session, not a raw pty** — so a dropped WS reconnects with scrollback intact (the session keeps running in tmux regardless of who's watching). Do **not** adopt ttyd / wetty / gotty: they each bring their own server + auth and fight the model (channel is the daemon, the hub is the transport, the audience gate is the auth).
 
-> **Verify item (version floor):** `Bun.Terminal` is new in the 1.3.x line (~1.3.5). Confirm it against the Bun version the hub + channel pin **before committing to this mechanism**. If the floor is above the pinned Bun, the fallback is `tmux attach` over a pty the daemon already controls. (Flagged as a risk in §9.)
+> **Verify item (version floor):** `Bun.Terminal` (with `resize` / `setRawMode`) is confirmed present in Bun 1.3.14 — the floor is met for current Bun. Keep a ship-time check that the hub + channel Bun pins are ≥ that floor; if a pin ever regresses below it, the fallback is `tmux attach` over a pty the daemon already controls. (Tracked as low-risk R2 in §9.)
 
 ### 5.3 Auth: `audience: "surface"`, operator-gated inside channel
 
-The terminal WS mount declares **`audience: "surface"`**, not `operator`. Per `audience-gate.ts:36-45, 202-207`, a `surface`-audience mount passes the hub gate unconditionally **because the backend owns admission end-to-end** — the hub would otherwise add a second auth layer that blocks the backend's own auth plane. The `operator` tier (`audience-gate.ts:220-232`) is **session-cookie-only** and *"a Bearer never satisfies this tier"* — which would foreclose the Bearer/API/MCP reachability we want to keep open for the Phase-2 spawn face.
+The terminal WS mount declares **`audience: "surface"`**, not `operator`. Per `audience-gate.ts:207` (`if (audience === "surface") return null;`), a `surface`-audience mount passes the hub gate unconditionally **because the backend owns admission end-to-end** — the hub would otherwise add a second auth layer that blocks the backend's own auth plane. The `operator` tier (`audience-gate.ts:220-232`) is **session-cookie-only** and *"a Bearer never satisfies this tier"* — which would foreclose the Bearer/API/MCP reachability we want to keep open for the Phase-2 spawn face.
 
 So: the terminal WS uses `surface`, and **channel's backend enforces operator-only inside its own `requireScope`** (`src/auth.ts:70-95`) — yielding operator-grade restriction *today* without nailing the door shut on the API path *tomorrow*. This is the same pattern the docs-editor collab WS uses.
+
+**Token delivery.** A browser can't set an `Authorization` header on `new WebSocket(...)`, so the terminal WS delivers the hub token as a `?token=` query param — the same fallback the chat UI's SSE `EventSource` already uses. The mechanism exists end-to-end: `ws-bridge.ts` preserves `url.search` when it dials the upstream (`WsBridgeData.upstreamUrl` is "same path + query"), and channel's `extractToken` already accepts a query-param token under `allowQueryParam` (`src/auth.ts:43-54`). The terminal endpoint opts into `allowQueryParam: true`, exactly as `transports/http-ui.ts`'s `/ui/events` does for the SSE case.
 
 ### 5.4 Backpressure (the load-bearing design item)
 
 `ws-bridge.ts:55, 197-199, 225-234` enforces a hard **8 MiB buffered-bytes cap** (`DEFAULT_MAX_BUFFERED_BYTES`) that, when either side overflows, **closes BOTH sides with 1011**. The docstring is explicit: *"Backpressure is a blunt cap, not flow control … A slow consumer should reconnect rather than let the hub buffer unboundedly,"* and the cap is **not per-connection tunable** — it's a fixed ceiling.
 
-A terminal can legitimately flood it: a big build log, `yes`, a `cat` of a large file. Without backend-side flow control, a normal command would trip the cap and kill the terminal. So channel must do **flow control on its side of the socket**, below the 8 MiB ceiling:
+A terminal can legitimately flood it: a big build log, `yes`, a `cat` of a large file. The hub bridge (`ws-bridge.ts`) is just a blind client↔upstream pipe — it does not expose any flow-control hook for the daemon to read; its only response to overflow is to close both sides. So the flow control must live in **channel's own daemon**, which is itself a Bun WebSocket server and therefore holds the upstream end of the terminal socket as a `ServerWebSocket`. That gives it `ws.getBufferedAmount()` natively — the daemon watches *its own* send-buffer depth and throttles before bytes ever reach the bridge's ceiling:
 
-- **Throttle pty reads** — pause reading from `Bun.Terminal` / tmux when the outbound WS buffer climbs, resume when it drains. (`ws-bridge.ts` exposes `getBufferedAmount()`-style signals on its sockets; the channel backend monitors its own send buffer the same way.)
+- **Throttle pty reads** — pause reading from `Bun.Terminal` / tmux when `ws.getBufferedAmount()` on the daemon's terminal socket climbs, resume when it drains.
 - **xterm.js flow control** — xterm supports a high-watermark/ACK flow-control handshake; wire it so the browser signals when it's behind and the backend stops shoveling.
 - **Coalesce** rapid small frames into fewer larger ones to cut per-frame overhead, while staying well under the ceiling.
 
@@ -166,7 +168,7 @@ The goal: the channel backend never lets a single terminal's buffered bytes appr
 
 ## 6. Credential model
 
-**Store the Claude `CLAUDE_CODE_OAUTH_TOKEN` as a secret in channel's credential store, per-channel-configurable** — exactly the pattern channel already uses for per-channel credentials. `registry.ts` already keeps per-channel config (e.g. each telegram channel carries its own bot token in `config.token`, `registry.ts:9-11, 64-72`; written 0600, `registry.ts:160-164`). The Claude OAuth token follows that pattern: a per-channel `credential` field, defaulting to a single operator token, overridable per channel.
+**Store the Claude `CLAUDE_CODE_OAUTH_TOKEN` as a secret in channel's credential store, per-channel-configurable** — exactly the pattern channel already uses for per-channel credentials. `registry.ts` already keeps per-channel config (e.g. each telegram channel carries its own bot token in `config.token`), and `upsertChannelEntry` is the read-modify-write that persists a channel's config secrets, writing the file 0600 and `chmod`-ing it 0600 unconditionally (`registry.ts:152-164`). The Claude OAuth token follows that pattern: a per-channel `credential` field, defaulting to a single operator token, overridable per channel.
 
 - **The token:** `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` (1-year, the documented headless/CI auth path). Injected into the sandbox at launch as the session's auth.
 - **Default one operator token; per-channel override.** The per-channel field **is the multi-principal seam** — multi-user isn't a rewrite, just populating per-channel (eventually per-principal) credentials.
@@ -201,7 +203,7 @@ It **pairs with the existing `parachute expose` Cloudflare-tunnel machinery unch
 The script is provider-agnostic; the provider choice is a recommendation, not a dependency. Summary (full reasoning in the research note):
 
 - **DigitalOcean = simplest default.** No-KYC signup, cleanest console, a Marketplace 1-Click Docker image, `doctl` + `user_data` automation, public IP by default. ~$48/mo at 8 GB / 4 vCPU. Optimizes the #1 target: a non-expert's first setup.
-- **Hetzner = cost pick.** ~€7 EU / ~$17 US at 8 GB (3–6× cheaper) — but two real frictions for non-experts: KYC/iDenfy signup verification (added Mar 2026) and an EU/US price-and-traffic split. Frame as "if you'll do ID verification, it's far cheaper."
+- **Hetzner = cost pick.** ~€7 EU / ~$17 US at 8 GB (3–6× cheaper) — but two real frictions for non-experts: identity verification may be required at signup, and an EU/US price-and-traffic split. Frame as "if you're willing to clear any signup verification, it's far cheaper."
 - **Vultr / Linode** = DO-equivalents (~$40–48); no reason to lead with them.
 - **EC2 / GCP** = complexity tax + most expensive (2 vCPU not 4 at 8 GB, metered egress); only for existing AWS/GCP shops.
 - **Render / Fly stay lite-tier-only.** (NB: bubblewrap-only isolation *could* let a Fly full-VM work via user namespaces, but keep the recommendation simple: plain VPS for the full tier.)
@@ -252,7 +254,7 @@ The escalation isolation rung (§3.4 — gVisor / full VM, or the validating egr
 ### Risks
 
 - **R1 — terminal backpressure vs the 8 MiB WS ceiling.** The hub cap closes both sides on overflow and is not tunable (`ws-bridge.ts:55, 197-234`). Mitigation is backend-side flow control (§5.4). This is the single most load-bearing engineering item in the terminal work — a `yes` in a terminal must not kill the connection.
-- **R2 — `Bun.Terminal` version floor.** New in the 1.3.x line; verify against the pinned Bun before committing (§5.2). Fallback: pty-over-tmux the daemon controls.
+- **R2 — `Bun.Terminal` version floor (low risk).** `Bun.Terminal` (with `resize` / `setRawMode`) is confirmed present in Bun 1.3.14, so the floor is already met for current Bun. Keep a "verify against the pinned Bun at ship time" check (the hub + channel pin must be ≥ that floor), but this is lower-risk than originally stated. Fallback if a pin ever regresses: pty-over-tmux the daemon controls.
 - **R3 — interactive-token auth in the sandbox.** Verify `claude` authenticates from the injected `CLAUDE_CODE_OAUTH_TOKEN` alone, no `/login`, and that `ANTHROPIC_API_KEY` is absent so billing stays interactive (§6).
 - **R4 — capacity / quota.** All sessions on one operator token share the operator's interactive quota (§6). A busy fleet competes with the operator's own use. Per-principal credentials (Phase 3) is the answer.
 - **R5 — egress allowlist completeness.** Too narrow and a session can't fetch what a legitimate task needs (npm, a git remote); too broad and exfiltration is open (§3.3). Start static; graduate to the validating proxy for the multi-tenant tier.
@@ -262,7 +264,8 @@ The escalation isolation rung (§3.4 — gVisor / full VM, or the validating egr
 - **Q1 — workspace mount granularity.** Per-session workspace only (clean blast radius), or a shared read-only project mount + per-session writable overlay (more useful for dev agents)? Leaning per-session writable + broad RO reads, per Anthropic's default.
 - **Q2 — token lifecycle default.** Ephemeral-TTL for everything (revoke-on-death) vs a registered connection for standing agents that must survive a daemon restart. Likely both, selected by the spec (§4.2).
 - **Q3 — does the in-page terminal warrant its own view** in channel's UI, or fold into the existing chat/admin pages? (Decided home is channel's UI; the sub-placement is open.)
-- **Q4 — sandbox-runtime adoption surface.** Vendor it, depend on it, or shell out to its CLI? Affects the "wary of custom components" posture — prefer the thinnest integration that keeps the primitive battle-tested.
+- **Q4 — sandbox-runtime integration shape (pre-decide before Phase 1).** Vendor it, depend on it as a library, or shell out to its CLI? This is not just a packaging choice: if channel **shells out** to the sandbox-runtime binary, the daemon must trust whatever that binary resolves on `PATH` — which partially re-introduces the arbitrary-subprocess surface the sandbox is supposed to close (a poisoned `PATH` entry runs *outside* the sandbox, before it's established). Prefer the thinnest integration that keeps the primitive battle-tested *and* keeps the trust boundary at a pinned, known binary. Decide this before Phase 1 because it shapes the whole envelope.
+- **Q5 — multi-browser attach semantics.** Two browsers attaching to the same tmux pane share one input stream — their keystrokes interleave (standard tmux behavior). Fine for owner-operated (one person, two tabs), but it must be a deliberate Phase-1 expectation: do we present the terminal as **single-writer** (additional viewers are read-only) or **shared-view** (everyone can type, interleaving accepted)? Default to shared-view for v1 (matches `tmux attach`), but say so explicitly so it isn't a surprise.
 
 ---
 

@@ -27,7 +27,7 @@ What it does **not** have is an isolation boundary. The launcher runs `claude --
 
 Three framing points that bound the whole design:
 
-- **Not a new module, not a revival of parachute-agent.** This is channel's own deferred hardening. parachute-agent (`DEPRECATED.md`) is the cautionary tale, not the template — we harvest its *envelope* (per-session isolation, RO mounts, injected scoped token, resource + network limits) and explicitly drop its *machinery* (per-agent image builds, `INSTALL_SLUG`-keyed names that became the reaper scar, a second supervisor). Octopus is superseded the same way: harvest its pod registry, roster↔live reconciliation, send-keys + key-allowlist, and cross-team failure-mode catalog; do not lift its spawn path (it wraps Claude Code's fragile native team/tentacle apparatus) or its capture-pane scraping. Octopus gets a `DEPRECATED.md`.
+- **Not a new module, not a revival of parachute-agent.** This is channel's own deferred hardening. parachute-agent (`DEPRECATED.md`) is the cautionary tale, not the template — we harvest its *envelope* (per-session isolation, RO mounts, injected scoped token, resource + network limits) and explicitly drop its *machinery* (per-agent image builds, `INSTALL_SLUG`-keyed names that became the reaper scar, a second supervisor). Octopus is superseded the same way: harvest its pod registry, roster↔live reconciliation, send-keys + key-allowlist, and cross-team failure-mode catalog; do not lift its spawn path (it wraps Claude Code's fragile native team/tentacle apparatus) or its capture-pane scraping. Octopus gets a `DEPRECATED.md`. **Note the name collision:** retiring octopus-*the-module* (its fragile native-team spawn path) is precisely what *enables* octopus-*the-pattern* — one arm spawning its own scoped sub-arms — delivered cleanly through Phase 2's attenuated MCP spawn-face (§8) rather than the native apparatus. The idea lives on; only the brittle implementation retires.
 
 - **The billing/ToS model is "interactive Claude + a channel attached."** A launched session is a *full interactive* `claude` (it's `claude`, not `claude -p`), which runs on the operator's normal subscription limits — exactly the shape channel was built around (`PLAN.md:16-24`). It is **not** the metered headless `claude -p` / Agent-SDK credit path that runner uses. The credential story therefore draws on the normal interactive subscription; the real remaining constraint is **capacity** (agents share the operator's interactive quota), not ToS or a capped budget. See §6.
 
@@ -56,8 +56,8 @@ The system decomposes into three layers, two of which already largely exist in c
 Define a `Sandbox` interface whose **contract is held constant** and whose **mechanism varies by platform/tier**. The contract a launched session must satisfy, regardless of mechanism:
 
 1. **Scoped token injected** at launch (the per-channel credential, §6) — never the operator's broad env, never the hub master key. This mirrors runner's `buildChildEnv` discipline (`spawn.ts:103-149`): pass only what `claude` needs, scrub everything else.
-2. **Filesystem: reads broad, writes confined to a workspace.** The session reads what it needs to be useful but can only *write* inside its session workspace (today `~/.parachute/channel/sessions/<name>`, `launch-session.sh:37`). This is exactly Anthropic's default policy: *"reads allowed, writes allowed in workspace."*
-3. **Network egress: deny by default + a narrow allowlist** of `{ the Anthropic API, the hub/vault origin }`. This is **the load-bearing control** (§3.3).
+2. **Filesystem: reads and writes both scoped to declared binds.** Writes are confined to the private per-session workspace (today `~/.parachute/channel/sessions/<name>`, `launch-session.sh:37`) plus any `rw` mount the spec declares; *reads* are confined to the runtime/config, the workspace, and declared `ro`/`rw` mounts — **not** the broad host filesystem. This deliberately tightens Anthropic's "reads allowed" default; the reasoning + the `mounts` field are in §4.5.
+3. **Network egress: deny by default + an allowlist.** The deny-by-default is constant; the allowlist is a minimal base of `{ the Anthropic API, the hub/vault origin }` plus a per-arm `egress` declaration (§4.4). This is **the load-bearing control** (§3.3).
 4. **Resource limits** — memory/CPU caps so one session can't starve the host (each interactive Claude session can spike 1–2 GB under build load; see §7 sizing).
 5. **No host escape** — the session cannot reach the host control plane (the hub's operator token, other sessions' workspaces, the Docker socket if one exists).
 
@@ -77,7 +77,7 @@ A bonus consequence for the deploy story (§7): bubblewrap is **user-namespace**
 
 Per the article: *"every function reachable through any allowlisted domain is an attack surface."* Filesystem confinement matters, but for a session fed foreign-authored channel input the dominant risk is **egress** — exfiltration to an attacker endpoint, SSRF against the host's own control plane, or fetching attacker-supplied credentials. So:
 
-- **Deny all egress by default**, allowlist only `{ Anthropic API host(s), the hub/vault origin }`. A session needs the Anthropic API to think and the hub/vault to do its scoped work; it needs nothing else.
+- **Deny all egress by default.** The allowlist is a minimal base of `{ Anthropic API host(s), the hub/vault origin }` — what every arm needs — plus a per-arm `egress` declaration treated as part of scope (§4.4). A weaver arm runs on the base alone; a code-building arm opens exactly the package/source hosts it needs. There is no single global allowlist to get wrong.
 - **Ideally validate via a token-checking egress proxy** (the article's MITM-proxy pattern): the proxy admits only allowlisted domains and can verify the session token on the hub/vault leg, blocking both SSRF and attacker-supplied creds. v1 may start with a static domain allowlist enforced by the sandbox profile and graduate to the validating proxy; the proxy is the stronger posture for the multi-tenant tier (§3.4).
 - **The hub already has the IP-level admission half** for the terminal WS — `ws-connection-caps.ts` (per-IP 32 / total 512, env-overridable). That bounds *inbound* terminal connections; the egress allowlist bounds *outbound* session traffic. Different directions, both needed.
 
@@ -101,16 +101,30 @@ Graduate `launch-session.sh` into a proper command/API. The script is already ~8
 
 ### 4.1 The agent spec
 
-A launch is described by an **agent spec**:
+A launch is described by an **agent spec**. The spec is the single declaration of *everything an arm may reach* — its MCP surface (channels/vault/otherMcps), its **network egress**, and its **filesystem view** — so scope and isolation are read off one object:
 
 ```jsonc
 {
   "channels": ["aaron-dev"],                 // channels to attach (one MCP entry each)
   "vault":    { "name": "default", "access": "read", "tags": ["#channel-message"] },
   "otherMcps": [ /* additional MCP servers, by URL */ ],
-  "credential": "operator"                   // which stored Claude token to inject (§6); default = operator
+  "credential": "operator",                  // which stored Claude token to inject (§6); default = operator
+
+  // Network: ADDITIVE to a minimal base of { Anthropic API, the hub/vault origin }.
+  // A weaver-style arm declares [] (base only); a code-building arm opens what it needs.
+  "egress": ["registry.npmjs.org", "pypi.org", "github.com"],
+
+  // Filesystem: ADDITIVE to the default private per-session workspace (rw) + the
+  // implicit runtime/claude-config (ro). Reads are scoped to declared binds — NOT broad.
+  "mounts": [
+    { "hostPath": "/home/op/projects/foo", "mountPath": "/work/foo", "mode": "rw" },
+    { "hostPath": "/home/op/ref",           "mountPath": "/ref",      "mode": "ro" },
+    { "hostPath": "/srv/shared-artifacts",  "mountPath": "/shared",   "mode": "ro", "shared": "build-cache" }
+  ]
 }
 ```
+
+`egress` and `mounts` are the two fields that make this spec a complete least-privilege envelope (detailed in §4.4 and §4.5). The base egress + the implicit runtime/config mount are non-removable; the spec only *adds*.
 
 ### 4.2 From spec to a running sandboxed session
 
@@ -121,6 +135,38 @@ A launch is described by an **agent spec**:
 ### 4.3 Capability attenuation bounds the spawn-manager
 
 The composer **can't grant more than it holds.** It mints child tokens by attenuating its own grant — a spawn-manager holding `vault:default:read` cannot mint a child `vault:default:write`. This is the same least-privilege instinct `audience-gate.ts:129-155` encodes for scope matching, applied at mint time. It's what makes the future API/MCP spawn face (§8 Phase 2) safe: a remote caller can only spawn agents weaker than the principal it authenticated as.
+
+### 4.4 Network egress is part of scope, declared per-arm
+
+The Sandbox **contract** stays constant — egress is *deny-by-default* for every arm (§3.1, §3.3). What becomes per-arm is the **allowlist**, declared as the spec's `egress` field and unioned with a minimal non-removable base of `{ the Anthropic API, the hub/vault origin }`. This reframes egress from a single global policy into a dimension of **scope**: just as the MCP/token fields say *which vault and channels* an arm may reach, `egress` says *which other hosts* it may reach.
+
+- The **base** is what every arm needs to function: the Anthropic API to think, the hub/vault to do its scoped work. Nothing else.
+- The **declared allowlist** is least-egress-that-lets-this-arm-do-its-job. A weaver-style arm that only reads/writes the vault declares `[]` — its tiny network surface is a *feature*, not a limitation. A code-building arm declares `["registry.npmjs.org","pypi.org","github.com", …]` — exactly the package/source hosts it pulls from, and no more.
+
+This resolves the §3.3 tension that the earlier draft flagged-but-left-open (and folds R5): there is no single "right" allowlist to argue about, because the allowlist is **per-spec**. The design decision is the *principle* — least egress per arm, additive to the base — not a fixed host list. (The validating egress proxy of §3.4 is the stronger *enforcement* of this same per-arm allowlist for the multi-tenant tier.)
+
+### 4.5 Filesystem reads are scoped to declared binds (a principled divergence from Anthropic)
+
+The Sandbox contract holds writes to a private per-session workspace (§3.1 item 2). This doc **tightens reads too**: an arm's filesystem view is built from explicit binds only —
+
+> **Policy:** bind `{ runtime + claude-config (ro, implicit), the private session workspace (rw), each declared mount }`; **deny everything else** — including broad read of the operator's home.
+
+This is a **deliberate divergence from Anthropic's default** ("reads allowed, writes allowed in workspace"). Anthropic's broad-read is calibrated for a developer reading *their own* code on *their own* box — a flat-ish gradient where the reader already owns everything readable. Our arms sit at a steeper gradient: a foreign-input channel arm with broad read of the operator's home can read every credential, SSH key, `.env`, and *other vault* on the box — precisely the blast radius §2 says isolation exists to bound. bubblewrap already constructs the filesystem view from explicit binds; broad-read was Anthropic's *policy layer on top of that mechanism*. We keep the mechanism and choose the tighter policy, making reads **symmetric with egress** — both per-spec, both least-privilege, both additive to a minimal base.
+
+`mounts` is the per-arm read/write surface beyond the workspace: each entry binds a `hostPath` to a `mountPath` at `ro` or `rw`. A dev arm binds its project `rw` and a reference tree `ro`; a weaver binds nothing (workspace + config suffice).
+
+**`shared` mounts — a deliberate relaxation, named as such.** A mount may carry a `shared: "<name>"` tag, binding the *same* host directory into more than one arm. This is a **deliberate hole in the session-to-session isolation** that §2/§3 establish as a core property — a `shared: "x"` rw mount is a cross-session channel, and a classic **confused-deputy** vector: a foreign-input arm plants files that a trusted arm later reads and acts on. So shared mounts are governed, not casual:
+
+- **Named, opt-in, deliberate** — never implicit; a shared mount exists only because a spec asked for it by name.
+- **Trust-equivalence expectation** — share freely *among arms at the same trust level* (e.g. several of the operator's own dev arms sharing a build cache). Between a foreign-input arm and a trusted arm, **strongly prefer shared-`ro` sourced from the producer, and never shared-`rw`** across the trust boundary — the trusted arm must not read attacker-writable files as if they were its own.
+
+The tradeoff is real (convenience vs. a cross-session path); the doc names it so a future `shared:` use is a considered decision, not a reflex.
+
+### 4.6 The agent spec is the machine-executable form of a higher-level mandate (seam, forward-looking)
+
+The agent spec (§4.1) is deliberately a *machine-executable* object: tokens, MCP entries, an egress list, mount binds. But it is the executable projection of something more human-readable — a charter or mandate that says, in prose, *what this arm is for and what it's allowed to touch*. To avoid two drifting sources of truth, a higher-level declarative source should be able to **generate or reference** its agent spec, rather than the spec being hand-maintained in parallel with the prose.
+
+State this generally: the principle is *one source of truth for an arm's authority, with the executable spec derived from (or pinned to) the human-readable mandate* — not a hard coupling to any particular store's notion of "an arm." (A vault that models arms as notes is one natural source; a YAML charter checked into a repo is another. The seam is "declarative mandate → derived agent spec," whatever the upstream form.) This is a forward-looking note, not a Phase-1 deliverable; Phase 1 hand-authors specs. It is recorded here so the spec format leaves room to be *generated* later, and so nobody builds a second authority store that competes with the mandate.
 
 ---
 
@@ -248,24 +294,26 @@ The escalation isolation rung (§3.4 — gVisor / full VM, or the validating egr
 - **Credential = `CLAUDE_CODE_OAUTH_TOKEN` stored as a per-channel secret in channel's credential store**, default one operator token, per-channel override.
 - **VPS full-tier deploy is prioritized** as a v1 deliverable (the cloud-init script is the primary artifact).
 - **Sandbox-runtime (Seatbelt/bubblewrap) over Docker** for v1; Docker/gVisor/VM is the multi-tenant escalation, not v1.
+- **The sandbox-runtime is reached by library-link or a pinned absolute-path binary — NEVER `PATH` resolution.** A poisoned `PATH` entry would execute *before* the sandbox is established (the launcher resolving `sandbox-runtime` off `PATH` runs the attacker's binary outside any sandbox), re-opening the exact hole the sandbox closes. So the trust boundary is anchored to a known artifact: link the library, or invoke an absolute, operator-controlled path. (This was open-question Q4; now decided.)
+- **Filesystem reads are scoped to declared binds, and egress is per-arm — both additive to a minimal base** (§4.4, §4.5). Reads tighten Anthropic's broad-read default deliberately, given our steeper trust gradient.
 - **Channel is the home** for this work (session lifecycle + the new isolation); the terminal is a channel-UI concern over the WS bridge.
-- **Octopus retires** (gets a `DEPRECATED.md`); harvest the named parts only.
+- **In-page terminal is the Phase-1 release valve** — stays in v1, but is the deferrable piece if Phase 1 slips (§9 R1).
+- **Octopus retires** (gets a `DEPRECATED.md`); harvest the named parts only. Retiring octopus-*the-module* is what *enables* octopus-*the-pattern* — see §1.
 
 ### Risks
 
-- **R1 — terminal backpressure vs the 8 MiB WS ceiling.** The hub cap closes both sides on overflow and is not tunable (`ws-bridge.ts:55, 197-234`). Mitigation is backend-side flow control (§5.4). This is the single most load-bearing engineering item in the terminal work — a `yes` in a terminal must not kill the connection.
+- **R1 — terminal backpressure vs the 8 MiB WS ceiling.** The hub cap closes both sides on overflow and is not tunable (`ws-bridge.ts:55, 197-234`). Mitigation is backend-side flow control (§5.4). This is the single most load-bearing engineering item in the terminal work — a `yes` in a terminal must not kill the connection. **Schedule note — the in-page terminal is Phase 1's release valve.** It carries the hardest engineering risk (this backpressure work) for the *least* security/capability payoff: `tmux attach` on the host already provides the zoom-in, so the terminal is a convenience, not a load-bearing win. It stays in v1 (Aaron's call), but if Phase 1 must slip, **the terminal is the deferrable piece** — the sandbox envelope (§3), the spawn/scope command (§4), and the VPS path (§7) are the wins that must ship.
 - **R2 — `Bun.Terminal` version floor (low risk).** `Bun.Terminal` (with `resize` / `setRawMode`) is confirmed present in Bun 1.3.14, so the floor is already met for current Bun. Keep a "verify against the pinned Bun at ship time" check (the hub + channel pin must be ≥ that floor), but this is lower-risk than originally stated. Fallback if a pin ever regresses: pty-over-tmux the daemon controls.
 - **R3 — interactive-token auth in the sandbox.** Verify `claude` authenticates from the injected `CLAUDE_CODE_OAUTH_TOKEN` alone, no `/login`, and that `ANTHROPIC_API_KEY` is absent so billing stays interactive (§6).
-- **R4 — capacity / quota.** All sessions on one operator token share the operator's interactive quota (§6). A busy fleet competes with the operator's own use. Per-principal credentials (Phase 3) is the answer.
-- **R5 — egress allowlist completeness.** Too narrow and a session can't fetch what a legitimate task needs (npm, a git remote); too broad and exfiltration is open (§3.3). Start static; graduate to the validating proxy for the multi-tenant tier.
+- **R4 — capacity / quota (a Phase-1 operational reality, not a Phase-3 concern).** Every looping arm — `uni-dev`, `uni-weaver`, `uni-evolve`, plus any per-project sub-arms — draws on the operator's *one* interactive subscription, competing with each other **and** with the operator's own Claude Code use. This is a week-one throttle: it caps how many looping arms can run concurrently before the operator feels their own sessions slow. It doesn't change the design, but it shapes capacity expectations *now* — plan the initial fleet around one subscription's headroom. Per-principal credentials (§6, Phase 3) is the structural fix; until then, concurrency is the knob.
+- **R5 — egress allowlist completeness → RESOLVED by per-arm `egress` (§4.4).** The earlier worry ("one global allowlist is either too narrow or too broad") dissolves once the allowlist is per-spec: each arm declares least-egress for its own job, additive to the base. Residual: the *enforcement* hardening (static sandbox-profile allowlist now → the validating egress proxy for the multi-tenant tier, §3.4). Not a design open-question anymore.
 
 ### Open questions
 
 - **Q1 — workspace mount granularity.** Per-session workspace only (clean blast radius), or a shared read-only project mount + per-session writable overlay (more useful for dev agents)? Leaning per-session writable + broad RO reads, per Anthropic's default.
 - **Q2 — token lifecycle default.** Ephemeral-TTL for everything (revoke-on-death) vs a registered connection for standing agents that must survive a daemon restart. Likely both, selected by the spec (§4.2).
 - **Q3 — does the in-page terminal warrant its own view** in channel's UI, or fold into the existing chat/admin pages? (Decided home is channel's UI; the sub-placement is open.)
-- **Q4 — sandbox-runtime integration shape (pre-decide before Phase 1).** Vendor it, depend on it as a library, or shell out to its CLI? This is not just a packaging choice: if channel **shells out** to the sandbox-runtime binary, the daemon must trust whatever that binary resolves on `PATH` — which partially re-introduces the arbitrary-subprocess surface the sandbox is supposed to close (a poisoned `PATH` entry runs *outside* the sandbox, before it's established). Prefer the thinnest integration that keeps the primitive battle-tested *and* keeps the trust boundary at a pinned, known binary. Decide this before Phase 1 because it shapes the whole envelope.
-- **Q5 — multi-browser attach semantics.** Two browsers attaching to the same tmux pane share one input stream — their keystrokes interleave (standard tmux behavior). Fine for owner-operated (one person, two tabs), but it must be a deliberate Phase-1 expectation: do we present the terminal as **single-writer** (additional viewers are read-only) or **shared-view** (everyone can type, interleaving accepted)? Default to shared-view for v1 (matches `tmux attach`), but say so explicitly so it isn't a surprise.
+- **Q4 — multi-browser attach semantics.** Two browsers attaching to the same tmux pane share one input stream — their keystrokes interleave (standard tmux behavior). Fine for owner-operated (one person, two tabs), but it must be a deliberate Phase-1 expectation: do we present the terminal as **single-writer** (additional viewers are read-only) or **shared-view** (everyone can type, interleaving accepted)? Default to shared-view for v1 (matches `tmux attach`), but say so explicitly so it isn't a surprise.
 
 ---
 

@@ -15,6 +15,10 @@ import type { SandboxEngine } from "./sandbox/index.ts";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { AgentSpec } from "./sandbox/types.ts";
 import { channelEntryKey, vaultEntryKey } from "./agent-mcp-config.ts";
+import {
+  setDefaultClaudeCredential,
+  setChannelClaudeCredential,
+} from "./credentials.ts";
 
 let sessionsDir: string;
 afterEach(() => {
@@ -87,7 +91,9 @@ function baseDeps(over: Partial<SpawnAgentDeps> = {}): SpawnAgentDeps {
     vaultUrl: "http://127.0.0.1:1940",
     sessionsDir,
     runtimeReadOnly: ["/cfg/.claude"],
-    claudeOauthToken: "OAUTH-CRED-PLACEHOLDER",
+    // Stub the credential resolver so the test never touches a real store; the
+    // assertion below checks this exact token lands in CLAUDE_CODE_OAUTH_TOKEN.
+    resolveClaudeToken: () => "OAUTH-CRED-PLACEHOLDER",
     sandboxEngine: fakeEngine(),
     tmux: recordingTmux(),
     fetchFn: fakeMintFetch(),
@@ -399,3 +405,88 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     expect(maxActive).toBe(1);
   });
 });
+
+// ---- credential wiring (Stream 3 — resolve from the per-channel store) -------
+
+describe("spawnAgent — resolves the Claude credential from the per-channel store", () => {
+  let storeDir: string;
+  afterEach(() => {
+    if (storeDir) rmSync(storeDir, { recursive: true, force: true });
+  });
+
+  // The wiring under test reads `credentials.ts` keyed on the WAKE channel (the
+  // first channel). These tests use the REAL resolver (no `resolveClaudeToken`
+  // stub) against a throwaway store, proving the end-to-end resolve→inject path.
+  function depsWithRealResolver(): SpawnAgentDeps {
+    const d = baseDeps();
+    delete (d as { resolveClaudeToken?: unknown }).resolveClaudeToken;
+    return d;
+  }
+
+  test("injects the PER-CHANNEL override when the wake channel has one", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-cred-ovr-"));
+    storeDir = mkdtempSync(join(tmpdir(), "channel-creds-ovr-"));
+    setDefaultClaudeCredential("oat_DEFAULT", storeDir);
+    setChannelClaudeCredential("aaron-dev", "oat_AARON-OVERRIDE", storeDir);
+
+    const tmux = recordingTmux();
+    const deps = { ...depsWithRealResolver(), tmux, resolveClaudeToken: (ch: string) => resolveAgainst(storeDir, ch) };
+    const res = await spawnAgent({ name: "aaron-dev", channels: ["aaron-dev"] }, deps);
+    expect(res.alreadyRunning).toBe(false);
+    // The override (not the default) lands in CLAUDE_CODE_OAUTH_TOKEN.
+    expect(tmux.launched[0]!.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("oat_AARON-OVERRIDE");
+    expect(tmux.launched[0]!.env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  test("falls back to the DEFAULT/operator token when the wake channel has no override", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-cred-def-"));
+    storeDir = mkdtempSync(join(tmpdir(), "channel-creds-def-"));
+    setDefaultClaudeCredential("oat_DEFAULT", storeDir);
+
+    const tmux = recordingTmux();
+    const deps = { ...baseDeps(), tmux, resolveClaudeToken: (ch: string) => resolveAgainst(storeDir, ch) };
+    const res = await spawnAgent({ name: "other", channels: ["unconfigured-ch"] }, deps);
+    expect(res.alreadyRunning).toBe(false);
+    expect(tmux.launched[0]!.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("oat_DEFAULT");
+  });
+
+  test("resolves on the WAKE channel (first), not a later one", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-cred-wake-"));
+    storeDir = mkdtempSync(join(tmpdir(), "channel-creds-wake-"));
+    setDefaultClaudeCredential("oat_DEFAULT", storeDir);
+    setChannelClaudeCredential("first", "oat_FIRST", storeDir);
+    setChannelClaudeCredential("second", "oat_SECOND", storeDir);
+
+    const tmux = recordingTmux();
+    const deps = { ...baseDeps(), tmux, resolveClaudeToken: (ch: string) => resolveAgainst(storeDir, ch) };
+    await spawnAgent({ name: "multi", channels: ["first", "second"] }, deps);
+    // The wake channel is the first → its override is the session's auth.
+    expect(tmux.launched[0]!.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("oat_FIRST");
+  });
+
+  test("SECURITY: an unconfigured store ABORTS the launch BEFORE any mint/tmux side effect", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-cred-none-"));
+    storeDir = mkdtempSync(join(tmpdir(), "channel-creds-none-")); // empty store
+    const tmux = recordingTmux();
+    let minted = false;
+    const fetchFn = (async () => {
+      minted = true;
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    const deps = { ...baseDeps(), tmux, fetchFn, resolveClaudeToken: (ch: string) => resolveAgainst(storeDir, ch) };
+    await expect(
+      spawnAgent({ name: "x", channels: ["ghost"] }, deps),
+    ).rejects.toThrow(/no Claude credential/);
+    // No session launched, no token minted.
+    expect(tmux.launched).toHaveLength(0);
+    expect(minted).toBe(false);
+  });
+});
+
+// Resolve against a specific store dir (the real resolver hard-wires the default
+// state dir; this test helper threads the throwaway dir through, exercising the
+// SAME `resolveClaudeCredential` the production resolver calls).
+function resolveAgainst(storeDir: string, channel: string): string {
+  const { resolveClaudeCredential } = require("./credentials.ts") as typeof import("./credentials.ts");
+  return resolveClaudeCredential(channel, storeDir);
+}

@@ -12,8 +12,11 @@
  *      onto API billing, §6). `--strict-mcp-config` closes the MCP surface to
  *      exactly the spec.
  *
- * The credential injected here is a passed-in param/placeholder for THIS stream;
- * Stream 3 builds the real per-channel secret store (design §6, §4.1 credentialRef).
+ * The credential is resolved at launch from the per-channel secret store
+ * (`credentials.ts`, design §6): the spec's wake channel's per-channel override,
+ * falling back to the default/operator token, erroring when neither is set. The
+ * resolver is injectable (`deps.resolveClaudeToken`) so tests run hermetically
+ * without touching a real store.
  *
  * Env-scrubbing follows runner's `buildChildEnv` instinct
  * (`parachute-runner/src/spawn.ts`): pass only what claude needs, drop everything
@@ -41,6 +44,7 @@ import {
   type MintTokenDeps,
   type MintResult,
 } from "./mint-token.ts";
+import { resolveClaudeCredential } from "./credentials.ts";
 
 /**
  * Slug guard for `spec.name`. The name is used UNESCAPED as a tmux session
@@ -107,11 +111,15 @@ export interface SpawnAgentDeps {
    */
   runtimeReadOnly: string[];
   /**
-   * The Claude credential to inject as `CLAUDE_CODE_OAUTH_TOKEN`. For THIS stream
-   * a passed-in param/placeholder; Stream 3 resolves it from the per-channel
-   * secret store keyed by `spec.credentialRef`.
+   * Resolve the Claude OAuth token to inject as `CLAUDE_CODE_OAUTH_TOKEN`, given
+   * the spec's wake channel. Defaults to the real per-channel secret store
+   * (`credentials.ts` — channel override ?? default/operator ?? throw). Tests
+   * inject a stub so they never read a real store. The store throws
+   * `CredentialNotConfiguredError` when neither an override nor a default is set,
+   * which aborts the launch BEFORE any tmux session is created (no session ever
+   * runs without auth).
    */
-  claudeOauthToken: string;
+  resolveClaudeToken?: (channel: string) => string;
   /** Sandbox engine override (tests inject a fake). */
   sandboxEngine?: SandboxEngine;
   /** tmux launcher (tests inject a recorder). */
@@ -266,6 +274,16 @@ export async function spawnAgent(
     throw new Error(`spawnAgent: spec "${spec.name}" declares no channels`);
   }
 
+  // Resolve the Claude OAuth credential from the per-channel store keyed on the
+  // wake channel (the first channel — the one whose dev-channel flag the session
+  // launches under). A missing credential throws here (CredentialNotConfigured),
+  // BEFORE any mint or fs/tmux side effect, so a session never launches without
+  // auth. The token is read at spawn time so a rotate via the config API takes
+  // effect on the next spawn without a daemon restart.
+  const wakeChannel = normalizeChannel(spec.channels[0]!).name;
+  const resolveToken = deps.resolveClaudeToken ?? ((ch: string) => resolveClaudeCredential(ch));
+  const claudeOauthToken = resolveToken(wakeChannel);
+
   const mintDeps: MintTokenDeps = {
     hubOrigin: deps.hubOrigin,
     managerBearer: deps.managerBearer,
@@ -336,10 +354,11 @@ export async function spawnAgent(
   writeFileSync(mcpConfigPath, mcpConfigJson, { mode: 0o600 });
 
   // 3. Build the claude argv, sandbox-wrap it, launch in tmux with scrubbed env.
-  const firstChannel = normalizeChannel(spec.channels[0]!).name;
+  // `wakeChannel` (resolved above) is the first channel — the dev-channel flag's
+  // server name + the key the credential was resolved under.
   const claudeArgs = buildAgentClaudeArgs({
     mcpConfigPath,
-    firstChannelEntryKey: `channel-${firstChannel}`,
+    firstChannelEntryKey: `channel-${wakeChannel}`,
     ...(deps.claudeBin ? { claudeBin: deps.claudeBin } : {}),
   });
 
@@ -369,7 +388,7 @@ export async function spawnAgent(
   // Layer the scrubbed agent env UNDER the sandbox wrapper's env (proxy vars,
   // sandbox markers from the engine win on conflict; CLAUDE_CODE_OAUTH_TOKEN +
   // the passthrough fundamentals come from us). ANTHROPIC_API_KEY is absent.
-  const childEnv = buildAgentChildEnv(deps.parentEnv ?? process.env, deps.claudeOauthToken);
+  const childEnv = buildAgentChildEnv(deps.parentEnv ?? process.env, claudeOauthToken);
   const launchEnv: Record<string, string | undefined> = { ...childEnv, ...wrapped.env };
 
   await deps.tmux.newSession({

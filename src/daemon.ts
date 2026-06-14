@@ -52,6 +52,12 @@ import {
   type ChannelEntry,
 } from "./registry.ts";
 import { VaultTransport, CHANNEL_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
+import {
+  setDefaultClaudeCredential,
+  setChannelClaudeCredential,
+  removeChannelClaudeCredential,
+  describeClaudeCredentials,
+} from "./credentials.ts";
 import { ClientRegistry } from "./routing.ts";
 import {
   requireScope,
@@ -831,6 +837,82 @@ export function createFetchHandler(
         return json({ ok: true, name, removed: false }, 200);
       }
       return json({ ok: true, name, removed: true });
+    }
+
+    // ---------------------------------------------------------------------
+    // Claude OAuth credential store (design §6) — the per-channel secret a
+    // launched agent session runs on (`CLAUDE_CODE_OAUTH_TOKEN`). Same
+    // `channel:admin` gate + 0600 file-store + redaction-on-read posture as the
+    // channel config API above. The token comes from `claude setup-token`.
+    //
+    //   GET    /api/credentials/claude          → { defaultSet, channels:[names] } (NO secret)
+    //   POST   /api/credentials/claude          { token } → set the default/operator token
+    //   POST   /api/credentials/claude/:channel { token } → set a per-channel override
+    //   DELETE /api/credentials/claude/:channel → remove an override (falls back to default)
+    //
+    // Externally hub strips `/channel`, so these are `<hub>/channel/api/credentials/claude`.
+    // ---------------------------------------------------------------------
+    if (url.pathname === "/api/credentials/claude" && (req.method === "GET" || req.method === "POST")) {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+
+      if (req.method === "GET") {
+        // Inspect WITHOUT leaking the secret: whether a default is set + which
+        // channels carry an override (names only).
+        return json(describeClaudeCredentials(defaultStateDir()));
+      }
+
+      // POST — set the default / operator-level token.
+      let credBody: { token?: unknown };
+      try {
+        credBody = (await req.json()) as typeof credBody;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      if (typeof credBody.token !== "string" || credBody.token.length === 0) {
+        return json({ error: "body.token (non-empty string) is required" }, 400);
+      }
+      try {
+        setDefaultClaudeCredential(credBody.token, defaultStateDir());
+      } catch (err) {
+        return json({ error: `failed to write credentials.json: ${(err as Error).message}` }, 500);
+      }
+      // Echo back only the fact of the write — never the token.
+      return json({ ok: true, scope: "default" });
+    }
+
+    const credMatch = url.pathname.match(/^\/api\/credentials\/claude\/([^/]+)$/);
+    if (credMatch && (req.method === "POST" || req.method === "DELETE")) {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+      const channel = decodeURIComponent(credMatch[1]!);
+
+      if (req.method === "DELETE") {
+        let removed: boolean;
+        try {
+          removed = removeChannelClaudeCredential(channel, defaultStateDir());
+        } catch (err) {
+          return json({ error: `failed to update credentials.json: ${(err as Error).message}` }, 500);
+        }
+        return json({ ok: true, channel, removed });
+      }
+
+      // POST — set a per-channel override.
+      let credBody: { token?: unknown };
+      try {
+        credBody = (await req.json()) as typeof credBody;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      if (typeof credBody.token !== "string" || credBody.token.length === 0) {
+        return json({ error: "body.token (non-empty string) is required" }, 400);
+      }
+      try {
+        setChannelClaudeCredential(channel, credBody.token, defaultStateDir());
+      } catch (err) {
+        return json({ error: `failed to write credentials.json: ${(err as Error).message}` }, 500);
+      }
+      return json({ ok: true, scope: "channel", channel });
     }
 
     // ---------------------------------------------------------------------

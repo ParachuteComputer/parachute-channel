@@ -22,7 +22,7 @@
  * subscription path).
  */
 
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSpec, BaseBinds } from "./sandbox/types.ts";
 import { normalizeChannel } from "./sandbox/types.ts";
@@ -406,13 +406,63 @@ function shellQuote(arg: string): string {
 }
 
 /**
- * The real tmux launcher — `tmux new-session -d` running the sandboxed argv. The
- * env is applied via `tmux new-session`'s `-e KEY=VAL` (tmux ≥3.0) so the child
- * inherits exactly the launch env (scrubbed agent env + sandbox proxy vars), not
- * the operator's shell env. `argv` is the sandbox wrapper's argv (already
- * `["/bin/bash","-c", "<env … sandbox-exec … claude …>"]` on macOS), so tmux
- * runs it directly. Injected here (not used by tests, which use a recorder) so
- * the module is a real command, not just a planner.
+ * Build the per-session **launch script** body for an already-sandbox-wrapped argv.
+ *
+ * Why a script and not inline argv: on macOS `wrapWithSandboxArgv` returns
+ * `["/bin/bash","-c","<command embedding the ~84 KB Seatbelt -p profile inline>"]`.
+ * Passing that ~84 KB string as a tmux argument exceeds tmux's per-argument /
+ * command buffer, so `tmux new-session -- /bin/bash -c <84KB>` fails. Instead we
+ * write the wrapped command to a file and have tmux run only the short
+ * `/bin/bash <script-path>` argv — the 84 KB profile lives in the file, never on
+ * the tmux command line.
+ *
+ * Two argv shapes are handled generally:
+ *  - macOS Seatbelt: `["/bin/bash","-c", cmd]` → the script body IS `cmd` (it
+ *    already embeds the sandbox-exec invocation + the claude command).
+ *  - General argv (e.g. Linux bubblewrap `["bwrap", ...args, "claude", ...]`) →
+ *    the body `exec`s the argv with POSIX quoting (reusing `shellJoin`).
+ *
+ * The injected secret (CLAUDE_CODE_OAUTH_TOKEN) is passed via the environment by
+ * `newSession` (`-e KEY=VAL`), NOT written into the script — so the launch script
+ * body is token-free.
+ */
+export function buildLaunchScript(argv: string[]): string {
+  const header = "#!/bin/bash\nset -euo pipefail\n";
+  // The canonical macOS shape: `/bin/bash -c "<cmd>"`. The command string already
+  // is a complete shell program (it embeds the sandbox-exec call and the claude
+  // invocation), so the script body is exactly that command.
+  if (argv.length === 3 && argv[0] === "/bin/bash" && argv[1] === "-c") {
+    return `${header}${argv[2]}\n`;
+  }
+  // General argv: exec it directly with proper quoting so a giant arg (or many
+  // args) stays in the file, not on the tmux command line. `exec` so the wrapped
+  // process replaces this shell (no extra PID, signals reach claude directly).
+  return `${header}exec ${shellJoin(argv)}\n`;
+}
+
+/** Per-session launch-script path under the session workspace (`cwd`). */
+function launchScriptPath(cwd: string): string {
+  return join(cwd, ".launch.sh");
+}
+
+/**
+ * The real tmux launcher — `tmux new-session -d` running the sandboxed argv via a
+ * per-session **launch script**. The env is applied via `tmux new-session`'s
+ * `-e KEY=VAL` (tmux ≥3.0) so the child inherits exactly the launch env (scrubbed
+ * agent env + sandbox proxy vars), not the operator's shell env.
+ *
+ * `argv` is the sandbox wrapper's argv (on macOS already
+ * `["/bin/bash","-c", "<sandbox-exec … claude …>"]` where the command embeds the
+ * ~84 KB Seatbelt `-p` profile inline). That string is far too large to pass as a
+ * tmux argument — `tmux new-session -- /bin/bash -c <84KB>` overruns tmux's
+ * command buffer and fails. So we write the wrapped command to a per-session
+ * launch script (`<workspace>/.launch.sh`, 0600) and hand tmux only the SHORT argv
+ * `/bin/bash <script-path>`; the 84 KB profile lives in the file, off the command
+ * line. See `buildLaunchScript` for how the two argv shapes are handled.
+ *
+ * The script carries NO secret: the OAuth credential is injected via `-e` into the
+ * env, not written into the script body. Injected here (not used by tests, which
+ * use a recorder) so the module is a real command, not just a planner.
  */
 export function realTmuxLauncher(spawnFn: typeof Bun.spawn = Bun.spawn): TmuxLauncher {
   return {
@@ -429,6 +479,17 @@ export function realTmuxLauncher(spawnFn: typeof Bun.spawn = Bun.spawn): TmuxLau
       return code === 0;
     },
     async newSession(opts): Promise<void> {
+      // Write the wrapped command to a per-session launch script so tmux receives
+      // a short argv (the ~84 KB macOS Seatbelt profile would overrun tmux's
+      // command buffer if passed inline). The script lives in the session
+      // workspace alongside .mcp.json, 0600 — it carries no secret (the OAuth
+      // token rides the env via `-e`, below).
+      const scriptPath = launchScriptPath(opts.cwd);
+      writeFileSync(scriptPath, buildLaunchScript(opts.argv), { mode: 0o600 });
+      // Defensive: guarantee 0600 even under a permissive umask (the file is
+      // freshly created per-launch, so there's no looser-perms predecessor).
+      chmodSync(scriptPath, 0o600);
+
       const envArgs: string[] = [];
       for (const [k, v] of Object.entries(opts.env)) {
         if (typeof v === "string") envArgs.push("-e", `${k}=${v}`);
@@ -447,7 +508,8 @@ export function realTmuxLauncher(spawnFn: typeof Bun.spawn = Bun.spawn): TmuxLau
         "50",
         ...envArgs,
         "--",
-        ...opts.argv,
+        "/bin/bash",
+        scriptPath,
       ];
       const proc = spawnFn(argv, { stdout: "pipe", stderr: "pipe" });
       const code = await proc.exited;

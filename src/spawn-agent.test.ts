@@ -6,6 +6,8 @@ import {
   spawnAgent,
   buildAgentChildEnv,
   buildAgentClaudeArgs,
+  buildLaunchScript,
+  realTmuxLauncher,
   sessionName,
   shellJoin,
   type SpawnAgentDeps,
@@ -397,5 +399,88 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
       spawnAgent({ name: "s-c", channels: ["c"] }, baseDeps({ sandboxEngine: slowEngine(), tmux: recordingTmux() })),
     ]);
     expect(maxActive).toBe(1);
+  });
+});
+
+// ---- buildLaunchScript (the tmux-buffer fix) -------------------------------
+
+describe("buildLaunchScript — script body per argv shape, token-free", () => {
+  test("macOS `/bin/bash -c <cmd>` shape: the body IS the command", () => {
+    const script = buildLaunchScript(["/bin/bash", "-c", "sandbox-exec -p '...' claude --foo"]);
+    expect(script.startsWith("#!/bin/bash\nset -euo pipefail\n")).toBe(true);
+    expect(script).toContain("sandbox-exec -p '...' claude --foo");
+    // No `exec <bash> -c` re-wrapping for this canonical shape.
+    expect(script).not.toContain("exec /bin/bash");
+  });
+
+  test("general argv (Linux bubblewrap shape): exec's the quoted argv", () => {
+    const script = buildLaunchScript(["bwrap", "--ro-bind", "/usr", "/usr", "claude", "--mcp-config", "/ws/.mcp.json"]);
+    expect(script.startsWith("#!/bin/bash\nset -euo pipefail\n")).toBe(true);
+    expect(script).toContain("exec bwrap --ro-bind /usr /usr claude --mcp-config /ws/.mcp.json");
+  });
+});
+
+describe("realTmuxLauncher — launch-script indirection (tmux can't take the ~84KB profile inline)", () => {
+  /** A recording spawnFn matching the `Bun.spawn` shape the launcher awaits. */
+  function recordingSpawn(): {
+    fn: typeof Bun.spawn;
+    calls: string[][];
+  } {
+    const calls: string[][] = [];
+    const fn = ((argv: string[]) => {
+      calls.push(argv);
+      return {
+        exited: Promise.resolve(0),
+        stderr: new Response("").body,
+      };
+    }) as unknown as typeof Bun.spawn;
+    return { fn, calls };
+  }
+
+  test("a >100KB wrapped command is NOT passed inline — tmux gets a short script-path argv; the script is written 0600 with the command; token rides env via -e", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "launch-script-"));
+    try {
+      // A wrapped argv whose command embeds a giant (>100KB) profile inline — the
+      // exact shape that overran tmux's buffer in the integration smoke.
+      const bigProfile = "X".repeat(100_000);
+      const bigCommand = `sandbox-exec -p '${bigProfile}' claude --strict-mcp-config --mcp-config ${join(workspace, ".mcp.json")}`;
+      const wrappedArgv = ["/bin/bash", "-c", bigCommand];
+      expect(bigCommand.length).toBeGreaterThan(100_000);
+
+      const { fn, calls } = recordingSpawn();
+      const launcher = realTmuxLauncher(fn);
+      await launcher.newSession({
+        name: "big-agent",
+        argv: wrappedArgv,
+        env: { CLAUDE_CODE_OAUTH_TOKEN: "OAUTH-SECRET", SANDBOX_RUNTIME: "1" },
+        cwd: workspace,
+      });
+
+      // (a) the argv handed to tmux is SHORT — a script path, not the 100KB inline.
+      expect(calls).toHaveLength(1);
+      const tmuxArgv = calls[0]!;
+      const scriptPath = join(workspace, ".launch.sh");
+      expect(tmuxArgv[tmuxArgv.length - 2]).toBe("/bin/bash");
+      expect(tmuxArgv[tmuxArgv.length - 1]).toBe(scriptPath);
+      // The 100KB profile is NOWHERE on the tmux command line.
+      expect(tmuxArgv.some((a) => a.length > 50_000)).toBe(false);
+      expect(tmuxArgv.join(" ")).not.toContain(bigProfile);
+
+      // (b) the launch script is written, mode 0600, and contains the wrapped command.
+      expect(statSync(scriptPath).mode & 0o777).toBe(0o600);
+      const body = readFileSync(scriptPath, "utf8");
+      expect(body.startsWith("#!/bin/bash\nset -euo pipefail\n")).toBe(true);
+      expect(body).toContain(bigCommand);
+
+      // (c) env still passed via `-e KEY=VAL`.
+      expect(tmuxArgv).toContain("-e");
+      expect(tmuxArgv).toContain("CLAUDE_CODE_OAUTH_TOKEN=OAUTH-SECRET");
+      expect(tmuxArgv).toContain("SANDBOX_RUNTIME=1");
+
+      // SECURITY: the secret rides the ENV, never the script body.
+      expect(body).not.toContain("OAUTH-SECRET");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 });

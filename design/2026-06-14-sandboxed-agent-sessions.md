@@ -143,6 +143,8 @@ The Sandbox **contract** stays constant — egress is *deny-by-default* for ever
 - The **base** is what every arm needs to function: the Anthropic API to think, the hub/vault to do its scoped work. Nothing else.
 - The **declared allowlist** is least-egress-that-lets-this-arm-do-its-job. A weaver-style arm that only reads/writes the vault declares `[]` — its tiny network surface is a *feature*, not a limitation. A code-building arm declares `["registry.npmjs.org","pypi.org","github.com", …]` — exactly the package/source hosts it pulls from, and no more.
 
+**Egress breadth must be paired with input trust.** Every allowlisted host is an *exfiltration* path, not just a fetch path — so broad egress is only safe when the arm's input is trusted. A **foreign-input arm** (one fed channel messages or other attacker-influenceable content) should declare **minimal egress regardless of what its job "wants"**, because a prompt-injected session turns each allowlisted host into a place to ship stolen data. The dangerous combination to watch for is explicit: **foreign-input + needs-to-pull-packages.** When an arm genuinely needs both (e.g. building code from a foreign-authored request), don't just widen its egress — prefer to split the work (a trusted arm with broad egress prepares/fetches; the foreign-input arm runs with minimal egress against the prepared inputs), or route fetches through the validating egress proxy (§3.4) so the breadth is mediated rather than blanket.
+
 This resolves the §3.3 tension that the earlier draft flagged-but-left-open (and folds R5): there is no single "right" allowlist to argue about, because the allowlist is **per-spec**. The design decision is the *principle* — least egress per arm, additive to the base — not a fixed host list. (The validating egress proxy of §3.4 is the stronger *enforcement* of this same per-arm allowlist for the multi-tenant tier.)
 
 ### 4.5 Filesystem reads are scoped to declared binds (a principled divergence from Anthropic)
@@ -159,6 +161,7 @@ This is a **deliberate divergence from Anthropic's default** ("reads allowed, wr
 
 - **Named, opt-in, deliberate** — never implicit; a shared mount exists only because a spec asked for it by name.
 - **Trust-equivalence expectation** — share freely *among arms at the same trust level* (e.g. several of the operator's own dev arms sharing a build cache). Between a foreign-input arm and a trusted arm, **strongly prefer shared-`ro` sourced from the producer, and never shared-`rw`** across the trust boundary — the trusted arm must not read attacker-writable files as if they were its own.
+- **Shared-`ro` is not a clean boundary either** — it stops the consumer from *overwriting* the shared dir, but a foreign-input *producer* writing into a shared-`ro` mount still PLANTS data the consumer reads as input. So across a trust boundary, treat producer-supplied files with the **same skepticism as raw channel input** — `ro` removes the write-back vector, not the inject-and-be-read vector.
 
 The tradeoff is real (convenience vs. a cross-session path); the doc names it so a future `shared:` use is a considered decision, not a reflex.
 
@@ -294,7 +297,7 @@ The escalation isolation rung (§3.4 — gVisor / full VM, or the validating egr
 - **Credential = `CLAUDE_CODE_OAUTH_TOKEN` stored as a per-channel secret in channel's credential store**, default one operator token, per-channel override.
 - **VPS full-tier deploy is prioritized** as a v1 deliverable (the cloud-init script is the primary artifact).
 - **Sandbox-runtime (Seatbelt/bubblewrap) over Docker** for v1; Docker/gVisor/VM is the multi-tenant escalation, not v1.
-- **The sandbox-runtime is reached by library-link or a pinned absolute-path binary — NEVER `PATH` resolution.** A poisoned `PATH` entry would execute *before* the sandbox is established (the launcher resolving `sandbox-runtime` off `PATH` runs the attacker's binary outside any sandbox), re-opening the exact hole the sandbox closes. So the trust boundary is anchored to a known artifact: link the library, or invoke an absolute, operator-controlled path. (This was open-question Q4; now decided.)
+- **The sandbox-runtime is reached by library-link or a pinned absolute-path binary — NEVER `PATH` resolution.** A poisoned `PATH` entry would execute *before* the sandbox is established (the launcher resolving `sandbox-runtime` off `PATH` runs the attacker's binary outside any sandbox), re-opening the exact hole the sandbox closes. So the trust boundary is anchored to a known artifact: link the library, or invoke an absolute, operator-controlled path. (This was the former PATH-resolution open question; now decided.)
 - **Filesystem reads are scoped to declared binds, and egress is per-arm — both additive to a minimal base** (§4.4, §4.5). Reads tighten Anthropic's broad-read default deliberately, given our steeper trust gradient.
 - **Channel is the home** for this work (session lifecycle + the new isolation); the terminal is a channel-UI concern over the WS bridge.
 - **In-page terminal is the Phase-1 release valve** — stays in v1, but is the deferrable piece if Phase 1 slips (§9 R1).
@@ -310,7 +313,7 @@ The escalation isolation rung (§3.4 — gVisor / full VM, or the validating egr
 
 ### Open questions
 
-- **Q1 — workspace mount granularity.** Per-session workspace only (clean blast radius), or a shared read-only project mount + per-session writable overlay (more useful for dev agents)? Leaning per-session writable + broad RO reads, per Anthropic's default.
+- **Q1 — workspace mount granularity → RESOLVED by §4.5.** Reads are scoped to declared mounts, *not* broad RO: a dev arm declares its project (`rw`) and any reference tree (`ro`) explicitly via the spec's `mounts`, on top of the private per-session workspace. No broad-RO overlay.
 - **Q2 — token lifecycle default.** Ephemeral-TTL for everything (revoke-on-death) vs a registered connection for standing agents that must survive a daemon restart. Likely both, selected by the spec (§4.2).
 - **Q3 — does the in-page terminal warrant its own view** in channel's UI, or fold into the existing chat/admin pages? (Decided home is channel's UI; the sub-placement is open.)
 - **Q4 — multi-browser attach semantics.** Two browsers attaching to the same tmux pane share one input stream — their keystrokes interleave (standard tmux behavior). Fine for owner-operated (one person, two tabs), but it must be a deliberate Phase-1 expectation: do we present the terminal as **single-writer** (additional viewers are read-only) or **shared-view** (everyone can type, interleaving accepted)? Default to shared-view for v1 (matches `tmux attach`), but say so explicitly so it isn't a surprise.

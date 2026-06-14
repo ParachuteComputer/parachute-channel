@@ -22,9 +22,10 @@
  * subscription path).
  */
 
-import { writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSpec, BaseBinds } from "./sandbox/types.ts";
+import { normalizeChannel } from "./sandbox/types.ts";
 import { Sandbox, type SandboxEngine, type WrappedCommand } from "./sandbox/index.ts";
 import type { EgressBaseInput } from "./sandbox/egress.ts";
 import {
@@ -40,6 +41,39 @@ import {
   type MintTokenDeps,
   type MintResult,
 } from "./mint-token.ts";
+
+/**
+ * Slug guard for `spec.name`. The name is used UNESCAPED as a tmux session
+ * target (`-t`) and a path segment under `sessionsDir`, so it must be a strict
+ * slug — mirrors `scripts/launch-session.sh`'s existing check. Anything with
+ * `..`, `/`, or spaces would traverse the sessions dir or break tmux targeting.
+ * Phase 2 makes spawns API/MCP-triggered (the name becomes less-trusted input),
+ * so the guard is enforced now, before any fs/tmux side effect.
+ */
+const AGENT_NAME_SLUG = /^[a-z0-9_-]+$/i;
+
+/**
+ * Process-wide serialization for the sandbox-runtime singleton. `SandboxManager`
+ * is global (initialize → wrap → reset share one set of host proxies), so two
+ * concurrent `spawnAgent` calls would race the initialize→wrap window (a second
+ * `initialize` could clobber the first's config before its command is wrapped).
+ * Only that brief window needs the lock — the sandbox policy is baked into the
+ * argv at `wrapWithSandboxArgv`, after which the spawned process runs
+ * independently. This is a minimal FIFO async mutex: each acquirer chains onto
+ * the previous one's release.
+ */
+let spawnLock: Promise<void> = Promise.resolve();
+async function withSpawnLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prior = spawnLock;
+  let release!: () => void;
+  spawnLock = new Promise<void>((r) => (release = r));
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 /** A tmux launcher seam — real impl spawns tmux; tests inject a recorder. */
 export interface TmuxLauncher {
@@ -194,13 +228,26 @@ export function buildAgentClaudeArgs(opts: {
  * Spawn a sandboxed agent session from a spec. Idempotent: an existing tmux
  * session is a no-op (returns `alreadyRunning: true`).
  *
- * Order: mint per-resource tokens → write MCP config → build claude argv →
- * sandbox-wrap → tmux launch with scrubbed env.
+ * Order: validate name → mint per-resource tokens → write MCP config → build
+ * claude argv → sandbox-wrap → tmux launch with scrubbed env.
+ *
+ * **Concurrency-safe.** The sandbox-runtime singleton's initialize→wrap window is
+ * serialized process-wide (see `withSpawnLock`), so concurrent `spawnAgent` calls
+ * don't clobber each other's sandbox config. Each produces an independent MCP
+ * config + wrapped argv; the spawned processes then run independently.
  */
 export async function spawnAgent(
   spec: AgentSpec,
   deps: SpawnAgentDeps,
 ): Promise<SpawnAgentResult> {
+  // SECURITY: the name lands UNESCAPED in a tmux `-t` target and a path segment;
+  // reject anything that isn't a strict slug BEFORE any fs/tmux side effect.
+  if (!AGENT_NAME_SLUG.test(spec.name)) {
+    throw new Error(
+      `spawnAgent: spec name "${spec.name}" must be a slug (alphanumeric, dash, underscore only)`,
+    );
+  }
+
   const session = sessionName(spec.name);
   const workspace = sessionWorkspace(deps.sessionsDir, spec.name);
 
@@ -230,9 +277,12 @@ export async function spawnAgent(
   //    session with a credential the manager couldn't actually grant (§4.3).
   const tokens: Record<string, MintResult> = {};
   const channelEntries: ChannelMcpEntry[] = [];
-  for (const channel of spec.channels) {
+  for (const rawChannel of spec.channels) {
+    const { name: channel, access } = normalizeChannel(rawChannel);
+    // A read-only channel mints `channel:read` only — the arm is woken + reads
+    // but cannot reply; a write channel mints `channel:read channel:write`.
     const minted = await mintScopedToken(
-      { scope: channelScope({ write: true }), audience: "channel" },
+      { scope: channelScope({ write: access === "write" }), audience: "channel" },
       mintDeps,
     );
     tokens[channel] = minted;
@@ -280,11 +330,13 @@ export async function spawnAgent(
   });
   mkdirSync(workspace, { recursive: true });
   const mcpConfigPath = join(workspace, ".mcp.json");
+  // `mode: 0o600` on the write is sufficient here — the file is always newly
+  // created per-launch under the per-session workspace, so there's no pre-existing
+  // looser-perms file to tighten (unlike registry.ts's read-modify-write).
   writeFileSync(mcpConfigPath, mcpConfigJson, { mode: 0o600 });
-  chmodSync(mcpConfigPath, 0o600);
 
   // 3. Build the claude argv, sandbox-wrap it, launch in tmux with scrubbed env.
-  const firstChannel = spec.channels[0]!;
+  const firstChannel = normalizeChannel(spec.channels[0]!).name;
   const claudeArgs = buildAgentClaudeArgs({
     mcpConfigPath,
     firstChannelEntryKey: `channel-${firstChannel}`,
@@ -300,14 +352,19 @@ export async function spawnAgent(
     ...(deps.vaultUrl ? { vaultOrigin: deps.vaultUrl } : {}),
   };
 
+  // Serialize the sandbox-runtime singleton's initialize→wrap window across
+  // concurrent spawns (the policy is baked into the argv at wrap, so only this
+  // window races). Outside the lock the spawned process runs independently.
   const sandbox = new Sandbox(deps.sandboxEngine);
-  const wrapped = await sandbox.wrap({
-    spec,
-    baseBinds,
-    egressBase,
-    command: shellJoin(claudeArgs),
-    ...(deps.ripgrep ? { ripgrep: deps.ripgrep } : {}),
-  });
+  const wrapped = await withSpawnLock(() =>
+    sandbox.wrap({
+      spec,
+      baseBinds,
+      egressBase,
+      command: shellJoin(claudeArgs),
+      ...(deps.ripgrep ? { ripgrep: deps.ripgrep } : {}),
+    }),
+  );
 
   // Layer the scrubbed agent env UNDER the sandbox wrapper's env (proxy vars,
   // sandbox markers from the engine win on conflict; CLAUDE_CODE_OAUTH_TOKEN +
@@ -360,6 +417,10 @@ function shellQuote(arg: string): string {
 export function realTmuxLauncher(spawnFn: typeof Bun.spawn = Bun.spawn): TmuxLauncher {
   return {
     async hasSession(name: string): Promise<boolean> {
+      // Read-only existence probe — it inherits the parent's full env, which is
+      // fine and intentional: it only checks whether a session exists and starts
+      // no child process. The scrubbed-env discipline applies to `newSession`
+      // (which actually launches the agent), not to this side-effect-free query.
       const proc = spawnFn(["tmux", "has-session", "-t", name], {
         stdout: "ignore",
         stderr: "ignore",

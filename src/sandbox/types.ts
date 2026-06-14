@@ -77,11 +77,35 @@ export interface OtherMcpSpec {
  * (design §4.1). `egress` and `mounts` are additive to a non-removable base; the
  * spec only ever *adds*.
  */
+/**
+ * A channel binding for an arm. A bare string is shorthand for `{ name, access:
+ * "write" }` (back-compat — the common read+write resident session); the object
+ * form scopes a channel read-only so an arm that only *watches* a channel mints
+ * `channel:read` and never `channel:write` (the "scope an arm to channel X
+ * read-only" use case).
+ */
+export interface AgentChannelSpec {
+  /** Channel name (the `/mcp/<channel>` segment). */
+  name: string;
+  /**
+   * Channel access. `"write"` (default) mints `channel:read channel:write`;
+   * `"read"` mints `channel:read` only — the arm can be woken + read the channel
+   * but cannot reply.
+   */
+  access?: "read" | "write";
+}
+
+/** A channel entry: a bare name (= write access) or the scoped object form. */
+export type AgentChannel = string | AgentChannelSpec;
+
 export interface AgentSpec {
   /** Human-readable arm name; used as the tmux session + workspace slug. */
   name: string;
-  /** Channels to attach (one MCP entry each). */
-  channels: string[];
+  /**
+   * Channels to attach (one MCP entry each). Each entry is a bare name (read+write,
+   * back-compat) or `{ name, access: "read" }` to scope a channel read-only.
+   */
+  channels: AgentChannel[];
   /** Optional vault binding. */
   vault?: AgentVaultSpec;
   /** Additional MCP servers, by URL. */
@@ -125,3 +149,13 @@ export interface BaseBinds {
 
 /** Platform the Sandbox config is being built for. */
 export type SandboxPlatform = "darwin" | "linux";
+
+/**
+ * Normalize a channel entry (bare name or object) to `{ name, access }`. A bare
+ * string defaults to `write` (back-compat); the object form defaults to `write`
+ * when `access` is omitted.
+ */
+export function normalizeChannel(ch: AgentChannel): { name: string; access: "read" | "write" } {
+  if (typeof ch === "string") return { name: ch, access: "write" };
+  return { name: ch.name, access: ch.access ?? "write" };
+}

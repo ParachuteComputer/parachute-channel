@@ -15,13 +15,30 @@
  * through `initialize` → wrap → reset; the adapter makes that explicit.
  */
 
+// `@anthropic-ai/sandbox-runtime` is pinned EXACT (not `^`) in package.json — it's
+// an anthropic-experimental research preview whose config/API may evolve between
+// patch releases, and it is the load-bearing isolation engine. Treat a version
+// bump as an upgrade-gate: only raise the pin behind a green run of the sandbox
+// test suite (esp. the LIVE Seatbelt assertions in `live-seatbelt.test.ts`, which
+// prove the real boundary still holds against the new version).
 import { SandboxManager as RealSandboxManager } from "@anthropic-ai/sandbox-runtime";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { AgentSpec, BaseBinds, SandboxPlatform } from "./types.ts";
 import { buildSandboxConfig, currentSandboxPlatform } from "./config.ts";
 import type { EgressBaseInput } from "./egress.ts";
 
-export type { AgentSpec, AgentMount, AgentVaultSpec, OtherMcpSpec, BaseBinds, MountMode, SandboxPlatform } from "./types.ts";
+export type {
+  AgentSpec,
+  AgentMount,
+  AgentVaultSpec,
+  AgentChannel,
+  AgentChannelSpec,
+  OtherMcpSpec,
+  BaseBinds,
+  MountMode,
+  SandboxPlatform,
+} from "./types.ts";
+export { normalizeChannel } from "./types.ts";
 export {
   composeEgressAllowlist,
   baseEgressAllowlist,

@@ -20,7 +20,7 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { buildSandboxConfig } from "./config.ts";
 import type { AgentSpec, BaseBinds } from "./types.ts";
@@ -137,6 +137,47 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
       const r = await runSandboxed(cfg, `cat ${secretFile}`);
       expect(r.code).not.toBe(0);
       expect(r.stdout).not.toContain("TOPSECRET");
+    } finally {
+      rmSync(secretDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("PRODUCTION PATH: the spec-derived /Users deny blocks a read of a real home-dir file (no manual patch)", async () => {
+    // The §4.5 scoped-read property is "an arm cannot read the operator's home."
+    // Prove it through the PRODUCTION config — secret under the REAL home dir,
+    // workspace also under home (so the re-allow path is exercised against the
+    // real `/Users` deny), and NO manual `denyRead` patch. This is the test that
+    // proves the deployed `denyRead:["/Users"]` actually confines reads.
+    const home = homedir();
+    workspace = mkdtempSync(join(home, ".sbx-live-ws-"));
+    const secretDir = mkdtempSync(join(home, ".sbx-live-secret-"));
+    const secretFile = join(secretDir, "home-secret.txt");
+    writeFileSync(secretFile, "HOME-TOPSECRET-do-not-read");
+    try {
+      const spec: AgentSpec = { name: "homeread", channels: ["c"], egress: [] };
+      // buildSandboxConfig with platform "darwin" → denyRead:["/Users"],
+      // allowRead:[workspace]. We pass the config THROUGH unmodified.
+      const cfg = buildSandboxConfig({
+        spec,
+        baseBinds: { workspace, runtimeReadOnly: [] },
+        egressBase: { hubOrigin: "http://127.0.0.1:1939" },
+        platform: "darwin",
+      });
+      expect(cfg.filesystem.denyRead).toEqual(["/Users"]);
+      expect(cfg.filesystem.allowRead).toContain(workspace);
+      // The secret sits under /Users/<me>/… and is NOT in any bind → blocked.
+      const r = await runSandboxed(cfg, `cat ${secretFile}`);
+      expect(r.code).not.toBe(0);
+      expect(r.stdout).not.toContain("HOME-TOPSECRET");
+
+      // Positive control on the SAME production config: a file inside the
+      // workspace (also under /Users, but re-allowed by allowRead) IS readable —
+      // proving the deny didn't just break all reads.
+      const insideFile = join(workspace, "inside.txt");
+      writeFileSync(insideFile, "HOME-WORKSPACE-readable");
+      const ok = await runSandboxed(cfg, `cat ${insideFile}`);
+      expect(ok.code).toBe(0);
+      expect(ok.stdout).toContain("HOME-WORKSPACE-readable");
     } finally {
       rmSync(secretDir, { recursive: true, force: true });
     }

@@ -281,4 +281,121 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     // The attenuation failure happened BEFORE any tmux launch.
     expect(tmux.launched).toHaveLength(0);
   });
+
+  test("SECURITY: an adversarial spec.name is rejected BEFORE any fs/tmux/mint side effect", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-name-"));
+    for (const bad of ["..", "a/b", "a b", "../escape", ".", "a..b", "x;rm", ""]) {
+      const tmux = recordingTmux();
+      let minted = false;
+      const fetchFn = (async () => {
+        minted = true;
+        return new Response("{}", { status: 200 });
+      }) as unknown as typeof fetch;
+      await expect(
+        spawnAgent({ name: bad, channels: ["c"] }, baseDeps({ tmux, fetchFn })),
+      ).rejects.toThrow(/slug/);
+      // No side effects: no tmux launch, no mint attempt.
+      expect(tmux.launched).toHaveLength(0);
+      expect(minted).toBe(false);
+    }
+  });
+
+  test("a valid slug name is accepted (dashes + underscores ok)", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-okname-"));
+    const res = await spawnAgent({ name: "aaron_dev-2", channels: ["c"] }, baseDeps());
+    expect(res.alreadyRunning).toBe(false);
+    expect(res.session).toBe("aaron_dev-2-agent");
+  });
+
+  test("read-only channel mints channel:read ONLY (not read+write)", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-roch-"));
+    const scopes: string[] = [];
+    const fetchFn = (async (_u: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { scope: string };
+      scopes.push(body.scope);
+      return new Response(
+        JSON.stringify({ jti: "j", token: `T-${scopes.length}`, expires_at: "", scope: body.scope }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const spec: AgentSpec = {
+      name: "watcher",
+      channels: [
+        { name: "readonly-ch", access: "read" },
+        { name: "rw-ch", access: "write" },
+        "bare-ch", // bare string = write (back-compat)
+      ],
+    };
+    await spawnAgent(spec, baseDeps({ fetchFn }));
+    expect(scopes).toContain("channel:read"); // the read-only channel
+    expect(scopes.filter((s) => s === "channel:read")).toHaveLength(1);
+    expect(scopes.filter((s) => s === "channel:read channel:write")).toHaveLength(2); // rw + bare
+  });
+
+  test("CONCURRENCY: two concurrent spawnAgent calls produce correct, independent MCP configs + wrapping", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-conc-"));
+    // Independent engines/tmux per call so we can assert no cross-clobber. Each
+    // mint hub returns a token namespaced to the spec so configs are tellable apart.
+    function depsForArm(arm: string) {
+      let n = 0;
+      const fetchFn = (async (_u: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { scope: string };
+        n += 1;
+        return new Response(
+          JSON.stringify({ jti: `${arm}-${n}`, token: `${arm}-TOK-${n}`, expires_at: "", scope: body.scope }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as unknown as typeof fetch;
+      return baseDeps({ tmux: recordingTmux(), sandboxEngine: fakeEngine(), fetchFn });
+    }
+
+    const [a, b] = await Promise.all([
+      spawnAgent({ name: "arm-a", channels: ["ca"] }, depsForArm("A")),
+      spawnAgent({ name: "arm-b", channels: ["cb"] }, depsForArm("B")),
+    ]);
+
+    // Each got its OWN channel entry + token — no clobber across the race.
+    const pa = JSON.parse(a.mcpConfigJson) as { mcpServers: Record<string, { url: string; headers?: { Authorization: string } }> };
+    const pb = JSON.parse(b.mcpConfigJson) as { mcpServers: Record<string, { url: string; headers?: { Authorization: string } }> };
+    expect(pa.mcpServers[channelEntryKey("ca")]!.url).toBe("http://127.0.0.1:1941/mcp/ca");
+    expect(pb.mcpServers[channelEntryKey("cb")]!.url).toBe("http://127.0.0.1:1941/mcp/cb");
+    expect(pa.mcpServers[channelEntryKey("ca")]!.headers!.Authorization).toBe("Bearer A-TOK-1");
+    expect(pb.mcpServers[channelEntryKey("cb")]!.headers!.Authorization).toBe("Bearer B-TOK-1");
+    // Independent sandbox configs (each carries its own workspace allowWrite).
+    expect(a.wrapped.config.filesystem.allowWrite).toContain(a.workspace);
+    expect(b.wrapped.config.filesystem.allowWrite).toContain(b.workspace);
+    expect(a.workspace).not.toBe(b.workspace);
+  });
+
+  test("CONCURRENCY: the init→wrap window is serialized (never two engines in it at once)", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-serial-"));
+    // An engine whose initialize overlaps wrap by an await; if the lock didn't
+    // hold, two would be "in the window" simultaneously and maxActive would be >1.
+    let active = 0;
+    let maxActive = 0;
+    function slowEngine(): SandboxEngine {
+      return {
+        isSupportedPlatform: () => true,
+        isSandboxingEnabled: () => true,
+        async initialize() {
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          await Bun.sleep(15);
+        },
+        async wrapWithSandboxArgv(command: string) {
+          await Bun.sleep(15);
+          active -= 1;
+          return { argv: ["/bin/bash", "-c", command], env: {} };
+        },
+        async reset() {},
+      };
+    }
+    await Promise.all([
+      spawnAgent({ name: "s-a", channels: ["c"] }, baseDeps({ sandboxEngine: slowEngine(), tmux: recordingTmux() })),
+      spawnAgent({ name: "s-b", channels: ["c"] }, baseDeps({ sandboxEngine: slowEngine(), tmux: recordingTmux() })),
+      spawnAgent({ name: "s-c", channels: ["c"] }, baseDeps({ sandboxEngine: slowEngine(), tmux: recordingTmux() })),
+    ]);
+    expect(maxActive).toBe(1);
+  });
 });

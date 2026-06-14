@@ -49,6 +49,7 @@ import { ClientRegistry } from "./routing.ts";
 import { VaultTransport, CHANNEL_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 import { channelsFilePath } from "./registry.ts";
 import type { Channel } from "./registry.ts";
+import { credentialsFilePath, resolveClaudeCredential } from "./credentials.ts";
 import type { TransportContext, InboundMessage } from "./transport.ts";
 
 const sendAuth = { authorization: "Bearer " + SEND_TOKEN } as const;
@@ -554,6 +555,177 @@ describe("C — CHANNEL_VAULT_TRIGGER_TEMPLATE exposed via /.parachute/config", 
       expect(body.triggerTemplate.name).toBe("channel_inbound_<channel>");
       expect(body.triggerTemplate.when.tags).toEqual(["#channel-message/inbound"]);
       expect(body.triggerTemplate.action.webhook).toBe("<hub-origin>/channel/api/vault/inbound");
+    } finally {
+      srv.stop(true);
+    }
+  });
+});
+
+// ===========================================================================
+// D. Claude OAuth credential store API (channel:admin) — design §6
+// ===========================================================================
+describe("D — Claude credential store API (channel:admin)", () => {
+  test("POST /api/credentials/claude sets the default; persisted 0600; resolve returns it", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      const res = await fetch(`${base}/api/credentials/claude`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ token: "oat_DEFAULT-OPERATOR" }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, scope: "default" });
+
+      const file = credentialsFilePath(stateDir);
+      expect(existsSync(file)).toBe(true);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      // The token resolves for any channel (no override → default).
+      expect(resolveClaudeCredential("any-channel", stateDir)).toBe("oat_DEFAULT-OPERATOR");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("POST /api/credentials/claude/:channel sets an override that WINS over the default", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      await fetch(`${base}/api/credentials/claude`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ token: "oat_DEFAULT" }),
+      });
+      const res = await fetch(`${base}/api/credentials/claude/aaron-dev`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ token: "oat_AARON-OVERRIDE" }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, scope: "channel", channel: "aaron-dev" });
+
+      expect(resolveClaudeCredential("aaron-dev", stateDir)).toBe("oat_AARON-OVERRIDE"); // override wins
+      expect(resolveClaudeCredential("other", stateDir)).toBe("oat_DEFAULT"); // other → default
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("GET /api/credentials/claude reports presence + channel names — NEVER the token", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      await fetch(`${base}/api/credentials/claude`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ token: "oat_SECRET-DEFAULT" }),
+      });
+      await fetch(`${base}/api/credentials/claude/aaron-dev`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ token: "oat_SECRET-OVERRIDE" }),
+      });
+
+      const res = await fetch(`${base}/api/credentials/claude`, { headers: { ...adminAuth } });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { defaultSet: boolean; channels: string[] };
+      expect(body.defaultSet).toBe(true);
+      expect(body.channels).toEqual(["aaron-dev"]);
+      // No secret leaks.
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("oat_SECRET-DEFAULT");
+      expect(serialized).not.toContain("oat_SECRET-OVERRIDE");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("DELETE /api/credentials/claude/:channel removes the override (falls back to default)", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      await fetch(`${base}/api/credentials/claude`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ token: "oat_DEFAULT" }),
+      });
+      await fetch(`${base}/api/credentials/claude/aaron-dev`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ token: "oat_OVERRIDE" }),
+      });
+      const del = await fetch(`${base}/api/credentials/claude/aaron-dev`, {
+        method: "DELETE",
+        headers: { ...adminAuth },
+      });
+      expect(del.status).toBe(200);
+      expect(await del.json()).toMatchObject({ ok: true, channel: "aaron-dev", removed: true });
+      expect(resolveClaudeCredential("aaron-dev", stateDir)).toBe("oat_DEFAULT"); // back to default
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("POST with an empty/missing token → 400, nothing persisted", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      const empty = await fetch(`${base}/api/credentials/claude`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ token: "" }),
+      });
+      expect(empty.status).toBe(400);
+      const missing = await fetch(`${base}/api/credentials/claude`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({}),
+      });
+      expect(missing.status).toBe(400);
+      expect(existsSync(credentialsFilePath(stateDir))).toBe(false);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("credential API without channel:admin → 401 (none) / 403 (wrong scope), on every verb", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      // GET default
+      expect((await fetch(`${base}/api/credentials/claude`)).status).toBe(401);
+      expect((await fetch(`${base}/api/credentials/claude`, { headers: { ...readAuth } })).status).toBe(403);
+      // POST default
+      expect(
+        (await fetch(`${base}/api/credentials/claude`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: "x" }),
+        })).status,
+      ).toBe(401);
+      expect(
+        (await fetch(`${base}/api/credentials/claude`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...sendAuth },
+          body: JSON.stringify({ token: "x" }),
+        })).status,
+      ).toBe(403);
+      // POST per-channel
+      expect(
+        (await fetch(`${base}/api/credentials/claude/c`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: "x" }),
+        })).status,
+      ).toBe(401);
+      expect(
+        (await fetch(`${base}/api/credentials/claude/c`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...readAuth },
+          body: JSON.stringify({ token: "x" }),
+        })).status,
+      ).toBe(403);
+      // DELETE per-channel
+      expect((await fetch(`${base}/api/credentials/claude/c`, { method: "DELETE" })).status).toBe(401);
+      expect(
+        (await fetch(`${base}/api/credentials/claude/c`, { method: "DELETE", headers: { ...readAuth } })).status,
+      ).toBe(403);
+      // Nothing was persisted by any unauthorized call.
+      expect(existsSync(credentialsFilePath(stateDir))).toBe(false);
     } finally {
       srv.stop(true);
     }

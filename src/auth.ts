@@ -26,6 +26,21 @@ export const SCOPE_SEND = "channel:send" as const;
 /** Config-management scope: create/list/delete channels (hub-orchestrated setup). */
 export const SCOPE_ADMIN = "channel:admin" as const;
 
+/**
+ * The scope the in-page terminal requires. The terminal attaches to a session's
+ * live tmux pane — the MOST DANGEROUS capability the daemon exposes (full
+ * interactive control of the session's shell), so it is OPERATOR-GATED, not
+ * session-gated. We reuse `channel:admin`: the hub mints it ONLY for the
+ * logged-in operator's cookie session (`<hub>/admin/channel-token` →
+ * `channel:read channel:send channel:admin`), and never for a connecting Claude
+ * Code session (a session holds `channel:read`/`channel:write`, never
+ * `channel:admin`). So a session can never open a terminal onto itself or
+ * another — only the operator can. This is the design's "operator-gated"
+ * requirement expressed in channel's existing scope vocabulary (no new scope to
+ * mint, no hub change). See `design/2026-06-14-sandboxed-agent-sessions.md` §5.3.
+ */
+export const SCOPE_TERMINAL = SCOPE_ADMIN;
+
 /** JSON Response helper (shared spelling for the auth error bodies). */
 export function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {

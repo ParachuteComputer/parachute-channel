@@ -11,11 +11,13 @@
   "scripts": {
     "daemon": "bun src/daemon.ts",
     "bridge": "bun src/bridge.ts",
+    "spawn-agent": "bun scripts/spawn-agent.ts",
     "test": "bun test src/",
     "test:e2e": "bun e2e/llm/run.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.54",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@openparachute/scope-guard": "^0.4.0"
   },

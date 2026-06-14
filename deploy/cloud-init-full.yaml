@@ -1,0 +1,270 @@
+#cloud-config
+# ---------------------------------------------------------------------------
+# Parachute — FULL-tier cloud-init (Phase 1, sandboxed agent sessions)
+# ---------------------------------------------------------------------------
+# Provider-agnostic VPS user-data. Boots a fresh Ubuntu/Debian Linux box into a
+# working full-tier Parachute install: the hub + the channel module + everything
+# the sandboxed-agent-session path needs (bun, the `claude` CLI, the Anthropic
+# sandbox-runtime, tmux, bubblewrap, ripgrep, socat). On first boot it starts the
+# hub and prints the one-time admin bootstrap token + the /admin/setup URL to the
+# serial/console log, then tells the operator to run `parachute expose` for a
+# public URL.
+#
+# WHY full-tier (vs the Render/Fly "lite" tier): the lite tier runs only the
+# vault + hub + static surfaces in a single container — no agent sessions. The
+# FULL tier adds resident Claude Code sessions sandboxed with bubblewrap (the
+# Linux mechanism behind @anthropic-ai/sandbox-runtime; Seatbelt is the macOS
+# mechanism). Sessions need a real machine with bubblewrap, tmux, and the claude
+# CLI — that's what this script provisions. See
+# design/2026-06-14-sandboxed-agent-sessions.md §7 and deploy/README.md.
+#
+# PROVIDER-AGNOSTIC: every major cloud takes cloud-init user-data —
+#   - DigitalOcean: "User data" field on the create-droplet page (default,
+#     no-KYC; pick an 8GB droplet).
+#   - Hetzner Cloud: "Cloud config" field (cheapest; KYC caveat — see README).
+#   - GCP: `--metadata-from-file user-data=cloud-init-full.yaml`.
+#   - AWS EC2 (Ubuntu AMI): "User data" field — cloud-init is the default agent.
+#   - Generic libvirt/Proxmox/any cloud-init datasource: standard NoCloud seed.
+# Nothing below is provider-specific.
+#
+# RUN USER: the hub + sessions run as a non-root user (`parachute`), created
+# below. Only the package-install steps need root (cloud-init runs as root). The
+# hub installs its own systemd *user* unit under that account so it survives
+# reboots without running the agent stack as root.
+# ---------------------------------------------------------------------------
+
+# Keep the box patched on first boot.
+package_update: true
+package_upgrade: true
+
+# --- OS packages (apt) --------------------------------------------------------
+# unzip + curl: bun's install script needs them.
+# tmux: each resident Claude Code session runs in its own tmux session.
+# bubblewrap: the Linux sandbox mechanism for @anthropic-ai/sandbox-runtime.
+# ripgrep: the sandbox-runtime uses `rg` to scan deny-paths on Linux (required).
+# socat: the Linux sandbox bridges egress proxies over Unix sockets via socat.
+# gcc + libseccomp-dev: optional — the sandbox-runtime's seccomp Unix-socket
+#   layer compiles from C source on Linux; without them the box still sandboxes
+#   filesystem + network, only the extra Unix-socket-creation block degrades.
+# git: vault import + general module operations.
+# ca-certificates: TLS to api.anthropic.com / the npm registry / Cloudflare.
+packages:
+  - curl
+  - unzip
+  - git
+  - tmux
+  - bubblewrap
+  - ripgrep
+  - socat
+  - gcc
+  - libseccomp-dev
+  - ca-certificates
+
+# --- non-root run user --------------------------------------------------------
+# `parachute` owns the whole stack. Passwordless sudo is granted so the operator
+# can still administer the box after SSHing in as this user, but the hub +
+# sessions themselves run unprivileged.
+users:
+  - default
+  - name: parachute
+    gecos: Parachute service account
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo]
+    # Inherit the cloud's injected SSH keys so the operator can `ssh parachute@<ip>`.
+    ssh_authorized_keys: []
+
+write_files:
+  # The whole install lives in one script so it's auditable + re-runnable. It is
+  # idempotent: bun/claude/hub installs short-circuit if already present, and
+  # `parachute init` is itself idempotent.
+  - path: /usr/local/sbin/parachute-full-bootstrap.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      # Full-tier Parachute bootstrap — runs ONCE on first boot as the `parachute`
+      # user (invoked by the runcmd below via `sudo -iu parachute`).
+      set -euo pipefail
+
+      log() { echo "[parachute-bootstrap] $*"; }
+
+      # ----------------------------------------------------------------------
+      # 0. Ubuntu 24.04+ unprivileged-userns hardening.
+      #    bubblewrap + the seccomp layer need capability-bearing user
+      #    namespaces. 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1
+      #    which strips caps from new userns. Relax it (persisted) so the sandbox
+      #    can create its namespaces. No-op on older kernels / non-Ubuntu.
+      # ----------------------------------------------------------------------
+      if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+        log "relaxing apparmor_restrict_unprivileged_userns for bubblewrap"
+        echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-parachute-userns.conf >/dev/null
+        sudo sysctl --system >/dev/null 2>&1 || true
+      fi
+
+      # ----------------------------------------------------------------------
+      # 1. Bun — the runtime everything runs on.
+      # ----------------------------------------------------------------------
+      export BUN_INSTALL="$HOME/.bun"
+      export PATH="$BUN_INSTALL/bin:$PATH"
+      if ! command -v bun >/dev/null 2>&1; then
+        log "installing bun"
+        curl -fsSL https://bun.sh/install | bash
+      fi
+      # Persist PATH for future logins (so `parachute …` / `claude …` just work).
+      if ! grep -q 'BUN_INSTALL' "$HOME/.bashrc" 2>/dev/null; then
+        {
+          echo ''
+          echo '# Parachute — bun + globally-installed bins on PATH'
+          echo 'export BUN_INSTALL="$HOME/.bun"'
+          echo 'export PATH="$BUN_INSTALL/bin:$PATH"'
+        } >> "$HOME/.bashrc"
+      fi
+      log "bun: $(bun --version)"
+
+      # ----------------------------------------------------------------------
+      # 2. The Parachute hub (provides the `parachute` binary).
+      # ----------------------------------------------------------------------
+      if ! command -v parachute >/dev/null 2>&1; then
+        log "installing @openparachute/hub"
+        bun add -g @openparachute/hub
+      fi
+      log "parachute: $(parachute --version 2>/dev/null || echo '(installed)')"
+
+      # ----------------------------------------------------------------------
+      # 3. The channel module (the agent-session gateway) — installed globally so
+      #    the `parachute-channel` binary is on PATH for the hub supervisor to
+      #    resolve via Bun.which. (module.json startCmd = ["parachute-channel"].)
+      # ----------------------------------------------------------------------
+      if ! command -v parachute-channel >/dev/null 2>&1; then
+        log "installing @openparachute/channel"
+        bun add -g @openparachute/channel
+      fi
+
+      # ----------------------------------------------------------------------
+      # 4. The Anthropic sandbox-runtime (the isolation engine) + the `claude`
+      #    CLI (what each resident session runs). Both global so they're on PATH.
+      #    sandbox-runtime is pinned EXACT in the channel module's package.json;
+      #    here we install the same family globally so `srt` is present for any
+      #    out-of-process sandbox smoke. The channel module library-links its own
+      #    pinned copy at runtime (it never PATH-resolves the engine).
+      # ----------------------------------------------------------------------
+      if ! command -v claude >/dev/null 2>&1; then
+        log "installing @anthropic-ai/claude-code (the claude CLI)"
+        bun add -g @anthropic-ai/claude-code
+      fi
+      if ! command -v srt >/dev/null 2>&1; then
+        log "installing @anthropic-ai/sandbox-runtime (srt)"
+        bun add -g @anthropic-ai/sandbox-runtime
+      fi
+
+      # ----------------------------------------------------------------------
+      # 5. Sanity: confirm the sandbox prerequisites are actually present. These
+      #    are the load-bearing Linux deps; fail loudly now rather than at first
+      #    session launch.
+      # ----------------------------------------------------------------------
+      for bin in bwrap rg socat tmux git; do
+        if ! command -v "$bin" >/dev/null 2>&1; then
+          log "FATAL: required sandbox dependency '$bin' missing after install"
+          exit 1
+        fi
+      done
+      log "sandbox prerequisites present: bwrap rg socat tmux git"
+
+      # ----------------------------------------------------------------------
+      # 6. Bring the hub up. `parachute init` installs + starts the hub as a
+      #    systemd unit (survives reboots), always installs the vault module, and
+      #    would normally drop into the wizard. On a headless box we DON'T want
+      #    the interactive wizard or an auto-expose prompt — we want it to start,
+      #    print the bootstrap token, and hand control back. So:
+      #      --no-expose-prompt : don't try to interactively configure expose.
+      #      --expose none      : start loopback-only; operator runs `expose` later.
+      #      --cli-wizard       : never try to open a browser (there is none).
+      #    The one-time admin bootstrap token is printed to the hub log on first
+      #    boot ("parachute-bootstrap-<...>"); we surface it to the console below.
+      # ----------------------------------------------------------------------
+      log "running parachute init (headless, loopback-only)"
+      parachute init --expose none --no-expose-prompt --cli-wizard </dev/null || {
+        log "parachute init returned non-zero; the hub may still be up — checking status"
+      }
+
+      # Give the unit a moment, then confirm.
+      for _ in $(seq 1 30); do
+        if parachute status >/dev/null 2>&1; then break; fi
+        sleep 1
+      done
+      parachute status || true
+
+      # ----------------------------------------------------------------------
+      # 7. Surface the bootstrap token + setup URL to the SERIAL/CONSOLE log so
+      #    the operator can read it from the provider's console without SSH.
+      #    The token is generated on first boot and logged as
+      #    "parachute-bootstrap-<token>"; we grep it out of the hub log.
+      # ----------------------------------------------------------------------
+      # On Linux the hub runs under a systemd unit whose stdout goes to JOURNALD
+      # (the rendered unit sets no StandardOutput= file redirect — only the macOS
+      # launchd plist redirects to a file). So journald is the PRIMARY source for
+      # the token on a VPS; the on-disk hub log is a secondary fallback (it exists
+      # for the launchd/manual-foreground paths). PARACHUTE_HOME defaults to
+      # ~/.parachute, and the hub writes its file log under <home>/hub/logs/.
+      HUB_LOG="${PARACHUTE_HOME:-$HOME/.parachute}/hub/logs/hub.log"
+      TOKEN=""
+      for _ in $(seq 1 30); do
+        # Primary: systemd-user journal for the hub unit's stdout.
+        TOKEN="$(journalctl --user -n 1000 --no-pager 2>/dev/null | grep -ho 'parachute-bootstrap-[A-Za-z0-9_-]\+' | tail -n1 || true)"
+        # Fallback A: the on-disk hub log (launchd / foreground-serve path).
+        if [ -z "$TOKEN" ] && [ -f "$HUB_LOG" ]; then
+          TOKEN="$(grep -ho 'parachute-bootstrap-[A-Za-z0-9_-]\+' "$HUB_LOG" 2>/dev/null | tail -n1 || true)"
+        fi
+        # Fallback B: the bootstrap script's own tee'd log (captures init stdout).
+        if [ -z "$TOKEN" ] && [ -f /var/log/parachute-bootstrap.log ]; then
+          TOKEN="$(grep -ho 'parachute-bootstrap-[A-Za-z0-9_-]\+' /var/log/parachute-bootstrap.log 2>/dev/null | tail -n1 || true)"
+        fi
+        [ -n "$TOKEN" ] && break
+        sleep 2
+      done
+
+      echo "" | tee /dev/console
+      echo "==================================================================" | tee /dev/console
+      echo " PARACHUTE FULL-TIER BOOTSTRAP COMPLETE" | tee /dev/console
+      echo "==================================================================" | tee /dev/console
+      if [ -n "$TOKEN" ]; then
+        echo " One-time admin setup token:" | tee /dev/console
+        echo "     $TOKEN" | tee /dev/console
+      else
+        echo " Bootstrap token not found in the log yet. Retrieve it with:" | tee /dev/console
+        echo "     sudo -iu parachute journalctl --user | grep parachute-bootstrap-" | tee /dev/console
+        echo "     # (or: sudo -iu parachute grep parachute-bootstrap- ~/.parachute/hub/logs/hub.log)" | tee /dev/console
+      fi
+      echo "" | tee /dev/console
+      echo " The hub is running LOOPBACK-ONLY on this box (port 1939)." | tee /dev/console
+      echo " To finish setup you need a URL you can reach. Two options:" | tee /dev/console
+      echo "" | tee /dev/console
+      echo "  A) Get a public URL (recommended). SSH in as the parachute user:" | tee /dev/console
+      echo "        ssh parachute@<this-box-ip>" | tee /dev/console
+      echo "        parachute expose cloudflare --domain <your-host>   # public HTTPS via a Cloudflare Tunnel (needs a Cloudflare-managed domain)" | tee /dev/console
+      echo "        #   or, if you run Tailscale on the box + your devices:" | tee /dev/console
+      echo "        #     parachute expose tailnet     # private HTTPS, only your tailnet devices" | tee /dev/console
+      echo "     then open the printed URL's /admin/setup and paste the token above." | tee /dev/console
+      echo "" | tee /dev/console
+      echo "  B) Or tunnel the loopback port over SSH from your laptop:" | tee /dev/console
+      echo "        ssh -L 1939:127.0.0.1:1939 parachute@<this-box-ip>" | tee /dev/console
+      echo "     then open http://127.0.0.1:1939/admin/setup and paste the token." | tee /dev/console
+      echo "" | tee /dev/console
+      echo " After setup: install the Channel module + create agent sessions" | tee /dev/console
+      echo " from the admin UI (or `parachute install channel`)." | tee /dev/console
+      echo "==================================================================" | tee /dev/console
+
+      log "bootstrap script finished"
+
+runcmd:
+  # Run the bootstrap as the non-root `parachute` user (login shell so PATH +
+  # HOME resolve to that account). Tee a copy to a stable log for `cloud-init`
+  # post-mortems. `-i` gives a login env; the script re-derives BUN PATH itself.
+  - [ bash, -lc, "sudo -iu parachute /usr/local/sbin/parachute-full-bootstrap.sh 2>&1 | tee /var/log/parachute-bootstrap.log" ]
+
+# A clear console banner once cloud-init is fully done.
+final_message: |
+  Parachute full-tier bootstrap finished after $UPTIME seconds.
+  Read the admin setup token above (or: sudo -iu parachute grep parachute-bootstrap- ~/.parachute/logs/hub.log),
+  then SSH in and run `parachute expose public` for a URL, and visit /admin/setup.

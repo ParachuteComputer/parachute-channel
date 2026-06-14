@@ -82,8 +82,10 @@ export interface RedactedSpawnResult {
   tokens: RedactedToken[];
   /** The MCP server entry keys wired into the session (names only). */
   mcpServers: string[];
-  /** Egress allowlist baked into the sandbox (host:port domains). */
+  /** Egress allowlist baked into the sandbox (empty when unrestricted). */
   egress: string[];
+  /** True when the session runs with NO network restriction (allow-all). */
+  egressUnrestricted: boolean;
 }
 
 /** The spawn/list/kill operations the daemon routes call. Injectable for tests. */
@@ -219,6 +221,13 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
     spec.vault = parseVaultEntry(b.vault);
   }
 
+  if (b.egressUnrestricted !== undefined && b.egressUnrestricted !== null) {
+    if (typeof b.egressUnrestricted !== "boolean") {
+      throw new SpawnRequestError("body.egressUnrestricted must be a boolean");
+    }
+    if (b.egressUnrestricted) spec.egressUnrestricted = true;
+  }
+
   if (b.egress !== undefined && b.egress !== null) {
     if (!Array.isArray(b.egress)) {
       throw new SpawnRequestError("body.egress must be an array of host strings");
@@ -229,7 +238,8 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
         return h.trim();
       })
       .filter((h) => h.length > 0);
-    if (egress.length > 0) spec.egress = egress;
+    // egressUnrestricted is strictly broader; ignore per-host egress when set.
+    if (egress.length > 0 && !spec.egressUnrestricted) spec.egress = egress;
   }
 
   if (b.mounts !== undefined && b.mounts !== null) {
@@ -344,13 +354,16 @@ export function redactSpawnResult(result: SpawnAgentResult): RedactedSpawnResult
   } catch {
     mcpServers = [];
   }
+  // allowedDomains is absent when the session runs unrestricted (allow-all).
+  const allowed = result.wrapped.config.network.allowedDomains as string[] | undefined;
   return {
     session: result.session,
     workspace: result.workspace,
     alreadyRunning: result.alreadyRunning,
     tokens,
     mcpServers,
-    egress: result.wrapped.config.network.allowedDomains,
+    egress: allowed ?? [],
+    egressUnrestricted: allowed === undefined,
   };
 }
 

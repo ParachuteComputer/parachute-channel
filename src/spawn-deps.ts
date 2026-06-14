@@ -15,9 +15,9 @@
  * same least-privilege launch as one from the terminal.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve, join } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import {
   realTmuxLauncher,
   type SpawnAgentDeps,
@@ -70,9 +70,62 @@ function resolveChannelUrl(): string {
   return `http://127.0.0.1:${port}`;
 }
 
-/** Claude config dir bound read-only so the sandboxed session can read its config. */
-function claudeConfigDir(): string {
-  return process.env.CLAUDE_CONFIG_DIR ?? resolve(homedir(), ".claude");
+/**
+ * Claude runtime/config paths bound read-only so the sandboxed `claude` runs:
+ *   - the config DIR (`~/.claude` or $CLAUDE_CONFIG_DIR) — skills, plugins, settings;
+ *   - the config FILE `~/.claude.json` (at the home ROOT, a sibling of the dir).
+ *
+ * Binding `~/.claude.json` is load-bearing: without it claude can't see that it's
+ * already onboarded, so it runs FIRST-RUN SETUP, whose connectivity check is FATAL
+ * under the restricted egress proxy → the tmux session dies instantly with
+ * "An unknown error occurred (Unexpected)". With it bound, claude skips onboarding
+ * and starts cleanly under both restricted and open network. Bound READ-ONLY: a
+ * session can read the operator's claude config (it runs on the operator's claude
+ * credential anyway) but never mutate it for future sessions.
+ */
+function claudeConfigReads(): string[] {
+  const dir = process.env.CLAUDE_CONFIG_DIR ?? resolve(homedir(), ".claude");
+  const reads = [dir, resolve(homedir(), ".claude.json")];
+  // If CLAUDE_CONFIG_DIR is set, newer claude keeps its config json under it too.
+  if (process.env.CLAUDE_CONFIG_DIR) reads.push(join(process.env.CLAUDE_CONFIG_DIR, ".claude.json"));
+  return reads;
+}
+
+/**
+ * Resolve the `claude` binary to an ABSOLUTE path and the read binds the sandbox
+ * needs to actually exec it.
+ *
+ * Why this matters: the scoped-read policy DENIES the whole home tree (`/Users`)
+ * and re-allows only declared binds (mounts.ts §4.5). The claude CLI commonly
+ * installs UNDER the home tree (`~/.local/bin/claude` → `~/.local/share/claude/
+ * versions/<v>`), so without binding it the sandboxed launch fails with
+ * `claude: command not found` and the tmux session dies instantly. Relying on
+ * PATH alone is also fragile — the supervised daemon's PATH may differ from a
+ * login shell. So we resolve the absolute path (via the daemon's PATH) and bind
+ * the symlink + its realpath + the install dir read-only.
+ *
+ * Returns `null` when `claude` isn't found on the daemon's PATH — the caller
+ * falls back to the bare `"claude"` (PATH lookup at run) and binds nothing, which
+ * is correct when claude lives OUTSIDE the home tree (e.g. `/opt/homebrew/bin`,
+ * already readable) and the only honest option when it can't be located at all.
+ */
+function resolveClaudeBin(): { bin: string; reads: string[] } | null {
+  const sym = Bun.which("claude");
+  if (!sym) return null;
+  const reads = new Set<string>([sym]);
+  try {
+    const real = realpathSync(sym);
+    reads.add(real);
+    // The install dir + its parent — a versioned install keeps sibling files at
+    // `…/versions/<v>` under `…/share/claude`; binding both covers what the
+    // binary loads at runtime. Outside the home tree these are no-ops (already
+    // readable), so this is safe regardless of install layout.
+    reads.add(dirname(real));
+    reads.add(dirname(dirname(real)));
+  } catch {
+    // realpath failed (broken symlink?) — bind just the symlink we found.
+  }
+  return { bin: sym, reads: [...reads] };
 }
 
 /** Absolute path to the operator token file (for error messages). */
@@ -100,20 +153,31 @@ export function resolveSpawnDeps(): SpawnAgentDeps {
   const sessionsDir = join(stateDir, "sessions");
   const vaultUrl = process.env.PARACHUTE_VAULT_URL?.replace(/\/$/, "") || DEFAULT_VAULT_URL;
 
+  // Resolve the claude binary + the read binds it needs inside the sandbox (the
+  // home tree is denied, and claude commonly lives under it). null → fall back to
+  // bare "claude" on PATH (correct when claude is outside the home tree).
+  const claude = resolveClaudeBin();
+
+  // The runtime/config paths the sandboxed `claude` must read: its config dir +
+  // config file (skip-onboarding, see claudeConfigReads) + (when resolved) the
+  // binary itself and its install dir. System paths (/usr,/lib,/opt) stay
+  // readable; the per-session workspace (rw) is added by spawnAgent under sessionsDir.
+  const runtimeReadOnly = [...claudeConfigReads(), ...(claude?.reads ?? [])];
+
   return {
     hubOrigin: getHubOrigin(),
     managerBearer,
     channelUrl: resolveChannelUrl(),
     vaultUrl,
     sessionsDir,
-    // The claude config dir is the one runtime path the sandboxed `claude` must
-    // read (system paths /usr,/lib stay readable; the home tree is denied). The
-    // per-session workspace (rw) is added by spawnAgent under sessionsDir.
-    runtimeReadOnly: [claudeConfigDir()],
+    runtimeReadOnly,
     // The real per-channel Claude OAuth resolver (channel override ?? default ?? throw).
     resolveClaudeToken: (channel: string) => resolveClaudeCredential(channel, stateDir),
     // The real tmux launcher (writes the per-session launch script, runs tmux).
     tmux: realTmuxLauncher(),
+    // Absolute claude path so the sandbox doesn't depend on PATH resolution at run
+    // (and matches the bound binary). Omitted → spawnAgent defaults to "claude".
+    ...(claude ? { claudeBin: claude.bin } : {}),
     // sandboxEngine omitted → spawnAgent's `new Sandbox()` uses the real, pinned,
     // library-linked engine.
   };

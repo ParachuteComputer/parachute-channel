@@ -63,6 +63,7 @@ Flags:
   --vault <name>:<read|write>[:tag1,tag2]
                                   optional vault MCP scope (+ optional tag-scope).
   --egress <host,host,...>        optional additive egress allowlist (beyond the base).
+  --egress-all                    open the network entirely (allow ALL egress; trusted sessions only).
   --mount <hostPath:mountPath:ro|rw[:shared]>
                                   filesystem mount (repeatable; optional).
   --help                          show this help.
@@ -176,6 +177,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   const channels: AgentChannelSpec[] = [];
   let vault: AgentVaultSpec | undefined;
   const egress: string[] = [];
+  let egressUnrestricted = false;
   const mounts: AgentMount[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -203,6 +205,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
         i++;
         break;
       }
+      case "--egress-all": {
+        egressUnrestricted = true;
+        break;
+      }
       case "--mount": {
         mounts.push(parseMount(takeValue(argv, i, "--mount")));
         i++;
@@ -225,7 +231,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
 
   const spec: AgentSpec = { name, channels };
   if (vault) spec.vault = vault;
-  if (egress.length > 0) spec.egress = egress;
+  if (egressUnrestricted) spec.egressUnrestricted = true;
+  else if (egress.length > 0) spec.egress = egress;
   if (mounts.length > 0) spec.mounts = mounts;
   return { help: false, spec };
 }

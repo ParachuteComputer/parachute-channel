@@ -118,6 +118,17 @@ export interface AgentSpec {
    */
   egress?: string[];
   /**
+   * Open the network entirely — allow ALL egress, ignoring `egress[]` and the
+   * base allowlist (the sandbox runs with no network restriction; filesystem
+   * isolation is unchanged). This is the operator's explicit, deliberate choice
+   * for a TRUSTED session where the convenience of unrestricted network outweighs
+   * the exfiltration surface ("I know how this is contained"). Egress is the
+   * load-bearing control for a session fed FOREIGN-authored input (design §3.3),
+   * so this must never be the default and must be an explicit per-spawn opt-in.
+   * Mutually overrides `egress` (allow-all is strictly broader).
+   */
+  egressUnrestricted?: boolean;
+  /**
    * Filesystem mounts — ADDITIVE to the default private per-session workspace
    * (rw) + the implicit runtime/claude-config (ro). Reads are scoped to declared
    * binds, NOT broad (design §4.5).

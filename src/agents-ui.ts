@@ -9,25 +9,22 @@
  * daemon's `channel:admin`-gated JSON API:
  *
  *   - GET    /api/credentials/claude   → credential status (default set? overrides?)
- *   - POST   /api/credentials/claude   → set the default operator Claude token
- *   - POST   /api/credentials/claude/:channel  → per-channel override
- *   - DELETE /api/credentials/claude/:channel  → remove an override
+ *   - POST   /api/credentials/claude[/:channel]  → set default / per-channel token
+ *   - DELETE /api/credentials/claude/:channel    → remove an override
  *   - GET    /api/agents               → list running agent sessions
  *   - POST   /api/agents               → spawn a sandboxed agent from a spec
  *   - DELETE /api/agents/:name         → kill a session
- *   - GET    /.parachute/config        → channel list (prefills the spawn form)
+ *   - GET    /api/vaults               → installed vault instances (the picker)
+ *   - GET    /.parachute/config        → channel list (the picker)
  *
- * Auth: the page loads OPEN (like /ui, /admin, /terminal) and then fetches a
- * hub-minted `channel:admin` Bearer from `<origin>/admin/channel-token`
- * (cookie-gated — the operator's logged-in portal session), attaching it to every
- * /api call. A launched session is the most powerful thing this module does, so
- * the whole surface is operator-gated on `channel:admin` — the SAME gate the
- * terminal uses.
+ * UX: the DEFAULT flow is one-agent-one-channel — pick a channel, the agent name
+ * auto-fills from it, click Spawn. Everything else (extra channels, vault binding,
+ * network mode, mounts) lives under "Advanced" for the dynamic cases.
  *
- * Token hygiene mirrors the rest of the module: the Claude OAuth token the
- * operator pastes is POSTed once and never read back (the status endpoint returns
- * names/presence only); the spawn result shows scopes/audiences but never the
- * minted token values.
+ * Auth: loads OPEN (like /ui, /admin, /terminal), then fetches a hub-minted
+ * `channel:admin` Bearer from `<origin>/admin/channel-token` and attaches it to
+ * every /api call. Token hygiene: the pasted Claude token is POSTed once and never
+ * read back; the spawn result shows scopes but never minted token values.
  */
 
 export const AGENTS_UI_HTML = `<!doctype html>
@@ -50,17 +47,20 @@ export const AGENTS_UI_HTML = `<!doctype html>
     padding-bottom: 48px;
   }
   header {
-    display: flex; align-items: center; gap: 12px;
+    display: flex; align-items: center; gap: 14px;
     padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
     position: sticky; top: 0; z-index: 5;
   }
   header .brand { font-weight: 600; }
   header .brand small { color: var(--muted); font-weight: 400; }
+  header nav { display: flex; gap: 12px; }
+  header nav a { color: var(--muted); text-decoration: none; font-size: 13px; }
+  header nav a:hover { color: var(--fg); text-decoration: underline; }
   header .spacer { margin-left: auto; }
   #status { font-size: 12px; color: var(--muted); }
   #status.live { color: var(--accent); }
   #status.err { color: var(--danger); }
-  main { max-width: 920px; margin: 0 auto; padding: 20px; display: grid; gap: 20px; }
+  main { max-width: 940px; margin: 0 auto; padding: 20px; display: grid; gap: 20px; }
   section {
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px;
   }
@@ -71,10 +71,10 @@ export const AGENTS_UI_HTML = `<!doctype html>
     width: 100%; background: var(--bg); color: var(--fg);
     border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit;
   }
-  textarea { resize: vertical; min-height: 56px; }
   .row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
   .row > .grow { flex: 1 1 160px; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid3 { display: grid; grid-template-columns: 1.4fr 1fr 1.2fr; gap: 12px; }
   button {
     background: var(--bg); color: var(--fg); border: 1px solid var(--line);
     border-radius: 6px; padding: 8px 14px; font: inherit; cursor: pointer;
@@ -97,28 +97,35 @@ export const AGENTS_UI_HTML = `<!doctype html>
   td.actions a, td.actions button { margin-left: 6px; }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .channels-rows { display: grid; gap: 8px; margin-bottom: 8px; }
-  .channels-rows .crow { display: flex; gap: 8px; align-items: center; }
-  .channels-rows .crow input { flex: 1 1 auto; }
-  .channels-rows .crow select { flex: 0 0 130px; }
-  .mounts-rows { display: grid; gap: 8px; margin-bottom: 8px; }
-  .mounts-rows .mrow { display: flex; gap: 8px; align-items: center; }
+  details { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+  details[open] summary { color: var(--fg); margin-bottom: 12px; }
+  .sub { display: grid; gap: 12px; }
+  .extra-channels { display: grid; gap: 8px; }
+  .extra-channels .crow, .mounts-rows .mrow { display: flex; gap: 8px; align-items: center; }
+  .extra-channels .crow select.ch-name { flex: 1 1 auto; }
+  .extra-channels .crow select.ch-access { flex: 0 0 130px; }
+  .mounts-rows { display: grid; gap: 8px; }
   .mounts-rows .mrow input { flex: 1 1 auto; }
   .mounts-rows .mrow select { flex: 0 0 90px; }
   .msg { margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 13px; display: none; white-space: pre-wrap; }
   .msg.ok { display: block; background: #11241d; color: var(--accent); border: 1px solid #244; }
   .msg.err { display: block; background: #241313; color: var(--danger); border: 1px solid #3a2a2a; }
   code { color: var(--fg); background: #0b0d11; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   .scopes { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
-  .scopes div { font-family: ui-monospace, Menlo, monospace; }
   .muted { color: var(--muted); }
   .empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+  .warnbox { color: var(--warn); font-size: 12px; }
 </style>
 </head>
 <body>
   <header>
     <div class="brand">parachute-channel <small>· agents</small></div>
+    <nav>
+      <a id="nav-chat" href="#">Chat</a>
+      <a id="nav-terminal" href="#">Terminal</a>
+      <a id="nav-config" href="#">Config</a>
+    </nav>
     <span class="spacer"></span>
     <span id="status">connecting…</span>
   </header>
@@ -128,28 +135,29 @@ export const AGENTS_UI_HTML = `<!doctype html>
     <section id="cred-section">
       <h2>Claude credential</h2>
       <p class="hint">A launched session runs on a Claude subscription token from
-        <code>claude setup-token</code> (the 1-year headless auth) — injected per session, never your CLI login.
+        <code>claude setup-token</code> — injected per session, never your CLI login.
         Set a default once; override per channel if needed.</p>
       <div class="row">
         <span>Default credential: <span id="cred-default" class="pill off">checking…</span></span>
-        <span class="spacer"></span>
       </div>
       <div id="cred-overrides" class="scopes"></div>
-      <details style="margin-top:12px;">
+      <details>
         <summary>Set / rotate a credential</summary>
-        <div style="margin-top:10px;" class="grid2">
-          <div>
-            <label for="cred-channel">Scope (blank = default/operator)</label>
-            <input type="text" id="cred-channel" placeholder="channel name, or blank for default" />
+        <div class="sub">
+          <div class="grid2">
+            <div>
+              <label for="cred-channel">Scope (blank = default/operator)</label>
+              <input type="text" id="cred-channel" placeholder="channel name, or blank for default" />
+            </div>
+            <div>
+              <label for="cred-token">Token (oat_… from <code>claude setup-token</code>)</label>
+              <input type="password" id="cred-token" placeholder="oat_…" autocomplete="off" />
+            </div>
           </div>
-          <div>
-            <label for="cred-token">Token (oat_… from <code>claude setup-token</code>)</label>
-            <input type="password" id="cred-token" placeholder="oat_…" autocomplete="off" />
+          <div class="row">
+            <button id="cred-save" class="primary" type="button">Save credential</button>
+            <span class="muted" style="font-size:12px;">Stored 0600, never shown again.</span>
           </div>
-        </div>
-        <div class="row" style="margin-top:10px;">
-          <button id="cred-save" class="primary" type="button">Save credential</button>
-          <span class="muted" style="font-size:12px;">The token is stored 0600 and never shown again.</span>
         </div>
       </details>
       <div id="cred-msg" class="msg"></div>
@@ -158,55 +166,78 @@ export const AGENTS_UI_HTML = `<!doctype html>
     <!-- Spawn -->
     <section id="spawn-section">
       <h2>Spawn an agent</h2>
-      <p class="hint">Launches a sandboxed Claude Code session in tmux, scoped to the channels (and optional vault)
-        you declare. Network egress is deny-by-default beyond the Anthropic API + your hub/vault; filesystem reads
-        are scoped to the workspace + declared mounts.</p>
-      <div class="grid2">
+      <p class="hint">Launches a sandboxed Claude Code session in tmux, wired to a channel.
+        The common case is one agent per channel — pick a channel and spawn. Open Advanced for
+        extra channels, a vault, network, or mounts.</p>
+
+      <div class="grid3">
         <div>
-          <label for="spawn-name">Name (slug)</label>
-          <input type="text" id="spawn-name" placeholder="e.g. aaron" autocomplete="off" />
+          <label for="spawn-channel">Channel <span class="muted">(wake)</span></label>
+          <select id="spawn-channel"></select>
         </div>
         <div>
-          <label>Channels <span class="muted">(first = wake channel)</span></label>
-          <div id="channels-rows" class="channels-rows"></div>
-          <button id="add-channel" class="ghost" type="button">+ channel</button>
+          <label for="spawn-access">Access</label>
+          <select id="spawn-access">
+            <option value="write" selected>read+write</option>
+            <option value="read">read only</option>
+          </select>
+        </div>
+        <div>
+          <label for="spawn-name">Agent name</label>
+          <input type="text" id="spawn-name" placeholder="(defaults to channel)" autocomplete="off" />
         </div>
       </div>
 
-      <details style="margin-top:14px;">
-        <summary>Vault binding (optional)</summary>
-        <div class="grid2" style="margin-top:10px;">
+      <details id="advanced">
+        <summary>Advanced — extra channels, vault, network, mounts</summary>
+        <div class="sub">
           <div>
-            <label for="vault-name">Vault name</label>
-            <input type="text" id="vault-name" placeholder="e.g. default (blank = no vault)" autocomplete="off" />
+            <label>Additional channels <span class="muted">(beyond the wake channel above)</span></label>
+            <div id="extra-channels" class="extra-channels"></div>
+            <button id="add-channel" class="ghost" type="button" style="margin-top:8px;">+ channel</button>
           </div>
+
+          <div class="grid3">
+            <div>
+              <label for="vault-name">Vault</label>
+              <select id="vault-name"><option value="">(no vault)</option></select>
+            </div>
+            <div>
+              <label for="vault-access">Vault access</label>
+              <select id="vault-access">
+                <option value="read">read</option>
+                <option value="write">write</option>
+                <option value="admin">admin</option>
+              </select>
+            </div>
+            <div>
+              <label for="vault-tags">Tag scope (optional)</label>
+              <input type="text" id="vault-tags" placeholder="#channel-message, …" autocomplete="off" />
+            </div>
+          </div>
+
           <div>
-            <label for="vault-access">Access</label>
-            <select id="vault-access">
-              <option value="read">read</option>
-              <option value="write">write</option>
-              <option value="admin">admin</option>
+            <label for="net-mode">Network</label>
+            <select id="net-mode">
+              <option value="restricted" selected>Restricted — Anthropic API + hub/vault + listed hosts</option>
+              <option value="open">Open — allow ALL network (trusted sessions only)</option>
             </select>
+            <div id="egress-wrap" style="margin-top:8px;">
+              <label for="egress">Additional allowed hosts (comma-separated)</label>
+              <input type="text" id="egress" placeholder="registry.npmjs.org, github.com" autocomplete="off" />
+            </div>
+            <div id="open-warn" class="warnbox" style="display:none; margin-top:8px;">
+              ⚠ Open network removes egress confinement — anything the session can reach, it can send to.
+              Use only for sessions you trust.
+            </div>
+          </div>
+
+          <div>
+            <label>Filesystem mounts</label>
+            <div id="mounts-rows" class="mounts-rows"></div>
+            <button id="add-mount" class="ghost" type="button" style="margin-top:8px;">+ mount</button>
           </div>
         </div>
-        <div style="margin-top:10px;">
-          <label for="vault-tags">Tag scope (optional, comma-separated)</label>
-          <input type="text" id="vault-tags" placeholder="e.g. #channel-message" autocomplete="off" />
-        </div>
-      </details>
-
-      <details style="margin-top:12px;">
-        <summary>Network egress (optional)</summary>
-        <div style="margin-top:10px;">
-          <label for="egress">Additional allowed hosts (comma-separated, beyond the base)</label>
-          <input type="text" id="egress" placeholder="e.g. registry.npmjs.org, github.com" autocomplete="off" />
-        </div>
-      </details>
-
-      <details style="margin-top:12px;">
-        <summary>Filesystem mounts (optional)</summary>
-        <div id="mounts-rows" class="mounts-rows" style="margin-top:10px;"></div>
-        <button id="add-mount" class="ghost" type="button">+ mount</button>
       </details>
 
       <div class="row" style="margin-top:16px;">
@@ -229,12 +260,17 @@ export const AGENTS_UI_HTML = `<!doctype html>
 
 <script>
 (function () {
-  // Served through the hub the page is /channel/agents; locally it's /agents.
-  // Derive the mount prefix so the API + token URLs resolve under the same prefix
-  // (same shape as the terminal + chat UIs).
+  // Served through the hub the page is /channel/agents; locally /agents. Derive
+  // the mount prefix so API + token + nav URLs resolve under the same prefix.
   var MOUNT = location.pathname.replace(/\\/agents\\/?$/, "");
   var statusEl = document.getElementById("status");
   var TOKEN = null;
+  var knownChannels = [];
+
+  // Wire nav links under the same mount.
+  document.getElementById("nav-chat").href = MOUNT + "/ui";
+  document.getElementById("nav-terminal").href = MOUNT + "/terminal";
+  document.getElementById("nav-config").href = MOUNT + "/admin";
 
   function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = cls || ""; }
   function esc(s) {
@@ -243,9 +279,8 @@ export const AGENTS_UI_HTML = `<!doctype html>
     });
   }
   function showMsg(el, text, isErr) {
-    // textContent (NOT innerHTML) — server/result strings (session, workspace,
-    // scopes, egress, error messages) flow through here, so this deliberately
-    // avoids needing esc(): the browser never parses them as HTML.
+    // textContent (NOT innerHTML) — server/result strings flow through here, so
+    // this deliberately avoids needing esc(): the browser never parses them as HTML.
     el.textContent = text;
     el.className = "msg " + (isErr ? "err" : "ok");
   }
@@ -256,15 +291,9 @@ export const AGENTS_UI_HTML = `<!doctype html>
     return fetch(location.origin + "/admin/channel-token", { credentials: "include" })
       .then(function (r) { if (!r.ok) throw new Error("token " + r.status); return r.json(); })
       .then(function (j) { TOKEN = (j && j.token) ? j.token : null; return TOKEN; })
-      .catch(function (err) {
-        TOKEN = null;
-        setStatus("not authenticated", "err");
-        throw err;
-      });
+      .catch(function (err) { TOKEN = null; setStatus("not authenticated", "err"); throw err; });
   }
 
-  // Authed fetch against the daemon API. Retries ONCE on a 401 with a fresh token
-  // (the channel:admin token is short-lived).
   function api(path, opts, _retried) {
     opts = opts || {};
     var headers = Object.assign({}, opts.headers || {});
@@ -302,9 +331,7 @@ export const AGENTS_UI_HTML = `<!doctype html>
         ov.querySelectorAll("[data-cred-rm]").forEach(function (btn) {
           btn.addEventListener("click", function () { removeCred(btn.getAttribute("data-cred-rm")); });
         });
-      } else {
-        ov.innerHTML = "";
-      }
+      } else { ov.innerHTML = ""; }
       updateSpawnNote(j.defaultSet, j.channels || []);
       return j;
     }).catch(function (err) {
@@ -315,11 +342,9 @@ export const AGENTS_UI_HTML = `<!doctype html>
   function updateSpawnNote(defaultSet, overrides) {
     var note = document.getElementById("spawn-note");
     if (!defaultSet && (!overrides || !overrides.length)) {
-      note.textContent = "⚠ no Claude credential set — spawn will fail until you set one above.";
+      note.textContent = "⚠ no Claude credential set — set one above before spawning.";
       note.style.color = "var(--warn)";
-    } else {
-      note.textContent = "";
-    }
+    } else { note.textContent = ""; }
   }
 
   document.getElementById("cred-save").addEventListener("click", function () {
@@ -331,7 +356,7 @@ export const AGENTS_UI_HTML = `<!doctype html>
     var path = channel ? "/api/credentials/claude/" + encodeURIComponent(channel) : "/api/credentials/claude";
     apiJson(path, { method: "POST", body: JSON.stringify({ token: token }) }).then(function () {
       document.getElementById("cred-token").value = "";
-      showMsg(msg, channel ? ("Saved override for channel \\"" + channel + "\\".") : "Saved default credential.", false);
+      showMsg(msg, channel ? ("Saved override for channel " + channel + ".") : "Saved default credential.", false);
       loadCreds();
     }).catch(function (err) { showMsg(msg, "Failed: " + err.message, true); });
   });
@@ -340,29 +365,38 @@ export const AGENTS_UI_HTML = `<!doctype html>
     var msg = document.getElementById("cred-msg");
     clearMsg(msg);
     apiJson("/api/credentials/claude/" + encodeURIComponent(channel), { method: "DELETE" }).then(function () {
-      showMsg(msg, "Removed override for \\"" + channel + "\\".", false);
+      showMsg(msg, "Removed override for " + channel + ".", false);
       loadCreds();
     }).catch(function (err) { showMsg(msg, "Failed: " + err.message, true); });
   }
 
-  // --- spawn form: channel + mount rows -----------------------------------
-  var knownChannels = [];
-  function channelRow(value, access) {
+  // --- spawn form ---------------------------------------------------------
+  function channelOptions(selected) {
+    return knownChannels.map(function (c) {
+      return "<option value='" + esc(c) + "'" + (c === selected ? " selected" : "") + ">" + esc(c) + "</option>";
+    }).join("");
+  }
+
+  // Auto-fill the name from the chosen wake channel until the operator edits it.
+  var nameEdited = false;
+  var nameEl = document.getElementById("spawn-name");
+  var chanEl = document.getElementById("spawn-channel");
+  nameEl.addEventListener("input", function () { nameEdited = true; });
+  chanEl.addEventListener("change", function () {
+    if (!nameEdited) nameEl.value = chanEl.value;
+  });
+
+  function extraChannelRow() {
     var div = document.createElement("div");
     div.className = "crow";
-    var list = knownChannels.map(function (c) { return "<option value='" + esc(c) + "'>"; }).join("");
     div.innerHTML =
-      "<input type='text' class='ch-name' placeholder='channel name' list='known-channels' value='" + esc(value || "") + "' />" +
-      "<select class='ch-access'>" +
-        "<option value='write'" + (access === "read" ? "" : " selected") + ">read+write</option>" +
-        "<option value='read'" + (access === "read" ? " selected" : "") + ">read only</option>" +
-      "</select>" +
+      "<select class='ch-name'>" + channelOptions("") + "</select>" +
+      "<select class='ch-access'><option value='write'>read+write</option><option value='read'>read only</option></select>" +
       "<button class='ghost' type='button' title='remove'>✕</button>";
     div.querySelector("button").addEventListener("click", function () { div.remove(); });
-    document.getElementById("channels-rows").appendChild(div);
-    return div;
+    document.getElementById("extra-channels").appendChild(div);
   }
-  document.getElementById("add-channel").addEventListener("click", function () { channelRow("", "write"); });
+  document.getElementById("add-channel").addEventListener("click", function () { extraChannelRow(); });
 
   function mountRow() {
     var div = document.createElement("div");
@@ -374,23 +408,30 @@ export const AGENTS_UI_HTML = `<!doctype html>
       "<button class='ghost' type='button' title='remove'>✕</button>";
     div.querySelector("button").addEventListener("click", function () { div.remove(); });
     document.getElementById("mounts-rows").appendChild(div);
-    return div;
   }
   document.getElementById("add-mount").addEventListener("click", function () { mountRow(); });
 
+  // Network mode toggle: show host list only when restricted; warn when open.
+  var netMode = document.getElementById("net-mode");
+  netMode.addEventListener("change", function () {
+    var open = netMode.value === "open";
+    document.getElementById("egress-wrap").style.display = open ? "none" : "";
+    document.getElementById("open-warn").style.display = open ? "" : "none";
+  });
+
   function collectSpec() {
-    var name = document.getElementById("spawn-name").value.trim();
-    if (!name) throw new Error("name is required");
-    var channels = [];
-    document.querySelectorAll("#channels-rows .crow").forEach(function (row) {
-      var n = row.querySelector(".ch-name").value.trim();
+    var wake = chanEl.value;
+    if (!wake) throw new Error("pick a channel");
+    var name = nameEl.value.trim() || wake;
+    var channels = [{ name: wake, access: document.getElementById("spawn-access").value }];
+    document.querySelectorAll("#extra-channels .crow").forEach(function (row) {
+      var n = row.querySelector(".ch-name").value;
       if (!n) return;
       channels.push({ name: n, access: row.querySelector(".ch-access").value });
     });
-    if (!channels.length) throw new Error("at least one channel is required (the first is the wake channel)");
     var spec = { name: name, channels: channels };
 
-    var vn = document.getElementById("vault-name").value.trim();
+    var vn = document.getElementById("vault-name").value;
     if (vn) {
       var v = { name: vn, access: document.getElementById("vault-access").value };
       var tags = document.getElementById("vault-tags").value.split(",").map(function (t) { return t.trim(); }).filter(Boolean);
@@ -398,8 +439,12 @@ export const AGENTS_UI_HTML = `<!doctype html>
       spec.vault = v;
     }
 
-    var egress = document.getElementById("egress").value.split(",").map(function (h) { return h.trim(); }).filter(Boolean);
-    if (egress.length) spec.egress = egress;
+    if (netMode.value === "open") {
+      spec.egressUnrestricted = true;
+    } else {
+      var egress = document.getElementById("egress").value.split(",").map(function (h) { return h.trim(); }).filter(Boolean);
+      if (egress.length) spec.egress = egress;
+    }
 
     var mounts = [];
     document.querySelectorAll("#mounts-rows .mrow").forEach(function (row) {
@@ -422,16 +467,16 @@ export const AGENTS_UI_HTML = `<!doctype html>
     apiJson("/api/agents", { method: "POST", body: JSON.stringify(spec) }).then(function (r) {
       var lines = [];
       if (r.alreadyRunning) {
-        lines.push("Session \\"" + r.session + "\\" is already running (no-op).");
+        lines.push("Session " + r.session + " is already running (no-op).");
       } else {
-        lines.push("Launched \\"" + r.session + "\\".");
+        lines.push("Launched " + r.session + ".");
         lines.push("workspace: " + r.workspace);
         if (r.tokens && r.tokens.length) {
           lines.push("scopes:");
           r.tokens.forEach(function (t) { lines.push("  " + t.resource + " → " + t.scope); });
         }
         if (r.mcpServers && r.mcpServers.length) lines.push("MCP servers: " + r.mcpServers.join(", "));
-        if (r.egress && r.egress.length) lines.push("egress: " + r.egress.join(", "));
+        lines.push("network: " + (r.egressUnrestricted ? "OPEN (all hosts)" : ((r.egress || []).join(", ") || "base only")));
       }
       showMsg(msg, lines.join("\\n"), false);
       loadAgents();
@@ -443,9 +488,7 @@ export const AGENTS_UI_HTML = `<!doctype html>
   });
 
   // --- running agents list ------------------------------------------------
-  function terminalUrl(channel) {
-    return MOUNT + "/terminal?channel=" + encodeURIComponent(channel);
-  }
+  function terminalUrl(channel) { return MOUNT + "/terminal?channel=" + encodeURIComponent(channel); }
   function loadAgents() {
     return apiJson("/api/agents").then(function (j) {
       var host = document.getElementById("agents-table");
@@ -455,9 +498,7 @@ export const AGENTS_UI_HTML = `<!doctype html>
         return;
       }
       var rows = agents.map(function (a) {
-        var att = a.attached
-          ? "<span class='pill attached'>attached</span>"
-          : "<span class='pill detached'>idle</span>";
+        var att = a.attached ? "<span class='pill attached'>attached</span>" : "<span class='pill detached'>idle</span>";
         return "<tr>" +
           "<td><strong>" + esc(a.name) + "</strong></td>" +
           "<td><code>" + esc(a.session) + "</code></td>" +
@@ -478,46 +519,50 @@ export const AGENTS_UI_HTML = `<!doctype html>
   }
 
   function killAgent(name) {
-    // name is a server-enforced slug (alphanumeric/dash/underscore, agents.ts),
-    // so it carries no HTML/JS-special chars in the confirm string; it's
-    // encodeURI'd into the request path regardless.
-    if (!confirm("Kill agent \\"" + name + "\\"? This ends its tmux session.")) return;
+    // name is a server-enforced slug (alphanumeric/dash/underscore, agents.ts), so
+    // it carries no HTML/JS-special chars in the confirm string; encodeURI'd anyway.
+    if (!confirm("Kill agent " + name + "? This ends its tmux session.")) return;
     apiJson("/api/agents/" + encodeURIComponent(name), { method: "DELETE" }).then(function () {
       loadAgents();
     }).catch(function (err) { alert("Kill failed: " + err.message); });
   }
-
   document.getElementById("refresh").addEventListener("click", function () { loadAgents(); });
 
-  // --- channels (prefill the spawn form) ----------------------------------
+  // --- pickers: channels + vaults -----------------------------------------
   function loadChannels() {
     return fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
       knownChannels = (cfg.channels || []).map(function (c) { return c.name; });
-      var dl = document.getElementById("known-channels");
-      dl.innerHTML = knownChannels.map(function (c) { return "<option value='" + esc(c) + "'>"; }).join("");
-      // Seed one channel row (prefilled with the first known channel, if any).
-      if (!document.querySelector("#channels-rows .crow")) {
-        channelRow(knownChannels[0] || "", "write");
-      }
-    }).catch(function () { channelRow("", "write"); });
+      chanEl.innerHTML = knownChannels.length
+        ? channelOptions(knownChannels[0])
+        : "<option value=''>(no channels — add one in Config)</option>";
+      if (knownChannels.length && !nameEdited) nameEl.value = knownChannels[0];
+    }).catch(function () {
+      chanEl.innerHTML = "<option value=''>(channel list failed)</option>";
+    });
+  }
+  function loadVaults() {
+    return apiJson("/api/vaults").then(function (j) {
+      var vaults = j.vaults || [];
+      var sel = document.getElementById("vault-name");
+      sel.innerHTML = "<option value=''>(no vault)</option>" +
+        vaults.map(function (v) { return "<option value='" + esc(v) + "'>" + esc(v) + "</option>"; }).join("");
+    }).catch(function () { /* leave the (no vault) default */ });
   }
 
   // --- boot ---------------------------------------------------------------
   setStatus("authenticating…");
   fetchToken().then(function () {
     setStatus("● ready", "live");
-    return Promise.all([loadChannels(), loadCreds(), loadAgents()]);
+    return Promise.all([loadChannels(), loadVaults(), loadCreds(), loadAgents()]);
   }).then(function () {
-    // Poll the running list so kills/exits elsewhere reflect here.
     setInterval(loadAgents, 5000);
   }).catch(function (err) {
     setStatus("not authenticated", "err");
-    var msg = document.getElementById("spawn-msg");
-    showMsg(msg, "Open this page through the hub portal, signed in as the operator. " +
+    showMsg(document.getElementById("spawn-msg"),
+      "Open this page through the hub portal, signed in as the operator. " +
       "The agents surface needs a channel:admin token (" + err.message + ").", true);
   });
 })();
 </script>
-<datalist id="known-channels"></datalist>
 </body>
 </html>`;

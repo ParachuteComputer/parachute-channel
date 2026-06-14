@@ -49,6 +49,35 @@ function readManifest(path: string): ServicesManifest {
 }
 
 /**
+ * List the vault instance names installed on this host, from the vault module's
+ * registered `paths` (`/vault/<name>` → `<name>`). Used by the agents page's vault
+ * picker so an operator chooses from real vaults instead of typing a name blind.
+ * Best-effort: returns `[]` if the manifest is absent/unreadable (the picker then
+ * falls back to free text). Deduped + sorted; `default` floated first if present.
+ */
+export function listVaultNames(path: string = resolveManifestPath()): string[] {
+  let manifest: ServicesManifest;
+  try {
+    manifest = readManifest(path);
+  } catch {
+    return [];
+  }
+  const names = new Set<string>();
+  for (const svc of manifest.services) {
+    for (const p of svc.paths ?? []) {
+      // `paths` are operator-registered route prefixes, not URLs — take the literal
+      // segment (no decodeURIComponent: a stray %2F could synthesize a slash-bearing
+      // vault name, and real vault names are plain slugs).
+      const m = /^\/vault\/([^/]+)/.exec(p);
+      if (m && m[1]) names.add(m[1]);
+    }
+  }
+  const sorted = [...names].sort((a, b) => a.localeCompare(b));
+  // Float "default" to the front — it's the conventional primary vault.
+  return sorted.sort((a, b) => (a === "default" ? -1 : b === "default" ? 1 : 0));
+}
+
+/**
  * Idempotent upsert of a service entry. Merges into any existing row rather
  * than replacing it — preserves hub-stamped fields the module doesn't own.
  * Atomic write: stages to a tmp file, then renames over the target so a crash

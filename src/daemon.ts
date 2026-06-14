@@ -22,7 +22,7 @@ import { mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { timingSafeEqual } from "node:crypto";
-import { upsertService } from "./services-manifest.ts";
+import { upsertService, listVaultNames } from "./services-manifest.ts";
 
 /** Constant-time webhook-secret compare. Length check first (a length mismatch
  *  is never equal); timingSafeEqual on equal-length buffers avoids the
@@ -74,6 +74,7 @@ import {
   type TerminalWsData,
 } from "./terminal.ts";
 import { TERMINAL_UI_HTML } from "./terminal-ui.ts";
+import { serveTerminalAsset } from "./terminal-assets.ts";
 import { AGENTS_UI_HTML } from "./agents-ui.ts";
 import {
   createRealAgentOps,
@@ -798,6 +799,17 @@ export function createFetchHandler(
       return authJson({ error: "websocket upgrade failed" }, 400);
     }
 
+    // Terminal renderer assets (xterm.js + addon-fit + css) served SAME-ORIGIN
+    // (design §5; replaces the CDN load that broke behind strict networks/CSP).
+    // Public like the page itself — these are vendored static JS/CSS, no secrets.
+    // Must run BEFORE the `/terminal/<channel>` page match (this is a 2-segment
+    // path the single-segment termMatch wouldn't catch, but keep it explicit).
+    const assetMatch = url.pathname.match(/^\/terminal\/assets\/([^/]+)$/);
+    if (req.method === "GET" && assetMatch) {
+      const served = serveTerminalAsset(decodeURIComponent(assetMatch[1]!));
+      return served ?? json({ error: "not found" }, 404);
+    }
+
     // Terminal view (the xterm.js page) — `/terminal` or `/terminal/<channel>`
     // as a plain GET (no upgrade) serves the page; the page then opens the WS to
     // `/terminal/<channel>`. Loads OPEN (like /ui and /admin) so it can bootstrap
@@ -1142,6 +1154,15 @@ export function createFetchHandler(
         if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
         return json({ error: `failed to kill agent: ${(err as Error).message}` }, 500);
       }
+    }
+
+    // Installed vault instances (for the agents page's vault picker) — derived
+    // from the vault module's registered `/vault/<name>` paths in services.json.
+    // No secrets; channel:admin-gated to match the rest of the agents surface.
+    if (url.pathname === "/api/vaults" && req.method === "GET") {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+      return json({ vaults: listVaultNames() });
     }
 
     // ---------------------------------------------------------------------

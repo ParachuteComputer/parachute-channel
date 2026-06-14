@@ -3,39 +3,25 @@
  * `design/2026-06-14-sandboxed-agent-sessions.md` §5).
  *
  * Single self-contained document: HTML + inline CSS + inline JS, no build step
- * (same shape as `daemon.ts`'s chat UI + `admin-ui.ts`). xterm.js + the fit
- * addon load from a pinned CDN — there's no bundler in this repo, and the
- * existing UIs are all hand-written HTML strings, so a CDN import is the
- * minimal, in-pattern way to ship xterm without adding a build step.
+ * (same shape as `daemon.ts`'s chat UI + `admin-ui.ts`). xterm.js + the fit addon
+ * are served SAME-ORIGIN by the daemon (`/terminal/assets/*`, see
+ * `terminal-assets.ts`) — NOT from a CDN. The original CDN load broke whenever the
+ * operator's network or the hub's CSP blocked jsdelivr; vendoring + same-origin
+ * serving fixes that ("xterm.js failed to load — CDN blocked?").
  *
  * What the page does:
- *   1. Fetch the channel list (`<mount>/.parachute/config`) → a picker.
- *   2. Fetch a hub-minted `channel:admin` Bearer (`<origin>/admin/channel-token`,
- *      cookie-gated — the SAME token the chat + admin UIs use; the terminal is
- *      operator-gated, so the operator's token is exactly what's needed).
- *   3. Open a WebSocket to `<mount>/terminal/<channel>?token=…&cols=…&rows=…`
- *      (the token rides as `?token=` — a browser can't set Authorization on
- *      `new WebSocket()`). The daemon's upgrade gate validates channel:admin
- *      BEFORE upgrading.
- *   4. Relay xterm ↔ WS: xterm `onData` (keystrokes) → BINARY frames; pty output
- *      (BINARY frames) → `term.write`; xterm `onResize` → a JSON control frame
- *      `{type:"resize",cols,rows}`.
- *   5. Reconnect: because the backend attaches to TMUX (not a raw pty), a dropped
- *      socket just re-attaches to the live session with scrollback intact.
- *
- * Flow control (browser half of the §5.4 backpressure design): xterm's
- * `FlowControl`-style high-watermark — we count bytes written to xterm and, past
- * a watermark, the backend's own `getBufferedAmount` throttle is the primary
- * guard; the browser side keeps the renderer from falling so far behind it
- * stalls. The load-bearing flow control is server-side (terminal.ts); this is
- * the cooperative browser half.
+ *   1. Compute the mount prefix, then dynamically load the same-origin xterm
+ *      assets (CSS + JS), THEN boot — the `<script src>`/`<link>` can't be static
+ *      because their correct URL depends on the runtime mount prefix.
+ *   2. Fetch the channel list (`<mount>/.parachute/config`) → a picker.
+ *   3. Fetch a hub-minted `channel:admin` Bearer (`<origin>/admin/channel-token`).
+ *   4. Open a WebSocket to `<mount>/terminal/<channel>?token=…&cols=…&rows=…`.
+ *      The daemon's upgrade gate validates channel:admin BEFORE upgrading.
+ *   5. Relay xterm ↔ WS: keystrokes → BINARY frames; pty output (BINARY) →
+ *      `term.write`; resize → a JSON control frame `{type:"resize",cols,rows}`.
+ *   6. Reconnect: the backend attaches to TMUX, so a dropped socket re-attaches to
+ *      the live session with scrollback intact.
  */
-
-// Pinned xterm.js + fit addon (CDN, no build step). Versions pinned for
-// reproducibility; SRI omitted to keep the single-file page simple (the page is
-// operator-only, same-origin behind the hub). xterm 5.x is the current line.
-const XTERM_VERSION = "5.3.0";
-const XTERM_FIT_VERSION = "0.10.0";
 
 export const TERMINAL_UI_HTML = `<!doctype html>
 <html lang="en">
@@ -44,7 +30,6 @@ export const TERMINAL_UI_HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="referrer" content="no-referrer" />
 <title>parachute-channel · terminal</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@${XTERM_VERSION}/css/xterm.min.css" />
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef;
@@ -64,6 +49,8 @@ export const TERMINAL_UI_HTML = `<!doctype html>
   }
   header .brand { font-weight: 600; }
   header .brand small { color: var(--muted); font-weight: 400; }
+  header nav a { color: var(--muted); text-decoration: none; font-size: 13px; margin-right: 4px; }
+  header nav a:hover { color: var(--fg); text-decoration: underline; }
   header select {
     background: var(--bg); color: var(--fg);
     border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font: inherit;
@@ -93,16 +80,15 @@ export const TERMINAL_UI_HTML = `<!doctype html>
 <body>
   <header>
     <div class="brand">parachute-channel <small>· terminal</small></div>
+    <nav><a id="nav-agents" href="#">← Agents</a></nav>
     <select id="channel" title="channel"></select>
     <button id="reconnect" type="button" title="Re-attach to the tmux session">Reconnect</button>
     <span class="spacer"></span>
-    <span id="status">connecting…</span>
+    <span id="status">loading…</span>
   </header>
   <div id="notice" class="notice" hidden></div>
   <div id="term-wrap"><div id="term"></div></div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@${XTERM_VERSION}/lib/xterm.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@${XTERM_FIT_VERSION}/lib/addon-fit.min.js"></script>
 <script>
 (function () {
   var sel = document.getElementById("channel");
@@ -112,16 +98,57 @@ export const TERMINAL_UI_HTML = `<!doctype html>
   var termHost = document.getElementById("term");
 
   // Served through the hub the page is /channel/terminal; locally it's
-  // /terminal. Derive the mount prefix so the WS + token URLs resolve under the
-  // same prefix (same shape as the chat UI's MOUNT).
+  // /terminal. Derive the mount prefix so the WS + token + asset URLs resolve
+  // under the same prefix (same shape as the chat UI's MOUNT).
   var MOUNT = location.pathname.replace(/\\/terminal(\\/[^/]*)?\\/?$/, "");
 
-  if (typeof window.Terminal !== "function") {
-    showNotice("xterm.js failed to load (CDN blocked?). The terminal needs it. " +
-      "You can always attach on the host: <code>tmux attach -t &lt;channel&gt;-agent</code>.", true);
-    setStatus("xterm unavailable", "err");
-    return;
+  // Wire the nav link to the agents page under the same mount.
+  document.getElementById("nav-agents").href = MOUNT + "/agents";
+
+  function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = cls || ""; }
+  function showNotice(html, isErr) {
+    noticeEl.innerHTML = html;
+    noticeEl.className = "notice" + (isErr ? " err" : "");
+    noticeEl.hidden = false;
   }
+  function clearNotice() { noticeEl.hidden = true; noticeEl.innerHTML = ""; }
+
+  // --- same-origin asset loading ------------------------------------------
+  // xterm CSS + JS are served by the daemon at <mount>/terminal/assets/* (NOT a
+  // CDN). Their correct URL depends on MOUNT, so we inject them at runtime, then
+  // boot once xterm is defined.
+  function loadAssets(cb) {
+    var base = MOUNT + "/terminal/assets/";
+    var link = document.createElement("link");
+    link.rel = "stylesheet"; link.href = base + "xterm.css";
+    document.head.appendChild(link);
+    loadScript(base + "xterm.js", function () {
+      loadScript(base + "addon-fit.js", cb);
+    });
+  }
+  function loadScript(src, cb) {
+    var s = document.createElement("script");
+    s.src = src;
+    s.onload = cb;
+    s.onerror = function () {
+      setStatus("xterm unavailable", "err");
+      showNotice("Failed to load the terminal renderer from <code>" + src + "</code>. " +
+        "You can always attach on the host: <code>tmux attach -t &lt;channel&gt;-agent</code>.", true);
+    };
+    document.head.appendChild(s);
+  }
+
+  setStatus("loading renderer…");
+  loadAssets(boot);
+
+  function boot() {
+    if (typeof window.Terminal !== "function") {
+      setStatus("xterm unavailable", "err");
+      showNotice("The terminal renderer didn't initialize. " +
+        "You can always attach on the host: <code>tmux attach -t &lt;channel&gt;-agent</code>.", true);
+      return;
+    }
+    setStatus("connecting…");
 
   // --- xterm setup --------------------------------------------------------
   var term = new window.Terminal({
@@ -130,9 +157,6 @@ export const TERMINAL_UI_HTML = `<!doctype html>
     fontSize: 13,
     scrollback: 5000,
     theme: { background: "#000000", foreground: "#e6e9ef" },
-    // Cooperative flow control: xterm acks after writing; combined with the
-    // backend's getBufferedAmount throttle (terminal.ts §5.4) this keeps the
-    // renderer from stalling under a flood.
     convertEol: false,
   });
   var fit = null;
@@ -148,17 +172,6 @@ export const TERMINAL_UI_HTML = `<!doctype html>
   var reconnectTimer = null;
   var enc = new TextEncoder();
 
-  function setStatus(text, cls) {
-    statusEl.textContent = text;
-    statusEl.className = cls || "";
-  }
-  function showNotice(html, isErr) {
-    noticeEl.innerHTML = html;
-    noticeEl.className = "notice" + (isErr ? " err" : "");
-    noticeEl.hidden = false;
-  }
-  function clearNotice() { noticeEl.hidden = true; noticeEl.innerHTML = ""; }
-
   function currentChannel() { return sel.value; }
 
   function doFit() {
@@ -167,12 +180,6 @@ export const TERMINAL_UI_HTML = `<!doctype html>
   }
 
   // --- token (operator channel:admin, minted by the hub) ------------------
-  // The terminal WS is operator-gated on channel:admin. The hub mints that for
-  // the logged-in operator at <origin>/admin/channel-token (cookie-gated) — the
-  // same endpoint the chat + admin UIs use. We fetch it from the page origin
-  // (which IS the hub origin when served through the expose) and pass it as
-  // ?token= on the WebSocket URL (a browser can't set Authorization on
-  // new WebSocket()).
   window.__token = null;
   function fetchToken() {
     return fetch(window.location.origin + "/admin/channel-token", { credentials: "include" })
@@ -209,49 +216,38 @@ export const TERMINAL_UI_HTML = `<!doctype html>
 
     socket.onopen = function () {
       setStatus("● attached · " + ch, "live");
-      // Send the current geometry immediately so the pty matches the page.
       sendResize();
       term.focus();
     };
     socket.onmessage = function (ev) {
-      // BINARY = raw pty output. (The backend only ever sends binary; a text
-      // frame would be an out-of-band notice — render it as text.)
       if (typeof ev.data === "string") { term.write(ev.data); return; }
       term.write(new Uint8Array(ev.data));
     };
     socket.onclose = function (ev) {
-      if (socket !== ws) return; // superseded by a newer connect
+      if (socket !== ws) return;
       ws = null;
       if (manualClose) return;
       if (ev.code === 1013) {
-        // Backend closed us for being too slow (terminal.ts MAX_QUEUE_BYTES).
         setStatus("disconnected (too slow)", "err");
         showNotice("The terminal fell too far behind and was disconnected. Reconnecting will " +
           "re-attach to the live session (scrollback intact via tmux).", true);
       } else if (ev.code === 1000) {
         setStatus("session ended");
-        showNotice("The tmux session ended (or detached). Start a session with " +
-          "<code>./scripts/launch-session.sh &lt;channel&gt; &lt;channel&gt;</code>, then Reconnect.", false);
-        return; // don't auto-reconnect a deliberately-ended session
+        showNotice("The tmux session ended (or detached). Spawn a session from the " +
+          "<a href='" + MOUNT + "/agents'>Agents</a> page, then Reconnect.", false);
+        return;
       } else {
         setStatus("reconnecting…", "err");
       }
       scheduleReconnect();
     };
-    socket.onerror = function () {
-      // onclose follows; status is set there. Surface a hint only if we never
-      // opened (likely auth or no tmux session).
-      if (socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CONNECTING) {
-        // leave reconnect/backoff to onclose
-      }
-    };
+    socket.onerror = function () {};
   }
 
   function scheduleReconnect() {
     if (reconnectTimer) return;
     reconnectTimer = setTimeout(function () {
       reconnectTimer = null;
-      // Refresh the (short-lived) token before re-attaching.
       fetchToken().then(function () { connect(); });
     }, 1500);
   }
@@ -270,7 +266,7 @@ export const TERMINAL_UI_HTML = `<!doctype html>
     }
   }
   term.onResize(function () { sendResize(); });
-  window.addEventListener("resize", function () { doFit(); /* onResize fires sendResize */ });
+  window.addEventListener("resize", function () { doFit(); });
 
   reconnectBtn.addEventListener("click", function () {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -293,9 +289,8 @@ export const TERMINAL_UI_HTML = `<!doctype html>
         var chans = (cfg.channels || []);
         if (!chans.length) { setStatus("no channels configured"); return; }
         var preselect = new URL(window.location.href).searchParams.get("channel");
-        // Also honor a channel baked into the path (/terminal/<channel>).
         var pathCh = (location.pathname.match(/\\/terminal\\/([^/]+)/) || [])[1];
-        if (pathCh) preselect = decodeURIComponent(pathCh);
+        if (pathCh && pathCh !== "assets") preselect = decodeURIComponent(pathCh);
         chans.forEach(function (c) {
           var opt = document.createElement("option");
           opt.value = c.name; opt.textContent = c.name + " (" + c.transport + ")";
@@ -308,6 +303,7 @@ export const TERMINAL_UI_HTML = `<!doctype html>
   }
 
   fetchToken().then(loadChannelsAndConnect);
+  } // end boot()
 })();
 </script>
 </body>

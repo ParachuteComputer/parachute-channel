@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { resolveManifestPath, upsertService, type ServiceEntry } from "./services-manifest.ts";
+import { resolveManifestPath, upsertService, listVaultNames, type ServiceEntry } from "./services-manifest.ts";
 
 function tmp(): string {
   return join(mkdtempSync(join(tmpdir(), "pc-manifest-")), "services.json");
@@ -78,5 +78,29 @@ describe("upsertService", () => {
     expect(() => upsertService(CHANNEL, path)).toThrow(/malformed/);
     expect(existsSync(path)).toBe(true); // original left intact
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ not_services: true }); // content untouched
+  });
+});
+
+describe("listVaultNames", () => {
+  test("extracts vault names from the vault module's /vault/<name> paths, default first", () => {
+    const path = tmp();
+    writeFileSync(path, JSON.stringify({ services: [
+      { name: "parachute-vault", port: 1940, paths: ["/vault/boulder", "/vault/default", "/vault/techne"], health: "x", version: "1" },
+      { name: "parachute-channel", port: 1941, paths: ["/channel"], health: "x", version: "1" },
+    ] }));
+    expect(listVaultNames(path)).toEqual(["default", "boulder", "techne"]);
+  });
+
+  test("dedupes across services and ignores non-vault paths", () => {
+    const path = tmp();
+    writeFileSync(path, JSON.stringify({ services: [
+      { name: "a", port: 1, paths: ["/vault/x", "/other"], health: "x", version: "1" },
+      { name: "b", port: 2, paths: ["/vault/x", "/vault/y"], health: "x", version: "1" },
+    ] }));
+    expect(listVaultNames(path).sort()).toEqual(["x", "y"]);
+  });
+
+  test("returns [] when the manifest is absent or unreadable", () => {
+    expect(listVaultNames(join(tmpdir(), "does-not-exist-" + Math.floor(performance.now()), "services.json"))).toEqual([]);
   });
 });

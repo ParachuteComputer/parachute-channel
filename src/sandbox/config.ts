@@ -56,14 +56,20 @@ export function currentSandboxPlatform(): SandboxPlatform {
 export function buildSandboxConfig(input: BuildSandboxConfigInput): SandboxRuntimeConfig {
   const platform = input.platform ?? currentSandboxPlatform();
 
-  const allowedDomains = composeEgressAllowlist(input.egressBase, input.spec.egress);
   const fs = composeFilesystemView(input.baseBinds, input.spec.mounts, platform);
 
+  // Network: by default the non-removable base unioned with the spec's additions.
+  // When the spec opts into `egressUnrestricted`, we OMIT `allowedDomains` entirely
+  // — the sandbox-runtime treats an absent allowedDomains as "no network
+  // restriction" (verified: present-but-empty = block all; absent = allow all).
+  // The cast is because the runtime's TS type marks allowedDomains required while
+  // its runtime honors the absent case as the documented allow-all path.
+  const network: SandboxRuntimeConfig["network"] = input.spec.egressUnrestricted
+    ? ({ deniedDomains: [] } as unknown as SandboxRuntimeConfig["network"])
+    : { allowedDomains: composeEgressAllowlist(input.egressBase, input.spec.egress), deniedDomains: [] };
+
   const config: SandboxRuntimeConfig = {
-    network: {
-      allowedDomains,
-      deniedDomains: [],
-    },
+    network,
     filesystem: {
       denyRead: fs.denyRead,
       allowRead: fs.allowRead,

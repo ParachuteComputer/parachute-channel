@@ -139,6 +139,14 @@ describe("buildSpecFromBody", () => {
       buildSpecFromBody({ name: "a", channels: ["c"], mounts: [{ hostPath: "/h", mountPath: "/m", mode: "x" }] }),
     ).toThrow(/mode/);
   });
+  test("egressUnrestricted is accepted and overrides per-host egress", () => {
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], egressUnrestricted: true, egress: ["x.com"] });
+    expect(spec.egressUnrestricted).toBe(true);
+    expect(spec.egress).toBeUndefined(); // allow-all is strictly broader
+  });
+  test("rejects a non-boolean egressUnrestricted", () => {
+    expect(() => buildSpecFromBody({ name: "a", channels: ["c"], egressUnrestricted: "yes" })).toThrow(/egressUnrestricted/);
+  });
   test("rejects relative mount paths (must be absolute)", () => {
     expect(() =>
       buildSpecFromBody({ name: "a", channels: ["c"], mounts: [{ hostPath: "rel", mountPath: "/m", mode: "ro" }] }),
@@ -174,10 +182,24 @@ describe("redactSpawnResult", () => {
     ]);
     expect(red.mcpServers).toEqual(["channel-aaron", "vault-default"]);
     expect(red.egress).toEqual(["api.anthropic.com:443"]);
+    expect(red.egressUnrestricted).toBe(false);
     // The smoking gun: no token VALUE appears anywhere in the serialized result.
     const wire = JSON.stringify(red);
     expect(wire).not.toContain("SECRET-CHANNEL-TOKEN");
     expect(wire).not.toContain("SECRET-VAULT-TOKEN");
+  });
+  test("an unrestricted-network result (no allowedDomains) → egressUnrestricted true, egress []", () => {
+    const unrestricted: SpawnAgentResult = {
+      ...result,
+      wrapped: {
+        ...result.wrapped,
+        // allow-all: allowedDomains absent (the runtime's no-restriction shape).
+        config: { network: { deniedDomains: [] }, filesystem: { denyRead: [], allowWrite: [], denyWrite: [] } } as unknown as SpawnAgentResult["wrapped"]["config"],
+      },
+    };
+    const red = redactSpawnResult(unrestricted);
+    expect(red.egressUnrestricted).toBe(true);
+    expect(red.egress).toEqual([]);
   });
 });
 
@@ -437,6 +459,29 @@ describe("/api/agents — operator-gated on channel:admin", () => {
       });
       expect(res.status).toBe(403);
       expect(((await res.json()) as { error: string }).error).toContain("mint failed");
+    } finally {
+      srv.stop(true);
+    }
+  });
+});
+
+describe("GET /api/vaults", () => {
+  test("no token → 401", async () => {
+    const { srv, base } = buildServer();
+    try {
+      expect((await fetch(`${base}/api/vaults`)).status).toBe(401);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("admin token → 200 with a vaults array", async () => {
+    const { srv, base } = buildServer();
+    try {
+      const res = await fetch(`${base}/api/vaults`, { headers: adminAuth });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { vaults: unknown };
+      expect(Array.isArray(body.vaults)).toBe(true);
     } finally {
       srv.stop(true);
     }

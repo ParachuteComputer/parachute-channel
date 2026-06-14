@@ -146,6 +146,11 @@ export function renderAdminPage(mount = ""): string {
         </div>
         <h1>Manage channels</h1>
         <p class="subtitle">Add and remove the channels your Claude Code sessions talk over. Each channel is bound to one transport.</p>
+        <p class="subtitle" style="margin-top:6px;">
+          <a id="nav-agents" href="#">Agents →</a> spawn &amp; watch sandboxed sessions ·
+          <a id="nav-chat" href="#">Chat</a> ·
+          <a id="nav-terminal" href="#">Terminal</a>
+        </p>
       </header>
 
       <div id="status-banner" class="banner" hidden></div>
@@ -563,6 +568,15 @@ const PAGE_SCRIPT = String.raw`
   // prefix and the /api/channels URL under it.
   var MOUNT = window.__CHANNEL_MOUNT__ || "";
   var API_URL = window.__CHANNEL_API_URL__ || "/api/channels";
+
+  // Wire the header nav links to the sibling surfaces under the same mount.
+  (function wireNav() {
+    var map = { "nav-agents": "/agents", "nav-chat": "/ui", "nav-terminal": "/terminal" };
+    Object.keys(map).forEach(function (id) {
+      var a = document.getElementById(id);
+      if (a) a.href = MOUNT + map[id];
+    });
+  })();
 
   // --- Auth: a channel:admin Bearer minted by the hub --------------------
   // The channel config API (/api/channels) requires a hub JWT with

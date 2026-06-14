@@ -79,6 +79,12 @@ describe("parseArgs — name + channels + vault + egress + mounts → the right 
     expect(spec!.channels[0]).toEqual({ name: "first" });
     expect(spec!.channels[1]).toEqual({ name: "second" });
   });
+
+  test("--egress-all sets egressUnrestricted and overrides --egress", () => {
+    const { spec } = parseArgs(["a", "--channel", "c", "--egress", "x.com", "--egress-all"]);
+    expect(spec!.egressUnrestricted).toBe(true);
+    expect(spec!.egress).toBeUndefined(); // allow-all is strictly broader
+  });
 });
 
 describe("parseArgs — --help short-circuits", () => {

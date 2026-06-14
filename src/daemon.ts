@@ -74,6 +74,17 @@ import {
   type TerminalWsData,
 } from "./terminal.ts";
 import { TERMINAL_UI_HTML } from "./terminal-ui.ts";
+import { AGENTS_UI_HTML } from "./agents-ui.ts";
+import {
+  createRealAgentOps,
+  buildSpecFromBody,
+  redactSpawnResult,
+  SpawnRequestError,
+  type AgentOps,
+} from "./agents.ts";
+import { SpawnDepsError } from "./spawn-deps.ts";
+import { CredentialNotConfiguredError } from "./credentials.ts";
+import { MintError } from "./mint-token.ts";
 import { validateHubJwt } from "./hub-jwt.ts";
 import {
   handleProtectedResource,
@@ -697,7 +708,12 @@ function clampQueryDim(raw: string | null, fallback: number): number {
 export function createFetchHandler(
   channels: Map<string, Channel>,
   registry: ClientRegistry,
+  opts?: { agentOps?: AgentOps },
 ): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
+  // Spawn/list/kill operations behind the web agents surface. Lazily defaulted to
+  // the real ops (resolve-deps + real tmux); tests inject a stub so the routes are
+  // exercised without a hub, a sandbox, or a tmux server. Built once per handler.
+  const agentOps: AgentOps = opts?.agentOps ?? createRealAgentOps();
   /** Resolve the transport for a channel name, or null on miss. */
   function transportFor(channel: string | undefined): Transport | null {
     if (!channel) return null;
@@ -789,6 +805,17 @@ export function createFetchHandler(
     // gated. Served by the daemon (spans every channel via a picker).
     if (req.method === "GET" && (url.pathname === "/terminal" || termMatch)) {
       return new Response(TERMINAL_UI_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // Agent management page (the web spawn/list/kill surface, design §4/§5) —
+    // `/agents`. Loads OPEN (like /ui, /admin, /terminal) so it can bootstrap its
+    // hub-minted channel:admin token; the `/api/agents` + `/api/credentials/*`
+    // calls it makes are what `requireScope` gates. Served by the daemon (spans
+    // every channel via the spawn form + the running-agents list).
+    if (req.method === "GET" && url.pathname === "/agents") {
+      return new Response(AGENTS_UI_HTML, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
@@ -1040,6 +1067,81 @@ export function createFetchHandler(
         return json({ error: `failed to write credentials.json: ${(err as Error).message}` }, 500);
       }
       return json({ ok: true, scope: "channel", channel });
+    }
+
+    // ---------------------------------------------------------------------
+    // Agent management API (the web spawn/list/kill surface, design §4/§5) —
+    // the SAME least-privilege launch path as the operator CLI
+    // (`scripts/spawn-agent.ts`), driven from the browser. Operator-gated on
+    // `channel:admin` (a launched session is the most powerful thing this module
+    // does, so the whole surface uses the same gate as the terminal).
+    //
+    //   GET    /api/agents          → list running agent tmux sessions (no secrets)
+    //   POST   /api/agents          { name, channels, vault?, egress?, mounts? } → spawn
+    //   DELETE /api/agents/:name    → kill the session
+    //
+    // Externally hub strips `/channel`, so these are `<hub>/channel/api/agents`.
+    // The spawn response surfaces scopes/audiences but NEVER the minted token
+    // values (redactSpawnResult); the launch resolves its deps lazily so a
+    // credential set via the creds API takes effect without a daemon restart.
+    // ---------------------------------------------------------------------
+    if (url.pathname === "/api/agents" && (req.method === "GET" || req.method === "POST")) {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+
+      if (req.method === "GET") {
+        try {
+          return json({ agents: await agentOps.list() });
+        } catch (err) {
+          return json({ error: `failed to list agents: ${(err as Error).message}` }, 500);
+        }
+      }
+
+      // POST — spawn a sandboxed agent from a spec.
+      let spawnBody: unknown;
+      try {
+        spawnBody = await req.json();
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      let spec;
+      try {
+        spec = buildSpecFromBody(spawnBody);
+      } catch (err) {
+        if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
+        throw err;
+      }
+      try {
+        const result = await agentOps.spawn(spec);
+        return json(redactSpawnResult(result));
+      } catch (err) {
+        // A missing operator token (no manager bearer) → 503: the daemon can't
+        // mint child tokens until the hub is provisioned.
+        if (err instanceof SpawnDepsError) return json({ error: err.message }, 503);
+        // A missing Claude credential → 400 with the fix (set it via the creds API
+        // / the page's credential form).
+        if (err instanceof CredentialNotConfiguredError) return json({ error: err.message }, 400);
+        // An over-broad / refused mint (the hub's canGrant) → surface the hub's status.
+        if (err instanceof MintError) {
+          return json({ error: `token mint failed: ${err.message}` }, err.status >= 400 && err.status < 600 ? err.status : 502);
+        }
+        // A bad slug (spawnAgent's guard) or any other launch fault.
+        return json({ error: (err as Error).message }, 400);
+      }
+    }
+
+    const agentMatch = url.pathname.match(/^\/api\/agents\/([^/]+)$/);
+    if (agentMatch && req.method === "DELETE") {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+      const name = decodeURIComponent(agentMatch[1]!);
+      try {
+        const { killed } = await agentOps.kill(name);
+        return json({ ok: true, name, killed });
+      } catch (err) {
+        if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
+        return json({ error: `failed to kill agent: ${(err as Error).message}` }, 500);
+      }
     }
 
     // ---------------------------------------------------------------------
@@ -1531,6 +1633,16 @@ function main(): void {
       // gives, but declaring it explicitly future-proofs against a later `uis`
       // declaration accidentally gating the terminal at hub-users. Design §5.3.
       uis: {
+        // The web spawn/list/kill surface — the DEFAULT way to operate (spawn an
+        // agent, scope it, watch it). audience "surface" so the hub passes it
+        // through; channel owns admission end-to-end (operator-grade channel:admin,
+        // enforced on every /api/agents call). Design §4/§5.
+        agents: {
+          displayName: "Agents",
+          tagline: "Spawn, scope, and watch sandboxed Claude Code sessions.",
+          path: "/channel/agents",
+          audience: "surface",
+        },
         terminal: {
           displayName: "Terminal",
           tagline: "Attach to a session's live tmux pane in the browser.",

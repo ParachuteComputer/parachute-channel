@@ -56,11 +56,19 @@ import { ClientRegistry } from "./routing.ts";
 import {
   requireScope,
   extractToken,
+  json as authJson,
   SCOPE_READ,
   SCOPE_WRITE,
   SCOPE_SEND,
   SCOPE_ADMIN,
+  SCOPE_TERMINAL,
 } from "./auth.ts";
+import {
+  createTerminalWsHandlers,
+  type TerminalWsData,
+  type SpawnTerminalFn,
+} from "./terminal.ts";
+import { TERMINAL_UI_HTML } from "./terminal-ui.ts";
 import { validateHubJwt } from "./hub-jwt.ts";
 import {
   handleProtectedResource,
@@ -606,15 +614,85 @@ function json(data: unknown, status = 200): Response {
 // ---------------------------------------------------------------------------
 
 /**
+ * Decide whether a terminal WebSocket upgrade is authorized + which tmux session
+ * it targets. Pure over its inputs (no `server.upgrade`, no pty) so the auth +
+ * routing layer is unit-testable without a live hub or a real socket — the same
+ * shape the HTTP gate tests rely on.
+ *
+ * Auth: OPERATOR-GATED on `channel:admin` (`SCOPE_TERMINAL`). The token rides in
+ * as a `?token=` query param (browsers can't set Authorization on
+ * `new WebSocket()`), so `allowQueryParam: true`. The no-token path
+ * short-circuits to 401 before any JWKS fetch (testable offline). The channel
+ * must exist (a terminal onto an unknown channel is a 404, never an enumeration
+ * oracle — but this endpoint is operator-only behind the admin scope, so a plain
+ * 404 is fine).
+ *
+ * Returns either `{ ok: true, ... }` with the tmux session name (`<name>-agent`,
+ * matching `scripts/launch-session.sh:38`) + the client's requested geometry, or
+ * `{ ok: false, response }` carrying the deny Response the caller returns as-is.
+ */
+export async function authorizeTerminalUpgrade(
+  req: Request,
+  url: URL,
+  channels: Map<string, Channel>,
+  channelName: string,
+): Promise<
+  | { ok: true; channel: string; session: string; cols: number; rows: number }
+  | { ok: false; response: Response }
+> {
+  if (!channels.has(channelName)) {
+    return {
+      ok: false,
+      response: authJson(
+        {
+          error: `unknown channel "${channelName}" — known channels: ${
+            [...channels.keys()].join(", ") || "(none)"
+          }`,
+        },
+        404,
+      ),
+    };
+  }
+  // Operator-grade gate. allowQueryParam: true — the only way a browser
+  // WebSocket can present the token (no Authorization header on `new WebSocket`).
+  const denied = await requireScope(req, url, SCOPE_TERMINAL, true);
+  if (denied) return { ok: false, response: denied };
+
+  // tmux session name convention: `<name>-agent` (launch-session.sh:38). Attach
+  // a viewer pty to THIS session; the session itself is created by the launcher.
+  const session = `${channelName}-agent`;
+  const cols = clampQueryDim(url.searchParams.get("cols"), 80);
+  const rows = clampQueryDim(url.searchParams.get("rows"), 24);
+  return { ok: true, channel: channelName, session, cols, rows };
+}
+
+/** Is this request a WebSocket upgrade? (case-insensitive `Upgrade: websocket`). */
+export function isWebSocketUpgrade(req: Request): boolean {
+  return (req.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
+}
+
+/** Parse + clamp a `?cols=`/`?rows=` query dim to [1, 9999], with a fallback. */
+function clampQueryDim(raw: string | null, fallback: number): number {
+  const n = raw === null ? NaN : parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return n > 9999 ? 9999 : n;
+}
+
+/**
  * Build the daemon's HTTP fetch handler over a channel registry + client
  * registry. Extracted as a factory so tests can exercise routing + the auth
  * gate on an ephemeral `Bun.serve` without booting the real daemon (and without
  * a live hub — the no-token 401 path short-circuits before JWKS).
+ *
+ * `server` is the `Bun.serve` instance (passed as `fetch`'s 2nd arg at runtime),
+ * needed for `server.upgrade()` on the terminal WS route. It's optional so the
+ * existing tests (which call the handler with one arg) keep working — a terminal
+ * upgrade request with no server falls through to the normal 426-style refusal.
  */
 export function createFetchHandler(
   channels: Map<string, Channel>,
   registry: ClientRegistry,
-): (req: Request) => Promise<Response> {
+): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
   /** Resolve the transport for a channel name, or null on miss. */
   function transportFor(channel: string | undefined): Transport | null {
     if (!channel) return null;
@@ -657,8 +735,58 @@ export function createFetchHandler(
     return true;
   }
 
-  return async function fetch(req) {
+  return async function fetch(req, server) {
     const url = new URL(req.url);
+
+    // -------------------------------------------------------------------
+    // Terminal WebSocket upgrade — `/terminal/<channel>` (design §5).
+    //
+    // The in-page xterm.js terminal attaches to the channel's tmux session
+    // (`<channel>-agent`) via Bun's native pty. Externally this is
+    // `<hub>/channel/terminal/<channel>`; the hub strips `/channel` (stripPrefix)
+    // and forwards the `Upgrade: websocket` over its Bun-native WS bridge (which
+    // honors channel's `websocket: true` declaration), so the daemon sees the
+    // bare `/terminal/<channel>` upgrade here. OPERATOR-GATED on channel:admin
+    // (the most dangerous capability), token via `?token=`. Must run BEFORE the
+    // generic routing so the upgrade isn't 404'd.
+    const termMatch = url.pathname.match(/^\/terminal\/([^/]+)$/);
+    if (termMatch && isWebSocketUpgrade(req)) {
+      const channelName = decodeURIComponent(termMatch[1]!);
+      const decision = await authorizeTerminalUpgrade(req, url, channels, channelName);
+      if (!decision.ok) return decision.response;
+      if (!server?.upgrade) {
+        // No server handle (e.g. a unit test calling the handler directly, or a
+        // build where Bun.serve didn't pass it) — the upgrade can't happen here.
+        return authJson(
+          { error: "websocket upgrade unavailable on this server" },
+          503,
+        );
+      }
+      const data: TerminalWsData = {
+        session: decision.session,
+        channel: decision.channel,
+        cols: decision.cols,
+        rows: decision.rows,
+      };
+      const upgraded = server.upgrade(req, { data });
+      if (upgraded) {
+        // Bun's contract: return undefined from fetch after a successful upgrade
+        // — the socket now belongs to the websocket handlers.
+        return undefined as unknown as Response;
+      }
+      return authJson({ error: "websocket upgrade failed" }, 400);
+    }
+
+    // Terminal view (the xterm.js page) — `/terminal` or `/terminal/<channel>`
+    // as a plain GET (no upgrade) serves the page; the page then opens the WS to
+    // `/terminal/<channel>`. Loads OPEN (like /ui and /admin) so it can bootstrap
+    // its hub-minted channel:admin token fetch; the WS upgrade above is what's
+    // gated. Served by the daemon (spans every channel via a picker).
+    if (req.method === "GET" && (url.pathname === "/terminal" || termMatch)) {
+      return new Response(TERMINAL_UI_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
 
     // Health check — per-channel client counts.
     if (url.pathname === "/health") {
@@ -1262,11 +1390,21 @@ function main(): void {
 
   const registry = new ClientRegistry();
 
-  const server = Bun.serve({
+  // The terminal WS handler set (pty↔socket relay + backpressure flow control,
+  // src/terminal.ts). One handler object serves every terminal connection;
+  // per-connection state lives on `ws.data`. The fetch handler routes accepted
+  // upgrades into these via `server.upgrade(req, { data })`.
+  const terminalWs = createTerminalWsHandlers();
+
+  const fetchHandler = createFetchHandler(channels, registry);
+  const server = Bun.serve<TerminalWsData, never>({
     port: PORT,
     hostname: "127.0.0.1",
     idleTimeout: 0,
-    fetch: createFetchHandler(channels, registry),
+    // `fetch` receives `server` as its 2nd arg at runtime — needed for
+    // `server.upgrade()` on the terminal WS route.
+    fetch: (req, srv) => fetchHandler(req, srv),
+    websocket: terminalWs,
   });
 
   console.log(`parachute-channel: daemon listening on http://127.0.0.1:${PORT}`);
@@ -1298,6 +1436,27 @@ function main(): void {
       stripPrefix: true,
       uiUrl: "/channel/ui", // portal "Open UI" link (also in module.json; written here in case hub reads it from services.json)
       configUiUrl: "/channel/admin", // module-owned config surface (modular-UI P4); hub frames/links it. Also in module.json.
+      // WebSocket support — tells the hub's Bun-native upgrade bridge to forward
+      // `Upgrade: websocket` requests on `/channel/*` to this daemon (the
+      // in-page terminal, design §5.1). DENY-BY-DEFAULT in the hub: without this
+      // the upgrade is refused (426) before it ever reaches us. Declared on
+      // module.json too (the install-time contract); the hub honors either
+      // source. No hub change needed — the hub already reads this field.
+      websocket: true,
+      // The terminal mount, declared as a `uis` sub-unit with audience "surface"
+      // so the hub's audience gate PASSES IT THROUGH (the channel daemon owns
+      // admission end-to-end — operator-grade channel:admin, enforced here). A
+      // `surface` audience is the same pass-through the no-uis-match default
+      // gives, but declaring it explicitly future-proofs against a later `uis`
+      // declaration accidentally gating the terminal at hub-users. Design §5.3.
+      uis: {
+        terminal: {
+          displayName: "Terminal",
+          tagline: "Attach to a session's live tmux pane in the browser.",
+          path: "/channel/terminal",
+          audience: "surface",
+        },
+      },
     });
     console.log(`parachute-channel: self-registered into services.json (port ${PORT}, mount /channel)`);
   } catch (err) {

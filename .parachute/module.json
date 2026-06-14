@@ -9,6 +9,7 @@
   "stripPrefix": true,
   "uiUrl": "/channel/ui",
   "configUiUrl": "/channel/admin",
+  "websocket": true,
   "focus": "experimental",
   "adminCapabilities": ["config"],
   "startCmd": ["parachute-channel"],

@@ -34,17 +34,12 @@
  *   CLAUDE_CONFIG_DIR          claude config dir bound read-only into the sandbox (default ~/.claude).
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve, join } from "node:path";
 import {
   spawnAgent,
-  realTmuxLauncher,
   type SpawnAgentDeps,
 } from "../src/spawn-agent.ts";
-import { CredentialNotConfiguredError, resolveClaudeCredential } from "../src/credentials.ts";
-import { defaultStateDir } from "../src/registry.ts";
-import { getHubOrigin } from "../src/hub-jwt.ts";
+import { CredentialNotConfiguredError } from "../src/credentials.ts";
+import { resolveSpawnDeps } from "../src/spawn-deps.ts";
 import { channelEntryKey, vaultEntryKey } from "../src/agent-mcp-config.ts";
 import { MintError } from "../src/mint-token.ts";
 import type {
@@ -53,9 +48,6 @@ import type {
   AgentVaultSpec,
   AgentMount,
 } from "../src/sandbox/types.ts";
-
-const DEFAULT_CHANNEL_PORT = 1941;
-const DEFAULT_VAULT_URL = "http://127.0.0.1:1940";
 
 const USAGE = `spawn-agent — launch a sandboxed Claude Code agent session
 
@@ -239,78 +231,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
 }
 
 // ---------------------------------------------------------------------------
-// Real-dep resolution (only reached on the actual run, not in unit tests).
+// Run-time helpers (only reached on the actual run, not in unit tests).
 // ---------------------------------------------------------------------------
-
-/** Base for `operator.token` — `$PARACHUTE_HOME` else `~/.parachute`. */
-function parachuteHome(): string {
-  return process.env.PARACHUTE_HOME ?? resolve(homedir(), ".parachute");
-}
-
-/**
- * The spawn-manager's OWN bearer — `~/.parachute/operator.token`, the local
- * operator credential the hub attenuates child mints against (same file vault's
- * `readOperatorToken` reads). Mirrors launch-session.sh leaning on the operator's
- * logged-in `parachute auth mint-token`; here we present the operator bearer to
- * the hub directly so the mint runs in-process with no shell-out.
- */
-function readManagerBearer(): string | null {
-  try {
-    const path = resolve(parachuteHome(), "operator.token");
-    if (!existsSync(path)) return null;
-    const raw = readFileSync(path, "utf-8").trim();
-    return raw.length > 0 ? raw : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Default channel daemon base URL: PARACHUTE_CHANNEL_URL, else loopback:<port>. */
-function resolveChannelUrl(): string {
-  const explicit = process.env.PARACHUTE_CHANNEL_URL?.replace(/\/$/, "");
-  if (explicit) return explicit;
-  const port = parseInt(process.env.PARACHUTE_CHANNEL_PORT ?? "", 10) || DEFAULT_CHANNEL_PORT;
-  return `http://127.0.0.1:${port}`;
-}
-
-/** Claude config dir bound read-only so the sandboxed session can read its config. */
-function claudeConfigDir(): string {
-  return process.env.CLAUDE_CONFIG_DIR ?? resolve(homedir(), ".claude");
-}
-
-/** Build the real SpawnAgentDeps from the environment. */
-function realDeps(): SpawnAgentDeps {
-  const managerBearer = readManagerBearer();
-  if (!managerBearer) {
-    throw new ArgError(
-      `no operator token at ${resolve(parachuteHome(), "operator.token")} — the manager bearer the\n` +
-        `hub attenuates child mints against. Log in / provision the hub so the operator token exists\n` +
-        `(it's what \`parachute auth mint-token\` uses), then re-run.`,
-    );
-  }
-
-  const stateDir = defaultStateDir();
-  const sessionsDir = join(stateDir, "sessions");
-  const vaultUrl = process.env.PARACHUTE_VAULT_URL?.replace(/\/$/, "") || DEFAULT_VAULT_URL;
-
-  return {
-    hubOrigin: getHubOrigin(),
-    managerBearer,
-    channelUrl: resolveChannelUrl(),
-    vaultUrl,
-    sessionsDir,
-    // The claude config dir is the one runtime path the sandboxed `claude` must
-    // read (system paths /usr,/lib stay readable; the home tree is denied). The
-    // per-session workspace (rw) is added by spawnAgent under sessionsDir.
-    runtimeReadOnly: [claudeConfigDir()],
-    // The real per-channel Claude OAuth resolver (channel override ?? default ?? throw).
-    resolveClaudeToken: (channel: string) => resolveClaudeCredential(channel, stateDir),
-    // The real tmux launcher (writes the per-session launch script, runs tmux).
-    tmux: realTmuxLauncher(),
-    // sandboxEngine omitted → spawnAgent's `new Sandbox()` uses the real, pinned,
-    // library-linked engine.
-  };
-}
 
 /** Format a per-aud scope summary line for each minted token. */
 function scopeLines(result: Awaited<ReturnType<typeof spawnAgent>>): string[] {
@@ -341,7 +263,7 @@ async function main(): Promise<number> {
 
   let deps: SpawnAgentDeps;
   try {
-    deps = realDeps();
+    deps = resolveSpawnDeps();
   } catch (err) {
     process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
     return 1;

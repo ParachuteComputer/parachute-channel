@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.54",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@openparachute/scope-guard": "^0.4.0"
   },

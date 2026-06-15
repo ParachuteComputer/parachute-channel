@@ -63,7 +63,9 @@ function fakeEngine(): SandboxEngine & { initializedWith: SandboxRuntimeConfig |
       // Emulate the real shape: a bash -c wrapper carrying the command + proxy env.
       return {
         argv: ["/bin/bash", "-c", `SBX ${command}`],
-        env: { SANDBOX_RUNTIME: "1", HTTPS_PROXY: "http://localhost:5555" },
+        // Include a TMPDIR the engine would set — spawnAgent must OVERRIDE it with
+        // a workspace-writable path (the override regression guard below).
+        env: { SANDBOX_RUNTIME: "1", HTTPS_PROXY: "http://localhost:5555", TMPDIR: "/tmp/claude" },
       };
     },
     async reset() {},
@@ -200,6 +202,17 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     // ...and the sandbox proxy env layered on top.
     expect(launch.env.SANDBOX_RUNTIME).toBe("1");
     expect(launch.env.HTTPS_PROXY).toBe("http://localhost:5555");
+
+    // 3b. TMPDIR (+ claude-specific + generic) point at a WRITABLE dir inside the
+    // workspace, OVERRIDING the sandbox engine's own TMPDIR — without this claude
+    // can't create its scratch dir and dies "Claude Code could not start: EPERM".
+    const wsTmp = join(res.workspace, "tmp");
+    expect(launch.env.TMPDIR).toBe(wsTmp);
+    expect(launch.env.CLAUDE_CODE_TMPDIR).toBe(wsTmp);
+    expect(launch.env.TMP).toBe(wsTmp);
+    expect(launch.env.TEMP).toBe(wsTmp);
+    // ...and the dir is actually created on disk (writable, where the child looks).
+    expect(statSync(wsTmp).isDirectory()).toBe(true);
 
     // 4. The MCP config has the right entries with DISTINCT tokens (one per aud).
     const parsed = JSON.parse(res.mcpConfigJson) as {

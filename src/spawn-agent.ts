@@ -385,11 +385,31 @@ export async function spawnAgent(
     }),
   );
 
-  // Layer the scrubbed agent env UNDER the sandbox wrapper's env (proxy vars,
-  // sandbox markers from the engine win on conflict; CLAUDE_CODE_OAUTH_TOKEN +
-  // the passthrough fundamentals come from us). ANTHROPIC_API_KEY is absent.
+  // A writable per-session temp dir INSIDE the workspace (the workspace is the
+  // sandbox's one writable region). claude needs a writable TMPDIR to start — its
+  // default (`/tmp/claude-<uid>/…`) is OUTSIDE the workspace, which the sandbox
+  // DENIES, so without this claude dies immediately with
+  // "Claude Code could not start: EPERM … mkdir '/tmp/claude-<uid>/…'". Pointing
+  // TMPDIR (+ the claude-specific + the generic TMP/TEMP) at this dir keeps all of
+  // claude's scratch writes within the allowed workspace.
+  const sessionTmp = join(workspace, "tmp");
+  mkdirSync(sessionTmp, { recursive: true });
+
+  // Layer the scrubbed agent env UNDER the sandbox wrapper's env: the engine's
+  // proxy vars / sandbox markers win over our childEnv on conflict;
+  // CLAUDE_CODE_OAUTH_TOKEN + the passthrough fundamentals come from us;
+  // ANTHROPIC_API_KEY is absent. EXCEPTION: the temp vars are layered LAST so they
+  // override even the engine's own TMPDIR (which points at a non-writable path
+  // under our scoped-read policy — the cause of the "could not start" death).
   const childEnv = buildAgentChildEnv(deps.parentEnv ?? process.env, claudeOauthToken);
-  const launchEnv: Record<string, string | undefined> = { ...childEnv, ...wrapped.env };
+  const launchEnv: Record<string, string | undefined> = {
+    ...childEnv,
+    ...wrapped.env,
+    TMPDIR: sessionTmp,
+    CLAUDE_CODE_TMPDIR: sessionTmp,
+    TMP: sessionTmp,
+    TEMP: sessionTmp,
+  };
 
   await deps.tmux.newSession({
     name: session,

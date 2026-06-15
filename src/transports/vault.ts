@@ -391,16 +391,23 @@ export class VaultTransport implements Transport {
   async loadTranscript(opts?: { limit?: number }): Promise<ChannelMessage[]> {
     const channel = this.channel;
     const limit = opts?.limit ?? 200;
-    // `?tag=` takes the literal tag; the `#` must be percent-encoded (`%23`) or
-    // the route never sees it. `?metadata=` is the JSON-object alias the vault
-    // parses into a `{field:{op:value}}` filter (parachute-vault routes.ts
-    // parseMetadataJsonAlias) — encode the whole JSON value.
-    const metaFilter = JSON.stringify({ channel: { eq: channel } });
+    // Query by the parent TAG only and filter to this channel CLIENT-SIDE. We do
+    // NOT use the `?metadata={channel:{eq:...}}` operator filter: an operator
+    // query on `channel` requires that field to be declared `indexed: true` in the
+    // vault's tag schema, which we can't assume (the vault returns HTTP 400
+    // FIELD_NOT_INDEXED otherwise). Tagging-both + client-side filter is the
+    // module's index-free floor (same philosophy as the tag-both write) — it works
+    // on any vault with no per-vault schema setup. (Declaring the channel field
+    // indexed is a future scale optimization, not a requirement.)
+    //
+    // Because the tag query returns notes across ALL channels, OVERFETCH so this
+    // channel's recent history isn't crowded out by other channels' interleaved
+    // notes, then keep the most recent `limit` for this channel below.
+    const fetchLimit = Math.min(Math.max(limit * 4, 500), 2000);
     const params = new URLSearchParams();
     params.set("tag", CHANNEL_MESSAGE_TAG); // URLSearchParams encodes `#` → `%23`
-    params.set("metadata", metaFilter);
     params.set("include_content", "true");
-    params.set("limit", String(limit));
+    params.set("limit", String(fetchLimit));
     const url = `${this.vaultUrl}/vault/${this.vault}/api/notes?${params.toString()}`;
 
     const res = await fetch(url, {
@@ -436,6 +443,9 @@ export class VaultTransport implements Transport {
     for (const note of notes) {
       if (typeof note.id !== "string" || !note.id) continue;
       const meta = note.metadata ?? {};
+      // Client-side channel filter (see the index-free note above): keep only
+      // notes whose metadata.channel matches this channel.
+      if (meta.channel !== channel) continue;
       const tags = note.tags ?? [];
       // Direction: prefer the explicit metadata field; fall back to the child tag.
       let direction: "inbound" | "outbound";
@@ -460,7 +470,8 @@ export class VaultTransport implements Transport {
     }
     // Ascending by ts; notes with no ts sort first (stable, deterministic).
     messages.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
-    return messages;
+    // Keep the most recent `limit` for this channel (we overfetched the tag).
+    return messages.length > limit ? messages.slice(messages.length - limit) : messages;
   }
 
   /**

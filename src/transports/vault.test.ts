@@ -131,7 +131,7 @@ describe("VaultTransport — reply (outbound note write)", () => {
 });
 
 describe("VaultTransport — loadTranscript (read the durable store)", () => {
-  test("queries tag=#channel-message + metadata.channel filter, include_content, limit; parses + sorts ascending by ts", async () => {
+  test("queries by tag only (NO operator metadata filter), filters this channel client-side, sorts ascending by ts", async () => {
     let capturedUrl = "";
     let capturedAuth = "";
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -140,7 +140,8 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
       if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
         capturedUrl = u;
         capturedAuth = (init?.headers as Record<string, string> | undefined)?.authorization ?? "";
-        // Return notes OUT of ts order to prove the client-side ascending sort.
+        // Return notes OUT of ts order (prove the ascending sort) + a note from a
+        // DIFFERENT channel (prove the client-side channel filter excludes it).
         return new Response(
           JSON.stringify([
             {
@@ -148,6 +149,12 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
               content: "session reply",
               tags: ["#channel-message", "#channel-message/outbound"],
               metadata: { channel: "eng", direction: "outbound", sender: "session", ts: "2026-06-08T00:00:02Z", in_reply_to: "n-in" },
+            },
+            {
+              id: "n-other",
+              content: "different channel — must be excluded",
+              tags: ["#channel-message", "#channel-message/inbound"],
+              metadata: { channel: "other", direction: "inbound", sender: "x", ts: "2026-06-08T00:00:03Z" },
             },
             {
               id: "n-in",
@@ -167,16 +174,17 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
     await t.start(fakeCtx("eng"));
     const msgs = await t.loadTranscript();
 
-    // The query URL carries the encoded parent tag + the metadata channel filter.
+    // Query carries the encoded parent tag + include_content, and DELIBERATELY no
+    // `metadata=` operator filter (the channel field isn't indexed on a bare vault;
+    // we filter client-side). Overfetches the tag so other channels don't crowd us out.
     expect(capturedUrl.startsWith("http://127.0.0.1:1940/vault/default/api/notes?")).toBe(true);
     expect(capturedUrl).toContain("tag=%23channel-message");
-    // metadata={"channel":{"eq":"eng"}} URI-encoded.
-    expect(capturedUrl).toContain("metadata=" + encodeURIComponent(JSON.stringify({ channel: { eq: "eng" } })));
     expect(capturedUrl).toContain("include_content=true");
-    expect(capturedUrl).toContain("limit=200");
+    expect(capturedUrl).not.toContain("metadata=");
     expect(capturedAuth).toBe("Bearer write-token-xyz");
 
-    // Parsed + sorted ascending by ts (n-in before n-out).
+    // The "other" channel note is filtered OUT; the two "eng" notes remain, sorted
+    // ascending by ts (n-in before n-out).
     expect(msgs).toHaveLength(2);
     expect(msgs[0]!.id).toBe("n-in");
     expect(msgs[0]!.direction).toBe("inbound");
@@ -187,20 +195,27 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
     expect(msgs[1]!.inReplyTo).toBe("n-in");
   });
 
-  test("honors a custom limit", async () => {
-    let capturedUrl = "";
+  test("caps the returned transcript to the requested limit (most-recent by ts)", async () => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
-        capturedUrl = u;
-        return new Response("[]", { status: 200 });
+        return new Response(
+          JSON.stringify([1, 2, 3, 4].map((i) => ({
+            id: "n" + i,
+            content: "m" + i,
+            tags: ["#channel-message", "#channel-message/inbound"],
+            metadata: { channel: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:0" + i + "Z" },
+          }))),
+          { status: 200 },
+        );
       }
       return new Response("{}", { status: 200 });
     }) as typeof fetch;
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
-    await t.loadTranscript({ limit: 50 });
-    expect(capturedUrl).toContain("limit=50");
+    const msgs = await t.loadTranscript({ limit: 2 });
+    // 4 notes fetched → the 2 most recent (by ts) returned, ascending.
+    expect(msgs.map((m) => m.id)).toEqual(["n3", "n4"]);
   });
 
   test("falls back to the child tag for direction when metadata.direction is absent", async () => {

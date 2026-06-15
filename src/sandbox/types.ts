@@ -111,40 +111,58 @@ export interface AgentSpec {
   /** Additional MCP servers, by URL. */
   otherMcps?: OtherMcpSpec[];
   /**
-   * Isolation posture — the single knob that sets BOTH the read scope and the
-   * network egress, matched to the trust gradient:
+   * Filesystem READ scope — ONE of Anthropic's two containment boundaries
+   * (https://www.anthropic.com/engineering/claude-code-sandboxing). Orthogonal to
+   * {@link network} — the agent's reach into the local disk and its reach onto the
+   * network are independent controls, deliberately NOT bundled.
    *
-   *   - `"trusted"` (DEFAULT): the operator's own self-spawned agent on a flat
-   *     trust gradient. Reads are BROAD (the runtime default — claude reads its
-   *     binary, the system, the operator's files without per-path binds) and the
-   *     network is OPEN. Writes are still confined to the per-session workspace
-   *     (which holds the agent's private HOME), so it can't corrupt the operator's
-   *     real config or escape its workspace. This is what makes the sandbox STABLE
-   *     for running claude — claude's own runtime never collides with a deny.
+   *   - `"workspace"` (DEFAULT): SCOPED reads. The home tree (`/Users` on macOS,
+   *     `/home` on Linux) is DENIED, then re-allowed ONLY for the per-session
+   *     workspace + the claude runtime + declared mounts. The agent literally
+   *     cannot read the operator's secrets — `~/.parachute/operator.token` (the
+   *     hub bearer), SSH keys, other projects — even though the network is open.
+   *     This is the security-correct default: scoped disk, exfiltration surface
+   *     removed at the source.
    *
-   *   - `"confined"`: for an agent fed FOREIGN/untrusted input. Reads are SCOPED
-   *     (home tree denied, re-allowed to workspace + the claude runtime + declared
-   *     mounts) and egress is RESTRICTED to the non-removable base
-   *     (`{ Anthropic API, hub/vault }`) UNIONed with `egress[]`. The real
-   *     isolation surface — only turn it on when the agent processes input you
-   *     don't trust.
+   *   - `"full"`: BROAD reads (the runtime default — the whole filesystem is
+   *     readable). An explicit, deliberate escape hatch for the rare agent that
+   *     genuinely needs to read across the operator's disk AND is trusted not to
+   *     leak it. Combined with `network: "open"` this is the maximum-reach posture
+   *     — only choose it knowingly.
    *
-   * Defaults to `"trusted"` (owner-operated). The per-session writable HOME +
-   * temp + onboarding seed are provided in BOTH postures (claude must always be
-   * able to run); `isolation` only governs reach BEYOND claude's own runtime.
+   * WRITES are confined to the per-session workspace + rw mounts in BOTH cases
+   * (the agent can never corrupt the operator's files or escape its workspace),
+   * exactly per Anthropic's "read/write the cwd, block outside" model.
    */
-  isolation?: "trusted" | "confined";
+  filesystem?: "workspace" | "full";
+  /**
+   * Network egress — the SECOND containment boundary, orthogonal to
+   * {@link filesystem}:
+   *
+   *   - `"open"` (DEFAULT): full internet, no restriction. The right default for
+   *     an owner-operated agent on a trusted box (claude needs the network to be
+   *     useful) — SAFE because the `"workspace"` filesystem default already keeps
+   *     local secrets unreadable, so "open network" can't exfiltrate what the
+   *     agent can't see.
+   *
+   *   - `"restricted"`: egress confined to a non-removable base
+   *     (`{ Anthropic API, hub/vault }`) UNIONed with {@link egress}. For an agent
+   *     fed FOREIGN/untrusted input, where you want to bound where it can reach
+   *     even for data it legitimately holds.
+   */
+  network?: "open" | "restricted";
   /**
    * Network egress hosts ADDITIVE to the non-removable base — only meaningful
-   * under `isolation: "confined"` (in `"trusted"` the network is fully open, so
-   * this is ignored). A confined code-building agent opens exactly the
-   * package/source hosts it needs here.
+   * under `network: "restricted"` (when the network is `"open"` this is ignored).
+   * A restricted code-building agent opens exactly the package/source hosts it
+   * needs here.
    */
   egress?: string[];
   /**
    * Filesystem mounts — ADDITIVE to the default private per-session workspace
-   * (rw) + the implicit runtime/claude-config (ro). Reads are scoped to declared
-   * binds, NOT broad (design §4.5).
+   * (rw) + the implicit runtime/claude-config (ro). Under `filesystem:
+   * "workspace"` (the default) these are the ONLY host paths re-allowed for
+   * reads beyond the workspace — mount the project you want the agent to work on.
    */
   mounts?: AgentMount[];
   /**

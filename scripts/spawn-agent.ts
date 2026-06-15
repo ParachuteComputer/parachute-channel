@@ -62,10 +62,12 @@ Flags:
                                   The FIRST channel is the wake channel.
   --vault <name>:<read|write>[:tag1,tag2]
                                   optional vault MCP scope (+ optional tag-scope).
-  --confined                      isolate for UNTRUSTED input: scoped reads (home denied) +
-                                  egress restricted to the base + --egress hosts.
-                                  Default is "trusted": broad reads + open network.
-  --egress <host,host,...>        additive egress allowlist (only used with --confined).
+  --full-read                     give the agent FULL read access to your disk.
+                                  Default: reads are sandboxed to the workspace
+                                  (your home tree, incl. operator.token, is unreadable).
+  --restricted                    restrict network egress to the base + --egress hosts
+                                  (for UNTRUSTED input). Default: open (full internet).
+  --egress <host,host,...>        additive egress allowlist (only used with --restricted).
   --mount <hostPath:mountPath:ro|rw[:shared]>
                                   filesystem mount (repeatable; optional).
   --help                          show this help.
@@ -179,7 +181,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
   const channels: AgentChannelSpec[] = [];
   let vault: AgentVaultSpec | undefined;
   const egress: string[] = [];
-  let confined = false;
+  let fullRead = false;
+  let restricted = false;
   const mounts: AgentMount[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -207,8 +210,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
         i++;
         break;
       }
-      case "--confined": {
-        confined = true;
+      case "--full-read": {
+        fullRead = true;
+        break;
+      }
+      case "--restricted": {
+        restricted = true;
         break;
       }
       case "--mount": {
@@ -233,7 +240,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
 
   const spec: AgentSpec = { name, channels };
   if (vault) spec.vault = vault;
-  if (confined) spec.isolation = "confined";
+  if (fullRead) spec.filesystem = "full";
+  if (restricted) spec.network = "restricted";
   if (egress.length > 0) spec.egress = egress;
   if (mounts.length > 0) spec.mounts = mounts;
   return { help: false, spec };

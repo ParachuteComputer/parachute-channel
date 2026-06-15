@@ -139,14 +139,18 @@ describe("buildSpecFromBody", () => {
       buildSpecFromBody({ name: "a", channels: ["c"], mounts: [{ hostPath: "/h", mountPath: "/m", mode: "x" }] }),
     ).toThrow(/mode/);
   });
-  test("isolation defaults to trusted (omitted) and accepts 'confined' + egress", () => {
-    expect(buildSpecFromBody({ name: "a", channels: ["c"] }).isolation).toBeUndefined(); // default = trusted
-    const spec = buildSpecFromBody({ name: "a", channels: ["c"], isolation: "confined", egress: ["x.com"] });
-    expect(spec.isolation).toBe("confined");
-    expect(spec.egress).toEqual(["x.com"]); // additive hosts kept (used under confined)
+  test("filesystem/network default (omitted) and accept explicit values + egress", () => {
+    const def = buildSpecFromBody({ name: "a", channels: ["c"] });
+    expect(def.filesystem).toBeUndefined(); // default = workspace (scoped reads)
+    expect(def.network).toBeUndefined(); // default = open
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], filesystem: "full", network: "restricted", egress: ["x.com"] });
+    expect(spec.filesystem).toBe("full");
+    expect(spec.network).toBe("restricted");
+    expect(spec.egress).toEqual(["x.com"]); // additive hosts kept (used under restricted)
   });
-  test("rejects an invalid isolation value", () => {
-    expect(() => buildSpecFromBody({ name: "a", channels: ["c"], isolation: "loose" })).toThrow(/isolation/);
+  test("rejects invalid filesystem / network values", () => {
+    expect(() => buildSpecFromBody({ name: "a", channels: ["c"], filesystem: "loose" })).toThrow(/filesystem/);
+    expect(() => buildSpecFromBody({ name: "a", channels: ["c"], network: "loose" })).toThrow(/network/);
   });
   test("rejects relative mount paths (must be absolute)", () => {
     expect(() =>
@@ -171,10 +175,11 @@ describe("redactSpawnResult", () => {
     wrapped: {
       argv: ["/bin/bash", "-c", "..."],
       env: {},
-      config: { network: { allowedDomains: ["api.anthropic.com:443"], deniedDomains: [] }, filesystem: { denyRead: [], allowWrite: [], denyWrite: [] } },
+      // scoped reads (denyRead carries the home tree) + restricted network (allowedDomains present).
+      config: { network: { allowedDomains: ["api.anthropic.com:443"], deniedDomains: [] }, filesystem: { denyRead: ["/Users"], allowWrite: [], denyWrite: [] } },
     },
   };
-  test("surfaces scopes + mcp servers + egress, NEVER the token values", () => {
+  test("surfaces scopes + mcp servers + posture + egress, NEVER the token values", () => {
     const red = redactSpawnResult(result);
     expect(red.session).toBe("aaron-agent");
     expect(red.tokens).toEqual([
@@ -183,23 +188,26 @@ describe("redactSpawnResult", () => {
     ]);
     expect(red.mcpServers).toEqual(["channel-aaron", "vault-default"]);
     expect(red.egress).toEqual(["api.anthropic.com:443"]);
-    expect(red.isolation).toBe("confined"); // allowedDomains present → confined
+    expect(red.network).toBe("restricted"); // allowedDomains present → restricted
+    expect(red.filesystem).toBe("workspace"); // home-tree denyRead present → scoped
     // The smoking gun: no token VALUE appears anywhere in the serialized result.
     const wire = JSON.stringify(red);
     expect(wire).not.toContain("SECRET-CHANNEL-TOKEN");
     expect(wire).not.toContain("SECRET-VAULT-TOKEN");
   });
-  test("a trusted result (no allowedDomains) → isolation 'trusted', egress []", () => {
-    const trusted: SpawnAgentResult = {
+  test("an open result (no allowedDomains, no denyRead) → network 'open' + filesystem 'full', egress []", () => {
+    const open: SpawnAgentResult = {
       ...result,
       wrapped: {
         ...result.wrapped,
-        // trusted: allowedDomains absent (the runtime's no-restriction shape).
+        // open network: allowedDomains absent (the runtime's no-restriction shape);
+        // full reads: denyRead empty.
         config: { network: { deniedDomains: [] }, filesystem: { denyRead: [], allowWrite: [], denyWrite: [] } } as unknown as SpawnAgentResult["wrapped"]["config"],
       },
     };
-    const red = redactSpawnResult(trusted);
-    expect(red.isolation).toBe("trusted");
+    const red = redactSpawnResult(open);
+    expect(red.network).toBe("open");
+    expect(red.filesystem).toBe("full");
     expect(red.egress).toEqual([]);
   });
 });

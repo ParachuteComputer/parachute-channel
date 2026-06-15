@@ -77,6 +77,30 @@ export interface InboundNote {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * One message in a channel transcript, as the built-in chat renders it. This is
+ * the transport-neutral shape `loadTranscript` produces from the vault notes; the
+ * daemon's `GET /api/channels/<ch>/messages` returns `{ messages: ChannelMessage[] }`.
+ *
+ * `direction` drives the chat's bubble placement: `inbound` (human → session) is
+ * "you" (right), `outbound` (session → human) is "them" (left) — mirroring the
+ * Telegram/vault transport meaning, NOT the chat's local point of view.
+ */
+export interface ChannelMessage {
+  /** The vault note id — the chat dedups its poll by this. */
+  id: string;
+  /** The message body (the note content). */
+  text: string;
+  /** `inbound` = human→session ("you"); `outbound` = session→human ("them"). */
+  direction: "inbound" | "outbound";
+  /** Who authored it (metadata.sender), e.g. "operator" / "session" / "aaron". */
+  sender: string;
+  /** ISO timestamp (metadata.ts) — the transcript is sorted ascending by this. */
+  ts: string;
+  /** The inbound note id this reply threads to, when present (outbound only). */
+  inReplyTo?: string;
+}
+
 const DEFAULT_VAULT_URL = "http://127.0.0.1:1940";
 const DEFAULT_PATH_PREFIX = "channel";
 /** Parent tag — carried LITERALLY on every note; query this + metadata.channel to
@@ -336,6 +360,178 @@ export class VaultTransport implements Transport {
   }
 
   // react / edit / download: vault has no reactions; v1 is reply-only. Omitted.
+
+  // -------------------------------------------------------------------------
+  // Transcript — read the durable store the chat + Telegram + any vault surface
+  // all share. The chat polls this; on send it writes an inbound note (below).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Read this channel's whole transcript (both directions) from the vault and
+   * map it to `ChannelMessage[]`, sorted ascending by `ts`.
+   *
+   * The query is the canonical "list a channel's transcript" shape from the
+   * tagging model: ONE `tag=#channel-message` (the parent, carried literally on
+   * every note) + a `metadata.channel == <this channel>` filter. Because the
+   * parent is on every note, this returns BOTH inbound and outbound — the slash
+   * children are namespace, not query inheritance, so we never key off them here.
+   *
+   *   GET <vaultUrl>/vault/<vault>/api/notes
+   *       ?tag=%23channel-message              (the `#` MUST be percent-encoded)
+   *       &metadata={"channel":{"eq":"<ch>"}}  (JSON `?metadata=` alias, URI-encoded)
+   *       &include_content=true                (we need the bodies)
+   *       &limit=<n>                           (default 200)
+   *
+   * The vault returns a bare JSON array of note objects ({id, content, tags,
+   * metadata, ...}). Direction comes from `metadata.direction`, falling back to
+   * the inbound/outbound CHILD tag if the metadata field is missing. On a non-ok
+   * vault response we throw with a clear message — the daemon route maps it to an
+   * error the chat surfaces (no silent empty transcript).
+   */
+  async loadTranscript(opts?: { limit?: number }): Promise<ChannelMessage[]> {
+    const channel = this.channel;
+    const limit = opts?.limit ?? 200;
+    // Query by the parent TAG only and filter to this channel CLIENT-SIDE. We do
+    // NOT use the `?metadata={channel:{eq:...}}` operator filter: an operator
+    // query on `channel` requires that field to be declared `indexed: true` in the
+    // vault's tag schema, which we can't assume (the vault returns HTTP 400
+    // FIELD_NOT_INDEXED otherwise). Tagging-both + client-side filter is the
+    // module's index-free floor (same philosophy as the tag-both write) — it works
+    // on any vault with no per-vault schema setup. (Declaring the channel field
+    // indexed is a future scale optimization, not a requirement.)
+    //
+    // Because the tag query returns notes across ALL channels, OVERFETCH so this
+    // channel's recent history isn't crowded out by other channels' interleaved
+    // notes, then keep the most recent `limit` for this channel below.
+    const fetchLimit = Math.min(Math.max(limit * 4, 500), 2000);
+    const params = new URLSearchParams();
+    params.set("tag", CHANNEL_MESSAGE_TAG); // URLSearchParams encodes `#` → `%23`
+    params.set("include_content", "true");
+    params.set("limit", String(fetchLimit));
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes?${params.toString()}`;
+
+    const res = await fetch(url, {
+      headers: { authorization: `Bearer ${this.token}` },
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(
+        `vault transport: load transcript failed (${res.status}) ${detail}`.trim(),
+      );
+    }
+
+    let notes: Array<{
+      id?: string;
+      content?: string;
+      tags?: string[];
+      metadata?: Record<string, unknown>;
+    }>;
+    try {
+      const parsed = (await res.json()) as unknown;
+      // The structured-query route returns a bare array; tolerate a `{notes:[]}`
+      // envelope too in case a future shape wraps it.
+      notes = Array.isArray(parsed)
+        ? (parsed as typeof notes)
+        : ((parsed as { notes?: typeof notes })?.notes ?? []);
+    } catch (err) {
+      throw new Error(
+        `vault transport: load transcript — bad JSON from vault: ${(err as Error).message}`,
+      );
+    }
+
+    const messages: ChannelMessage[] = [];
+    for (const note of notes) {
+      if (typeof note.id !== "string" || !note.id) continue;
+      const meta = note.metadata ?? {};
+      // Client-side channel filter (see the index-free note above): keep only
+      // notes whose metadata.channel matches this channel.
+      if (meta.channel !== channel) continue;
+      const tags = note.tags ?? [];
+      // Direction: prefer the explicit metadata field; fall back to the child tag.
+      let direction: "inbound" | "outbound";
+      if (meta.direction === "inbound" || meta.direction === "outbound") {
+        direction = meta.direction;
+      } else if (tags.includes(CHANNEL_MESSAGE_OUTBOUND_TAG)) {
+        direction = "outbound";
+      } else {
+        // Default to inbound (a human message) when neither signal is present —
+        // it renders as "you", the safe default for an unlabeled note.
+        direction = "inbound";
+      }
+      const msg: ChannelMessage = {
+        id: note.id,
+        text: typeof note.content === "string" ? note.content : "",
+        direction,
+        sender: typeof meta.sender === "string" ? meta.sender : "",
+        ts: typeof meta.ts === "string" ? meta.ts : "",
+      };
+      if (typeof meta.in_reply_to === "string") msg.inReplyTo = meta.in_reply_to;
+      messages.push(msg);
+    }
+    // Ascending by ts; notes with no ts sort first (stable, deterministic).
+    messages.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+    // Keep the most recent `limit` for this channel (we overfetched the tag).
+    return messages.length > limit ? messages.slice(messages.length - limit) : messages;
+  }
+
+  /**
+   * Write a human→session INBOUND note — the chat's "send". This mirrors
+   * `reply()` exactly except the tags + direction: the inbound CHILD tag
+   * (`#channel-message/inbound`) is what the vault trigger fires on, so writing
+   * this note WAKES the subscribed session via the existing vault trigger. We do
+   * NOT also `ctx.emit` — that would double-wake (one wake from the trigger, one
+   * from here). The trigger is the single wake path; this is purely the write.
+   *
+   * Returns the created note id so the chat can dedup its optimistic local echo
+   * against the same id when the note round-trips through the next poll.
+   */
+  async writeInbound(text: string, sender?: string): Promise<{ id: string }> {
+    const channel = this.channel;
+    const ts = new Date().toISOString();
+    const id = crypto.randomUUID();
+    const safeChannel = channel.replace(/[^a-zA-Z0-9_-]/g, "-");
+    const path = `${this.pathPrefix}/${safeChannel}/${id}`;
+
+    const metadata: Record<string, string> = {
+      channel,
+      direction: "inbound",
+      sender: sender ?? "operator",
+      ts,
+    };
+
+    const res = await fetch(`${this.vaultUrl}/vault/${this.vault}/api/notes`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        content: text,
+        path,
+        // Parent (queryable membership) + inbound child (the trigger discriminator
+        // that wakes the session). Both literal — the child alone is invisible to
+        // a `tag:#channel-message` query.
+        tags: [CHANNEL_MESSAGE_TAG, CHANNEL_MESSAGE_INBOUND_TAG],
+        metadata,
+      }),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(
+        `vault transport: write inbound failed (${res.status}) ${detail}`.trim(),
+      );
+    }
+
+    let noteId: string = id;
+    try {
+      const created = (await res.json()) as { id?: string; note?: { id?: string } };
+      noteId = created?.id ?? created?.note?.id ?? id;
+    } catch {
+      // Non-JSON / empty body — keep the proposed id.
+    }
+    return { id: noteId };
+  }
 
   // -------------------------------------------------------------------------
   // Inbound — the daemon's webhook hands us a new inbound note to deliver.

@@ -391,9 +391,22 @@ ${SHELL_JS}
   var sendBtn = document.getElementById("send");
   var form = document.getElementById("composer");
   var es = null;
-  // MOUNT, escapeHtml, fetchToken (caches on window.__token), authedFetch come
-  // from SHELL_JS. Wire the shared nav for the chat view.
+  // Vault-backed chat state: the selected channel's transport kind, the poll
+  // timer, and the set of note ids already rendered (dedup the poll + reconcile
+  // optimistic echoes). MOUNT, escapeHtml, fetchToken (caches on window.__token),
+  // authedFetch come from SHELL_JS. Wire the shared nav for the chat view.
+  var channelTransports = {}; // name -> transport kind ("vault" | "http-ui" | ...)
+  var pollTimer = null;
+  var seenIds = {}; // note id -> true, for the vault poll dedup
+  var POLL_MS = 3500;
   wireShell("chat");
+
+  function transportFor(ch) { return channelTransports[ch] || ""; }
+  function isVault(ch) { return transportFor(ch) === "vault"; }
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
 
   // ----- Layer 2 auth -----------------------------------------------------
   // The daemon's send + SSE endpoints require a hub-issued channel JWT
@@ -479,6 +492,78 @@ ${SHELL_JS}
     transcript.scrollTop = transcript.scrollHeight;
   }
 
+  // Render one vault transcript message, deduped by note id. Direction mapping:
+  // the human/operator is INBOUND -> "you" (right bubble); the session reply is
+  // OUTBOUND -> "them" (left). This mirrors the transport's direction semantics,
+  // not the chat's local point of view. Returns true if it rendered (new id).
+  function addVaultMessage(m) {
+    if (!m || !m.id || seenIds[m.id]) return false;
+    seenIds[m.id] = true;
+    var kind = m.direction === "outbound" ? "them" : "you";
+    add(kind, m.text || "");
+    return true;
+  }
+
+  // Poll a vault channel's transcript: re-query, append only unseen ids. This is
+  // how a session's replies + messages from other clients (Telegram, other
+  // browsers) show up. Reconciles optimistic echoes too — an echo we already
+  // rendered locally is in seenIds (we key it on the returned note id at send
+  // time), so the round-tripped note isn't double-rendered.
+  function pollVault(ch) {
+    if (!ch || ch !== currentChannel() || !isVault(ch)) return;
+    authedFetch(MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/messages").then(function (r) {
+      if (!r.ok) {
+        if (r.status === 401) { setStatus("re-authenticating…", ""); ensureToken(); return; }
+        return r.json().catch(function(){return {};}).then(function (j) {
+          setStatus("history error: " + (j.error || r.status), "err");
+        });
+      }
+      return r.json().then(function (data) {
+        // Channel may have changed while the request was in flight.
+        if (ch !== currentChannel()) return;
+        var msgs = (data && data.messages) || [];
+        var appended = 0;
+        msgs.forEach(function (m) { if (addVaultMessage(m)) appended++; });
+        setStatus("● live · " + ch, "live");
+      });
+    }).catch(function (err) { setStatus("history error: " + err, "err"); });
+  }
+
+  // Load a vault channel: clear, fetch the transcript once (render history), then
+  // start polling. Sets the composer live. authedFetch attaches the bearer.
+  function connectVault(ch) {
+    stopPolling();
+    if (es) { es.close(); es = null; }
+    seenIds = {};
+    setStatus("loading history…", "");
+    authedFetch(MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/messages").then(function (r) {
+      if (ch !== currentChannel()) return;
+      if (!r.ok) {
+        if (r.status === 401) {
+          return ensureToken().then(function () { if (ch === currentChannel()) connectVault(ch); });
+        }
+        return r.json().catch(function(){return {};}).then(function (j) {
+          setStatus("history error: " + (j.error || r.status), "err");
+          sendBtn.disabled = false; // a transient read failure shouldn't block sending
+          pollTimer = setInterval(function () { pollVault(ch); }, POLL_MS);
+        });
+      }
+      return r.json().then(function (data) {
+        if (ch !== currentChannel()) return;
+        var msgs = (data && data.messages) || [];
+        msgs.forEach(function (m) { addVaultMessage(m); });
+        setStatus("● live · " + ch, "live");
+        sendBtn.disabled = false;
+        pollTimer = setInterval(function () { pollVault(ch); }, POLL_MS);
+      });
+    }).catch(function (err) {
+      if (ch !== currentChannel()) return;
+      setStatus("history error: " + err, "err");
+      sendBtn.disabled = false;
+      pollTimer = setInterval(function () { pollVault(ch); }, POLL_MS);
+    });
+  }
+
   // Render a permission prompt as an interactive bubble with Approve / Deny.
   //
   // SCOPE NOTE (flagged): submitting a verdict has NO daemon endpoint today, and
@@ -535,9 +620,13 @@ ${SHELL_JS}
 
   function connect() {
     if (es) { es.close(); es = null; }
+    stopPolling();
     var ch = currentChannel();
     if (!ch) { setStatus("no channel", ""); sendBtn.disabled = true; return; }
     updateSetup(ch);
+    // Vault channels read/write the durable #channel-message store via the daemon
+    // (load transcript + poll); http-ui channels use the ephemeral SSE path below.
+    if (isVault(ch)) { connectVault(ch); return; }
     setStatus("connecting…", "");
     var url = MOUNT + "/ui/events?channel=" + encodeURIComponent(ch);
     if (window.__token) url += "&token=" + encodeURIComponent(window.__token);
@@ -581,21 +670,36 @@ ${SHELL_JS}
     });
   }
 
+  // Reconcile a vault send: the POST returns the created note id. Key it into
+  // the SAME seenIds object the send started against (captured at call time as
+  // ids, NOT the live seenIds var — a channel switch reassigns seenIds to a fresh
+  // empty object, and we must not write this id into a different channel's set) so
+  // the round-tripped note isn't rendered a second time on the next poll (the
+  // optimistic echo already shows it).
+  function reconcileVaultEcho(r, ids) {
+    return r.json().catch(function(){return {};}).then(function (j) {
+      if (j && j.id) ids[j.id] = true;
+    });
+  }
+
   function send() {
     var text = input.value.trim();
     var ch = currentChannel();
     if (!text || !ch) return;
-    add("you", text);
+    var vault = isVault(ch);
+    var ids = seenIds; // bind the current channel's dedup set for reconcile
+    add("you", text); // optimistic echo (vault: operator=inbound="you"; http-ui: local)
     input.value = "";
     autosize();
     postSend(ch, text).then(function (r) {
-      if (r.ok) return;
+      if (r.ok) { if (vault) return reconcileVaultEcho(r, ids); return; }
       // The token is short-lived; on a 401 refresh it once and retry the send.
       if (r.status === 401) {
         return ensureToken().then(function (tok) {
           if (!tok) { add("sys", "send failed: not authenticated"); return; }
           return postSend(ch, text).then(function (r2) {
-            if (!r2.ok) return r2.json().catch(function(){return {};}).then(function (j) {
+            if (r2.ok) { if (vault) return reconcileVaultEcho(r2, ids); return; }
+            return r2.json().catch(function(){return {};}).then(function (j) {
               add("sys", "send failed: " + (j.error || r2.status));
             });
           });
@@ -625,16 +729,15 @@ ${SHELL_JS}
     connect();
   });
 
-  // No http-ui channel to chat on: don't dead-end. Drop a forward CTA into the
-  // transcript pointing at Config (to add a channel) + Home, and disable the
-  // composer (nothing to send to).
+  // No channels at all: don't dead-end. Drop a forward CTA into the transcript
+  // pointing at Config (to add a channel) + Home, and disable the composer.
   function showNoChannelCta() {
     setStatus("no channels", "");
     sendBtn.disabled = true;
     var el = document.createElement("div");
     el.className = "msg sys";
     var p = document.createElement("div");
-    p.textContent = "No http-ui channel to chat on yet.";
+    p.textContent = "No channels yet — add one in Config →";
     el.appendChild(p);
     var links = document.createElement("div");
     links.style.marginTop = "6px";
@@ -654,12 +757,17 @@ ${SHELL_JS}
 
   function loadChannelsAndConnect() {
     return fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
-      var chans = (cfg.channels || []).filter(function (c) { return c.transport === "http-ui"; });
+      // Show ALL channels and pick behavior by transport — vault channels read
+      // the durable transcript + poll; http-ui channels use the ephemeral SSE.
+      var chans = (cfg.channels || []);
+      channelTransports = {};
+      chans.forEach(function (c) { channelTransports[c.name] = c.transport; });
       if (!chans.length) { showNoChannelCta(); return; }
       var preselect = new URL(window.location.href).searchParams.get("channel");
       chans.forEach(function (c) {
         var opt = document.createElement("option");
-        opt.value = c.name; opt.textContent = c.name;
+        // Tag the kind in the label so it's obvious which channels are durable.
+        opt.value = c.name; opt.textContent = c.name + " (" + c.transport + ")";
         if (c.name === preselect) opt.selected = true;
         sel.appendChild(opt);
       });
@@ -1535,9 +1643,96 @@ export function createFetchHandler(
       return json({ ok: true });
     }
 
-    // Built-in chat UI — a global channel-picker page across all http-ui
-    // channels. Served by the daemon (not a transport) because it spans every
-    // http-ui channel; the per-channel send + SSE routes live in the transport.
+    // Transcript read — GET /api/channels/<ch>/messages (chat-facing; gated on
+    // `channel:read`, same as /ui/events). The built-in chat polls this to render
+    // a channel's durable history and pick up replies + messages from other
+    // clients (Telegram, other browsers). Behavior by transport:
+    //   - vault → loadTranscript() against the channel's vault (the daemon does
+    //     the vault I/O with the channel's stored vault token — the chat's
+    //     channel:read token never touches the vault).
+    //   - http-ui → that transport's traffic is ephemeral (SSE-only, no buffer),
+    //     so there's no durable transcript to replay → { messages: [] }.
+    //   - other (telegram) → no transcript surface here → { messages: [] }.
+    // 404 for an unknown channel. Externally `<hub>/channel/api/channels/<ch>/messages`.
+    {
+      const msgMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/messages$/);
+      if (req.method === "GET" && msgMatch) {
+        const denied = await requireScope(req, url, SCOPE_READ);
+        if (denied) return denied;
+        const channelName = decodeURIComponent(msgMatch[1]!);
+        const ch = channels.get(channelName);
+        if (!ch) {
+          return json(
+            {
+              error: `unknown channel "${channelName}" — known channels: ${[...channels.keys()].join(", ") || "(none)"}`,
+            },
+            404,
+          );
+        }
+        if (ch.transport instanceof VaultTransport) {
+          try {
+            const messages = await ch.transport.loadTranscript();
+            return json({ messages });
+          } catch (err) {
+            // The vault read failed (unreachable / bad token / 5xx). Surface a
+            // 502 so the chat shows "couldn't load history" rather than a silent
+            // empty transcript that looks like "no messages yet".
+            return json({ error: String(err) }, 502);
+          }
+        }
+        // http-ui + telegram: no durable transcript to replay here.
+        return json({ messages: [] });
+      }
+    }
+
+    // Send for a VAULT channel — POST /api/channels/<ch>/send (chat-facing; gated
+    // on `channel:send`, same scope http-ui's send uses). The daemon owns this for
+    // vault transports because the http-ui transport's ingestHttp only matches its
+    // OWN channel name; a vault channel needs the daemon to dispatch. For a vault
+    // channel the daemon writes a `#channel-message/inbound` note via the channel's
+    // stored vault token — which WAKES the session through the existing vault
+    // trigger (we do NOT also emit; that would double-wake). http-ui channels fall
+    // through to their transport's ingestHttp (unchanged), so this guard handles
+    // ONLY vault channels and passes everything else on.
+    {
+      const sendMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/send$/);
+      if (req.method === "POST" && sendMatch) {
+        const channelName = decodeURIComponent(sendMatch[1]!);
+        const ch = channels.get(channelName);
+        // Only intercept VAULT channels; let http-ui keep its ingestHttp send path
+        // (and an unknown channel falls through to the final 404, matching prior
+        // behavior — http-ui's ingestHttp also only answered for a live channel).
+        if (ch && ch.transport instanceof VaultTransport) {
+          const denied = await requireScope(req, url, SCOPE_SEND);
+          if (denied) return denied;
+          let text: string;
+          try {
+            const body = (await req.json()) as { text?: unknown };
+            if (typeof body.text !== "string" || body.text.length === 0) {
+              return json({ error: "body must be { text: <non-empty string> }" }, 400);
+            }
+            text = body.text;
+          } catch {
+            return json({ error: "invalid JSON body" }, 400);
+          }
+          try {
+            // Writing the inbound note IS the wake (via the vault trigger) — the
+            // transport deliberately does not emit. Return { ok, id } so the chat
+            // can reconcile its optimistic echo against the real note id on the
+            // next poll.
+            const { id } = await ch.transport.writeInbound(text, "operator");
+            return json({ ok: true, id });
+          } catch (err) {
+            return errResponse(err);
+          }
+        }
+      }
+    }
+
+    // Built-in chat UI — a global channel-picker page across all channels.
+    // Served by the daemon (not a transport) because it spans every channel; the
+    // per-channel http-ui send + SSE routes live in the http-ui transport, and
+    // the vault read/send routes are the daemon-level handlers above.
     if (req.method === "GET" && url.pathname === "/ui") {
       return new Response(CHAT_UI_HTML, {
         headers: { "content-type": "text/html; charset=utf-8" },

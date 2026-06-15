@@ -115,7 +115,6 @@ export const AGENTS_UI_HTML = `<!doctype html>
   .scopes { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
   .muted { color: var(--muted); }
   .empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
-  .warnbox { color: var(--warn); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -219,16 +218,16 @@ export const AGENTS_UI_HTML = `<!doctype html>
           <div>
             <label for="net-mode">Network</label>
             <select id="net-mode">
-              <option value="restricted" selected>Restricted — Anthropic API + hub/vault + listed hosts</option>
-              <option value="open">Open — allow ALL network (trusted sessions only)</option>
+              <option value="open" selected>Open — full network access (default)</option>
+              <option value="restricted">Restricted — only Anthropic API + hub/vault + listed hosts</option>
             </select>
-            <div id="egress-wrap" style="margin-top:8px;">
+            <div id="egress-wrap" style="display:none; margin-top:8px;">
               <label for="egress">Additional allowed hosts (comma-separated)</label>
               <input type="text" id="egress" placeholder="registry.npmjs.org, github.com" autocomplete="off" />
             </div>
-            <div id="open-warn" class="warnbox" style="display:none; margin-top:8px;">
-              ⚠ Open network removes egress confinement — anything the session can reach, it can send to.
-              Use only for sessions you trust.
+            <div id="open-warn" class="muted" style="display:none; font-size:12px; margin-top:8px;">
+              Open is the default — the session reaches the network like any local process (it's still
+              filesystem-sandboxed). Choose Restricted to confine egress when a session handles untrusted input.
             </div>
           </div>
 
@@ -413,11 +412,13 @@ export const AGENTS_UI_HTML = `<!doctype html>
 
   // Network mode toggle: show host list only when restricted; warn when open.
   var netMode = document.getElementById("net-mode");
-  netMode.addEventListener("change", function () {
+  function syncNetMode() {
     var open = netMode.value === "open";
     document.getElementById("egress-wrap").style.display = open ? "none" : "";
     document.getElementById("open-warn").style.display = open ? "" : "none";
-  });
+  }
+  netMode.addEventListener("change", syncNetMode);
+  syncNetMode(); // default is open → show the note, hide the hosts field
 
   function collectSpec() {
     var wake = chanEl.value;

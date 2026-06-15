@@ -128,6 +128,24 @@ export class Sandbox {
       ...(input.allowPty !== undefined ? { allowPty: input.allowPty } : {}),
       ...(input.ripgrep ? { ripgrep: input.ripgrep } : {}),
     });
+    // Reset the process-global singleton BEFORE re-initializing. Without this, a
+    // prior spawn's network config leaks into this wrap: most visibly, an OPEN
+    // (no-proxy) session inherits a prior RESTRICTED session's `HTTP(S)_PROXY` env
+    // (baked into the wrapped argv), so claude routes to a now-wrong/absent proxy
+    // and dies with "An unknown error occurred (Unexpected)". Reset → initialize →
+    // wrap runs inside the caller's spawn lock, so each spawn produces a wrap that
+    // reflects ONLY its own config. (Caveat: because the singleton's host proxies
+    // are global, resetting here tears down a concurrently-running RESTRICTED
+    // session's proxy on the next spawn — a known v1 limitation of the singleton
+    // backend; OPEN sessions use no proxy and are unaffected. The escalation rung
+    // §3.4 is a per-session backend that removes this.)
+    try {
+      await this.engine.reset();
+    } catch {
+      // Any reset error is ignored: on the first-ever wrap there's nothing to tear
+      // down, and a later teardown fault must not block the (re-)initialize that
+      // follows. The fresh initialize() below re-establishes a clean state regardless.
+    }
     await this.engine.initialize(config);
     const { argv, env } = await this.engine.wrapWithSandboxArgv(input.command);
     return { argv, env, config };

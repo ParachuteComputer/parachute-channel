@@ -81,7 +81,7 @@ export const TERMINAL_UI_HTML = `<!doctype html>
   <header>
     <div class="brand">parachute-channel <small>· terminal</small></div>
     <nav><a id="nav-agents" href="#">← Agents</a></nav>
-    <select id="channel" title="channel"></select>
+    <select id="channel" title="agent session"></select>
     <button id="reconnect" type="button" title="Re-attach to the tmux session">Reconnect</button>
     <span class="spacer"></span>
     <span id="status">loading…</span>
@@ -276,33 +276,59 @@ export const TERMINAL_UI_HTML = `<!doctype html>
   sel.addEventListener("change", function () {
     term.reset();
     var url = new URL(window.location.href);
-    url.searchParams.set("channel", sel.value);
+    url.searchParams.set("agent", sel.value);
+    url.searchParams.delete("channel"); // migrate the legacy param name
     history.replaceState(null, "", url);
     connect();
   });
 
-  // --- boot: list channels, then token, then connect ----------------------
-  function loadChannelsAndConnect() {
-    return fetch(MOUNT + "/.parachute/config")
-      .then(function (r) { return r.json(); })
-      .then(function (cfg) {
-        var chans = (cfg.channels || []);
-        if (!chans.length) { setStatus("no channels configured"); return; }
-        var preselect = new URL(window.location.href).searchParams.get("channel");
-        var pathCh = (location.pathname.match(/\\/terminal\\/([^/]+)/) || [])[1];
-        if (pathCh && pathCh !== "assets") preselect = decodeURIComponent(pathCh);
-        chans.forEach(function (c) {
+  // --- boot: list running AGENTS, then connect ----------------------------
+  // The terminal attaches to an AGENT's tmux session (name-agent), so the picker
+  // lists running agents (operator-gated /api/agents), NOT channels — an agent has
+  // its own name, which isn't necessarily a configured channel.
+  function authedFetch(path) {
+    var headers = {};
+    if (window.__token) headers["authorization"] = "Bearer " + window.__token;
+    return fetch(MOUNT + path, { headers: headers });
+  }
+  function requestedAgent() {
+    var u = new URL(window.location.href);
+    var p = u.searchParams.get("agent") || u.searchParams.get("channel") || "";
+    var pathA = (location.pathname.match(/\\/terminal\\/([^/]+)/) || [])[1];
+    if (pathA && pathA !== "assets") p = decodeURIComponent(pathA);
+    return p;
+  }
+  function loadAgentsAndConnect() {
+    return authedFetch("/api/agents")
+      .then(function (r) { if (!r.ok) throw new Error("agents " + r.status); return r.json(); })
+      .then(function (j) {
+        var names = (j.agents || []).map(function (a) { return a.name; });
+        var want = requestedAgent();
+        // Keep the requested agent selectable even if the list is momentarily
+        // stale (e.g. just spawned) — the upgrade validates the session at attach.
+        if (want && names.indexOf(want) < 0) names.unshift(want);
+        if (!names.length) {
+          setStatus("no agents running");
+          showNotice("No agent sessions running. Spawn one on the " +
+            "<a href='" + MOUNT + "/agents'>Agents</a> page, then reload.", false);
+          return;
+        }
+        names.forEach(function (n) {
           var opt = document.createElement("option");
-          opt.value = c.name; opt.textContent = c.name + " (" + c.transport + ")";
-          if (c.name === preselect) opt.selected = true;
+          opt.value = n; opt.textContent = n;
+          if (n === want) opt.selected = true;
           sel.appendChild(opt);
         });
         connect();
       })
-      .catch(function (err) { setStatus("config load failed", "err"); showNotice("Could not load channels: " + err, true); });
+      .catch(function (err) {
+        setStatus("agent list failed", "err");
+        showNotice("Could not load agents (" + err + "). Open this page through the hub " +
+          "portal signed in as the operator.", true);
+      });
   }
 
-  fetchToken().then(loadChannelsAndConnect);
+  fetchToken().then(loadAgentsAndConnect);
   } // end boot()
 })();
 </script>

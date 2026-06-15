@@ -81,6 +81,7 @@ import {
   buildSpecFromBody,
   redactSpawnResult,
   SpawnRequestError,
+  AGENT_NAME_SLUG,
   type AgentOps,
 } from "./agents.ts";
 import { SpawnDepsError } from "./spawn-deps.ts";
@@ -639,34 +640,40 @@ function json(data: unknown, status = 200): Response {
  * Auth: OPERATOR-GATED on `channel:admin` (`SCOPE_TERMINAL`). The token rides in
  * as a `?token=` query param (browsers can't set Authorization on
  * `new WebSocket()`), so `allowQueryParam: true`. The no-token path
- * short-circuits to 401 before any JWKS fetch (testable offline). The channel
- * must exist (a terminal onto an unknown channel is a 404, never an enumeration
- * oracle — but this endpoint is operator-only behind the admin scope, so a plain
- * 404 is fine).
+ * short-circuits to 401 before any JWKS fetch (testable offline).
  *
- * Returns either `{ ok: true, ... }` with the tmux session name (`<name>-agent`,
- * matching `scripts/launch-session.sh:38`) + the client's requested geometry, or
- * `{ ok: false, response }` carrying the deny Response the caller returns as-is.
+ * The path segment is an AGENT name — the tmux session is `<name>-agent`. An agent
+ * has its OWN name (chosen at spawn), which is NOT necessarily a configured
+ * channel (the 1:1 channel↔session assumption from the launch-session.sh era no
+ * longer holds — an operator can name an agent anything). So we DON'T require the
+ * name to be a known channel; we slug-guard it (it lands UNESCAPED in a tmux `-t`
+ * target) and let the attach handle a non-existent session — `tmux attach` to a
+ * missing session fails cleanly and the relay closes 1000 ("session ended"), no
+ * reconnect loop. Operator-only behind channel:admin, so there's no enumeration
+ * concern. (`channels` is no longer consulted; kept in the signature for the
+ * stable call shape.)
+ *
+ * Returns either `{ ok: true, ... }` with the tmux session name (`<name>-agent`)
+ * + the client's requested geometry, or `{ ok: false, response }` carrying the
+ * deny Response the caller returns as-is.
  */
 export async function authorizeTerminalUpgrade(
   req: Request,
   url: URL,
-  channels: Map<string, Channel>,
-  channelName: string,
+  _channels: Map<string, Channel>,
+  agentName: string,
 ): Promise<
   | { ok: true; channel: string; session: string; cols: number; rows: number }
   | { ok: false; response: Response }
 > {
-  if (!channels.has(channelName)) {
+  // Slug-guard: the name lands unescaped in a tmux `-t <session>` target and the
+  // session string `<name>-agent`. Reject anything that isn't a strict slug.
+  if (!AGENT_NAME_SLUG.test(agentName)) {
     return {
       ok: false,
       response: authJson(
-        {
-          error: `unknown channel "${channelName}" — known channels: ${
-            [...channels.keys()].join(", ") || "(none)"
-          }`,
-        },
-        404,
+        { error: `invalid agent name "${agentName}" (alphanumeric, dash, underscore only)` },
+        400,
       ),
     };
   }
@@ -675,12 +682,12 @@ export async function authorizeTerminalUpgrade(
   const denied = await requireScope(req, url, SCOPE_TERMINAL, true);
   if (denied) return { ok: false, response: denied };
 
-  // tmux session name convention: `<name>-agent` (launch-session.sh:38). Attach
-  // a viewer pty to THIS session; the session itself is created by the launcher.
-  const session = `${channelName}-agent`;
+  // tmux session name convention: `<name>-agent`. Attach a viewer pty to THIS
+  // session; the session itself is created by the spawn path.
+  const session = `${agentName}-agent`;
   const cols = clampQueryDim(url.searchParams.get("cols"), 80);
   const rows = clampQueryDim(url.searchParams.get("rows"), 24);
-  return { ok: true, channel: channelName, session, cols, rows };
+  return { ok: true, channel: agentName, session, cols, rows };
 }
 
 /** Is this request a WebSocket upgrade? (case-insensitive `Upgrade: websocket`). */
@@ -761,7 +768,7 @@ export function createFetchHandler(
     const url = new URL(req.url);
 
     // -------------------------------------------------------------------
-    // Terminal WebSocket upgrade — `/terminal/<channel>` (design §5).
+    // Terminal WebSocket upgrade — `/terminal/<agent>` (design §5).
     //
     // The in-page xterm.js terminal attaches to the channel's tmux session
     // (`<channel>-agent`) via Bun's native pty. Externally this is

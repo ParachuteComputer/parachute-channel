@@ -39,7 +39,7 @@ import { resolveSpawnDeps, sessionsDir as defaultSessionsDir } from "./spawn-dep
 const AGENT_SESSION_SUFFIX = "-agent";
 
 /** Same slug shape `spawnAgent` enforces — validated early so a bad name 400s. */
-const AGENT_NAME_SLUG = /^[a-z0-9_-]+$/i;
+export const AGENT_NAME_SLUG = /^[a-z0-9_-]+$/i;
 
 /** A malformed spawn request body — the caller maps `.message` to a 400. */
 export class SpawnRequestError extends Error {

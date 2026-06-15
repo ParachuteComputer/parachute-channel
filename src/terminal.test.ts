@@ -462,21 +462,24 @@ describe("authorizeTerminalUpgrade — operator-gated channel:admin", () => {
     }
   });
 
-  test("unknown channel → reject (404), even with a valid admin token (no traversal / no session)", async () => {
-    const url = new URL(`http://127.0.0.1/terminal/ghost?token=${ADMIN_TOKEN}`);
+  test("an agent name that isn't a configured channel is ACCEPTED → its session (agents have own names)", async () => {
+    // The terminal attaches to an AGENT (tmux <name>-agent), not a channel — so a
+    // valid-slug name that isn't in the channel map is accepted (a non-existent
+    // session just fails to attach downstream with a clean 1000, no 404 here).
+    const url = new URL(`http://127.0.0.1/terminal/weaver?token=${ADMIN_TOKEN}`);
     const r = new Request(url, { headers: { upgrade: "websocket" } });
-    const d = await authorizeTerminalUpgrade(r, url, channels(["eng"]), "ghost");
-    expect(d.ok).toBe(false);
-    if (!d.ok) expect(d.response.status).toBe(404);
+    const d = await authorizeTerminalUpgrade(r, url, channels(["eng"]), "weaver");
+    expect(d.ok).toBe(true);
+    if (d.ok) expect(d.session).toBe("weaver-agent");
   });
 
-  test("a path-traversal-shaped channel name is treated as an unknown channel → 404 (no escape)", async () => {
+  test("a path-traversal-shaped name is rejected by the slug guard → 400 (no escape into tmux -t)", async () => {
     const weird = "../../etc";
     const url = new URL(`http://127.0.0.1/terminal/${encodeURIComponent(weird)}?token=${ADMIN_TOKEN}`);
     const r = new Request(url, { headers: { upgrade: "websocket" } });
     const d = await authorizeTerminalUpgrade(r, url, channels(["eng"]), weird);
     expect(d.ok).toBe(false);
-    if (!d.ok) expect(d.response.status).toBe(404);
+    if (!d.ok) expect(d.response.status).toBe(400);
   });
 });
 

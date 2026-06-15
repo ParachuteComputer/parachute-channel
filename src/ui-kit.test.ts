@@ -138,6 +138,23 @@ describe("renderMarkdown (SHELL_JS, XSS-safe Markdown subset)", () => {
     expect(out).toContain("[click]");
   });
 
+  test("rejects data: URLs too — only http/https survive as anchors", () => {
+    const out = renderMarkdown("[x](data:text/html,<script>alert(1)</script>)");
+    expect(out).not.toContain("<a ");
+    expect(out).not.toContain("href=");
+    // any escaped markup inside is inert text, never executable.
+    expect(out).not.toContain("<script>");
+  });
+
+  test("escapes other canonical XSS vectors (img onerror, svg onload)", () => {
+    const out1 = renderMarkdown('<img src=x onerror=alert(1)>');
+    expect(out1).not.toContain("<img");
+    expect(out1).toContain("&lt;img");
+    const out2 = renderMarkdown('<svg onload=alert(1)>');
+    expect(out2).not.toContain("<svg");
+    expect(out2).toContain("&lt;svg");
+  });
+
   test("converts newlines to <br>", () => {
     expect(renderMarkdown("line1\nline2")).toContain("line1<br>line2");
   });

@@ -130,6 +130,190 @@ describe("VaultTransport — reply (outbound note write)", () => {
   });
 });
 
+describe("VaultTransport — loadTranscript (read the durable store)", () => {
+  test("queries tag=#channel-message + metadata.channel filter, include_content, limit; parses + sorts ascending by ts", async () => {
+    let capturedUrl = "";
+    let capturedAuth = "";
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      // Ignore the ensureSchema PUTs fired by start(); only the GET /api/notes is the transcript read.
+      if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
+        capturedUrl = u;
+        capturedAuth = (init?.headers as Record<string, string> | undefined)?.authorization ?? "";
+        // Return notes OUT of ts order to prove the client-side ascending sort.
+        return new Response(
+          JSON.stringify([
+            {
+              id: "n-out",
+              content: "session reply",
+              tags: ["#channel-message", "#channel-message/outbound"],
+              metadata: { channel: "eng", direction: "outbound", sender: "session", ts: "2026-06-08T00:00:02Z", in_reply_to: "n-in" },
+            },
+            {
+              id: "n-in",
+              content: "hi session",
+              tags: ["#channel-message", "#channel-message/inbound"],
+              metadata: { channel: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:01Z" },
+            },
+          ]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      // ensureSchema PUTs
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const msgs = await t.loadTranscript();
+
+    // The query URL carries the encoded parent tag + the metadata channel filter.
+    expect(capturedUrl.startsWith("http://127.0.0.1:1940/vault/default/api/notes?")).toBe(true);
+    expect(capturedUrl).toContain("tag=%23channel-message");
+    // metadata={"channel":{"eq":"eng"}} URI-encoded.
+    expect(capturedUrl).toContain("metadata=" + encodeURIComponent(JSON.stringify({ channel: { eq: "eng" } })));
+    expect(capturedUrl).toContain("include_content=true");
+    expect(capturedUrl).toContain("limit=200");
+    expect(capturedAuth).toBe("Bearer write-token-xyz");
+
+    // Parsed + sorted ascending by ts (n-in before n-out).
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0]!.id).toBe("n-in");
+    expect(msgs[0]!.direction).toBe("inbound");
+    expect(msgs[0]!.text).toBe("hi session");
+    expect(msgs[0]!.sender).toBe("aaron");
+    expect(msgs[1]!.id).toBe("n-out");
+    expect(msgs[1]!.direction).toBe("outbound");
+    expect(msgs[1]!.inReplyTo).toBe("n-in");
+  });
+
+  test("honors a custom limit", async () => {
+    let capturedUrl = "";
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
+        capturedUrl = u;
+        return new Response("[]", { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.loadTranscript({ limit: 50 });
+    expect(capturedUrl).toContain("limit=50");
+  });
+
+  test("falls back to the child tag for direction when metadata.direction is absent", async () => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
+        return new Response(
+          JSON.stringify([
+            { id: "a", content: "x", tags: ["#channel-message", "#channel-message/outbound"], metadata: { channel: "eng", ts: "2026-06-08T00:00:01Z" } },
+            { id: "b", content: "y", tags: ["#channel-message", "#channel-message/inbound"], metadata: { channel: "eng", ts: "2026-06-08T00:00:02Z" } },
+          ]),
+          { status: 200 },
+        );
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const msgs = await t.loadTranscript();
+    expect(msgs.find((m) => m.id === "a")!.direction).toBe("outbound");
+    expect(msgs.find((m) => m.id === "b")!.direction).toBe("inbound");
+  });
+
+  test("throws a clear error on a non-ok vault response", async () => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
+        return new Response("nope", { status: 502 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await expect(t.loadTranscript()).rejects.toThrow(/load transcript failed/);
+  });
+});
+
+describe("VaultTransport — writeInbound (the chat's send → wakes the session)", () => {
+  test("POSTs an INBOUND note tagged [#channel-message, #channel-message/inbound] with direction + channel + sender + Bearer", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ id: "inbound-note-1" }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const result = await t.writeInbound("wake up", "operator");
+
+    expect(result.id).toBe("inbound-note-1");
+    const noteCalls = calls.filter((c) => c.url.endsWith("/api/notes") && c.init.method === "POST");
+    expect(noteCalls).toHaveLength(1);
+    const call = noteCalls[0]!;
+    expect(call.url).toBe("http://127.0.0.1:1940/vault/default/api/notes");
+    expect((call.init.headers as Record<string, string>).authorization).toBe("Bearer write-token-xyz");
+
+    const sent = JSON.parse(String(call.init.body)) as {
+      content: string;
+      path: string;
+      tags: string[];
+      metadata: Record<string, string>;
+    };
+    expect(sent.content).toBe("wake up");
+    // The INBOUND tag pair — the child is the trigger discriminator that wakes the session.
+    expect(sent.tags).toEqual(["#channel-message", "#channel-message/inbound"]);
+    expect(sent.tags).toContain("#channel-message");
+    expect(sent.tags).toContain("#channel-message/inbound");
+    // It must NOT carry the outbound tag (that would be a reply, never wake).
+    expect(sent.tags).not.toContain("#channel-message/outbound");
+    expect(sent.metadata.channel).toBe("eng");
+    expect(sent.metadata.direction).toBe("inbound");
+    expect(sent.metadata.sender).toBe("operator");
+    expect(typeof sent.metadata.ts).toBe("string");
+    expect(sent.path.startsWith("channel/eng/")).toBe(true);
+  });
+
+  test("defaults sender to 'operator' when omitted", async () => {
+    let captured: Record<string, string> | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith("/api/notes") && init?.method === "POST") {
+        captured = (JSON.parse(String(init?.body)) as { metadata: Record<string, string> }).metadata;
+      }
+      return new Response(JSON.stringify({ id: "n" }), { status: 201 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.writeInbound("hi");
+    expect(captured!.sender).toBe("operator");
+  });
+
+  test("does NOT emit (no double-wake) — the trigger is the single wake path", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ id: "n" }), { status: 201 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    const ctx = fakeCtx("eng");
+    await t.start(ctx);
+    await t.writeInbound("hi");
+    // writeInbound must never ctx.emit — the vault trigger wakes the session.
+    expect(ctx.emitted).toHaveLength(0);
+  });
+
+  test("throws a clear error on a non-ok vault response", async () => {
+    globalThis.fetch = (async () =>
+      new Response("boom", { status: 500 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await expect(t.writeInbound("x")).rejects.toThrow(/write inbound failed/);
+  });
+});
+
 describe("VaultTransport — ingestInbound", () => {
   test("emits the inbound content + meta onto its channel", () => {
     const t = new VaultTransport(baseConfig());

@@ -313,12 +313,27 @@ ${THEME_CSS}
   }
   /* Light-theme message bubbles. "you" = accent; "them" = soft surface; "sys" =
      muted/italic system line; "perm" = a warn style for permission prompts. */
-  .msg { max-width: 78%; padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+  /* Bodies render Markdown (renderMarkdown -> innerHTML): newlines become <br>
+     and code blocks become <pre>, so the bubble itself wraps normally rather than
+     preserving raw whitespace (which would double the line breaks). */
+  .msg { max-width: 78%; padding: 8px 12px; border-radius: 12px; white-space: normal; word-wrap: break-word; overflow-wrap: anywhere; }
   .msg.you { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
   .msg.them { align-self: flex-start; background: var(--bg-soft); color: var(--fg); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
   .msg.sys { align-self: center; background: transparent; color: var(--fg-muted); font-size: 0.8rem; font-style: italic; max-width: 90%; }
   .msg.perm { align-self: flex-start; background: var(--warn-soft); border: 1px solid var(--warn); border-left: 3px solid var(--warn); color: var(--warn); max-width: 90%; }
+  /* Markdown bits inside a bubble: inline code + fenced blocks, links, emphasis. */
+  .msg code { font-family: var(--font-mono); font-size: 0.85em; background: rgba(0,0,0,0.06); padding: 0.05rem 0.3rem; border-radius: 4px; }
+  .msg.you code { background: rgba(255,255,255,0.22); }
+  .msg pre { margin: 6px 0; padding: 8px 10px; background: rgba(0,0,0,0.06); border-radius: 8px; overflow-x: auto; }
+  .msg pre code { background: transparent; padding: 0; font-size: 0.82em; }
+  .msg.you pre { background: rgba(255,255,255,0.18); }
+  .msg a { text-decoration: underline; }
+  .msg.you a { color: #fff; }
   .files { margin-top: 4px; font-size: 0.8rem; opacity: .85; }
+  .files .file-name { font-family: var(--font-mono); }
+  /* Permission bubble: Approve/Deny row + the follow-up note. */
+  .perm-actions { display: flex; gap: 8px; margin-top: 8px; }
+  .perm-note { margin-top: 8px; font-size: 0.78rem; color: var(--fg-muted); font-style: italic; }
   form {
     display: flex; gap: 8px; padding: 12px 16px;
     border-top: 1px solid var(--border); background: var(--card);
@@ -429,13 +444,83 @@ ${SHELL_JS}
   function add(kind, text, files) {
     var el = document.createElement("div");
     el.className = "msg " + kind;
-    el.textContent = text;
+    // Message bodies render through renderMarkdown (SHELL_JS) — a SMALL, XSS-safe
+    // Markdown subset (escapes first, then a bounded set of patterns). Trusted
+    // HTML out, so assign via innerHTML. Phase 4's vault-backed chat reuses it.
+    el.innerHTML = renderMarkdown(text);
     if (files && files.length) {
+      // ATTACHMENTS: a reply's files is a string[] of file PATHS on the daemon
+      // host (the bridge documents reply files as absolute paths, e.g.
+      // /abs/path.png). There is NO endpoint that serves a reply attachment
+      // as a downloadable blob: the daemon's POST /api/download goes the OTHER
+      // way (a Telegram file_id -> a server-local path) and requires
+      // channel:write, which the chat page's token (channel:read channel:send)
+      // does not hold. So we render the names clearly rather than fabricate a
+      // download link. Making these downloadable needs new backend work (a
+      // blob-serving route scoped to channel:read) — left for a follow-up.
       var f = document.createElement("div");
       f.className = "files";
-      f.textContent = "📎 " + files.join(", ");
+      var label = document.createElement("span");
+      label.textContent = "📎 ";
+      f.appendChild(label);
+      files.forEach(function (name, i) {
+        if (i) f.appendChild(document.createTextNode(", "));
+        var n = document.createElement("span");
+        n.className = "file-name";
+        // Show the basename (paths are host-local); title carries the full path.
+        var base = String(name).split("/").pop() || String(name);
+        n.textContent = base;
+        n.title = String(name);
+        f.appendChild(n);
+      });
       el.appendChild(f);
     }
+    transcript.appendChild(el);
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  // Render a permission prompt as an interactive bubble with Approve / Deny.
+  //
+  // SCOPE NOTE (flagged): submitting a verdict has NO daemon endpoint today, and
+  // the chat page's token is channel:read + channel:send only. The existing
+  // POST /api/permission is the OUTBOUND prompt (bridge -> channel,
+  // transport.sendPermission) gated channel:write — NOT a verdict sink; the
+  // verdict path (ctx.emitPermissionVerdict -> bridges/MCP sessions) has no HTTP
+  // route the browser can call. So the buttons are wired to a clear, honest
+  // "needs backend + channel:write" state rather than a call that would 401 or
+  // hit the wrong endpoint. When the verdict route + scope land (Phase 4), swap
+  // the handler body for the real POST. We deliberately do NOT weaken the gate.
+  function addPermission(d) {
+    var el = document.createElement("div");
+    el.className = "msg perm";
+    var head = document.createElement("div");
+    head.innerHTML = renderMarkdown("🔐 **permission:** " + (d.tool_name || "") +
+      "\\n" + (d.description || "") + "\\n" + (d.input_preview || ""));
+    el.appendChild(head);
+    var actions = document.createElement("div");
+    actions.className = "perm-actions";
+    var note = document.createElement("div");
+    note.className = "perm-note";
+    function disableWithNote(verdict) {
+      approve.disabled = true; deny.disabled = true;
+      note.textContent = "Recorded your choice (" + verdict + ") in the UI. Approving/denying " +
+        "from chat needs a verdict endpoint + a channel:write token — follow-up. " +
+        "For now respond in the session's terminal.";
+    }
+    var approve = document.createElement("button");
+    approve.type = "button";
+    approve.className = "btn btn-sm btn-primary";
+    approve.textContent = "Approve";
+    approve.addEventListener("click", function () { disableWithNote("approve"); });
+    var deny = document.createElement("button");
+    deny.type = "button";
+    deny.className = "btn btn-sm btn-danger";
+    deny.textContent = "Deny";
+    deny.addEventListener("click", function () { disableWithNote("deny"); });
+    actions.appendChild(approve);
+    actions.appendChild(deny);
+    el.appendChild(actions);
+    el.appendChild(note);
     transcript.appendChild(el);
     transcript.scrollTop = transcript.scrollHeight;
   }
@@ -468,7 +553,7 @@ ${SHELL_JS}
     es.addEventListener("permission", function (e) {
       try {
         var d = JSON.parse(e.data);
-        add("perm", "🔐 permission: " + d.tool_name + "\\n" + (d.description || "") + "\\n" + (d.input_preview || ""));
+        addPermission(d);
       } catch (_) {}
     });
     es.addEventListener("close", function () { setStatus("closed", ""); });
@@ -540,10 +625,37 @@ ${SHELL_JS}
     connect();
   });
 
+  // No http-ui channel to chat on: don't dead-end. Drop a forward CTA into the
+  // transcript pointing at Config (to add a channel) + Home, and disable the
+  // composer (nothing to send to).
+  function showNoChannelCta() {
+    setStatus("no channels", "");
+    sendBtn.disabled = true;
+    var el = document.createElement("div");
+    el.className = "msg sys";
+    var p = document.createElement("div");
+    p.textContent = "No http-ui channel to chat on yet.";
+    el.appendChild(p);
+    var links = document.createElement("div");
+    links.style.marginTop = "6px";
+    var add = document.createElement("a");
+    add.href = MOUNT + "/admin";
+    add.textContent = "Add a channel →";
+    var sep = document.createTextNode("   ");
+    var home = document.createElement("a");
+    home.href = MOUNT + "/home";
+    home.textContent = "Home";
+    links.appendChild(add);
+    links.appendChild(sep);
+    links.appendChild(home);
+    el.appendChild(links);
+    transcript.appendChild(el);
+  }
+
   function loadChannelsAndConnect() {
     return fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
       var chans = (cfg.channels || []).filter(function (c) { return c.transport === "http-ui"; });
-      if (!chans.length) { setStatus("no http-ui channels configured", ""); return; }
+      if (!chans.length) { showNoChannelCta(); return; }
       var preselect = new URL(window.location.href).searchParams.get("channel");
       chans.forEach(function (c) {
         var opt = document.createElement("option");

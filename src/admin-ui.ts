@@ -354,6 +354,14 @@ const STYLES = `
   .btn-remove:hover { background: ${PALETTE.dangerSoft}; border-color: ${PALETTE.danger}; }
   .btn-remove:disabled { opacity: 0.5; cursor: progress; }
 
+  /* Cross-action links (Spawn agent / Chat) on each channel row. The kit's .btn
+     is button-styled; as <a> elements they need inline-flex + no underline to
+     match. They sit just before Remove (which keeps margin-left:auto pushing the
+     status block left). */
+  .row-actions { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .channel-row .btn { display: inline-flex; align-items: center; text-decoration: none; line-height: 1; }
+  .channel-row .btn:hover { text-decoration: none; }
+
   .add-form { display: flex; flex-direction: column; gap: 1rem; }
   /* A focus ring on inputs/selects — a touch richer than the kit's plain focus. */
   select:focus, input:focus {
@@ -631,6 +639,25 @@ const PAGE_SCRIPT = String.raw`
         status.appendChild(clients);
       }
       li.appendChild(status);
+
+      // Lifecycle cross-actions: jump from a configured channel straight to
+      // spawning an agent on it, or to its chat. These land on the other
+      // surfaces with ?channel=<name> pre-filled (MOUNT-prefixed so they resolve
+      // under the hub proxy). Styled as the kit's small ghost buttons; Remove
+      // stays as-is.
+      var actions = document.createElement("span");
+      actions.className = "row-actions";
+      var spawn = document.createElement("a");
+      spawn.className = "btn btn-sm btn-ghost";
+      spawn.href = MOUNT + "/agents?channel=" + encodeURIComponent(c.name);
+      spawn.textContent = "Spawn agent";
+      actions.appendChild(spawn);
+      var chat = document.createElement("a");
+      chat.className = "btn btn-sm btn-ghost";
+      chat.href = MOUNT + "/ui?channel=" + encodeURIComponent(c.name);
+      chat.textContent = "Chat";
+      actions.appendChild(chat);
+      li.appendChild(actions);
 
       var rm = document.createElement("button");
       rm.type = "button";

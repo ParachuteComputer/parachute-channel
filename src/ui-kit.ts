@@ -277,6 +277,65 @@ export const SHELL_JS = `
   function escapeHtml(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
+  // Render a SMALL, SAFE subset of Markdown to HTML. XSS-safe by construction:
+  // the input is escapeHtml'd FIRST (so no raw HTML can survive), THEN a limited
+  // set of patterns is applied to the already-escaped string. Supports fenced
+  // code blocks, inline code, bold, italic, links (http/https only), and line
+  // breaks. Anything else passes through as escaped text. Returns trusted HTML —
+  // assign it via innerHTML. Shared so Phase 4's vault-backed chat reuses it.
+  //
+  // No literal backtick appears in this source (SHELL_JS is asserted backtick-
+  // free so it is safe to interpolate into a host template literal); the fence +
+  // inline-code markers are built from char code 96 at runtime.
+  function renderMarkdown(text) {
+    var BT = String.fromCharCode(96); // the backtick character
+    var escaped = escapeHtml(String(text == null ? "" : text));
+    // 1. Fenced code blocks: a run of 3+ backticks, optional language token on
+    //    the open line, body until the closing fence. Pull these out FIRST and
+    //    park them as placeholders so inline rules never touch code contents.
+    // (These dynamic regexes are built via new RegExp from strings inside SHELL_JS,
+    //  which is itself a template literal then eval'd, so regex backslashes are
+    //  written four-deep in this source to survive both unescapes to a single
+    //  regex escape at runtime. The placeholder NUL sentinels are written the
+    //  same way so they reach the runtime as a real NUL.)
+    var blocks = [];
+    var fence = new RegExp(BT + "{3,}([^\\\\n]*)\\\\n([\\\\s\\\\S]*?)" + BT + "{3,}", "g");
+    escaped = escaped.replace(fence, function (_m, _lang, code) {
+      blocks.push(code.replace(/\\n$/, ""));
+      return "\\u0000B" + (blocks.length - 1) + "\\u0000";
+    });
+    // 2. Inline code: a single backtick run. Park it too so bold/italic/link
+    //    rules never fire inside code.
+    var inlines = [];
+    var inline = new RegExp(BT + "([^" + BT + "\\\\n]+)" + BT, "g");
+    escaped = escaped.replace(inline, function (_m, code) {
+      inlines.push(code);
+      return "\\u0000I" + (inlines.length - 1) + "\\u0000";
+    });
+    // 3. Links: [text](url) — only http/https URLs survive; anything else (e.g.
+    //    javascript:) renders as inert escaped text. The URL is already HTML-
+    //    escaped; we re-escape the double-quote for the attribute context.
+    escaped = escaped.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g, function (m, label, url) {
+      if (!/^https?:\\/\\//i.test(url)) return m;
+      var safeUrl = url.replace(/"/g, "&quot;");
+      return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' + label + "</a>";
+    });
+    // 4. Bold (**x**) then italic (*x* / _x_). Bold first so ** is consumed
+    //    before the single-* italic rule sees it.
+    escaped = escaped.replace(/\\*\\*([^*\\n]+)\\*\\*/g, "<strong>$1</strong>");
+    escaped = escaped.replace(/(^|[^*])\\*([^*\\n]+)\\*/g, "$1<em>$2</em>");
+    escaped = escaped.replace(/(^|[^_])_([^_\\n]+)_/g, "$1<em>$2</em>");
+    // 5. Line breaks → <br>.
+    escaped = escaped.replace(/\\n/g, "<br>");
+    // 6. Restore the parked code spans (their contents stay escaped, never parsed).
+    escaped = escaped.replace(/\\u0000I(\\d+)\\u0000/g, function (_m, i) {
+      return "<code>" + inlines[+i] + "</code>";
+    });
+    escaped = escaped.replace(/\\u0000B(\\d+)\\u0000/g, function (_m, i) {
+      return "<pre><code>" + blocks[+i] + "</code></pre>";
+    });
+    return escaped;
+  }
   function setStatus(text, kind) {
     var el = document.getElementById("status");
     if (!el) return;

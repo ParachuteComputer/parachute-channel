@@ -192,6 +192,7 @@ export function buildAgentChildEnv(
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
     "XDG_RUNTIME_DIR",
   ];
   for (const k of passthrough) {
@@ -230,7 +231,8 @@ export function buildAgentChildEnv(
  * `oauthAccount` is dropped (the agent authenticates via CLAUDE_CODE_OAUTH_TOKEN).
  * If the operator has no config, fall back to the two flags that gate the prompts.
  *
- * Returns the env overrides (HOME + CLAUDE_CONFIG_DIR + XDG_* + the temp vars) to
+ * Returns the env overrides (CLAUDE_CONFIG_DIR + XDG_* + the temp vars — NOT HOME,
+ * which is deliberately left as the operator's so claude finds its real install) to
  * layer LAST over the launch env so they win over the inherited + engine env.
  * Idempotent: an existing seed is left as-is (claude owns it after first boot).
  * `operatorConfigPath` is injectable for tests.

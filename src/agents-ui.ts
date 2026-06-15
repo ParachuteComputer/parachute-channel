@@ -474,6 +474,12 @@ ${SHELL_JS}
   // The terminal attaches to an AGENT (its tmux session), so the link carries the
   // agent name as ?agent= (the terminal page also accepts the legacy ?channel=).
   function terminalUrl(agent) { return MOUNT + "/terminal?agent=" + encodeURIComponent(agent); }
+  // /api/agents returns { name, session, attached } — it does NOT carry the
+  // agent's wake channel(s). The default is one-agent-one-channel (the spawn form
+  // auto-names the agent after its wake channel), so the Chat link uses the agent
+  // name as the channel (?channel=<name>). When an agent was custom-named off its
+  // channel, the chat page still loads on its picker — no fabricated data.
+  function chatUrl(channel) { return MOUNT + "/ui?channel=" + encodeURIComponent(channel); }
   function loadAgents() {
     return apiJson("/api/agents").then(function (j) {
       var host = document.getElementById("agents-table");
@@ -489,6 +495,7 @@ ${SHELL_JS}
           "<td><code>" + esc(a.session) + "</code></td>" +
           "<td>" + att + "</td>" +
           "<td class='actions'>" +
+            "<a href='" + esc(chatUrl(a.name)) + "'>chat →</a>" +
             "<a href='" + esc(terminalUrl(a.name)) + "' target='_blank' rel='noopener'>terminal ↗</a>" +
             "<button class='ghost danger' data-kill='" + esc(a.name) + "' type='button'>kill</button>" +
           "</td></tr>";
@@ -514,13 +521,37 @@ ${SHELL_JS}
   document.getElementById("refresh").addEventListener("click", function () { loadAgents(); });
 
   // --- pickers: channels + vaults -----------------------------------------
+  // A ?channel=<name> query param (from a "Spawn agent" link on another surface)
+  // pre-selects that channel + auto-fills the agent name, so the form lands
+  // ready-to-go. Only honored when the channel actually exists in the list.
+  function requestedChannel() {
+    try { return new URL(window.location.href).searchParams.get("channel") || ""; }
+    catch (_e) { return ""; }
+  }
   function loadChannels() {
     return fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
       knownChannels = (cfg.channels || []).map(function (c) { return c.name; });
-      chanEl.innerHTML = knownChannels.length
-        ? channelOptions(knownChannels[0])
-        : "<option value=''>(no channels — add one in Config)</option>";
-      if (knownChannels.length && !nameEdited) nameEl.value = knownChannels[0];
+      if (!knownChannels.length) {
+        // No channels configured: don't dead-end. Show a CTA to Config in the
+        // picker AND surface it on the spawn form (a channel is required first).
+        chanEl.innerHTML = "<option value=''>(no channels — add one in Config)</option>";
+        showMsg(document.getElementById("spawn-msg"),
+          "No channels configured yet — configure a channel first, then spawn an agent on it.", true);
+        var sm = document.getElementById("spawn-msg");
+        // Append a real link (showMsg uses textContent; add the link after it).
+        var a = document.createElement("a");
+        a.href = MOUNT + "/admin";
+        a.textContent = " Configure a channel first →";
+        a.style.display = "inline-block";
+        a.style.marginTop = "6px";
+        sm.appendChild(document.createElement("br"));
+        sm.appendChild(a);
+        return;
+      }
+      var want = requestedChannel();
+      var pre = (want && knownChannels.indexOf(want) >= 0) ? want : knownChannels[0];
+      chanEl.innerHTML = channelOptions(pre);
+      if (!nameEdited) nameEl.value = pre;
     }).catch(function () {
       chanEl.innerHTML = "<option value=''>(channel list failed)</option>";
     });

@@ -139,6 +139,7 @@ ${SHELL_JS}
   }
 
   function chatUrl(channel) { return MOUNT + "/ui?channel=" + encodeURIComponent(channel); }
+  function spawnUrl(channel) { return MOUNT + "/agents?channel=" + encodeURIComponent(channel); }
   function terminalUrl(agent) { return MOUNT + "/terminal?agent=" + encodeURIComponent(agent); }
 
   // --- channels (OPEN config + health, no token needed) -------------------
@@ -174,6 +175,7 @@ ${SHELL_JS}
             "<span class='spacer'></span>" +
             clients +
             "<span class='links'>" +
+              "<a href='" + esc(spawnUrl(c.name)) + "'>spawn →</a>" +
               "<a href='" + esc(chatUrl(c.name)) + "'>chat →</a>" +
             "</span>" +
           "</div>";

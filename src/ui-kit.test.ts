@@ -75,4 +75,70 @@ describe("SHELL_JS", () => {
   test("is safe to interpolate — no naked backtick that could break a host literal", () => {
     expect(SHELL_JS.includes("`")).toBe(false);
   });
+  test("exports a renderMarkdown helper (reused by the chat transcript)", () => {
+    expect(SHELL_JS).toContain("function renderMarkdown");
+  });
+});
+
+// renderMarkdown lives inside SHELL_JS (vanilla JS, no DOM). Evaluate SHELL_JS in
+// a fresh function scope and hand back its renderMarkdown so we can exercise it
+// directly — the same code the chat page runs in the browser.
+function loadRenderMarkdown(): (text: string) => string {
+  // SHELL_JS defines `var MOUNT = window.location...` at the top; stub a minimal
+  // window so that line doesn't throw when evaluated outside a browser.
+  const factory = new Function(
+    "window",
+    SHELL_JS + "\nreturn renderMarkdown;",
+  ) as (w: unknown) => (text: string) => string;
+  return factory({ location: { pathname: "/ui" } });
+}
+
+describe("renderMarkdown (SHELL_JS, XSS-safe Markdown subset)", () => {
+  const renderMarkdown = loadRenderMarkdown();
+
+  test("escapes raw HTML first — a <script> tag never survives as markup", () => {
+    const out = renderMarkdown("<script>alert(1)</script>");
+    expect(out).not.toContain("<script>");
+    expect(out).toContain("&lt;script&gt;");
+  });
+
+  test("renders bold and italic", () => {
+    expect(renderMarkdown("**bold**")).toContain("<strong>bold</strong>");
+    expect(renderMarkdown("an *italic* word")).toContain("<em>italic</em>");
+  });
+
+  test("renders inline code and fenced code blocks", () => {
+    const bt = String.fromCharCode(96);
+    expect(renderMarkdown(bt + "inline" + bt)).toContain("<code>inline</code>");
+    const fenced = renderMarkdown(bt + bt + bt + "\nconst x = 1;\n" + bt + bt + bt);
+    expect(fenced).toContain("<pre><code>");
+    expect(fenced).toContain("const x = 1;");
+  });
+
+  test("does not apply inline rules inside code spans", () => {
+    const bt = String.fromCharCode(96);
+    const out = renderMarkdown(bt + "**not bold**" + bt);
+    expect(out).toContain("<code>**not bold**</code>");
+    expect(out).not.toContain("<strong>");
+  });
+
+  test("renders http/https links as anchors with the url preserved", () => {
+    const out = renderMarkdown("[site](https://example.com/x)");
+    expect(out).toContain('href="https://example.com/x"');
+    expect(out).toContain(">site</a>");
+    expect(out).toContain('rel="noopener noreferrer"');
+  });
+
+  test("rejects javascript: URLs — renders inert escaped text, no anchor", () => {
+    const out = renderMarkdown("[click](javascript:alert(1))");
+    // No anchor and no href is produced — the would-be URL never reaches markup.
+    expect(out).not.toContain("<a ");
+    expect(out).not.toContain("href=");
+    // The markdown is left as inert escaped text (safe — not an executable link).
+    expect(out).toContain("[click]");
+  });
+
+  test("converts newlines to <br>", () => {
+    expect(renderMarkdown("line1\nline2")).toContain("line1<br>line2");
+  });
 });

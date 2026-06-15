@@ -145,6 +145,20 @@ export type SpawnTerminalFn = (
   },
 ) => SpawnedTerminal;
 
+/**
+ * The env for the `tmux attach` viewer process: the inherited env with TERM
+ * forced to a real terminfo entry matching the pty (`xterm-256color`). The daemon
+ * runs under launchd/systemd with NO TERM, so without this `tmux attach` can't
+ * find terminfo and aborts "open terminal failed: terminal does not support
+ * clear" — the WS attaches but the pane shows only that error. Pure + exported so
+ * the wiring is unit-testable without fighting Bun's readonly globals.
+ */
+export function tmuxAttachEnv(
+  parentEnv: Record<string, string | undefined> = process.env,
+): Record<string, string | undefined> {
+  return { ...parentEnv, TERM: "xterm-256color" };
+}
+
 /** Default pty spawn — the real `Bun.Terminal` + `tmux attach`. */
 export const defaultSpawnTerminal: SpawnTerminalFn = (session, opts) => {
   // `Bun.Terminal` is the native pty (verified present with write/resize/
@@ -175,9 +189,11 @@ export const defaultSpawnTerminal: SpawnTerminalFn = (session, opts) => {
     }
   ).Bun.spawn(["tmux", "attach", "-t", session], {
     terminal,
-    // No env scrub here — this pty runs `tmux attach`, which only TALKS to the
-    // already-running tmux server; it never starts the Claude session (that's
-    // the sandboxed spawn path, §4). The session's own isolation is upstream.
+    // TERM forced to a real terminfo entry (see tmuxAttachEnv) so `tmux attach`
+    // doesn't abort "does not support clear". No further scrub: this pty only
+    // TALKS to the already-running tmux server; it never starts the Claude session
+    // (that's the sandboxed spawn path, §4).
+    env: tmuxAttachEnv(),
     stdout: "ignore",
     stderr: "ignore",
   });

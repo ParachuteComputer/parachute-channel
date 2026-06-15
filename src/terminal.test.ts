@@ -41,6 +41,7 @@ mock.module("./hub-jwt.ts", () => ({
 
 import {
   createTerminalWsHandlers,
+  tmuxAttachEnv,
   parseControlFrame,
   HUB_WS_CAP_BYTES,
   PAUSE_FRAC,
@@ -400,6 +401,21 @@ describe("lifecycle — teardown", () => {
     expect(proc().killed).toBe(true);
     // Idempotent — a second close is a no-op (no throw, no double behavior change).
     expect(() => handlers.close(asWs(ws))).not.toThrow();
+  });
+});
+
+// ===========================================================================
+// tmuxAttachEnv — TERM wiring for the `tmux attach` viewer
+// ===========================================================================
+describe("tmuxAttachEnv — forces a real TERM so `tmux attach` finds terminfo", () => {
+  test("sets TERM=xterm-256color (else tmux aborts 'does not support clear')", () => {
+    expect(tmuxAttachEnv({ PATH: "/usr/bin" }).TERM).toBe("xterm-256color");
+  });
+  test("preserves the inherited env + overrides a stale/empty TERM", () => {
+    const env = tmuxAttachEnv({ PATH: "/usr/bin", HOME: "/home/op", TERM: "" });
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.HOME).toBe("/home/op");
+    expect(env.TERM).toBe("xterm-256color"); // empty/missing TERM is the daemon's reality
   });
 });
 

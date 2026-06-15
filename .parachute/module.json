@@ -7,7 +7,7 @@
   "paths": ["/channel"],
   "health": "/health",
   "stripPrefix": true,
-  "uiUrl": "/channel/ui",
+  "uiUrl": "/channel/home",
   "configUiUrl": "/channel/admin",
   "websocket": true,
   "focus": "experimental",

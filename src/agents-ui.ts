@@ -471,7 +471,9 @@ ${SHELL_JS}
   });
 
   // --- running agents list ------------------------------------------------
-  function terminalUrl(channel) { return MOUNT + "/terminal?channel=" + encodeURIComponent(channel); }
+  // The terminal attaches to an AGENT (its tmux session), so the link carries the
+  // agent name as ?agent= (the terminal page also accepts the legacy ?channel=).
+  function terminalUrl(agent) { return MOUNT + "/terminal?agent=" + encodeURIComponent(agent); }
   function loadAgents() {
     return apiJson("/api/agents").then(function (j) {
       var host = document.getElementById("agents-table");

@@ -76,6 +76,7 @@ import {
 import { TERMINAL_UI_HTML } from "./terminal-ui.ts";
 import { serveTerminalAsset } from "./terminal-assets.ts";
 import { AGENTS_UI_HTML } from "./agents-ui.ts";
+import { HOME_UI_HTML } from "./home-ui.ts";
 import {
   createRealAgentOps,
   buildSpecFromBody,
@@ -802,6 +803,17 @@ export function createFetchHandler(
     // every channel via the spawn form + the running-agents list).
     if (req.method === "GET" && url.pathname === "/agents") {
       return new Response(AGENTS_UI_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // Home / overview landing (Phase 2) — `/home`, the DEFAULT page the hub
+    // portal lands on (`uiUrl: "/channel/home"`). Loads OPEN (like /ui, /admin,
+    // /terminal, /agents): the channels card reads the public config, the agents
+    // card mints a hub-minted channel:admin token client-side and tolerates a
+    // failed mint. Served by the daemon (spans every channel + agent).
+    if (req.method === "GET" && url.pathname === "/home") {
+      return new Response(HOME_UI_HTML, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
@@ -1612,7 +1624,7 @@ function main(): void {
       // `parachute restart channel` 404s and we don't survive reboot (channel#34).
       startCmd: START_CMD,
       stripPrefix: true,
-      uiUrl: "/channel/ui", // portal "Open UI" link (also in module.json; written here in case hub reads it from services.json)
+      uiUrl: "/channel/home", // portal "Open UI" link → the Home overview landing (also in module.json; written here in case hub reads it from services.json)
       configUiUrl: "/channel/admin", // module-owned config surface (modular-UI P4); hub frames/links it. Also in module.json.
       // WebSocket support — tells the hub's Bun-native upgrade bridge to forward
       // `Upgrade: websocket` requests on `/channel/*` to this daemon (the

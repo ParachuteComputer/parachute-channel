@@ -58,8 +58,8 @@ ${THEME_CSS}
     tag: "terminal",
     status: "loading…",
     controls:
-      '<select id="channel" class="btn-sm" title="agent session" style="width:auto;"></select>' +
-      '<button id="reconnect" type="button" class="btn btn-sm" title="Re-attach to the tmux session">Reconnect</button>',
+      '<select id="agent" class="btn-sm" title="agent session" style="width:auto;"></select>' +
+      '<button id="reconnect" type="button" class="btn btn-sm" title="Re-attach to the agent session">Reconnect</button>',
   })}
   <div id="notice" class="notice" hidden></div>
   <div id="term-wrap"><div id="term"></div></div>
@@ -67,7 +67,9 @@ ${THEME_CSS}
 <script>
 ${SHELL_JS}
 (function () {
-  var sel = document.getElementById("channel");
+  // The picker lists running AGENTS (an agent's tmux session is what the terminal
+  // attaches to), so its id is "agent" — not "channel". See loadAgentsAndConnect.
+  var sel = document.getElementById("agent");
   var noticeEl = document.getElementById("notice");
   var reconnectBtn = document.getElementById("reconnect");
   var termHost = document.getElementById("term");
@@ -103,7 +105,7 @@ ${SHELL_JS}
     s.onerror = function () {
       setStatus("xterm unavailable", "err");
       showNotice("Failed to load the terminal renderer from <code>" + src + "</code>. " +
-        "You can always attach on the host: <code>tmux attach -t &lt;channel&gt;-agent</code>.", true);
+        "You can always attach on the host: <code>tmux attach -t &lt;agent-name&gt;-agent</code>.", true);
     };
     document.head.appendChild(s);
   }
@@ -115,7 +117,7 @@ ${SHELL_JS}
     if (typeof window.Terminal !== "function") {
       setStatus("xterm unavailable", "err");
       showNotice("The terminal renderer didn't initialize. " +
-        "You can always attach on the host: <code>tmux attach -t &lt;channel&gt;-agent</code>.", true);
+        "You can always attach on the host: <code>tmux attach -t &lt;agent-name&gt;-agent</code>.", true);
       return;
     }
     setStatus("connecting…");
@@ -142,7 +144,7 @@ ${SHELL_JS}
   var reconnectTimer = null;
   var enc = new TextEncoder();
 
-  function currentChannel() { return sel.value; }
+  function currentAgent() { return sel.value; }
 
   function doFit() {
     if (!fit) return;
@@ -163,28 +165,30 @@ ${SHELL_JS}
   }
 
   // --- WebSocket relay ----------------------------------------------------
-  function wsUrl(ch) {
+  // The path segment is the AGENT name — the daemon attaches to that agent's tmux
+  // session (<name>-agent). NOT a channel.
+  function wsUrl(agent) {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
     var dims = "cols=" + term.cols + "&rows=" + term.rows;
-    var u = proto + "//" + location.host + MOUNT + "/terminal/" + encodeURIComponent(ch) + "?" + dims;
+    var u = proto + "//" + location.host + MOUNT + "/terminal/" + encodeURIComponent(agent) + "?" + dims;
     if (window.__token) u += "&token=" + encodeURIComponent(window.__token);
     return u;
   }
 
   function connect() {
-    var ch = currentChannel();
-    if (!ch) { setStatus("no channel"); return; }
+    var agent = currentAgent();
+    if (!agent) { setStatus("no agent"); return; }
     if (ws) { manualClose = true; try { ws.close(); } catch (_e) {} ws = null; }
     manualClose = false;
     clearNotice();
     setStatus("connecting…");
     doFit();
-    var socket = new WebSocket(wsUrl(ch));
+    var socket = new WebSocket(wsUrl(agent));
     socket.binaryType = "arraybuffer";
     ws = socket;
 
     socket.onopen = function () {
-      setStatus("● attached · " + ch, "live");
+      setStatus("● attached · " + agent, "live");
       sendResize();
       term.focus();
     };
@@ -202,7 +206,7 @@ ${SHELL_JS}
           "re-attach to the live session (scrollback intact via tmux).", true);
       } else if (ev.code === 1000) {
         setStatus("session ended");
-        showNotice("The tmux session ended (or detached). Spawn a session from the " +
+        showNotice("The agent's tmux session ended (or detached). Spawn an agent from the " +
           "<a href='" + MOUNT + "/agents'>Agents</a> page, then Reconnect.", false);
         return;
       } else {

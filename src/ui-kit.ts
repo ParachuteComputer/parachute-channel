@@ -54,8 +54,9 @@ export const BRAND = {
   fontMono: `ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace`,
 } as const;
 
-/** The four navigable views, in nav order. Home arrives in Phase 2. */
+/** The navigable views, in nav order. Home is the default landing (Phase 2). */
 export const NAV_VIEWS = [
+  { view: "home", label: "Home", path: "/home" },
   { view: "chat", label: "Chat", path: "/ui" },
   { view: "agents", label: "Agents", path: "/agents" },
   { view: "terminal", label: "Terminal", path: "/terminal" },
@@ -262,8 +263,8 @@ export function appShell(opts: { active: ShellView; controls?: string; status?: 
  */
 export const SHELL_JS = `
   // Public mount prefix: "" on loopback, "/channel" behind the hub proxy.
-  var MOUNT = window.location.pathname.replace(/\\/(ui|admin|agents|terminal)(\\/[^?]*)?\\/?$/, "");
-  var NAV_MAP = { chat: "/ui", agents: "/agents", terminal: "/terminal", config: "/admin" };
+  var MOUNT = window.location.pathname.replace(/\\/(home|ui|admin|agents|terminal)(\\/[^?]*)?\\/?$/, "");
+  var NAV_MAP = { home: "/home", chat: "/ui", agents: "/agents", terminal: "/terminal", config: "/admin" };
   function wireShell(active) {
     var links = document.querySelectorAll(".app-nav a[data-view]");
     for (var i = 0; i < links.length; i++) {

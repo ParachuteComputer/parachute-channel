@@ -485,7 +485,7 @@ describe("module.json — modular-UI (P4) declaration", () => {
     const m = JSON.parse(await Bun.file(manifestPath).text()) as Record<string, unknown>;
     expect(m.name).toBe("channel");
     expect(m.port).toBe(1941);
-    expect(m.uiUrl).toBe("/channel/ui");
+    expect(m.uiUrl).toBe("/channel/home");
     const scopes = m.scopes as { defines?: string[] } | undefined;
     expect(scopes?.defines).toContain("channel:admin");
   });

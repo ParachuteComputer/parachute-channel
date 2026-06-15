@@ -7,13 +7,20 @@ import { describe, test, expect } from "bun:test";
 import { THEME_CSS, SHELL_JS, appShell, NAV_VIEWS, BRAND } from "./ui-kit.ts";
 
 describe("appShell", () => {
-  test("renders the brand + all four nav tabs, marking only the active one", () => {
+  test("renders the brand + all nav tabs, marking only the active one", () => {
     const h = appShell({ active: "agents" });
     expect(h).toContain("app-header");
     expect(h).toContain('class="brand-mark"');
     for (const v of NAV_VIEWS) expect(h).toContain(`data-view="${v.view}"`);
     // active tab gets class="active"; others don't.
     expect(h).toContain('data-view="agents" href="#" class="active"');
+    expect(h).toContain('data-view="chat" href="#"');
+    expect(h).not.toContain('data-view="chat" href="#" class="active"');
+  });
+
+  test("marks Home active when it is the current view", () => {
+    const h = appShell({ active: "home" });
+    expect(h).toContain('data-view="home" href="#" class="active"');
     expect(h).toContain('data-view="chat" href="#"');
     expect(h).not.toContain('data-view="chat" href="#" class="active"');
   });
@@ -32,8 +39,8 @@ describe("appShell", () => {
     expect(appShell({ active: "terminal" })).not.toContain("app-controls");
   });
 
-  test("nav covers exactly chat/agents/terminal/config (no Home yet)", () => {
-    expect(NAV_VIEWS.map((v) => v.view)).toEqual(["chat", "agents", "terminal", "config"]);
+  test("nav covers exactly home/chat/agents/terminal/config, Home first", () => {
+    expect(NAV_VIEWS.map((v) => v.view)).toEqual(["home", "chat", "agents", "terminal", "config"]);
   });
 });
 

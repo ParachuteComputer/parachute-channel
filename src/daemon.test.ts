@@ -174,6 +174,14 @@ describe("UI-facing + discovery endpoints stay open (no token, 200)", () => {
     expect(res.headers.get("content-type")).toContain("text/html");
   });
 
+  test("GET /home → 200 (html) — the overview landing (uiUrl points here)", async () => {
+    const res = await fetch(`${base}/home`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const body = await res.text();
+    expect(body).toContain("app-nav");
+  });
+
   test("GET /admin → 200 (html) — the page loads open; its API calls are gated", async () => {
     const res = await fetch(`${base}/admin`);
     expect(res.status).toBe(200);

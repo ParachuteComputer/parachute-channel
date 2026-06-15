@@ -41,6 +41,11 @@ export const BRAND = {
   dangerSoft: "rgba(163, 57, 43, 0.08)",
   success: "#3d6849",
   successSoft: "rgba(61, 104, 73, 0.08)",
+  // A warm amber for warnings (distinct from danger-red and accent-teal) — fits
+  // the warm-light palette. Used for "needs attention" states (e.g. no credential
+  // set yet, a permission prompt) that aren't errors.
+  warn: "#8a6d1b",
+  warnSoft: "rgba(184, 134, 11, 0.12)",
   // The terminal content pane stays dark — a terminal is black everywhere.
   termBg: "#000000",
   termFg: "#e6e9ef",
@@ -82,6 +87,8 @@ export const THEME_CSS = `
     --danger-soft: ${BRAND.dangerSoft};
     --success: ${BRAND.success};
     --success-soft: ${BRAND.successSoft};
+    --warn: ${BRAND.warn};
+    --warn-soft: ${BRAND.warnSoft};
     --term-bg: ${BRAND.termBg};
     --term-fg: ${BRAND.termFg};
     --font-sans: ${BRAND.fontSans};
@@ -185,7 +192,7 @@ export const THEME_CSS = `
   }
   .banner-error, .banner-err { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
   .banner-success, .banner-ok { background: var(--success-soft); border-color: var(--success); color: var(--success); }
-  .banner-warn { background: var(--bg-soft); border-color: var(--border); color: var(--fg-muted); }
+  .banner-warn { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
   .banner code { font-family: var(--font-mono); font-size: 0.85em; background: rgba(255,255,255,0.5); padding: 0.05rem 0.3rem; border-radius: 3px; }
 
   /* ---- Inputs / fields --------------------------------------------------- */
@@ -209,6 +216,7 @@ export const THEME_CSS = `
   .pill { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.78rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--border); color: var(--fg-muted); background: var(--bg-soft); }
   .pill.on, .pill.attached { color: var(--accent-hover); border-color: var(--accent); background: var(--accent-soft); }
   .pill.off { color: var(--fg-dim); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
   .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; display: inline-block; background: var(--fg-dim); }
   .dot.live { background: var(--accent); }
 

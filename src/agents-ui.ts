@@ -311,7 +311,7 @@ ${SHELL_JS}
     var note = document.getElementById("spawn-note");
     if (!defaultSet && (!overrides || !overrides.length)) {
       note.textContent = "⚠ no Claude credential set — set one above before spawning.";
-      note.style.color = "var(--danger)";
+      note.style.color = "var(--warn)";
     } else { note.textContent = ""; }
   }
 

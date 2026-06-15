@@ -316,7 +316,7 @@ ${THEME_CSS}
   .msg.you { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
   .msg.them { align-self: flex-start; background: var(--bg-soft); color: var(--fg); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
   .msg.sys { align-self: center; background: transparent; color: var(--fg-muted); font-size: 0.8rem; font-style: italic; max-width: 90%; }
-  .msg.perm { align-self: flex-start; background: var(--bg-soft); border: 1px solid var(--border); color: var(--fg-muted); max-width: 90%; }
+  .msg.perm { align-self: flex-start; background: var(--warn-soft); border: 1px solid var(--warn); border-left: 3px solid var(--warn); color: var(--warn); max-width: 90%; }
   .files { margin-top: 4px; font-size: 0.8rem; opacity: .85; }
   form {
     display: flex; gap: 8px; padding: 12px 16px;

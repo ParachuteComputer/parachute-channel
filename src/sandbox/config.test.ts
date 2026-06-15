@@ -9,25 +9,39 @@ const BASE_BINDS: BaseBinds = {
 };
 const EGRESS_BASE: EgressBaseInput = { hubOrigin: "https://hub.example.com" };
 
-// These cases exercise the CONFINED posture (scoped reads + egress floor), so the
-// helper defaults to it; a spread `p` can override (e.g. to test trusted).
+// Most cases exercise the egress floor, which needs network "restricted". Scoped
+// reads are the DEFAULT (filesystem "workspace"), so the helper only sets the
+// network and leaves filesystem at its default. A spread `p` overrides (e.g.
+// `filesystem: "full"` to test broad reads).
 function specOf(p: Partial<AgentSpec> = {}): AgentSpec {
-  return { name: "arm", channels: ["ch"], isolation: "confined", ...p };
+  return { name: "arm", channels: ["ch"], network: "restricted", ...p };
 }
 
-describe("buildSandboxConfig — trusted (default) posture", () => {
-  test("trusted: NO read deny (broad) + NO allowedDomains (open network), writes still confined", () => {
+describe("buildSandboxConfig — defaults (scoped reads + open network)", () => {
+  test("DEFAULT: scoped reads (home tree denied) + open network (no allowedDomains), writes confined", () => {
     const cfg = buildSandboxConfig({
-      spec: { name: "arm", channels: ["ch"] }, // no isolation → trusted default
+      spec: { name: "arm", channels: ["ch"] }, // no filesystem/network → both defaults
       baseBinds: BASE_BINDS,
       egressBase: EGRESS_BASE,
       platform: "darwin",
     });
-    // Broad reads: no home-tree deny.
-    expect(cfg.filesystem.denyRead).toEqual([]);
-    // Open network: allowedDomains omitted entirely (runtime = no restriction).
+    // Scoped reads by default: the home tree is DENIED — this is what keeps the
+    // operator's secrets (~/.parachute/operator.token, SSH keys) unreadable.
+    expect(cfg.filesystem.denyRead).toContain("/Users");
+    // Open network by default: allowedDomains omitted entirely (runtime = no restriction).
     expect((cfg.network as { allowedDomains?: string[] }).allowedDomains).toBeUndefined();
-    // Writes are STILL confined to the workspace even when trusted.
+    // Writes confined to the workspace.
+    expect(cfg.filesystem.allowWrite).toContain("/state/sessions/arm");
+  });
+
+  test("filesystem 'full': broad reads (no home-tree deny), writes still confined", () => {
+    const cfg = buildSandboxConfig({
+      spec: { name: "arm", channels: ["ch"], filesystem: "full" },
+      baseBinds: BASE_BINDS,
+      egressBase: EGRESS_BASE,
+      platform: "darwin",
+    });
+    expect(cfg.filesystem.denyRead).toEqual([]);
     expect(cfg.filesystem.allowWrite).toContain("/state/sessions/arm");
   });
 });
@@ -104,9 +118,9 @@ describe("buildSandboxConfig — spec → SandboxRuntimeConfig", () => {
     expect(cfg.ripgrep).toEqual({ command: "/abs/rg" });
   });
 
-  test("the produced config matches the runtime's required shape (keys present)", () => {
+  test("a restricted-network config carries the full runtime shape (allowedDomains present)", () => {
     const cfg = buildSandboxConfig({
-      spec: specOf(),
+      spec: specOf(), // network "restricted" → allowedDomains present
       baseBinds: BASE_BINDS,
       egressBase: EGRESS_BASE,
       platform: "darwin",
@@ -117,5 +131,20 @@ describe("buildSandboxConfig — spec → SandboxRuntimeConfig", () => {
     expect(cfg.filesystem).toHaveProperty("allowRead");
     expect(cfg.filesystem).toHaveProperty("allowWrite");
     expect(cfg.filesystem).toHaveProperty("denyWrite");
+  });
+
+  test("an open-network config OMITS allowedDomains but keeps the rest of the shape", () => {
+    const cfg = buildSandboxConfig({
+      spec: { name: "arm", channels: ["ch"] }, // default → network open
+      baseBinds: BASE_BINDS,
+      egressBase: EGRESS_BASE,
+      platform: "darwin",
+    });
+    // allowedDomains is deliberately ABSENT on open (the runtime's allow-all shape);
+    // this is NOT a protocol guarantee that allowedDomains is always present.
+    expect(cfg.network).not.toHaveProperty("allowedDomains");
+    expect(cfg.network).toHaveProperty("deniedDomains");
+    expect(cfg.filesystem).toHaveProperty("denyRead");
+    expect(cfg.filesystem).toHaveProperty("allowWrite");
   });
 });

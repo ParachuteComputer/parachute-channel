@@ -64,7 +64,7 @@ afterEach(() => {
 d("LIVE Seatbelt — network egress", () => {
   test("positive control: the harness can run a trivial sandboxed command", async () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-pos-"));
-    const spec: AgentSpec = { name: "pos", channels: ["c"], isolation: "confined", egress: [] };
+    const spec: AgentSpec = { name: "pos", channels: ["c"], network: "restricted", egress: [] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },
@@ -79,7 +79,7 @@ d("LIVE Seatbelt — network egress", () => {
   test("DENIED: curl to a host NOT in the allowlist is blocked", async () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-deny-"));
     // Allowlist the base only (anthropic + the loopback hub). example.com is NOT on it.
-    const spec: AgentSpec = { name: "deny", channels: ["c"], isolation: "confined", egress: [] };
+    const spec: AgentSpec = { name: "deny", channels: ["c"], network: "restricted", egress: [] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },
@@ -99,7 +99,7 @@ d("LIVE Seatbelt — network egress", () => {
 
   test("a spec that adds an egress host gets that host on the allowlist (additive)", async () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-add-"));
-    const spec: AgentSpec = { name: "add", channels: ["c"], isolation: "confined", egress: ["example.com"] };
+    const spec: AgentSpec = { name: "add", channels: ["c"], network: "restricted", egress: ["example.com"] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },
@@ -122,7 +122,7 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
     const secretFile = join(secretDir, "secret.txt");
     writeFileSync(secretFile, "TOPSECRET-do-not-read");
     try {
-      const spec: AgentSpec = { name: "read", channels: ["c"], isolation: "confined", egress: [] };
+      const spec: AgentSpec = { name: "read", channels: ["c"], network: "restricted", egress: [] };
       const cfg = buildSandboxConfig({
         spec,
         baseBinds: { workspace, runtimeReadOnly: [] },
@@ -154,7 +154,7 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
     const secretFile = join(secretDir, "home-secret.txt");
     writeFileSync(secretFile, "HOME-TOPSECRET-do-not-read");
     try {
-      const spec: AgentSpec = { name: "homeread", channels: ["c"], isolation: "confined", egress: [] };
+      const spec: AgentSpec = { name: "homeread", channels: ["c"], network: "restricted", egress: [] };
       // buildSandboxConfig with platform "darwin" → denyRead:["/Users"],
       // allowRead:[workspace]. We pass the config THROUGH unmodified.
       const cfg = buildSandboxConfig({
@@ -183,11 +183,50 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
     }
   }, 60_000);
 
+  test("DEFAULT POSTURE: ~/.parachute (operator.token's dir) is UNREADABLE, the workspace IS readable, network is OPEN", async () => {
+    // The security guarantee Aaron asked for: the DEFAULT spawn (no filesystem/no
+    // network knob) must (a) be unable to read the operator's secrets — modelled by
+    // a decoy planted in the REAL ~/.parachute, exactly where operator.token lives —
+    // while (b) still having the workspace readable and (c) the network fully OPEN.
+    // Reads scoped by default; internet open by default.
+    const home = homedir();
+    workspace = mkdtempSync(join(home, ".sbx-live-default-ws-"));
+    const decoy = join(home, ".parachute", `.sbx-live-decoy-${process.pid}.txt`);
+    writeFileSync(decoy, "OPERATOR-TOKEN-DECOY-do-not-read");
+    try {
+      // DEFAULT spec: neither filesystem nor network set → workspace-scoped reads + open net.
+      const spec: AgentSpec = { name: "deflt", channels: ["c"] };
+      const cfg = buildSandboxConfig({
+        spec,
+        baseBinds: { workspace, runtimeReadOnly: [] },
+        egressBase: { hubOrigin: "http://127.0.0.1:1939" },
+        platform: "darwin",
+      });
+      // Defaults: scoped reads (/Users denied) + OPEN network (no allowedDomains).
+      expect(cfg.filesystem.denyRead).toEqual(["/Users"]);
+      expect((cfg.network as { allowedDomains?: string[] }).allowedDomains).toBeUndefined();
+
+      // (a) the decoy in ~/.parachute is DENIED — operator.token is equally unreadable.
+      const blocked = await runSandboxed(cfg, `cat ${decoy}`);
+      expect(blocked.code).not.toBe(0);
+      expect(blocked.stdout).not.toContain("OPERATOR-TOKEN-DECOY");
+
+      // (b) positive control: a workspace file IS readable under the SAME config.
+      const inside = join(workspace, "inside.txt");
+      writeFileSync(inside, "WORKSPACE-readable-by-default");
+      const ok = await runSandboxed(cfg, `cat ${inside}`);
+      expect(ok.code).toBe(0);
+      expect(ok.stdout).toContain("WORKSPACE-readable-by-default");
+    } finally {
+      rmSync(decoy, { force: true });
+    }
+  }, 60_000);
+
   test("ALLOWED: reading a file INSIDE the workspace bind succeeds", async () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-read-ok-"));
     const f = join(workspace, "inside.txt");
     writeFileSync(f, "READABLE-inside-workspace");
-    const spec: AgentSpec = { name: "readok", channels: ["c"], isolation: "confined", egress: [] };
+    const spec: AgentSpec = { name: "readok", channels: ["c"], network: "restricted", egress: [] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },
@@ -204,7 +243,7 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
     const outsideDir = mkdtempSync(join(tmpdir(), "sbx-live-outside-"));
     const target = join(outsideDir, "should-not-exist.txt");
     try {
-      const spec: AgentSpec = { name: "write", channels: ["c"], isolation: "confined", egress: [] };
+      const spec: AgentSpec = { name: "write", channels: ["c"], network: "restricted", egress: [] };
       const cfg = buildSandboxConfig({
         spec,
         baseBinds: { workspace, runtimeReadOnly: [] },
@@ -223,7 +262,7 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
   test("ALLOWED: writing INSIDE the workspace succeeds", async () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-write-ok-"));
     const target = join(workspace, "out.txt");
-    const spec: AgentSpec = { name: "writeok", channels: ["c"], isolation: "confined", egress: [] };
+    const spec: AgentSpec = { name: "writeok", channels: ["c"], network: "restricted", egress: [] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },

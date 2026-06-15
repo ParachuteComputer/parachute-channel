@@ -80,11 +80,14 @@ describe("parseArgs — name + channels + vault + egress + mounts → the right 
     expect(spec!.channels[1]).toEqual({ name: "second" });
   });
 
-  test("default is trusted (no isolation field); --confined sets it + keeps --egress", () => {
-    expect(parseArgs(["a", "--channel", "c"]).spec!.isolation).toBeUndefined(); // default trusted
-    const { spec } = parseArgs(["a", "--channel", "c", "--egress", "x.com", "--confined"]);
-    expect(spec!.isolation).toBe("confined");
-    expect(spec!.egress).toEqual(["x.com"]); // additive hosts kept (used under confined)
+  test("defaults omit filesystem/network; --full-read + --restricted set them + keep --egress", () => {
+    const def = parseArgs(["a", "--channel", "c"]).spec!;
+    expect(def.filesystem).toBeUndefined(); // default = workspace (scoped reads)
+    expect(def.network).toBeUndefined(); // default = open
+    const { spec } = parseArgs(["a", "--channel", "c", "--egress", "x.com", "--full-read", "--restricted"]);
+    expect(spec!.filesystem).toBe("full");
+    expect(spec!.network).toBe("restricted");
+    expect(spec!.egress).toEqual(["x.com"]); // additive hosts kept (used under restricted)
   });
 });
 

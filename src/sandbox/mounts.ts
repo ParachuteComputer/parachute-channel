@@ -71,14 +71,14 @@ export function composeFilesystemView(
     if (m.mode === "rw") writePaths.push(m.hostPath);
   }
 
-  // WRITES are confined in BOTH postures (workspace + rw mounts) — the agent
-  // never escapes its workspace or corrupts the operator's files, regardless of
-  // read scope. READS depend on the posture:
-  //   - scopedReads (confined): deny the home tree, re-allow the read surface
-  //     within it (workspace + runtime/config + mounts). The isolation control.
-  //   - broad (trusted, the default for owner-operated agents): no deny — claude
-  //     reads its binary, the system, and the operator's files freely, so its own
-  //     runtime never collides with a deny. (System paths are readable in both.)
+  // WRITES are confined in BOTH cases (workspace + rw mounts) — the agent never
+  // escapes its workspace or corrupts the operator's files, regardless of read
+  // scope. READS depend on `filesystem`:
+  //   - scopedReads (filesystem "workspace", the DEFAULT): deny the home tree,
+  //     re-allow the read surface within it (workspace + runtime/config + mounts).
+  //     Keeps the operator's secrets (e.g. ~/.parachute/operator.token) unreadable.
+  //   - broad (filesystem "full", explicit opt-in): no deny — claude reads the
+  //     whole disk. (System paths are readable in both.)
   if (!scopedReads) {
     return { denyRead: [], allowRead: [], allowWrite: dedupePreserveOrder(writePaths), denyWrite: [] };
   }

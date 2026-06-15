@@ -56,20 +56,23 @@ export function currentSandboxPlatform(): SandboxPlatform {
 export function buildSandboxConfig(input: BuildSandboxConfigInput): SandboxRuntimeConfig {
   const platform = input.platform ?? currentSandboxPlatform();
 
-  // The single isolation knob (default "trusted") sets BOTH read scope + egress.
-  const confined = input.spec.isolation === "confined";
+  // The two containment boundaries are INDEPENDENT (Anthropic's model). Each has a
+  // security-first default: reads scoped to the workspace, network open.
+  const scopedReads = input.spec.filesystem !== "full"; // default "workspace" = scoped
+  const restrictedNet = input.spec.network === "restricted"; // default "open"
 
-  // Reads are scoped only when confined; trusted = broad reads (claude's own
-  // runtime never collides with a deny — the stability win). Writes are confined
-  // to the workspace in both.
-  const fs = composeFilesystemView(input.baseBinds, input.spec.mounts, platform, confined);
+  // Filesystem: scoped reads (deny home tree, re-allow workspace + claude runtime +
+  // mounts) unless explicitly "full". Writes are confined to the workspace + rw
+  // mounts in BOTH cases. The scoped default is what keeps the operator's secrets
+  // (e.g. ~/.parachute/operator.token) unreadable even with the network open.
+  const fs = composeFilesystemView(input.baseBinds, input.spec.mounts, platform, scopedReads);
 
-  // Network: trusted = OPEN (omit `allowedDomains` — the runtime treats an absent
-  // allowedDomains as "no restriction"; verified: present-but-empty = block all,
-  // absent = allow all). confined = the non-removable base UNIONed with the spec's
-  // additions. The cast is because the runtime's TS type marks allowedDomains
+  // Network: "open" (default) OMITS `allowedDomains` — the runtime treats an absent
+  // allowedDomains as "no restriction" (verified: present-but-empty = block all,
+  // absent = allow all). "restricted" = the non-removable base UNIONed with the
+  // spec's additions. The cast is because the runtime's TS type marks allowedDomains
   // required while its runtime honors the absent case as the documented allow-all.
-  const network: SandboxRuntimeConfig["network"] = confined
+  const network: SandboxRuntimeConfig["network"] = restrictedNet
     ? { allowedDomains: composeEgressAllowlist(input.egressBase, input.spec.egress), deniedDomains: [] }
     : ({ deniedDomains: [] } as unknown as SandboxRuntimeConfig["network"]);
 

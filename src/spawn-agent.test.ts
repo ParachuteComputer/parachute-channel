@@ -257,7 +257,7 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
       name: "aaron-dev",
       channels: ["aaron-dev"],
       vault: { name: "default", access: "read", tags: ["#channel-message"] },
-      isolation: "confined", // exercise the egress floor + scoped reads (step 6)
+      network: "restricted", // exercise the egress floor; scoped reads are the default (step 6)
     };
     const res = await spawnAgent(spec, baseDeps({ tmux, sandboxEngine: engine }));
 

@@ -216,20 +216,33 @@ export const AGENTS_UI_HTML = `<!doctype html>
           </div>
 
           <div>
-            <label for="net-mode">Isolation</label>
+            <label for="fs-mode">Filesystem</label>
+            <select id="fs-mode">
+              <option value="workspace" selected>Sandboxed to its workspace (default) — can't read your files or secrets</option>
+              <option value="full">Full read access — can read your whole disk (use with care)</option>
+            </select>
+            <div id="fs-warn" class="muted" style="display:none; font-size:12px; margin-top:8px;">
+              Default: the agent reads only its own workspace + mounts + the claude runtime. Your home
+              tree (including <code>~/.parachute/operator.token</code>, SSH keys, other projects) is
+              unreadable. Writes are always confined to the workspace. Switch to Full read only when an
+              agent genuinely needs to see across your disk and you trust it not to leak.
+            </div>
+          </div>
+
+          <div>
+            <label for="net-mode">Network</label>
             <select id="net-mode">
-              <option value="trusted" selected>Trusted — full read + open network (default)</option>
-              <option value="confined">Confined — scoped reads + restricted network (untrusted input)</option>
+              <option value="open" selected>Open — full internet (default)</option>
+              <option value="restricted">Restricted — Anthropic + hub/vault + listed hosts only (untrusted input)</option>
             </select>
             <div id="egress-wrap" style="display:none; margin-top:8px;">
               <label for="egress">Additional allowed hosts (comma-separated)</label>
               <input type="text" id="egress" placeholder="registry.npmjs.org, github.com" autocomplete="off" />
             </div>
-            <div id="open-warn" class="muted" style="display:none; font-size:12px; margin-top:8px;">
-              Trusted is the default for your own agents — the session reads the system + your files and
-              reaches the network like any local process (it still gets a private writable home and can't
-              write outside its workspace). Choose Confined for an agent that handles untrusted input:
-              its reads are scoped to its workspace and its network is restricted.
+            <div id="net-note" class="muted" style="display:none; font-size:12px; margin-top:8px;">
+              Open is safe as the default because the workspace filesystem sandbox already keeps your
+              secrets unreadable — open network can't exfiltrate what the agent can't see. Choose
+              Restricted to also bound where an agent fed untrusted input can reach.
             </div>
           </div>
 
@@ -412,16 +425,24 @@ export const AGENTS_UI_HTML = `<!doctype html>
   }
   document.getElementById("add-mount").addEventListener("click", function () { mountRow(); });
 
-  // Isolation toggle: show the additional-hosts field only when Confined; show the
-  // explainer note when Trusted (the default).
+  // Filesystem toggle: show the caution note only when Full read is selected.
+  var fsMode = document.getElementById("fs-mode");
+  function syncFsMode() {
+    document.getElementById("fs-warn").style.display = fsMode.value === "full" ? "" : "none";
+  }
+  fsMode.addEventListener("change", syncFsMode);
+  syncFsMode(); // default is workspace → note hidden
+
+  // Network toggle: show the additional-hosts field only when Restricted; show the
+  // "open is safe" note when Open (the default).
   var netMode = document.getElementById("net-mode");
   function syncNetMode() {
-    var trusted = netMode.value === "trusted";
-    document.getElementById("egress-wrap").style.display = trusted ? "none" : "";
-    document.getElementById("open-warn").style.display = trusted ? "" : "none";
+    var open = netMode.value === "open";
+    document.getElementById("egress-wrap").style.display = open ? "none" : "";
+    document.getElementById("net-note").style.display = open ? "" : "none";
   }
   netMode.addEventListener("change", syncNetMode);
-  syncNetMode(); // default is trusted → show the note, hide the hosts field
+  syncNetMode(); // default is open → show the note, hide the hosts field
 
   function collectSpec() {
     var wake = chanEl.value;
@@ -443,12 +464,13 @@ export const AGENTS_UI_HTML = `<!doctype html>
       spec.vault = v;
     }
 
-    if (netMode.value === "confined") {
-      spec.isolation = "confined";
+    if (fsMode.value === "full") spec.filesystem = "full"; // else workspace (default)
+    if (netMode.value === "restricted") {
+      spec.network = "restricted";
       var egress = document.getElementById("egress").value.split(",").map(function (h) { return h.trim(); }).filter(Boolean);
       if (egress.length) spec.egress = egress;
     }
-    // else: trusted (default) — no isolation field; broad reads + open network.
+    // defaults (omitted): filesystem "workspace" (scoped reads) + network "open".
 
     var mounts = [];
     document.querySelectorAll("#mounts-rows .mrow").forEach(function (row) {
@@ -480,8 +502,10 @@ export const AGENTS_UI_HTML = `<!doctype html>
           r.tokens.forEach(function (t) { lines.push("  " + t.resource + " → " + t.scope); });
         }
         if (r.mcpServers && r.mcpServers.length) lines.push("MCP servers: " + r.mcpServers.join(", "));
-        lines.push("isolation: " + (r.isolation || "trusted") +
-          (r.isolation === "confined" ? " (egress: " + ((r.egress || []).join(", ") || "base only") + ")" : " (full read + open network)"));
+        lines.push("filesystem: " + (r.filesystem || "workspace") +
+          (r.filesystem === "full" ? " (reads whole disk)" : " (sandboxed to workspace)"));
+        lines.push("network: " + (r.network || "open") +
+          (r.network === "restricted" ? " (egress: " + ((r.egress || []).join(", ") || "base only") + ")" : " (full internet)"));
       }
       showMsg(msg, lines.join("\\n"), false);
       loadAgents();

@@ -82,9 +82,11 @@ export interface RedactedSpawnResult {
   tokens: RedactedToken[];
   /** The MCP server entry keys wired into the session (names only). */
   mcpServers: string[];
-  /** Isolation posture the session launched under. */
-  isolation: "trusted" | "confined";
-  /** Egress allowlist baked into the sandbox (empty when trusted/open). */
+  /** Filesystem read scope the session launched under. */
+  filesystem: "workspace" | "full";
+  /** Network posture the session launched under. */
+  network: "open" | "restricted";
+  /** Egress allowlist baked into the sandbox (empty when network is open). */
   egress: string[];
 }
 
@@ -221,11 +223,18 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
     spec.vault = parseVaultEntry(b.vault);
   }
 
-  if (b.isolation !== undefined && b.isolation !== null) {
-    if (b.isolation !== "trusted" && b.isolation !== "confined") {
-      throw new SpawnRequestError('body.isolation must be "trusted" or "confined"');
+  if (b.filesystem !== undefined && b.filesystem !== null) {
+    if (b.filesystem !== "workspace" && b.filesystem !== "full") {
+      throw new SpawnRequestError('body.filesystem must be "workspace" or "full"');
     }
-    spec.isolation = b.isolation;
+    spec.filesystem = b.filesystem;
+  }
+
+  if (b.network !== undefined && b.network !== null) {
+    if (b.network !== "open" && b.network !== "restricted") {
+      throw new SpawnRequestError('body.network must be "open" or "restricted"');
+    }
+    spec.network = b.network;
   }
 
   if (b.egress !== undefined && b.egress !== null) {
@@ -238,8 +247,8 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
         return h.trim();
       })
       .filter((h) => h.length > 0);
-    // Additional allowed hosts — only take effect under `isolation: "confined"`
-    // (trusted = fully open network); harmless to carry otherwise.
+    // Additional allowed hosts — only take effect under `network: "restricted"`
+    // (open = fully open network); harmless to carry otherwise.
     if (egress.length > 0) spec.egress = egress;
   }
 
@@ -314,6 +323,13 @@ function parseMountEntry(raw: unknown, i: number): AgentMount {
   // but a relative `hostPath` would resolve against the session's cwd in
   // surprising ways — make the trust boundary explicit with a clean 400 here
   // rather than a confusing sandbox behavior downstream.
+  //
+  // NOTE: a mount's hostPath is added to `allowRead`, which OVERRIDES the
+  // `filesystem: "workspace"` home-tree deny. So an operator who mounts a
+  // home-tree path (e.g. ~/.parachute) deliberately re-opens that path to the
+  // agent even under the scoped default. That's intentional (this endpoint is
+  // channel:admin-gated; the operator is choosing it), not an injection bypass —
+  // but weigh it before mounting sensitive home-tree paths.
   if (!m.hostPath.startsWith("/")) {
     throw new SpawnRequestError(`body.mounts[${i}].hostPath must be an absolute path (start with "/")`);
   }
@@ -355,15 +371,18 @@ export function redactSpawnResult(result: SpawnAgentResult): RedactedSpawnResult
   } catch {
     mcpServers = [];
   }
-  // allowedDomains is present only in CONFINED mode (trusted omits it = open net).
+  // network: allowedDomains is present only when restricted (open omits it).
   const allowed = result.wrapped.config.network.allowedDomains as string[] | undefined;
+  // filesystem: scoped reads carry a home-tree denyRead; "full" leaves it empty.
+  const scopedReads = (result.wrapped.config.filesystem.denyRead ?? []).length > 0;
   return {
     session: result.session,
     workspace: result.workspace,
     alreadyRunning: result.alreadyRunning,
     tokens,
     mcpServers,
-    isolation: allowed === undefined ? "trusted" : "confined",
+    filesystem: scopedReads ? "workspace" : "full",
+    network: allowed === undefined ? "open" : "restricted",
     egress: allowed ?? [],
   };
 }

@@ -98,6 +98,21 @@ export interface AgentChannelSpec {
 /** A channel entry: a bare name (= write access) or the scoped object form. */
 export type AgentChannel = string | AgentChannelSpec;
 
+/**
+ * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md):
+ *
+ *  - `"interactive"` (DEFAULT — existing behavior, unchanged): an idle interactive
+ *    `claude` in a tmux pane, fed inbound by pushing onto a subscribed MCP
+ *    development channel. Carries the deaf-on-restart machinery (#67/#68/#70/#71).
+ *    Best for "watch / drive a live session" — the operator attaches the terminal.
+ *  - `"programmatic"`: NO resident process. An inbound message becomes one
+ *    on-demand `claude -p --resume <sid>` turn ({@link AgentBackend}); the reply is
+ *    posted back as an outbound `#channel-message/outbound` note. No idle session →
+ *    nothing to go deaf, no reconnect, no replay, no consent gate. Best for clean
+ *    per-message "do a task, report back" turns.
+ */
+export type AgentBackendKind = "interactive" | "programmatic";
+
 export interface AgentSpec {
   /** Human-readable arm name; used as the tmux session + workspace slug. */
   name: string;
@@ -171,6 +186,14 @@ export interface AgentSpec {
    * builds the real per-channel secret store.
    */
   credentialRef?: string;
+  /**
+   * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md).
+   * Default `"interactive"` (the existing tmux path, unchanged). `"programmatic"`
+   * routes inbound to on-demand `claude -p` turns with no resident process. See
+   * {@link AgentBackendKind}. Persisted in spec.json so a daemon restart re-registers
+   * a programmatic agent on boot.
+   */
+  backend?: AgentBackendKind;
 }
 
 /**

@@ -468,7 +468,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
     const { srv, base } = buildServer({
       async list() {
         return [
-          { name: "aaron", session: "aaron-agent", attached: true, workspace: "/s/aaron", hasWorkspace: true },
+          { name: "aaron", session: "aaron-agent", attached: true, workspace: "/s/aaron", hasWorkspace: true, backend: "interactive" as const },
         ];
       },
     });

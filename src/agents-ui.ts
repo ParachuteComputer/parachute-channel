@@ -204,6 +204,15 @@ ${THEME_CSS}
         </div>
       </div>
 
+      <div style="margin-top:12px;">
+        <label for="spawn-backend">Backend</label>
+        <select id="spawn-backend">
+          <option value="interactive" selected>Interactive — watch / drive a live tmux session</option>
+          <option value="programmatic">Programmatic — clean per-message turns, no live terminal</option>
+        </select>
+        <div id="backend-note" class="muted" style="font-size:12px; margin-top:8px;"></div>
+      </div>
+
       <details id="advanced">
         <summary>Advanced — extra channels, vault, network, mounts</summary>
         <div class="sub">
@@ -517,6 +526,25 @@ ${SHELL_JS}
   netMode.addEventListener("change", syncNetMode);
   syncNetMode(); // default is open → show the note, hide the hosts field
 
+  // Backend toggle: a one-line explanation of each. Interactive = the existing
+  // tmux session you watch/drive (terminal attach). Programmatic = no live
+  // terminal; each inbound message becomes one clean claude -p turn whose reply
+  // is posted back (resume keeps the conversation). The note updates on change.
+  var backendMode = document.getElementById("spawn-backend");
+  function syncBackendMode() {
+    var note = document.getElementById("backend-note");
+    if (backendMode.value === "programmatic") {
+      note.textContent = "Programmatic: no live terminal. Each message runs one on-demand claude -p turn " +
+        "(resumes the prior conversation) and its reply is posted back to the channel. No idle session to go " +
+        "deaf, no reconnect — ideal for fire-and-forget 'do a task, report back'. The Terminal link won't apply.";
+    } else {
+      note.textContent = "Interactive: an idle Claude Code session in a tmux pane you can attach to (Terminal ↗). " +
+        "Messages inject into the live session; you watch it work.";
+    }
+  }
+  backendMode.addEventListener("change", syncBackendMode);
+  syncBackendMode(); // default is interactive
+
   function collectSpec() {
     var wake = chanEl.value;
     if (!wake) throw new Error("pick a channel");
@@ -553,6 +581,8 @@ ${SHELL_JS}
       mounts.push({ hostPath: host, mountPath: mount, mode: row.querySelector(".mt-mode").value });
     });
     if (mounts.length) spec.mounts = mounts;
+    // Backend selector — default interactive (omit so the server default applies).
+    if (backendMode.value === "programmatic") spec.backend = "programmatic";
     return spec;
   }
 
@@ -565,7 +595,13 @@ ${SHELL_JS}
     btn.disabled = true; btn.textContent = "Spawning…";
     apiJson("/api/agents", { method: "POST", body: JSON.stringify(spec) }).then(function (r) {
       var lines = [];
-      if (r.alreadyRunning) {
+      if (r.backend === "programmatic") {
+        // Programmatic spawn returns { name, channel, backend, workspace, alreadyRunning }.
+        lines.push((r.alreadyRunning ? "Re-registered" : "Registered") + " programmatic agent " + r.name + ".");
+        lines.push("channel: " + r.channel);
+        lines.push("workspace: " + r.workspace);
+        lines.push("No tmux session — inbound messages run on-demand claude -p turns; replies post back to the channel.");
+      } else if (r.alreadyRunning) {
         lines.push("Session " + r.session + " is already running (no-op).");
       } else {
         lines.push("Launched " + r.session + ".");
@@ -632,20 +668,40 @@ ${SHELL_JS}
         return;
       }
       var rows = agents.map(function (a) {
-        var att = a.attached ? "<span class='pill attached'>attached</span>" : "<span class='pill detached'>idle</span>";
+        var prog = a.backend === "programmatic";
+        // Backend column: a small label so it's obvious which agents are which.
+        var backendCell = prog
+          ? "<span class='pill connected' title='no tmux — on-demand claude -p turns'>programmatic</span>"
+          : "<span class='pill detached' title='tmux session you can attach to'>interactive</span>";
+        // State column: interactive uses tmux attached; programmatic uses its live
+        // turn status (idle | working | queued:N) reported by the server.
+        var stateCell = prog
+          ? "<span class='pill' title='turn status'>" + esc(a.status || "idle") + "</span>"
+          : (a.attached ? "<span class='pill attached'>attached</span>" : "<span class='pill detached'>idle</span>");
+        // Connection column: programmatic has no live subscriber to count — show
+        // its turn status instead of the SSE/MCP counts. Interactive uses /health.
+        var connCell = prog
+          ? "<span class='pill connected'>● " + esc(a.status || "idle") + "</span>"
+          : connectionCell(liveByChannel[a.name]);
+        // Actions: programmatic has no terminal to attach (no tmux). "restart" maps
+        // to a conversation reset server-side. Chat link still applies (the channel
+        // transcript shows its replies).
+        var actions = "<a href='" + esc(chatUrl(a.name)) + "'>chat →</a>";
+        if (!prog) {
+          actions += "<a href='" + esc(terminalUrl(a.name)) + "' target='_blank' rel='noopener'>terminal ↗</a>";
+        }
+        actions += "<button class='ghost' data-restart='" + esc(a.name) + "' type='button' title='" +
+          (prog ? "Reset the conversation (next message starts fresh)" : "Re-source env + reconnect this session") + "'>" +
+          (prog ? "reset" : "restart / reconnect") + "</button>" +
+          "<button class='ghost danger' data-kill='" + esc(a.name) + "' type='button'>" + (prog ? "deregister" : "kill") + "</button>";
         return "<tr>" +
           "<td><strong>" + esc(a.name) + "</strong></td>" +
-          "<td><code>" + esc(a.session) + "</code></td>" +
-          "<td>" + att + "</td>" +
-          "<td>" + connectionCell(liveByChannel[a.name]) + "</td>" +
-          "<td class='actions'>" +
-            "<a href='" + esc(chatUrl(a.name)) + "'>chat →</a>" +
-            "<a href='" + esc(terminalUrl(a.name)) + "' target='_blank' rel='noopener'>terminal ↗</a>" +
-            "<button class='ghost' data-restart='" + esc(a.name) + "' type='button' title='Re-source env + reconnect this session'>restart / reconnect</button>" +
-            "<button class='ghost danger' data-kill='" + esc(a.name) + "' type='button'>kill</button>" +
-          "</td></tr>";
+          "<td>" + backendCell + "</td>" +
+          "<td>" + stateCell + "</td>" +
+          "<td>" + connCell + "</td>" +
+          "<td class='actions'>" + actions + "</td></tr>";
       }).join("");
-      host.innerHTML = "<table><thead><tr><th>Agent</th><th>tmux session</th><th>State</th><th>Connection</th><th></th></tr></thead><tbody>" +
+      host.innerHTML = "<table><thead><tr><th>Agent</th><th>Backend</th><th>State</th><th>Connection</th><th></th></tr></thead><tbody>" +
         rows + "</tbody></table>";
       host.querySelectorAll("[data-kill]").forEach(function (btn) {
         btn.addEventListener("click", function () { killAgent(btn.getAttribute("data-kill")); });

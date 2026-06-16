@@ -30,11 +30,14 @@ import {
   spawnAgent,
   sessionName,
   sessionWorkspace,
+  persistSpec,
   readPersistedSpec,
   type SpawnAgentResult,
   type SpawnAgentDeps,
 } from "./spawn-agent.ts";
 import { resolveSpawnDeps, sessionsDir as defaultSessionsDir } from "./spawn-deps.ts";
+import { normalizeChannel } from "./sandbox/types.ts";
+import { resolveClaudeCredential } from "./credentials.ts";
 
 /** The `-agent` suffix tmux sessions launched by `spawnAgent` carry. */
 const AGENT_SESSION_SUFFIX = "-agent";
@@ -62,6 +65,18 @@ export interface AgentInfo {
   workspace: string;
   /** Whether the session's workspace (with its .mcp.json) is present on disk. */
   hasWorkspace: boolean;
+  /**
+   * Which backend drives this agent. `"interactive"` (the default — a tmux session)
+   * or `"programmatic"` (no tmux; on-demand `claude -p` turns). The list merges
+   * interactive tmux sessions + registered programmatic agents (design 2026-06-16).
+   */
+  backend: "interactive" | "programmatic";
+  /**
+   * Programmatic-only live status — `idle` | `working` | `queued:N` (N = pending).
+   * Absent for interactive agents (their liveness is the tmux `attached` flag +
+   * /health's `mcp_sessions`). Present for programmatic agents in place of those.
+   */
+  status?: string;
 }
 
 /** A redacted mint summary — scope + audience + expiry, NEVER the token value. */
@@ -167,6 +182,7 @@ export function agentInfoFromSessions(
       attached: s.attached,
       workspace,
       hasWorkspace: existsSync(join(workspace, ".mcp.json")),
+      backend: "interactive",
     });
   }
   agents.sort((a, b) => a.name.localeCompare(b.name));
@@ -271,6 +287,16 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
     }
     const mounts = b.mounts.map((raw, i) => parseMountEntry(raw, i));
     if (mounts.length > 0) spec.mounts = mounts;
+  }
+
+  // Backend selector — the pluggable agent backend (design 2026-06-16). Default
+  // `"interactive"` (existing behavior); `"programmatic"` routes to on-demand
+  // `claude -p` turns. Persisted in spec.json so a restart re-registers it.
+  if (b.backend !== undefined && b.backend !== null) {
+    if (b.backend !== "interactive" && b.backend !== "programmatic") {
+      throw new SpawnRequestError('body.backend must be "interactive" or "programmatic"');
+    }
+    spec.backend = b.backend;
   }
 
   return spec;
@@ -466,5 +492,80 @@ export function createRealAgentOps(opts?: {
       const result = await spawnAgent(spec, depsFactory());
       return { ...redactSpawnResult(result), killed };
     },
+  };
+}
+
+/**
+ * The redacted result a PROGRAMMATIC spawn returns to the wire — there is no tmux
+ * session and no per-launch minted-token set (the programmatic backend mints the
+ * vault token per-turn, not at spawn), so this is a thin "registered" acknowledgment
+ * mirroring the interactive result's non-secret fields.
+ */
+export interface ProgrammaticSpawnResult {
+  /** The agent slug. */
+  name: string;
+  /** The wake channel the agent serves. */
+  channel: string;
+  /** Always "programmatic" — lets the page render the right status affordances. */
+  backend: "programmatic";
+  /** Per-session workspace dir (where .mcp.json is written per-turn + spec.json lives). */
+  workspace: string;
+  /** Whether an agent was already registered under this name (idempotent replace). */
+  alreadyRunning: boolean;
+}
+
+/**
+ * Validate + set up a PROGRAMMATIC agent spawn — the no-tmux counterpart to
+ * {@link spawnAgent} (design 2026-06-16 step 2). It does the spawn-time, NON-turn
+ * work: slug-guard the name, require a wake channel, resolve the Claude credential
+ * EARLY (a missing one throws {@link CredentialNotConfiguredError} BEFORE registering
+ * — so a programmatic agent never registers without auth, exactly like the
+ * interactive spawn never launches without it), and persist spec.json (carrying
+ * `backend: "programmatic"`) so a daemon restart re-registers it on boot.
+ *
+ * It does NOT itself register the agent in the live registry or mint any token — the
+ * daemon owns the {@link ProgrammaticAgentRegistry} instance and calls
+ * `registry.register(spec)` after this returns; the per-turn workspace/.mcp.json/mint
+ * are the backend's per-`deliver` job. Returns the (non-secret) workspace + channel.
+ *
+ * `resolveClaudeToken` + `sessionsDirPath` are injectable so tests run hermetically
+ * (no real credential store, a temp sessions dir).
+ */
+export function setupProgrammaticSpawn(
+  spec: AgentSpec,
+  opts?: {
+    resolveClaudeToken?: (channel: string) => string;
+    sessionsDirPath?: string;
+  },
+): ProgrammaticSpawnResult {
+  if (!AGENT_NAME_SLUG.test(spec.name)) {
+    throw new SpawnRequestError(
+      `agent name "${spec.name}" must be a slug (alphanumeric, dash, underscore only)`,
+    );
+  }
+  if (spec.channels.length === 0) {
+    throw new SpawnRequestError(`spec "${spec.name}" declares no channels (the first is the wake channel)`);
+  }
+  const channel = normalizeChannel(spec.channels[0]!).name;
+  const dir = opts?.sessionsDirPath ?? defaultSessionsDir();
+  const workspace = sessionWorkspace(dir, spec.name);
+
+  // Resolve the Claude credential EARLY — a missing one throws
+  // CredentialNotConfiguredError, which the daemon maps to a 400 with the fix, so a
+  // programmatic agent never registers (and never runs a turn) without auth.
+  const resolveToken = opts?.resolveClaudeToken ?? ((ch: string) => resolveClaudeCredential(ch));
+  resolveToken(channel);
+
+  // Was a spec already persisted (an idempotent re-spawn)? Persist the (possibly
+  // updated) spec carrying backend:"programmatic" so a restart re-registers it.
+  const prior = readPersistedSpec(workspace);
+  persistSpec(workspace, { ...spec, backend: "programmatic" });
+
+  return {
+    name: spec.name,
+    channel,
+    backend: "programmatic",
+    workspace,
+    alreadyRunning: prior !== null,
   };
 }

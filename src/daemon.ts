@@ -18,7 +18,7 @@
  * disagree (channel#41).
  */
 
-import { mkdirSync, readFileSync } from "fs";
+import { mkdirSync, readFileSync, existsSync, readdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { timingSafeEqual } from "node:crypto";
@@ -86,11 +86,25 @@ import {
   createRealAgentOps,
   buildSpecFromBody,
   redactSpawnResult,
+  setupProgrammaticSpawn,
   SpawnRequestError,
   AGENT_NAME_SLUG,
   type AgentOps,
+  type AgentInfo,
 } from "./agents.ts";
-import { SpawnDepsError } from "./spawn-deps.ts";
+import { SpawnDepsError, sessionsDir as defaultSessionsDir, resolveSpawnDeps } from "./spawn-deps.ts";
+import {
+  ProgrammaticBackend,
+  realProgrammaticSpawn,
+  type ProgrammaticBackendDeps,
+} from "./backends/programmatic.ts";
+import {
+  ProgrammaticAgentRegistry,
+  type WriteOutbound,
+} from "./backends/registry.ts";
+import { AgentSessionState } from "./agent-session-state.ts";
+import { readPersistedSpec, sessionWorkspace } from "./spawn-agent.ts";
+import { normalizeChannel } from "./sandbox/types.ts";
 import { CredentialNotConfiguredError } from "./credentials.ts";
 import { MintError } from "./mint-token.ts";
 import { validateHubJwt } from "./hub-jwt.ts";
@@ -209,15 +223,31 @@ const START_CMD: string[] = resolveStartCmd(INSTALL_DIR);
 // Registry + routing
 // ---------------------------------------------------------------------------
 
-/** Build the per-channel context a transport routes through. */
-function contextFor(
+/** Build the per-channel context a transport routes through. Exported for tests
+ *  (the inbound-routing fork lives here). */
+export function contextFor(
   registry: ClientRegistry,
   channel: string,
   deliveryState: DeliveryState,
+  programmatic?: ProgrammaticAgentRegistry,
 ): TransportContext {
   return {
     channel,
     emit(msg: InboundMessage): void {
+      // PROGRAMMATIC ROUTING (design 2026-06-16 step 3). If a programmatic agent is
+      // registered for this channel, the inbound becomes one on-demand `claude -p`
+      // turn — ENQUEUE it (the per-channel serial worker drains it) and do NOT also
+      // push to SSE/MCP: a programmatic agent has no live subscriber, so a fan-out
+      // would reach no one AND the delivery high-water-mark must NOT advance (there's
+      // nothing to deliver to; the queue is the durability). The note's id rides in
+      // `meta.note_id` so the reply threads to it.
+      if (programmatic?.hasChannel(channel)) {
+        programmatic.enqueue(channel, {
+          content: msg.content,
+          ...(msg.meta?.note_id ? { inReplyTo: msg.meta.note_id } : {}),
+        });
+        return;
+      }
       // Route on the bound `channel`, NOT msg.channel — the transport's own
       // channel is authoritative. This makes it impossible for a transport to
       // emit onto another channel (closing a silent cross-channel-leak footgun)
@@ -396,6 +426,7 @@ async function addChannelLive(
   registry: ClientRegistry,
   entry: ChannelEntry,
   deliveryState: DeliveryState,
+  programmatic?: ProgrammaticAgentRegistry,
 ): Promise<Channel> {
   const existing = channels.get(entry.name);
   if (existing) {
@@ -411,7 +442,7 @@ async function addChannelLive(
   const transport = instantiateTransport(entry);
   const channel: Channel = { name: entry.name, transport, entry };
   channels.set(entry.name, channel);
-  await transport.start(contextFor(registry, entry.name, deliveryState));
+  await transport.start(contextFor(registry, entry.name, deliveryState, programmatic));
   return channel;
 }
 
@@ -433,6 +464,169 @@ async function removeChannelLive(
   }
   channels.delete(name);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Programmatic-agent backend wiring (design 2026-06-16)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the {@link WriteOutbound} the programmatic registry posts a turn's reply
+ * through: resolve the channel's transport from the live `channels` map and call its
+ * `reply()` — the SAME outbound path the interactive `reply` tool uses, so a
+ * programmatic reply is durable + renders in the chat UI exactly like an
+ * interactive one. For a VaultTransport this writes a `#channel-message/outbound`
+ * note; the vault inbound trigger keys on `#channel-message/inbound`, so writing the
+ * reply CANNOT re-trigger the inbound webhook (verified: no loop). `inReplyTo`
+ * threads the reply to the inbound note id.
+ *
+ * A missing transport (channel deregistered between the turn + its reply) throws —
+ * the registry's drain logs it and moves on; it never re-runs the turn (which would
+ * fork the conversation).
+ */
+export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutbound {
+  return async (channel, reply, inReplyTo) => {
+    const ch = channels.get(channel);
+    if (!ch) {
+      throw new Error(`no live transport for channel "${channel}" — cannot post the reply`);
+    }
+    await ch.transport.reply({
+      channel,
+      text: reply,
+      ...(inReplyTo ? { meta: { in_reply_to: inReplyTo } } : {}),
+    });
+  };
+}
+
+/**
+ * Build the REAL programmatic-agent registry — the {@link ProgrammaticBackend}
+ * wired to the env-resolved spawn deps + the per-channel session-id store, plus the
+ * outbound-write callback over the live `channels`. Lazily defaulted by
+ * `createFetchHandler` and constructed explicitly by `main` (so the same instance
+ * the routes use is the one the transports' `contextFor` enqueues onto).
+ *
+ * Best-effort on the backend deps: if the operator token / hub origin can't be
+ * resolved yet, the backend still constructs (its mint happens per-turn and will
+ * surface the error there as a `{ ok: false }` — not at boot), so a daemon with no
+ * hub provisioned yet still starts and can register programmatic agents.
+ */
+export function createDefaultProgrammaticRegistry(
+  channels: Map<string, Channel>,
+): ProgrammaticAgentRegistry {
+  const stateDir = defaultStateDir();
+  const sessionState = new AgentSessionState({ stateDir });
+  // Resolve the spawn deps lazily/defensively — a missing operator token must not
+  // crash boot (the interactive path resolves per-spawn too). We read what we can
+  // and let the per-turn mint surface any gap as a failure-value.
+  let backendDeps: ProgrammaticBackendDeps;
+  try {
+    const deps = resolveSpawnDeps();
+    backendDeps = {
+      hubOrigin: deps.hubOrigin,
+      managerBearer: deps.managerBearer,
+      ...(deps.vaultUrl ? { vaultUrl: deps.vaultUrl } : {}),
+      sessionsDir: deps.sessionsDir,
+      runtimeReadOnly: deps.runtimeReadOnly,
+      sessionState,
+      spawnFn: realProgrammaticSpawn(),
+      ...(deps.claudeBin ? { claudeBin: deps.claudeBin } : {}),
+    };
+  } catch {
+    // No operator token yet — construct with placeholders; a per-turn mint will
+    // fail cleanly (as a value) until the hub is provisioned. The registry + queue
+    // still work; only the actual `claude -p` turn needs the credential.
+    backendDeps = {
+      hubOrigin: "",
+      managerBearer: "",
+      sessionsDir: defaultSessionsDir(),
+      runtimeReadOnly: [],
+      sessionState,
+      spawnFn: realProgrammaticSpawn(),
+    };
+  }
+  const backend = new ProgrammaticBackend(backendDeps);
+  return new ProgrammaticAgentRegistry({
+    backend,
+    writeOutbound: buildWriteOutbound(channels),
+  });
+}
+
+/**
+ * Map the registered programmatic agents to the {@link AgentInfo} shape the
+ * `/api/agents` list returns — `backend: "programmatic"` + a live `status`
+ * (`idle` | `working` | `queued:N`) in place of the interactive `attached`/
+ * `mcp_sessions` liveness (design 2026-06-16 step 6). No tmux session, so `session`
+ * is the conventional `<name>-agent` label for display continuity and `attached` is
+ * always false.
+ */
+export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry): AgentInfo[] {
+  const dir = defaultSessionsDir();
+  return programmatic
+    .list()
+    .map((h) => {
+      const s = programmatic.statusOf(h.channel);
+      const status = s.state === "queued" ? `queued:${s.queued}` : s.state;
+      const workspace = sessionWorkspace(dir, h.name);
+      return {
+        name: h.name,
+        session: `${h.name}-agent`,
+        attached: false,
+        workspace,
+        hasWorkspace: existsSync(join(workspace, "spec.json")),
+        backend: "programmatic" as const,
+        status,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * BOOT RE-REGISTER (design 2026-06-16 step 2). Scan the per-session workspaces under
+ * the sessions dir, read each `spec.json`, and re-register every spec whose
+ * `backend === "programmatic"` into the live registry — so a programmatic agent,
+ * which has no resident process to survive a restart, resumes routing inbound to an
+ * on-demand turn after a daemon restart. The persisted session_id (a separate store)
+ * makes that next turn `--resume` the prior conversation, so no message is lost in
+ * the restart window beyond the normal inbound-trigger durability.
+ *
+ * INTERACTIVE specs are SKIPPED — their tmux sessions survive a daemon restart on
+ * their own (or are restarted via the supervisor), and re-registering them here
+ * would be wrong (they aren't programmatic). Best-effort: an unreadable spec / a
+ * register failure is logged per-agent and never aborts boot. Returns the count
+ * re-registered. `sessionsDirPath` is injectable for tests.
+ */
+export async function reregisterProgrammaticAgents(
+  programmatic: ProgrammaticAgentRegistry,
+  sessionsDirPath: string = defaultSessionsDir(),
+): Promise<number> {
+  let entries: string[];
+  try {
+    entries = readdirSync(sessionsDirPath, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    // No sessions dir yet (first boot) — nothing to re-register.
+    return 0;
+  }
+  let count = 0;
+  for (const name of entries) {
+    const workspace = sessionWorkspace(sessionsDirPath, name);
+    const spec = readPersistedSpec(workspace);
+    if (!spec || spec.backend !== "programmatic") continue;
+    try {
+      await programmatic.register(spec);
+      count++;
+      console.log(`parachute-channel: re-registered programmatic agent "${spec.name}" (channel ${normalizeChannel(spec.channels[0]!).name}).`);
+    } catch (err) {
+      console.error(
+        `parachute-channel: failed to re-register programmatic agent "${name}" from spec.json: ${(err as Error).message}`,
+      );
+    }
+  }
+  if (count > 0) {
+    console.log(`parachute-channel: re-registered ${count} programmatic agent(s) from persisted specs.`);
+  }
+  return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,12 +1249,24 @@ function clampQueryDim(raw: string | null, fallback: number): number {
 export function createFetchHandler(
   channels: Map<string, Channel>,
   registry: ClientRegistry,
-  opts?: { agentOps?: AgentOps; deliveryState?: DeliveryState },
+  opts?: {
+    agentOps?: AgentOps;
+    deliveryState?: DeliveryState;
+    programmatic?: ProgrammaticAgentRegistry;
+  },
 ): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
   // Spawn/list/kill operations behind the web agents surface. Lazily defaulted to
   // the real ops (resolve-deps + real tmux); tests inject a stub so the routes are
   // exercised without a hub, a sandbox, or a tmux server. Built once per handler.
   const agentOps: AgentOps = opts?.agentOps ?? createRealAgentOps();
+
+  // The programmatic-agent registry (design 2026-06-16) — inbound for a registered
+  // channel routes to an on-demand `claude -p` turn instead of a push. `main`
+  // constructs the real one (with the real backend + the outbound-write wiring);
+  // tests inject a fake-backed instance. Defaulted lazily to the real registry so a
+  // plain `createFetchHandler(channels, registry)` still wires programmatic agents.
+  const programmatic: ProgrammaticAgentRegistry =
+    opts?.programmatic ?? createDefaultProgrammaticRegistry(channels);
 
   // Per-channel delivery high-water-mark store (the no-silent-loss spine). The
   // daemon's `main` passes the boot-time instance; tests that don't care get a
@@ -1206,7 +1412,10 @@ export function createFetchHandler(
       });
     }
 
-    // Health check — per-channel client counts.
+    // Health check — per-channel client counts. Programmatic agents (design
+    // 2026-06-16 step 6) are listed separately with their backend + live status
+    // (`programmatic · idle|working|queued:N`) instead of `mcp_sessions` — a
+    // programmatic agent has no live subscriber, so SSE/MCP counts don't describe it.
     if (url.pathname === "/health") {
       return json({
         status: "ok",
@@ -1217,6 +1426,15 @@ export function createFetchHandler(
           mcp_sessions: mcpSessionCount(c.name),
         })),
         total_clients: registry.size,
+        programmatic_agents: programmatic.list().map((h) => {
+          const s = programmatic.statusOf(h.channel);
+          return {
+            name: h.name,
+            channel: h.channel,
+            backend: "programmatic",
+            status: s.state === "queued" ? `queued:${s.queued}` : s.state,
+          };
+        }),
       });
     }
 
@@ -1342,7 +1560,7 @@ export function createFetchHandler(
         return json({ error: `failed to write channels.json: ${(err as Error).message}` }, 500);
       }
       try {
-        await addChannelLive(channels, registry, entry, deliveryState);
+        await addChannelLive(channels, registry, entry, deliveryState, programmatic);
       } catch (err) {
         return json(
           {
@@ -1547,7 +1765,13 @@ export function createFetchHandler(
 
       if (req.method === "GET") {
         try {
-          return json({ agents: await agentOps.list() });
+          // The list MERGES interactive tmux sessions + registered programmatic
+          // agents (design 2026-06-16 step 6). Programmatic agents have no tmux
+          // session, so they carry `backend: "programmatic"` + a live `status`
+          // (idle|working|queued:N) instead of `attached`/`mcp_sessions`.
+          const interactive = await agentOps.list();
+          const programmaticInfos = listProgrammaticAgents(programmatic);
+          return json({ agents: [...interactive, ...programmaticInfos] });
         } catch (err) {
           return json({ error: `failed to list agents: ${(err as Error).message}` }, 500);
         }
@@ -1567,6 +1791,74 @@ export function createFetchHandler(
         if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
         throw err;
       }
+
+      // MUTUAL EXCLUSION (design 2026-06-16 step 7). A given agent name must not run
+      // BOTH backends at once — they'd collide on the same per-session workspace +
+      // spec.json. The wake channel is shared too (one wake source). Reject a spawn
+      // that conflicts with the OTHER backend already active for this name/channel.
+      const wantsProgrammatic = spec.backend === "programmatic";
+      const wakeChannel = normalizeChannel(spec.channels[0]!).name;
+      if (wantsProgrammatic) {
+        // Refuse if an INTERACTIVE tmux session already holds this name.
+        let interactiveLive = false;
+        try {
+          interactiveLive = (await agentOps.list()).some((a) => a.name === spec.name);
+        } catch {
+          // A tmux-list failure shouldn't block a programmatic spawn — proceed.
+        }
+        if (interactiveLive) {
+          return json(
+            {
+              error: `agent "${spec.name}" is already running as an INTERACTIVE (tmux) session. ` +
+                `Kill it first, or spawn the programmatic agent under a different name.`,
+            },
+            409,
+          );
+        }
+        // Refuse if a DIFFERENT programmatic agent already claims this wake channel
+        // — a channel routes inbound to at most one agent, and re-registering a new
+        // name onto an occupied channel would orphan the prior one. Re-spawning the
+        // SAME name onto its OWN channel is the idempotent-replace path (allowed).
+        if (programmatic.hasChannel(wakeChannel) && programmatic.getByChannel(wakeChannel)?.name !== spec.name) {
+          return json(
+            {
+              error: `programmatic agent "${programmatic.getByChannel(wakeChannel)?.name}" already ` +
+                `serves channel "${wakeChannel}". Kill it first, or pick a different channel.`,
+            },
+            409,
+          );
+        }
+      } else {
+        // Interactive spawn — refuse if a PROGRAMMATIC agent already holds this
+        // name OR the wake channel (a channel routes inbound to at most one backend).
+        if (programmatic.hasName(spec.name) || programmatic.hasChannel(wakeChannel)) {
+          return json(
+            {
+              error: `a PROGRAMMATIC agent is already registered for ` +
+                `${programmatic.hasName(spec.name) ? `name "${spec.name}"` : `channel "${wakeChannel}"`}. ` +
+                `Kill it first, or pick a different name/channel for the interactive session.`,
+            },
+            409,
+          );
+        }
+      }
+
+      // PROGRAMMATIC spawn — no tmux. Validate + persist spec.json (the no-tmux
+      // setup), then register in the live registry (so inbound for the channel
+      // enqueues). Boot re-registers from the persisted spec on the next restart.
+      if (wantsProgrammatic) {
+        try {
+          const setup = setupProgrammaticSpawn(spec);
+          await programmatic.register({ ...spec, backend: "programmatic" });
+          return json(setup);
+        } catch (err) {
+          if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
+          if (err instanceof CredentialNotConfiguredError) return json({ error: err.message }, 400);
+          return json({ error: (err as Error).message }, 400);
+        }
+      }
+
+      // INTERACTIVE spawn (the existing tmux path, UNCHANGED).
       try {
         const result = await agentOps.spawn(spec);
         return json(redactSpawnResult(result));
@@ -1599,6 +1891,21 @@ export function createFetchHandler(
       const denied = await requireScope(req, url, SCOPE_ADMIN);
       if (denied) return denied;
       const name = decodeURIComponent(restartMatch[1]!);
+      // PROGRAMMATIC restart — there is no tmux session to kill + re-spawn (the
+      // interactive restart's whole job). The closest analog is RESETTING the
+      // conversation: clear the persisted session id so the next message starts
+      // fresh. The agent stays registered. (design 2026-06-16 step 6 — the
+      // per-session restart is interactive-only; programmatic resets session-state.)
+      if (programmatic.hasName(name)) {
+        await programmatic.resetSession(name);
+        return json({
+          ok: true,
+          name,
+          backend: "programmatic",
+          session_reset: true,
+          note: "programmatic agent — conversation reset (next message starts a fresh session); no process to restart.",
+        });
+      }
       try {
         const result = await agentOps.restart(name);
         return json(result);
@@ -1618,6 +1925,12 @@ export function createFetchHandler(
       const denied = await requireScope(req, url, SCOPE_ADMIN);
       if (denied) return denied;
       const name = decodeURIComponent(agentMatch[1]!);
+      // PROGRAMMATIC delete — deregister (drop the channel/name indexes + queue,
+      // clear the backend session). No tmux to kill (design 2026-06-16 step 6).
+      if (programmatic.hasName(name)) {
+        const deregistered = await programmatic.deregister(name);
+        return json({ ok: true, name, backend: "programmatic", killed: deregistered });
+      }
       try {
         const { killed } = await agentOps.kill(name);
         return json({ ok: true, name, killed });
@@ -2183,13 +2496,21 @@ function main(): void {
     defaultMark: new Date().toISOString(),
   });
 
+  // The PROGRAMMATIC-agent registry (design 2026-06-16), constructed ONCE at boot
+  // and shared by the fetch handler (the /api/agents + /health routes), the
+  // transports' `contextFor` (inbound enqueue), and the boot re-register below — so
+  // the SAME instance the routes operate on is the one inbound enqueues onto. Built
+  // here (not lazily in createFetchHandler) precisely so the transports started
+  // below route inbound to it.
+  const programmatic = createDefaultProgrammaticRegistry(channels);
+
   // The terminal WS handler set (pty↔socket relay + backpressure flow control,
   // src/terminal.ts). One handler object serves every terminal connection;
   // per-connection state lives on `ws.data`. The fetch handler routes accepted
   // upgrades into these via `server.upgrade(req, { data })`.
   const terminalWs = createTerminalWsHandlers();
 
-  const fetchHandler = createFetchHandler(channels, registry, { deliveryState });
+  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic });
   const server = Bun.serve<TerminalWsData, never>({
     port: PORT,
     hostname: "127.0.0.1",
@@ -2271,12 +2592,22 @@ function main(): void {
   // the channels (from `loadRegistry`); addChannelLive replaces-in-place, which
   // for a freshly-instantiated boot transport means stop()→re-instantiate→start.
   // Per-channel failures are logged and don't abort the others; the daemon must
-  // still serve the channels that did come up.
+  // still serve the channels that did come up. Pass the programmatic registry so a
+  // channel with a registered programmatic agent routes inbound to its serial queue.
   for (const channel of [...channels.values()]) {
-    addChannelLive(channels, registry, channel.entry, deliveryState).catch((err) => {
+    addChannelLive(channels, registry, channel.entry, deliveryState, programmatic).catch((err) => {
       console.error(`parachute-channel: transport "${channel.name}" start failed:`, err);
     });
   }
+
+  // BOOT RE-REGISTER (design 2026-06-16 step 2). A programmatic agent has NO
+  // resident process, so it doesn't survive a daemon restart as a tmux session
+  // would — but its spec.json (carrying `backend: "programmatic"`) persists. Scan
+  // the per-session workspaces and re-register every programmatic spec so inbound
+  // for its channel resumes routing to an on-demand turn (the persisted session_id
+  // makes the next turn `--resume` the prior conversation — no deaf problem). Best-
+  // effort: a single bad spec is logged and skipped.
+  void reregisterProgrammaticAgents(programmatic);
 
   // Graceful shutdown — stop all transports.
   async function shutdown(): Promise<void> {

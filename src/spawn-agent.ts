@@ -292,6 +292,29 @@ export function readPersistedSpec(workspace: string): AgentSpec | null {
 }
 
 /**
+ * Interpret the backend of a PERSISTED spec (backward-compat, design
+ * 2026-06-16 + Aaron's gating decision 2026-06-16).
+ *
+ * A stored `spec.json` with NO `backend` field predates the field — it was written
+ * by an OLDER build whose only backend was the tmux/interactive path (e.g. the live
+ * `uni-dev` agent). Such a spec MUST read as `"interactive"`, never `"programmatic"`:
+ * an existing interactive agent is never silently migrated to programmatic by a
+ * daemon restart.
+ *
+ * This is DELIBERATELY the OPPOSITE default from a NEW spawn request, where an
+ * omitted `backend` now means `"programmatic"` ({@link buildSpecFromBody} in
+ * `agents.ts`). The two defaults are distinct on purpose — "omitted" means
+ * "programmatic" for a fresh request but "interactive" for a file on disk — so the
+ * flip applies only going forward and never reinterprets already-running agents.
+ *
+ * Use this anywhere a stored spec's backend is interpreted (boot re-register, etc.)
+ * rather than reading `spec.backend` raw, so the back-compat default is in one place.
+ */
+export function interpretPersistedBackend(spec: AgentSpec): "interactive" | "programmatic" {
+  return spec.backend === "programmatic" ? "programmatic" : "interactive";
+}
+
+/**
  * Build the scrubbed child env for the sandboxed claude. Mirrors runner's
  * passthrough allowlist MINUS `ANTHROPIC_API_KEY` (and the `ANTHROPIC_*`/`CLAUDE_*`
  * wildcards, which would re-admit it) — the channel session runs on the

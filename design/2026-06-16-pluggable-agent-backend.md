@@ -124,7 +124,13 @@ interactive side's silent-loss footgun leak into the programmatic contract.
 | Continuity | free (long-lived process) | `resume=session_id` / streaming input |
 
 ## Phasing
-1. Keep **interactive as the default** backend (it works; #67/#68/#71 make it solid).
+1. ~~Keep **interactive as the default** backend~~ — **SUPERSEDED (2026-06-16):** once
+   the programmatic backend landed + was live-verified, the operator chose to make
+   **programmatic the default** and gate interactive behind an "Advanced" affordance
+   (it's the buggier path, kept available to "bring back out" if Anthropic's SDK
+   pricing change returns). New spawns default to programmatic; existing persisted
+   interactive specs are preserved via the context-split default (see #76 /
+   `interpretPersistedBackend`).
 2. Extract the **AgentBackend seam** without changing interactive behavior.
 3. Build the **programmatic backend** behind the seam; reproduce the watch-it-work
    view by streaming SDK output into the in-page terminal if we want parity.

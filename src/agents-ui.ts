@@ -182,9 +182,10 @@ ${THEME_CSS}
     <!-- Spawn -->
     <section id="spawn-section">
       <h2>Spawn an agent</h2>
-      <p class="hint">Launches a sandboxed Claude Code session in tmux, wired to a channel.
-        The common case is one agent per channel — pick a channel and spawn. Open Advanced for
-        extra channels, a vault, network, or mounts.</p>
+      <p class="hint">Launches a sandboxed Claude agent wired to a channel. The default backend is
+        Programmatic (reliable per-message turns); the live-terminal Interactive backend is under
+        Advanced. The common case is one agent per channel — pick a channel and spawn. Open the
+        lower Advanced section for extra channels, a vault, network, or mounts.</p>
 
       <div class="grid3">
         <div>
@@ -207,10 +208,25 @@ ${THEME_CSS}
       <div style="margin-top:12px;">
         <label for="spawn-backend">Backend</label>
         <select id="spawn-backend">
-          <option value="interactive" selected>Interactive — watch / drive a live tmux session</option>
-          <option value="programmatic">Programmatic — clean per-message turns, no live terminal</option>
+          <option value="programmatic" selected>Programmatic — clean per-message turns, reliable (recommended)</option>
+          <option value="interactive">Interactive — watch / drive a live tmux session (advanced)</option>
         </select>
         <div id="backend-note" class="muted" style="font-size:12px; margin-top:8px;"></div>
+        <details id="backend-advanced" style="margin-top:10px;">
+          <summary>Advanced — interactive (live terminal) backend</summary>
+          <div class="sub">
+            <p class="muted" style="font-size:12px; margin:0;">
+              Interactive runs a live Claude Code in a terminal you can attach to —
+              currently less stable (the deaf-on-restart / reconnect class). Use
+              Programmatic unless you specifically want to watch / drive a live session.
+              Selecting it below switches the backend to interactive.
+            </p>
+            <div class="row" style="margin-top:8px;">
+              <button id="backend-use-interactive" class="ghost" type="button">Use interactive backend</button>
+              <span class="muted" id="backend-current" style="font-size:12px;"></span>
+            </div>
+          </div>
+        </details>
       </div>
 
       <details id="advanced">
@@ -526,24 +542,38 @@ ${SHELL_JS}
   netMode.addEventListener("change", syncNetMode);
   syncNetMode(); // default is open → show the note, hide the hosts field
 
-  // Backend toggle: a one-line explanation of each. Interactive = the existing
-  // tmux session you watch/drive (terminal attach). Programmatic = no live
-  // terminal; each inbound message becomes one clean claude -p turn whose reply
-  // is posted back (resume keeps the conversation). The note updates on change.
+  // Backend toggle. PROGRAMMATIC is the default + recommended path (reliable — no
+  // deaf-on-restart / reconnect class). INTERACTIVE (the original tmux session you
+  // watch/drive via terminal attach) is the buggier opt-in, gated behind the
+  // "Advanced — interactive" disclosure; it stays fully selectable once expanded.
+  // The note updates on change; the advanced button switches to interactive.
   var backendMode = document.getElementById("spawn-backend");
   function syncBackendMode() {
     var note = document.getElementById("backend-note");
+    var cur = document.getElementById("backend-current");
     if (backendMode.value === "programmatic") {
-      note.textContent = "Programmatic: no live terminal. Each message runs one on-demand claude -p turn " +
+      note.textContent = "Programmatic (default): no live terminal. Each message runs one on-demand claude -p turn " +
         "(resumes the prior conversation) and its reply is posted back to the channel. No idle session to go " +
-        "deaf, no reconnect — ideal for fire-and-forget 'do a task, report back'. The Terminal link won't apply.";
+        "deaf, no reconnect — reliable, ideal for fire-and-forget 'do a task, report back'. The Terminal link won't apply.";
+      if (cur) cur.textContent = "Current: programmatic.";
     } else {
-      note.textContent = "Interactive: an idle Claude Code session in a tmux pane you can attach to (Terminal ↗). " +
-        "Messages inject into the live session; you watch it work.";
+      note.textContent = "Interactive (advanced): an idle Claude Code session in a tmux pane you can attach to (Terminal ↗). " +
+        "Messages inject into the live session; you watch it work — but it's currently less stable (deaf-on-restart / " +
+        "reconnect class). Use Programmatic unless you specifically want a live session.";
+      if (cur) cur.textContent = "Current: interactive (advanced).";
     }
   }
   backendMode.addEventListener("change", syncBackendMode);
-  syncBackendMode(); // default is interactive
+  // The Advanced disclosure's button switches the selector to interactive (and
+  // updates the note) — interactive stays fully selectable, just opt-in.
+  var useInteractiveBtn = document.getElementById("backend-use-interactive");
+  if (useInteractiveBtn) {
+    useInteractiveBtn.addEventListener("click", function () {
+      backendMode.value = "interactive";
+      syncBackendMode();
+    });
+  }
+  syncBackendMode(); // default is programmatic
 
   function collectSpec() {
     var wake = chanEl.value;
@@ -581,8 +611,11 @@ ${SHELL_JS}
       mounts.push({ hostPath: host, mountPath: mount, mode: row.querySelector(".mt-mode").value });
     });
     if (mounts.length) spec.mounts = mounts;
-    // Backend selector — default interactive (omit so the server default applies).
-    if (backendMode.value === "programmatic") spec.backend = "programmatic";
+    // Backend selector — programmatic is the default; send the selected backend
+    // EXPLICITLY. Programmatic could be omitted (it's now the server default for a
+    // new request), but interactive MUST be passed explicitly to opt out of that
+    // default, so send the value either way for clarity.
+    spec.backend = backendMode.value === "interactive" ? "interactive" : "programmatic";
     return spec;
   }
 

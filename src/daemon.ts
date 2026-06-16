@@ -103,7 +103,7 @@ import {
   type WriteOutbound,
 } from "./backends/registry.ts";
 import { AgentSessionState } from "./agent-session-state.ts";
-import { readPersistedSpec, sessionWorkspace } from "./spawn-agent.ts";
+import { readPersistedSpec, interpretPersistedBackend, sessionWorkspace } from "./spawn-agent.ts";
 import { normalizeChannel } from "./sandbox/types.ts";
 import { CredentialNotConfiguredError } from "./credentials.ts";
 import { MintError } from "./mint-token.ts";
@@ -612,7 +612,12 @@ export async function reregisterProgrammaticAgents(
   for (const name of entries) {
     const workspace = sessionWorkspace(sessionsDirPath, name);
     const spec = readPersistedSpec(workspace);
-    if (!spec || spec.backend !== "programmatic") continue;
+    // A persisted spec with NO `backend` field predates the field → INTERACTIVE
+    // (interpretPersistedBackend) and is SKIPPED here — its tmux session survives a
+    // restart on its own. Only specs that explicitly persisted `backend:
+    // "programmatic"` are re-registered. This is the back-compat guard that keeps an
+    // existing interactive agent (e.g. uni-dev) from being migrated to programmatic.
+    if (!spec || interpretPersistedBackend(spec) !== "programmatic") continue;
     try {
       await programmatic.register(spec);
       count++;

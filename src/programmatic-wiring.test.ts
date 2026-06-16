@@ -433,7 +433,7 @@ describe("mutual exclusion (design step 7)", () => {
       const res = await fetch(`${base}/api/agents`, {
         method: "POST",
         headers: { ...adminAuth, "content-type": "application/json" },
-        body: JSON.stringify({ name: "eng", channels: ["eng"] }), // interactive (default)
+        body: JSON.stringify({ name: "eng", channels: ["eng"], backend: "interactive" }), // explicit interactive (default is now programmatic)
       });
       expect(res.status).toBe(409);
       expect(ops.spawned).toHaveLength(0);
@@ -443,8 +443,47 @@ describe("mutual exclusion (design step 7)", () => {
   });
 });
 
-describe("interactive path untouched", () => {
-  test("a default (no backend) spawn still hits the interactive tmux AgentOps", async () => {
+describe("backend default flip + interactive path", () => {
+  // Default flip (design 2026-06-16 + Aaron's gating decision): a NEW request that
+  // OMITS `backend` now routes to the PROGRAMMATIC registry, not the interactive
+  // tmux AgentOps. Interactive is still fully reachable by passing it explicitly.
+  test("a default (no backend) spawn now hits the PROGRAMMATIC registry (not tmux)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prog-default-"));
+    const prevStateDir = process.env.PARACHUTE_CHANNEL_STATE_DIR;
+    try {
+      const backend = new FakeBackend();
+      const rec = recorder();
+      const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+      const ops = stubAgentOps();
+      // Point the state dir at the temp + seed a default Claude credential so
+      // setupProgrammaticSpawn's early credential resolve succeeds (no real store).
+      process.env.PARACHUTE_CHANNEL_STATE_DIR = dir;
+      const { writeFileSync } = await import("node:fs");
+      writeFileSync(join(dir, "credentials.json"), JSON.stringify({ claude: { default: "oat_test" } }), { mode: 0o600 });
+
+      const { srv, base } = buildServer({ channels: new Map(), agentOps: ops, programmatic });
+      try {
+        const res = await fetch(`${base}/api/agents`, {
+          method: "POST",
+          headers: { ...adminAuth, "content-type": "application/json" },
+          body: JSON.stringify({ name: "aaron", channels: ["aaron"] }), // no backend → programmatic now
+        });
+        expect(res.status).toBe(200);
+        expect(((await res.json()) as { backend: string }).backend).toBe("programmatic");
+        // It landed in the programmatic registry; the interactive tmux AgentOps was untouched.
+        expect(programmatic.hasName("aaron")).toBe(true);
+        expect(ops.spawned).toHaveLength(0);
+      } finally {
+        srv.stop(true);
+      }
+    } finally {
+      if (prevStateDir === undefined) delete process.env.PARACHUTE_CHANNEL_STATE_DIR;
+      else process.env.PARACHUTE_CHANNEL_STATE_DIR = prevStateDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an explicit backend:\"interactive\" spawn still hits the interactive tmux AgentOps", async () => {
     const backend = new FakeBackend();
     const rec = recorder();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
@@ -454,7 +493,7 @@ describe("interactive path untouched", () => {
       const res = await fetch(`${base}/api/agents`, {
         method: "POST",
         headers: { ...adminAuth, "content-type": "application/json" },
-        body: JSON.stringify({ name: "aaron", channels: ["aaron"] }),
+        body: JSON.stringify({ name: "aaron", channels: ["aaron"], backend: "interactive" }),
       });
       expect(res.status).toBe(200);
       // The interactive AgentOps.spawn ran; nothing landed in the programmatic registry.

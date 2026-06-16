@@ -108,9 +108,10 @@ describe("agentInfoFromSessions", () => {
 });
 
 describe("buildSpecFromBody", () => {
-  test("minimal valid body (one channel, defaults to write)", () => {
+  test("minimal valid body (one channel, defaults to write + programmatic backend)", () => {
     const spec = buildSpecFromBody({ name: "aaron", channels: ["aaron"] });
-    expect(spec).toEqual({ name: "aaron", channels: ["aaron"] });
+    // backend now defaults to "programmatic" for a new request (the default flip).
+    expect(spec).toEqual({ name: "aaron", channels: ["aaron"], backend: "programmatic" });
   });
   test("full body — channels (object form), vault+tags, egress, mounts", () => {
     const spec = buildSpecFromBody({
@@ -170,6 +171,23 @@ describe("buildSpecFromBody", () => {
     expect(() =>
       buildSpecFromBody({ name: "a", channels: ["c"], mounts: [{ hostPath: "/h", mountPath: "rel", mode: "ro" }] }),
     ).toThrow(/mountPath must be an absolute path/);
+  });
+  // Backend default flip (design 2026-06-16 + Aaron's gating decision): a NEW
+  // request that OMITS `backend` now defaults to "programmatic" (the reliable
+  // primary path), NOT "interactive". Explicit values are still honored.
+  test("omitted backend → programmatic (the new-request default)", () => {
+    expect(buildSpecFromBody({ name: "a", channels: ["c"] }).backend).toBe("programmatic");
+    // null is treated as omitted.
+    expect(buildSpecFromBody({ name: "a", channels: ["c"], backend: null }).backend).toBe("programmatic");
+  });
+  test("explicit backend:\"interactive\" is still honored (opt-out of the default)", () => {
+    expect(buildSpecFromBody({ name: "a", channels: ["c"], backend: "interactive" }).backend).toBe("interactive");
+  });
+  test("explicit backend:\"programmatic\" is honored", () => {
+    expect(buildSpecFromBody({ name: "a", channels: ["c"], backend: "programmatic" }).backend).toBe("programmatic");
+  });
+  test("rejects an invalid backend value", () => {
+    expect(() => buildSpecFromBody({ name: "a", channels: ["c"], backend: "weird" })).toThrow(/backend/);
   });
 });
 
@@ -441,6 +459,27 @@ describe("GET /agents — the management page (loads open)", () => {
       srv.stop(true);
     }
   });
+
+  // UI gating (design 2026-06-16 + Aaron's gating decision): the backend selector
+  // DEFAULTS to programmatic; interactive is moved behind an "Advanced" disclosure
+  // (a collapsed <details>) but stays fully selectable.
+  test("spawn form defaults the backend selector to programmatic + gates interactive under Advanced", async () => {
+    const { srv, base } = buildServer();
+    try {
+      const html = await (await fetch(`${base}/agents`)).text();
+      // The programmatic <option> carries `selected` (the default); interactive does not.
+      expect(html).toMatch(/<option value="programmatic" selected>/);
+      expect(html).not.toMatch(/<option value="interactive" selected>/);
+      expect(html).toContain('<option value="interactive">');
+      // Interactive lives behind an Advanced disclosure (a <details>) with the caveat.
+      expect(html).toContain('<details id="backend-advanced"');
+      expect(html).toContain("Advanced — interactive");
+      expect(html).toContain("less stable");
+      expect(html).toContain("Use Programmatic unless you specifically want");
+    } finally {
+      srv.stop(true);
+    }
+  });
 });
 
 describe("/api/agents — operator-gated on channel:admin", () => {
@@ -504,7 +543,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
     }
   });
 
-  test("POST with admin token + valid spec → 200 redacted result (no token values)", async () => {
+  test("POST with admin token + valid interactive spec → 200 redacted result (no token values)", async () => {
     const { srv, base } = buildServer({
       async spawn(spec) {
         return {
@@ -522,10 +561,12 @@ describe("/api/agents — operator-gated on channel:admin", () => {
       },
     });
     try {
+      // backend:"interactive" is now an explicit opt-in (the default flipped to
+      // programmatic) — this exercises the interactive (agentOps.spawn) path.
       const res = await fetch(`${base}/api/agents`, {
         method: "POST",
         headers: { ...adminAuth, "content-type": "application/json" },
-        body: JSON.stringify({ name: "aaron", channels: ["aaron"] }),
+        body: JSON.stringify({ name: "aaron", channels: ["aaron"], backend: "interactive" }),
       });
       expect(res.status).toBe(200);
       const text = await res.text();
@@ -560,7 +601,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
     }
   });
 
-  test("spawn throws CredentialNotConfiguredError → 400 with the fix", async () => {
+  test("interactive spawn throws CredentialNotConfiguredError → 400 with the fix", async () => {
     const { srv, base } = buildServer({
       async spawn() {
         throw new CredentialNotConfiguredError("aaron");
@@ -570,7 +611,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
       const res = await fetch(`${base}/api/agents`, {
         method: "POST",
         headers: { ...adminAuth, "content-type": "application/json" },
-        body: JSON.stringify({ name: "aaron", channels: ["aaron"] }),
+        body: JSON.stringify({ name: "aaron", channels: ["aaron"], backend: "interactive" }),
       });
       expect(res.status).toBe(400);
       expect(((await res.json()) as { error: string }).error).toContain("no Claude credential");
@@ -579,7 +620,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
     }
   });
 
-  test("spawn throws SpawnDepsError (no operator token) → 503", async () => {
+  test("interactive spawn throws SpawnDepsError (no operator token) → 503", async () => {
     const { srv, base } = buildServer({
       async spawn() {
         throw new SpawnDepsError("no operator token");
@@ -589,7 +630,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
       const res = await fetch(`${base}/api/agents`, {
         method: "POST",
         headers: { ...adminAuth, "content-type": "application/json" },
-        body: JSON.stringify({ name: "aaron", channels: ["aaron"] }),
+        body: JSON.stringify({ name: "aaron", channels: ["aaron"], backend: "interactive" }),
       });
       expect(res.status).toBe(503);
     } finally {
@@ -597,7 +638,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
     }
   });
 
-  test("spawn throws MintError → forwards the hub status", async () => {
+  test("interactive spawn throws MintError → forwards the hub status", async () => {
     const { srv, base } = buildServer({
       async spawn() {
         throw new MintError("over-broad scope", 403, "forbidden");
@@ -607,7 +648,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
       const res = await fetch(`${base}/api/agents`, {
         method: "POST",
         headers: { ...adminAuth, "content-type": "application/json" },
-        body: JSON.stringify({ name: "aaron", channels: ["aaron"] }),
+        body: JSON.stringify({ name: "aaron", channels: ["aaron"], backend: "interactive" }),
       });
       expect(res.status).toBe(403);
       expect(((await res.json()) as { error: string }).error).toContain("mint failed");

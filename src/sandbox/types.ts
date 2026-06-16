@@ -101,15 +101,24 @@ export type AgentChannel = string | AgentChannelSpec;
 /**
  * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md):
  *
- *  - `"interactive"` (DEFAULT — existing behavior, unchanged): an idle interactive
- *    `claude` in a tmux pane, fed inbound by pushing onto a subscribed MCP
- *    development channel. Carries the deaf-on-restart machinery (#67/#68/#70/#71).
- *    Best for "watch / drive a live session" — the operator attaches the terminal.
- *  - `"programmatic"`: NO resident process. An inbound message becomes one
+ *  - `"programmatic"` (the DEFAULT for a NEW spawn request, per Aaron's gating
+ *    decision 2026-06-16): NO resident process. An inbound message becomes one
  *    on-demand `claude -p --resume <sid>` turn ({@link AgentBackend}); the reply is
  *    posted back as an outbound `#channel-message/outbound` note. No idle session →
- *    nothing to go deaf, no reconnect, no replay, no consent gate. Best for clean
- *    per-message "do a task, report back" turns.
+ *    nothing to go deaf, no reconnect, no replay, no consent gate. The reliable
+ *    primary path; best for clean per-message "do a task, report back" turns.
+ *  - `"interactive"` (the original tmux path; now the opt-in/"advanced" backend): an
+ *    idle interactive `claude` in a tmux pane, fed inbound by pushing onto a
+ *    subscribed MCP development channel. Carries the deaf-on-restart machinery
+ *    (#67/#68/#70/#71) — currently less stable, kept for "watch / drive a live
+ *    session" (operator attaches the terminal) and to hedge the billing uncertainty.
+ *
+ * DEFAULT-RESOLUTION NOTE — the omitted-field default differs by context, on
+ * purpose: a NEW request that omits `backend` resolves to `"programmatic"`
+ * ({@link buildSpecFromBody} in `agents.ts`), but a PERSISTED `spec.json` that omits
+ * `backend` predates the field and resolves to `"interactive"`
+ * ({@link interpretPersistedBackend} in `spawn-agent.ts`) — so the flip applies going
+ * forward without silently migrating already-running interactive agents.
  */
 export type AgentBackendKind = "interactive" | "programmatic";
 
@@ -188,10 +197,13 @@ export interface AgentSpec {
   credentialRef?: string;
   /**
    * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md).
-   * Default `"interactive"` (the existing tmux path, unchanged). `"programmatic"`
-   * routes inbound to on-demand `claude -p` turns with no resident process. See
-   * {@link AgentBackendKind}. Persisted in spec.json so a daemon restart re-registers
-   * a programmatic agent on boot.
+   * A NEW spawn request that omits this defaults to `"programmatic"` (on-demand
+   * `claude -p` turns, no resident process — the reliable primary path, per Aaron's
+   * gating decision 2026-06-16); `"interactive"` (the original tmux path) is the
+   * opt-in/"advanced" backend. A PERSISTED spec.json that omits this resolves to
+   * `"interactive"` instead (back-compat — it predates the field). See
+   * {@link AgentBackendKind} for the full default-resolution note. Persisted in
+   * spec.json so a daemon restart re-registers a programmatic agent on boot.
    */
   backend?: AgentBackendKind;
 }

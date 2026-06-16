@@ -16,6 +16,7 @@ import {
   shellJoin,
   persistSpec,
   readPersistedSpec,
+  interpretPersistedBackend,
   specFilePath,
   type SpawnAgentDeps,
   type TmuxLauncher,
@@ -912,6 +913,41 @@ describe("persistSpec / readPersistedSpec — spawn-spec recovery for restart", 
       // Corrupt it -> null (the restart path treats this as "no spec").
       writeFileSync(specFilePath(ws), "{not json");
       expect(readPersistedSpec(ws)).toBeNull();
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("interpretPersistedBackend — persisted-spec backend back-compat", () => {
+  // A PERSISTED spec.json with NO `backend` field predates the field and is an
+  // INTERACTIVE agent (the original tmux path) — it must NEVER read as programmatic.
+  // This is the OPPOSITE default from a NEW request (buildSpecFromBody → programmatic),
+  // so existing interactive agents (e.g. the live uni-dev) are never silently migrated.
+  test("a spec with NO backend field → interactive (not programmatic)", () => {
+    expect(interpretPersistedBackend({ name: "uni-dev", channels: ["uni-dev"] })).toBe("interactive");
+  });
+  test("a spec with backend:\"programmatic\" → programmatic", () => {
+    expect(
+      interpretPersistedBackend({ name: "eng", channels: ["eng"], backend: "programmatic" }),
+    ).toBe("programmatic");
+  });
+  test("a spec with explicit backend:\"interactive\" → interactive", () => {
+    expect(
+      interpretPersistedBackend({ name: "a", channels: ["c"], backend: "interactive" }),
+    ).toBe("interactive");
+  });
+  test("a persisted spec.json round-trips through disk then reads as interactive (the uni-dev case)", () => {
+    const ws = mkdtempSync(join(tmpdir(), "spec-backcompat-"));
+    try {
+      // Simulate a pre-field spec.json on disk (no `backend` key), exactly like an
+      // existing interactive agent's persisted spec.
+      writeFileSync(specFilePath(ws), JSON.stringify({ name: "uni-dev", channels: ["uni-dev"] }) + "\n", { mode: 0o600 });
+      const spec = readPersistedSpec(ws);
+      expect(spec).not.toBeNull();
+      expect(spec!.backend).toBeUndefined();
+      // The interpreted backend is interactive — NOT migrated to programmatic.
+      expect(interpretPersistedBackend(spec!)).toBe("interactive");
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }

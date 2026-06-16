@@ -289,14 +289,26 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
     if (mounts.length > 0) spec.mounts = mounts;
   }
 
-  // Backend selector — the pluggable agent backend (design 2026-06-16). Default
-  // `"interactive"` (existing behavior); `"programmatic"` routes to on-demand
-  // `claude -p` turns. Persisted in spec.json so a restart re-registers it.
+  // Backend selector — the pluggable agent backend (design 2026-06-16). A NEW
+  // request that OMITS `backend` now defaults to `"programmatic"` (Aaron's gating
+  // decision 2026-06-16): programmatic is the reliable primary path (no
+  // deaf-on-restart / reconnect class); `"interactive"` (the original tmux path) is
+  // the buggier opt-in, gated behind "Advanced" in the UI but still fully selectable
+  // by passing `backend: "interactive"` explicitly here. The selected backend is
+  // persisted in spec.json so a restart re-registers it.
+  //
+  // CRITICAL — this NEW-request default is DISTINCT from the PERSISTED-spec default:
+  // a stored spec.json with NO `backend` field predates the field and is an
+  // INTERACTIVE agent ({@link interpretPersistedBackend}). Do NOT unify these — a
+  // missing field means "programmatic" for a fresh request but "interactive" for a
+  // file on disk, so existing interactive agents are never silently migrated.
   if (b.backend !== undefined && b.backend !== null) {
     if (b.backend !== "interactive" && b.backend !== "programmatic") {
       throw new SpawnRequestError('body.backend must be "interactive" or "programmatic"');
     }
     spec.backend = b.backend;
+  } else {
+    spec.backend = "programmatic";
   }
 
   return spec;

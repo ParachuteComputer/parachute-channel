@@ -400,6 +400,28 @@ describe("mutual exclusion (design step 7)", () => {
     }
   });
 
+  test("a DIFFERENT programmatic name onto an already-claimed channel → 409 (no orphan)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await programmatic.register({ name: "eng-a", channels: ["eng"], backend: "programmatic" });
+    const ops = stubAgentOps();
+    const { srv, base } = buildServer({ channels: new Map(), agentOps: ops, programmatic });
+    try {
+      const res = await fetch(`${base}/api/agents`, {
+        method: "POST",
+        headers: { ...adminAuth, "content-type": "application/json" },
+        body: JSON.stringify({ name: "eng-b", channels: ["eng"], backend: "programmatic" }),
+      });
+      expect(res.status).toBe(409);
+      // The prior agent is untouched (not orphaned by an overwrite).
+      expect(programmatic.getByChannel("eng")?.name).toBe("eng-a");
+      expect(programmatic.hasName("eng-b")).toBe(false);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
   test("interactive spawn when a programmatic agent holds the channel → 409 (tmux NOT spawned)", async () => {
     const backend = new FakeBackend();
     const rec = recorder();

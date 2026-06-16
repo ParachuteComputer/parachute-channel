@@ -1815,6 +1815,19 @@ export function createFetchHandler(
             409,
           );
         }
+        // Refuse if a DIFFERENT programmatic agent already claims this wake channel
+        // — a channel routes inbound to at most one agent, and re-registering a new
+        // name onto an occupied channel would orphan the prior one. Re-spawning the
+        // SAME name onto its OWN channel is the idempotent-replace path (allowed).
+        if (programmatic.hasChannel(wakeChannel) && programmatic.getByChannel(wakeChannel)?.name !== spec.name) {
+          return json(
+            {
+              error: `programmatic agent "${programmatic.getByChannel(wakeChannel)?.name}" already ` +
+                `serves channel "${wakeChannel}". Kill it first, or pick a different channel.`,
+            },
+            409,
+          );
+        }
       } else {
         // Interactive spawn — refuse if a PROGRAMMATIC agent already holds this
         // name OR the wake channel (a channel routes inbound to at most one backend).

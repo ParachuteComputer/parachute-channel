@@ -169,8 +169,12 @@ export class ProgrammaticAgentRegistry {
     const priorChannel = this.nameToChannel.get(spec.name);
     if (priorChannel !== undefined && priorChannel !== channel) {
       // The name moved to a different wake channel — drop the old channel index.
+      // An in-flight drain on the old channel self-terminates (it re-reads
+      // `byChannel`, now empty for that channel); we drop its `draining` flag too so
+      // the entry doesn't leak until that promise happens to settle.
       this.byChannel.delete(priorChannel);
       this.queues.delete(priorChannel);
+      this.draining.delete(priorChannel);
     }
     const backendHandle = await this.backend.start(spec);
     const handle: ProgrammaticAgentHandle = {

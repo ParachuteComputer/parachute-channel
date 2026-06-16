@@ -21,7 +21,7 @@
  *     the tmux AgentOps).
  */
 
-import { describe, test, expect, mock } from "bun:test";
+import { describe, test, expect, mock, afterEach } from "bun:test";
 
 const ADMIN_TOKEN = "test-admin-token"; // channel:read + send + admin
 import { HubJwtError, looksLikeJwt } from "@openparachute/scope-guard";
@@ -58,6 +58,79 @@ import type { Channel } from "./registry.ts";
 import type { AgentOps, AgentInfo, SpawnRequestError } from "./agents.ts";
 
 const adminAuth = { authorization: "Bearer " + ADMIN_TOKEN };
+
+// ---------------------------------------------------------------------------
+// Real-home safety guard (channel#75)
+//
+// A phantom `eng` programmatic agent appeared on a LIVE box because a test write
+// escaped isolation into the real `~/.parachute/channel/sessions/`. Boot re-register
+// then scanned it and resurrected the agent. Every test here that persists a spec /
+// touches the channel state dir MUST write ONLY to a per-test temp dir. The `afterEach`
+// real-home assertion below is the backstop; `withTempStateDir` is the easy-path helper
+// future state-touching tests should reach for.
+//
+// `realSessionsDir()` is the operator's REAL sessions dir, derived the SAME way the
+// daemon derives it (`~/.parachute/channel/sessions`) but WITHOUT honoring
+// PARACHUTE_CHANNEL_STATE_DIR — so it's the genuine home even while a test has the env
+// var pointed at a temp dir. A new test session/spec dir appearing under it is the
+// leak signature.
+import { homedir } from "node:os";
+import { readdirSync } from "node:fs";
+
+function realSessionsDir(): string {
+  return join(homedir(), ".parachute", "channel", "sessions");
+}
+
+function listRealSessions(): string[] {
+  try {
+    return readdirSync(realSessionsDir(), { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return []; // no real sessions dir on this machine → nothing to leak into
+  }
+}
+
+// Snapshot the real sessions dir before the suite; after EACH test assert nothing new
+// landed in it. Catches any spec write (or `setupProgrammaticSpawn` / boot re-register
+// path) that escaped its temp-dir guard. We compare set membership, not exact equality,
+// so a concurrently-running operator daemon spawning a legit agent doesn't false-fail
+// — only a NEW dir attributable to a test trips it (the test-fixture names are distinct
+// slugs like `eng`/`watcher`/`prog-test` that wouldn't normally be live).
+const realSessionsBaseline = new Set(listRealSessions());
+
+afterEach(() => {
+  const now = listRealSessions();
+  const leaked = now.filter((n) => !realSessionsBaseline.has(n));
+  expect(
+    leaked,
+    `test wrote ${leaked.length} new session dir(s) into the REAL ${realSessionsDir()} ` +
+      `(${leaked.join(", ")}) — every spec/state write must be inside a temp dir ` +
+      `(PARACHUTE_CHANNEL_STATE_DIR + mkdtemp). See channel#75.`,
+  ).toEqual([]);
+});
+
+/**
+ * Run `fn` with PARACHUTE_CHANNEL_STATE_DIR pointed at a fresh mkdtemp dir, so
+ * `defaultStateDir()` / `defaultSessionsDir()` (and anything that derives from them —
+ * `setupProgrammaticSpawn`, the credentials store, boot re-register's default arg)
+ * resolve UNDER the temp dir, never the operator's real home. Restores the prior env
+ * value and removes the temp dir in `finally`, even on throw. This is the temp-dir
+ * discipline the prompt calls the model — use it for any test that may write state.
+ */
+async function withTempStateDir<T>(fn: (dir: string) => Promise<T> | T): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "channel-state-"));
+  const prev = process.env.PARACHUTE_CHANNEL_STATE_DIR;
+  process.env.PARACHUTE_CHANNEL_STATE_DIR = dir;
+  try {
+    return await fn(dir);
+  } finally {
+    if (prev === undefined) delete process.env.PARACHUTE_CHANNEL_STATE_DIR;
+    else process.env.PARACHUTE_CHANNEL_STATE_DIR = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 /** A controllable fake backend (no `claude -p`). */
 class FakeBackend implements AgentBackend {
@@ -156,17 +229,15 @@ async function until(pred: () => boolean, tries = 200): Promise<void> {
 
 describe("spawn with backend:'programmatic'", () => {
   test("→ no tmux spawn, agent registered, spec.json carries backend", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "prog-spawn-"));
-    try {
+    // withTempStateDir points PARACHUTE_CHANNEL_STATE_DIR at a fresh mkdtemp dir so
+    // defaultStateDir/defaultSessionsDir resolve under <dir> (NOT the operator's real
+    // ~/.parachute) and restores + cleans up on exit — the temp-dir discipline a
+    // state-touching test must follow (channel#75). The afterEach backstop double-checks.
+    await withTempStateDir(async (dir) => {
       const backend = new FakeBackend();
       const rec = recorder();
       const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
       const ops = stubAgentOps();
-      // Point the channel state dir at our temp via PARACHUTE_CHANNEL_STATE_DIR so
-      // defaultStateDir → <dir> and the sessions dir + credentials store land under
-      // it (NOT the operator's real ~/.parachute).
-      const prevStateDir = process.env.PARACHUTE_CHANNEL_STATE_DIR;
-      process.env.PARACHUTE_CHANNEL_STATE_DIR = dir;
       // Seed a default Claude credential so setupProgrammaticSpawn's early resolve
       // succeeds against the temp store (no real store touched).
       const { writeFileSync } = await import("node:fs");
@@ -201,12 +272,8 @@ describe("spawn with backend:'programmatic'", () => {
         expect(persisted.backend).toBe("programmatic");
       } finally {
         srv.stop(true);
-        if (prevStateDir === undefined) delete process.env.PARACHUTE_CHANNEL_STATE_DIR;
-        else process.env.PARACHUTE_CHANNEL_STATE_DIR = prevStateDir;
       }
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 });
 
@@ -300,8 +367,20 @@ describe("inbound for a programmatic channel → deliver → outbound note", () 
   });
 });
 
+/** A live channels map containing `names` as keys — only membership matters to the
+ *  boot re-register channel-existence guard (`channels.has(wakeChannel)`), so the
+ *  transport is an inert stub. Mirrors a channels.json-derived map at the keys level. */
+function liveChannels(names: string[]): Map<string, Channel> {
+  const m = new Map<string, Channel>();
+  for (const name of names) {
+    const transport = { kind: "vault" } as unknown as Channel["transport"];
+    m.set(name, { name, transport, entry: { name, transport: "vault" } });
+  }
+  return m;
+}
+
 describe("boot re-register", () => {
-  test("a persisted programmatic spec.json → re-registered on start", async () => {
+  test("a persisted programmatic spec whose channel IS configured → re-registered on start", async () => {
     const dir = mkdtempSync(join(tmpdir(), "prog-boot-"));
     try {
       const sessionsDir = join(dir, "sessions");
@@ -313,7 +392,9 @@ describe("boot re-register", () => {
       const rec = recorder();
       const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
 
-      const count = await reregisterProgrammaticAgents(programmatic, sessionsDir);
+      // Both wake channels ("eng", "watch") are live — so the ONLY skip is the
+      // back-compat interactive one, not the channel-existence guard.
+      const count = await reregisterProgrammaticAgents(programmatic, liveChannels(["eng", "watch"]), sessionsDir);
       expect(count).toBe(1);
       expect(programmatic.hasName("eng")).toBe(true);
       // The interactive spec was NOT re-registered as programmatic.
@@ -323,11 +404,77 @@ describe("boot re-register", () => {
     }
   });
 
+  test("orphan guard: a programmatic spec whose channel is NOT configured → SKIPPED (no phantom)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prog-boot-orphan-"));
+    try {
+      const sessionsDir = join(dir, "sessions");
+      // Three spec dirs in the SAME temp sessions dir:
+      //  (a) programmatic, channel "eng" — CONFIGURED → re-registered.
+      //  (b) programmatic, channel "ghost" — NOT configured (orphaned/leaked) → SKIPPED.
+      //  (c) legacy no-backend spec — interactive → SKIPPED regardless of channel.
+      persistSpec(sessionWorkspace(sessionsDir, "eng"), { name: "eng", channels: ["eng"], backend: "programmatic" });
+      persistSpec(sessionWorkspace(sessionsDir, "stray"), { name: "stray", channels: ["ghost"], backend: "programmatic" });
+      persistSpec(sessionWorkspace(sessionsDir, "legacy"), { name: "legacy", channels: ["eng"] });
+
+      const backend = new FakeBackend();
+      const rec = recorder();
+      const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+
+      // Only "eng" is a live channel; "ghost" is not configured.
+      const logs: string[] = [];
+      const origLog = console.log;
+      console.log = (...args: unknown[]) => { logs.push(args.join(" ")); };
+      let count: number;
+      try {
+        count = await reregisterProgrammaticAgents(programmatic, liveChannels(["eng"]), sessionsDir);
+      } finally {
+        console.log = origLog;
+      }
+
+      // Exactly the configured-channel agent was re-registered.
+      expect(count).toBe(1);
+      expect(programmatic.hasName("eng")).toBe(true);
+      // The orphan (channel not configured) was SKIPPED — no phantom agent.
+      expect(programmatic.hasName("stray")).toBe(false);
+      expect(programmatic.hasChannel("ghost")).toBe(false);
+      // The legacy no-backend (interactive) spec was SKIPPED too.
+      expect(programmatic.hasName("legacy")).toBe(false);
+      // And the orphan skip emitted the one-line notice naming the missing channel.
+      expect(
+        logs.some((l) => l.includes('skipping re-register of "stray"') && l.includes('channel "ghost" not configured')),
+      ).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a programmatic spec with NO channel → SKIPPED (nothing to key/route on)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prog-boot-nochan-"));
+    try {
+      const sessionsDir = join(dir, "sessions");
+      persistSpec(sessionWorkspace(sessionsDir, "headless"), { name: "headless", channels: [], backend: "programmatic" });
+
+      const backend = new FakeBackend();
+      const rec = recorder();
+      const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+
+      const count = await reregisterProgrammaticAgents(programmatic, liveChannels([]), sessionsDir);
+      expect(count).toBe(0);
+      expect(programmatic.hasName("headless")).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("no sessions dir → 0 re-registered (clean first boot)", async () => {
     const backend = new FakeBackend();
     const rec = recorder();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
-    const count = await reregisterProgrammaticAgents(programmatic, join(tmpdir(), "does-not-exist-" + Date.now()));
+    const count = await reregisterProgrammaticAgents(
+      programmatic,
+      liveChannels([]),
+      join(tmpdir(), "does-not-exist-" + Date.now()),
+    );
     expect(count).toBe(0);
   });
 });
@@ -448,16 +595,15 @@ describe("backend default flip + interactive path", () => {
   // OMITS `backend` now routes to the PROGRAMMATIC registry, not the interactive
   // tmux AgentOps. Interactive is still fully reachable by passing it explicitly.
   test("a default (no backend) spawn now hits the PROGRAMMATIC registry (not tmux)", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "prog-default-"));
-    const prevStateDir = process.env.PARACHUTE_CHANNEL_STATE_DIR;
-    try {
+    // Temp-dir isolation via withTempStateDir (channel#75) — the spawn persists a
+    // spec.json under defaultSessionsDir, which must resolve under the temp dir.
+    await withTempStateDir(async (dir) => {
       const backend = new FakeBackend();
       const rec = recorder();
       const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
       const ops = stubAgentOps();
-      // Point the state dir at the temp + seed a default Claude credential so
-      // setupProgrammaticSpawn's early credential resolve succeeds (no real store).
-      process.env.PARACHUTE_CHANNEL_STATE_DIR = dir;
+      // Seed a default Claude credential so setupProgrammaticSpawn's early credential
+      // resolve succeeds (no real store).
       const { writeFileSync } = await import("node:fs");
       writeFileSync(join(dir, "credentials.json"), JSON.stringify({ claude: { default: "oat_test" } }), { mode: 0o600 });
 
@@ -476,11 +622,7 @@ describe("backend default flip + interactive path", () => {
       } finally {
         srv.stop(true);
       }
-    } finally {
-      if (prevStateDir === undefined) delete process.env.PARACHUTE_CHANNEL_STATE_DIR;
-      else process.env.PARACHUTE_CHANNEL_STATE_DIR = prevStateDir;
-      rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   test("an explicit backend:\"interactive\" spawn still hits the interactive tmux AgentOps", async () => {

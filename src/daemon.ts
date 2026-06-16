@@ -594,9 +594,23 @@ export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry):
  * would be wrong (they aren't programmatic). Best-effort: an unreadable spec / a
  * register failure is logged per-agent and never aborts boot. Returns the count
  * re-registered. `sessionsDirPath` is injectable for tests.
+ *
+ * ORPHAN GUARD (channel#75 — defense-in-depth). A spec dir is durable cruft: it can
+ * outlive the channel it was spawned for (a deleted agent whose workspace wasn't
+ * swept, a crash mid-spawn, a leaked test fixture, a hand-copied dir). Re-registering
+ * a programmatic agent whose wake channel ISN'T in the live channels config would
+ * resurrect a PHANTOM agent — one with nothing to receive for (no live channel feeds
+ * it inbound), confusing the operator and the agent list. So we re-register ONLY a
+ * spec whose wake channel STILL EXISTS in `channels` (the live channels.json-derived
+ * map); a spec for a missing channel is SKIPPED with a one-line notice, making any
+ * orphaned/leaked spec dir inert. The wake channel is keyed exactly as the registry
+ * keys it (`normalizeChannel(spec.channels[0]).name` — see `ProgrammaticAgentRegistry`).
+ * A spec with an EMPTY channels array is also skipped (it has no wake channel to key /
+ * route on — re-registering it would throw at the registry's channelOf).
  */
 export async function reregisterProgrammaticAgents(
   programmatic: ProgrammaticAgentRegistry,
+  channels: Map<string, Channel>,
   sessionsDirPath: string = defaultSessionsDir(),
 ): Promise<number> {
   let entries: string[];
@@ -618,10 +632,28 @@ export async function reregisterProgrammaticAgents(
     // "programmatic"` are re-registered. This is the back-compat guard that keeps an
     // existing interactive agent (e.g. uni-dev) from being migrated to programmatic.
     if (!spec || interpretPersistedBackend(spec) !== "programmatic") continue;
+    // ORPHAN GUARD: a spec with no wake channel, or whose wake channel isn't a live
+    // channel, has nothing to receive for — skip it so a leaked/stale spec dir can't
+    // resurrect a phantom agent. Keyed exactly as the registry keys the channel.
+    const wakeChannel = spec.channels[0]
+      ? normalizeChannel(spec.channels[0]).name
+      : undefined;
+    if (!wakeChannel) {
+      console.log(
+        `parachute-channel: skipping re-register of "${spec.name}" — spec declares no channel.`,
+      );
+      continue;
+    }
+    if (!channels.has(wakeChannel)) {
+      console.log(
+        `parachute-channel: skipping re-register of "${spec.name}" — channel "${wakeChannel}" not configured.`,
+      );
+      continue;
+    }
     try {
       await programmatic.register(spec);
       count++;
-      console.log(`parachute-channel: re-registered programmatic agent "${spec.name}" (channel ${normalizeChannel(spec.channels[0]!).name}).`);
+      console.log(`parachute-channel: re-registered programmatic agent "${spec.name}" (channel ${wakeChannel}).`);
     } catch (err) {
       console.error(
         `parachute-channel: failed to re-register programmatic agent "${name}" from spec.json: ${(err as Error).message}`,
@@ -2611,8 +2643,10 @@ function main(): void {
   // the per-session workspaces and re-register every programmatic spec so inbound
   // for its channel resumes routing to an on-demand turn (the persisted session_id
   // makes the next turn `--resume` the prior conversation — no deaf problem). Best-
-  // effort: a single bad spec is logged and skipped.
-  void reregisterProgrammaticAgents(programmatic);
+  // effort: a single bad spec is logged and skipped. The live `channels` map gates
+  // it: only a spec whose wake channel is a configured channel is re-registered, so
+  // a leaked/orphaned spec dir can't resurrect a phantom agent (channel#75).
+  void reregisterProgrammaticAgents(programmatic, channels);
 
   // Graceful shutdown — stop all transports.
   async function shutdown(): Promise<void> {

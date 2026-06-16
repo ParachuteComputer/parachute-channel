@@ -80,6 +80,67 @@ async function withSpawnLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * Inputs to {@link wrapArgvInSandbox} — the spec (carries network/filesystem/
+ * mounts/egress), the workspace + runtime read binds, the egress base origins, the
+ * argv to run, and the engine + ripgrep overrides.
+ */
+export interface WrapArgvInSandboxInput {
+  /** The agent spec — its network/filesystem/egress/mounts drive the sandbox config. */
+  spec: AgentSpec;
+  /** Private per-session workspace (rw). */
+  workspace: string;
+  /** Read-only runtime/claude-config binds the session needs to run `claude`. */
+  runtimeReadOnly: string[];
+  /** Hub origin for the non-removable egress base. */
+  hubOrigin: string;
+  /** Vault origin for the egress base (if the spec binds a vault). */
+  vaultUrl?: string;
+  /** The argv to sandbox-wrap (e.g. the `claude …` invocation). */
+  argv: string[];
+  /** Sandbox engine override (tests inject a fake). */
+  sandboxEngine?: SandboxEngine;
+  /**
+   * Optional ripgrep override threaded to the sandbox (macOS deny-path scan needs a
+   * real `rg`; pass one when the host has none on PATH).
+   */
+  ripgrep?: { command: string; args?: string[] };
+}
+
+/**
+ * Sandbox-wrap an argv for one launch — the SHARED sandbox seam both the
+ * interactive {@link spawnAgent} (tmux `claude`) and the programmatic backend
+ * (`claude -p`) call. Extracted so the sandbox/egress/filesystem policy lives in
+ * exactly ONE place: every launch, regardless of backend, gets the same egress
+ * floor (§4.4) + scoped-read confinement (§4.5) baked into its argv.
+ *
+ * It owns the process-wide serialization of the sandbox-runtime singleton's
+ * initialize→wrap window (`withSpawnLock`): the engine is global (one set of host
+ * proxies), so two concurrent wraps would race the initialize→wrap window. Only
+ * that brief window holds the lock — the policy is baked into the returned argv at
+ * `wrap`, after which the spawned process runs independently.
+ */
+export async function wrapArgvInSandbox(input: WrapArgvInSandboxInput): Promise<WrappedCommand> {
+  const baseBinds: BaseBinds = {
+    workspace: input.workspace,
+    runtimeReadOnly: input.runtimeReadOnly,
+  };
+  const egressBase: EgressBaseInput = {
+    hubOrigin: input.hubOrigin,
+    ...(input.vaultUrl ? { vaultOrigin: input.vaultUrl } : {}),
+  };
+  const sandbox = new Sandbox(input.sandboxEngine);
+  return withSpawnLock(() =>
+    sandbox.wrap({
+      spec: input.spec,
+      baseBinds,
+      egressBase,
+      command: shellJoin(input.argv),
+      ...(input.ripgrep ? { ripgrep: input.ripgrep } : {}),
+    }),
+  );
+}
+
 /** A tmux launcher seam — real impl spawns tmux; tests inject a recorder. */
 export interface TmuxLauncher {
   /**
@@ -605,28 +666,21 @@ export async function spawnAgent(
     ...(deps.claudeBin ? { claudeBin: deps.claudeBin } : {}),
   });
 
-  const baseBinds: BaseBinds = {
+  // Sandbox-wrap via the shared seam (also used by the programmatic backend) so
+  // both backends get the identical egress floor + scoped-read confinement, and
+  // the sandbox-runtime singleton's initialize→wrap window is serialized
+  // process-wide. The policy is baked into the returned argv; outside the lock the
+  // spawned process runs independently.
+  const wrapped = await wrapArgvInSandbox({
+    spec,
     workspace,
     runtimeReadOnly: deps.runtimeReadOnly,
-  };
-  const egressBase: EgressBaseInput = {
     hubOrigin: deps.hubOrigin,
-    ...(deps.vaultUrl ? { vaultOrigin: deps.vaultUrl } : {}),
-  };
-
-  // Serialize the sandbox-runtime singleton's initialize→wrap window across
-  // concurrent spawns (the policy is baked into the argv at wrap, so only this
-  // window races). Outside the lock the spawned process runs independently.
-  const sandbox = new Sandbox(deps.sandboxEngine);
-  const wrapped = await withSpawnLock(() =>
-    sandbox.wrap({
-      spec,
-      baseBinds,
-      egressBase,
-      command: shellJoin(claudeArgs),
-      ...(deps.ripgrep ? { ripgrep: deps.ripgrep } : {}),
-    }),
-  );
+    ...(deps.vaultUrl ? { vaultUrl: deps.vaultUrl } : {}),
+    argv: claudeArgs,
+    ...(deps.sandboxEngine ? { sandboxEngine: deps.sandboxEngine } : {}),
+    ...(deps.ripgrep ? { ripgrep: deps.ripgrep } : {}),
+  });
 
   // The agent's private, writable, pre-seeded HOME + temp dirs (the stability
   // keystone — see seedAgentHome). Everything claude reads/writes about itself

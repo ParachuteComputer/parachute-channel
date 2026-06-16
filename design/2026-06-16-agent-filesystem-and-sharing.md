@@ -10,10 +10,15 @@ reuse these primitives.
 
 ## The problem
 
-Today an agent's `~/.parachute/channel/sessions/<name>/` fuses four different things
-into one private blob:
+Today an agent's session dir (`~/.parachute/channel/sessions/<name>/` by default;
+overridable via `PARACHUTE_CHANNEL_STATE_DIR` / the injected `sessionsDir` dep) fuses
+four different things into one private blob:
 - the **working directory** (cwd),
-- the seeded `~/.claude` **config + library** (skills, slash commands, sub-agents),
+- a seeded **per-agent `CLAUDE_CONFIG_DIR`** (`<workspace>/home/.claude`, written by
+  `seedAgentHome`) holding **config + library** (skills, slash commands, sub-agents).
+  Note: the operator's real `~/.claude` is never written — only `~/.claude.json` is
+  *read* as a seed source, and the agent always runs with `CLAUDE_CONFIG_DIR` pointed
+  at its own dir, so CC's "user-level" config layer is fully controlled per-agent,
 - the **`.mcp.json`** (with the agent's scoped vault/channel tokens), and
 - **mutable runtime state** (sessions, history, locks, cache, tmp).
 
@@ -106,9 +111,15 @@ repo's `GH_TOKEN` travelling with its workspace).
 ## Open questions
 - **Shared-rw working dir concurrency** — multiple agents editing one dir step on each
   other like humans in a repo without git discipline. The `AgentMount.shared?` hook
-  exists; the *policy* (when shared-rw is allowed vs requires coordination) is open.
-  Shared-ro is always safe.
+  exists (v1 doc-level only — "plumbed through so a future use is a considered
+  decision," per `sandbox/types.ts`); the *policy* (when shared-rw is allowed vs
+  requires coordination) is open. Shared-ro is always safe.
 - **CC skills-sharing mechanism** — the exact way to share `skills/` while isolating
   `.mcp.json` (spike when building seam #2).
+- **Working dir vs library collision** — when a real repo is mounted as the working
+  dir, CC treats that repo as the project root and will read *its* `.claude/` (skills,
+  settings) too. The working-dir seam and the shared-library seam can interact
+  non-obviously there (repo-local `.claude/` layering on top of the shared library) —
+  resolve the precedence when building the library seam.
 - **One library or many** — a single global library vs per-purpose / per-"team"
   libraries an agent selects from.

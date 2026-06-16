@@ -188,13 +188,18 @@ export function specFilePath(workspace: string): string {
  *
  * The spec is NON-SECRET (channel names, access verbs, vault name, host paths) —
  * the actual credentials live in credentials.json (Claude) / the env store and are
- * re-resolved at each (re)spawn — so 0644 is fine; we still write under the 0700-ish
- * per-session workspace. Returns the path written.
+ * re-resolved at each (re)spawn. We still write it 0600 (matching the workspace's
+ * secret-bearing `.mcp.json`): the per-session workspace dir is umask-inherited (no
+ * tighter than 0755), so 0600 on the file is the real guard — defense-in-depth that
+ * also keeps the perms honest if a future field ever does carry something sensitive.
+ * `chmod`-ed unconditionally since writeFileSync's `mode` only applies on create.
+ * Returns the path written.
  */
 export function persistSpec(workspace: string, spec: AgentSpec): string {
   mkdirSync(workspace, { recursive: true });
   const path = specFilePath(workspace);
-  writeFileSync(path, JSON.stringify(spec, null, 2) + "\n");
+  writeFileSync(path, JSON.stringify(spec, null, 2) + "\n", { mode: 0o600 });
+  chmodSync(path, 0o600);
   return path;
 }
 

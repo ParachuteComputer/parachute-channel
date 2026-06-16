@@ -785,6 +785,9 @@ describe("persistSpec / readPersistedSpec — spawn-spec recovery for restart", 
       const spec: AgentSpec = { name: "a", channels: ["c"], filesystem: "full" };
       persistSpec(ws, spec);
       expect(readPersistedSpec(ws)).toEqual(spec);
+      // Written 0600 (matches the secret-bearing .mcp.json discipline; the workspace
+      // dir is only umask-tight, so the file perm is the real guard).
+      expect(statSync(specFilePath(ws)).mode & 0o777).toBe(0o600);
       // Corrupt it -> null (the restart path treats this as "no spec").
       writeFileSync(specFilePath(ws), "{not json");
       expect(readPersistedSpec(ws)).toBeNull();

@@ -94,6 +94,15 @@ export interface TmuxLauncher {
   }): Promise<void>;
   /** Whether a session by this name already exists (idempotency). */
   hasSession(name: string): Promise<boolean>;
+  /**
+   * Auto-answer claude's `--dangerously-load-development-channels` consent gate
+   * once it appears in the session's pane (channel#70). A headless tmux spawn has
+   * nobody at the keyboard, so the interactive "I am using this for local
+   * development" prompt would hang the session forever and the MCP never connects.
+   * We answer it by sending Enter to the pane. Returns the outcome; NEVER throws
+   * (a spawn must not fail because the prompt didn't show / capture failed).
+   */
+  confirmDevChannelsPrompt(session: string): Promise<"confirmed" | "already-running" | "timeout">;
 }
 
 export interface SpawnAgentDeps {
@@ -161,6 +170,13 @@ export interface SpawnAgentResult {
   wrapped: WrappedCommand;
   /** Already-running? (idempotent no-op). */
   alreadyRunning: boolean;
+  /**
+   * Outcome of auto-answering the dev-channels consent gate (channel#70):
+   * `"confirmed"` (we sent Enter), `"already-running"` (claude was past the prompt),
+   * or `"timeout"` (the prompt never appeared in the window — non-fatal). Absent on
+   * the already-running idempotent no-op path (no launch happened).
+   */
+  devChannelsPrompt?: "confirmed" | "already-running" | "timeout";
 }
 
 /** tmux session name for a spec — matches launch-session.sh's `<name>-agent`. */
@@ -418,12 +434,19 @@ export function seedAgentHome(
  * (the wake transport). `--strict-mcp-config` closes the MCP surface to the spec.
  *
  * `--dangerously-skip-permissions`: a spawned agent runs AUTONOMOUSLY — there is no
- * human at the terminal to answer claude's in-app permission / dev-channels
- * confirmation prompts, and the OS sandbox (+ scoped reads / egress when confined)
- * is the real containment, so claude's own prompts are redundant friction. Skipping
- * them is what lets the agent reach a usable state hands-off. (The meta "are you
- * sure" for this flag is pre-suppressed via the seeded settings.json — see
- * seedAgentHome.)
+ * human at the terminal to answer claude's in-app permission prompts, and the OS
+ * sandbox (+ scoped reads / egress when confined) is the real containment, so
+ * claude's own permission prompts are redundant friction. Skipping them is what lets
+ * the agent reach a usable state hands-off. (The meta "are you sure" for THIS flag is
+ * pre-suppressed via the seeded settings.json `skipDangerousModePermissionPrompt` —
+ * see seedAgentHome.)
+ *
+ * NOTE: `skipDangerousModePermissionPrompt` (and every other settings.json key / env
+ * var) suppresses ONLY the skip-permissions meta-prompt — it does NOT cover the
+ * SEPARATE `--dangerously-load-development-channels` consent gate ("I am using this
+ * for local development"), which has no skip flag and which `--channels` (the
+ * allowlist path) doesn't satisfy for custom `server:` channels. That gate is
+ * auto-answered post-launch by `confirmDevChannelsPrompt` (channel#70), not here.
  */
 export function buildAgentClaudeArgs(opts: {
   mcpConfigPath: string;
@@ -636,6 +659,13 @@ export async function spawnAgent(
     cwd: workspace,
   });
 
+  // Auto-answer claude's `--dangerously-load-development-channels` consent gate
+  // (channel#70). Without this, the headless tmux session hangs at the interactive
+  // "I am using this for local development" prompt forever and the MCP never
+  // connects. A non-"confirmed" result (already-running / timeout) is NON-FATAL —
+  // confirmDevChannelsPrompt never throws — so the spawn always returns.
+  const devChannelsPrompt = await deps.tmux.confirmDevChannelsPrompt(session);
+
   return {
     session,
     workspace,
@@ -643,6 +673,7 @@ export async function spawnAgent(
     mcpConfigJson,
     wrapped,
     alreadyRunning: false,
+    devChannelsPrompt,
   };
 }
 
@@ -700,6 +731,112 @@ export function buildLaunchScript(argv: string[]): string {
 /** Per-session launch-script path under the session workspace (`cwd`). */
 function launchScriptPath(cwd: string): string {
   return join(cwd, ".launch.sh");
+}
+
+/** The prompt marker for the dev-channels consent gate (channel#70). */
+export const DEV_CHANNELS_PROMPT_MARKER = "I am using this for local development";
+/**
+ * The ready marker shown once claude is running interactively. Our sessions always
+ * launch with `--dangerously-skip-permissions`, so the footer reads "bypass
+ * permissions on". Seeing it means the prompt is already past (or a future claude
+ * build dropped it) — short-circuit so we don't burn the full timeout.
+ *
+ * Coupling note: this is a claude-code UI-footer string (stable as of the claude-code
+ * we run today). If a future claude renames the footer, the worst case is we wait the
+ * full timeout before returning "timeout" — never a wrong keystroke — so the failure
+ * mode is benign. Update this string if the footer changes.
+ */
+export const DEV_CHANNELS_READY_MARKER = "bypass permissions on";
+
+/**
+ * Auto-confirm claude's `--dangerously-load-development-channels` consent gate in a
+ * detached tmux session (channel#70). The gate is INTERACTIVE — claude shows
+ *
+ *   WARNING: Loading development channels
+ *   ❯ 1. I am using this for local development
+ *     2. Exit
+ *
+ * on EVERY launch, and no settings.json key / env var / `--channels` flag suppresses
+ * it for custom `server:` channels. In a headless spawn nobody answers it, so claude
+ * hangs at the prompt forever and its MCP never connects (`/health` → `mcp_sessions:
+ * 0`). Because our sessions are interactive tmux panes (the operator attaches via the
+ * web terminal), we answer it the way a human would: send Enter to the pane.
+ *
+ * A BOUNDED poll loop — `capture-pane` every `intervalMs`, up to `timeoutMs`:
+ *  - prompt marker present → `send-keys Enter` → "confirmed".
+ *  - ready marker present (claude already running, prompt past / absent) →
+ *    "already-running" (no keystroke) — so a future claude that drops the prompt
+ *    doesn't make us wait the whole timeout.
+ *  - timeout → warn + "timeout". NEVER throws: the prompt not showing must not fail
+ *    a spawn (it may already have been past, or claude may render it differently),
+ *    and a capture/send subprocess failure degrades to best-effort.
+ *
+ * `spawnFn` / `timeoutMs` / `intervalMs` / `sleepFn` are injectable so tests run
+ * fast and hermetically (tiny timeout + no-op sleep). `Date.now()` is fine here —
+ * this is daemon code, not a workflow script.
+ */
+export async function confirmDevChannelsPrompt(
+  session: string,
+  opts: {
+    spawnFn?: typeof Bun.spawn;
+    timeoutMs?: number;
+    intervalMs?: number;
+    sleepFn?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<"confirmed" | "already-running" | "timeout"> {
+  const spawnFn = opts.spawnFn ?? Bun.spawn;
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  const intervalMs = opts.intervalMs ?? 400;
+  const sleep = opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+
+  // Capture the pane text; any subprocess failure degrades to "" (best-effort).
+  async function capture(): Promise<string> {
+    try {
+      const proc = spawnFn(["tmux", "capture-pane", "-t", session, "-p"], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      const text = await new Response(proc.stdout as ReadableStream<Uint8Array>).text();
+      await proc.exited;
+      return text;
+    } catch {
+      return "";
+    }
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  // Poll at least once even if timeoutMs <= 0 (do-while), so a present prompt is
+  // caught immediately without waiting an interval.
+  do {
+    const pane = await capture();
+    if (pane.includes(DEV_CHANNELS_PROMPT_MARKER)) {
+      try {
+        const proc = spawnFn(["tmux", "send-keys", "-t", session, "Enter"], {
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        await proc.exited;
+        return "confirmed";
+      } catch {
+        // The send subprocess failed — we saw the prompt but couldn't answer it.
+        // Don't claim "confirmed" (that would be a diagnostic lie); fall through to
+        // the warn + "timeout" so the operator is told to press Enter themselves.
+        break;
+      }
+    }
+    if (pane.includes(DEV_CHANNELS_READY_MARKER)) {
+      return "already-running";
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(intervalMs);
+  } while (Date.now() < deadline);
+
+  console.warn(
+    `parachute-channel: dev-channels consent prompt for tmux session "${session}" did not ` +
+      `appear within ${timeoutMs}ms (channel#70). If \`mcp_sessions\` stays 0, attach to the ` +
+      `session and press Enter in its terminal to clear the gate.`,
+  );
+  return "timeout";
 }
 
 /**
@@ -774,6 +911,11 @@ export function realTmuxLauncher(spawnFn: typeof Bun.spawn = Bun.spawn): TmuxLau
         const err = await new Response(proc.stderr as ReadableStream<Uint8Array>).text();
         throw new Error(`tmux new-session failed (exit ${code}): ${err.trim()}`);
       }
+    },
+    async confirmDevChannelsPrompt(session) {
+      // Delegate to the standalone helper, threading this launcher's spawnFn so the
+      // real tmux subprocesses are used (tests inject a recorder via the helper).
+      return confirmDevChannelsPrompt(session, { spawnFn });
     },
   };
 }

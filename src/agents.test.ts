@@ -283,6 +283,9 @@ describe("createRealAgentOps — restart (param recovery via persisted spec)", (
       async newSession(opts) {
         launched.push({ name: opts.name });
       },
+      async confirmDevChannelsPrompt() {
+        return "already-running";
+      },
     };
     const engine: SandboxEngine = {
       isSupportedPlatform: () => true,

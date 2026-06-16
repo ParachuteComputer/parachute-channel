@@ -7,6 +7,9 @@ import {
   buildAgentChildEnv,
   buildAgentClaudeArgs,
   buildLaunchScript,
+  confirmDevChannelsPrompt,
+  DEV_CHANNELS_PROMPT_MARKER,
+  DEV_CHANNELS_READY_MARKER,
   realTmuxLauncher,
   seedAgentHome,
   sessionName,
@@ -36,6 +39,7 @@ afterEach(() => {
 /** A recording tmux launcher. */
 function recordingTmux(existing = new Set<string>()): TmuxLauncher & {
   launched: Array<{ name: string; argv: string[]; env: Record<string, string | undefined>; cwd: string }>;
+  confirmed: string[];
 } {
   const launched: Array<{
     name: string;
@@ -43,13 +47,19 @@ function recordingTmux(existing = new Set<string>()): TmuxLauncher & {
     env: Record<string, string | undefined>;
     cwd: string;
   }> = [];
+  const confirmed: string[] = [];
   return {
     launched,
+    confirmed,
     async hasSession(name) {
       return existing.has(name);
     },
     async newSession(opts) {
       launched.push(opts);
+    },
+    async confirmDevChannelsPrompt(session) {
+      confirmed.push(session);
+      return "confirmed";
     },
   };
 }
@@ -328,6 +338,11 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     const launch = tmux.launched[0]!;
     expect(launch.name).toBe("aaron-dev-agent");
 
+    // 1b. The dev-channels consent gate is auto-answered for THIS session after the
+    // launch (channel#70) — otherwise the headless spawn hangs at the prompt forever.
+    expect(tmux.confirmed).toEqual(["aaron-dev-agent"]);
+    expect(res.devChannelsPrompt).toBe("confirmed");
+
     // 2. The launched argv is the sandbox wrapper carrying the claude command.
     expect(launch.argv[0]).toBe("/bin/bash");
     expect(launch.argv[2]).toContain("SBX claude");
@@ -419,6 +434,10 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     const res = await spawnAgent({ name: "arm", channels: ["c"] }, baseDeps({ tmux }));
     expect(res.alreadyRunning).toBe(true);
     expect(tmux.launched).toHaveLength(0);
+    // No launch → the dev-channels gate is NOT touched (guards against someone
+    // moving the confirm call above the early-return — channel#70).
+    expect(tmux.confirmed).toHaveLength(0);
+    expect(res.devChannelsPrompt).toBeUndefined();
   });
 
   test("a spec with no channels is rejected", async () => {
@@ -774,6 +793,108 @@ describe("realTmuxLauncher — launch-script indirection (tmux can't take the ~8
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }
+  });
+});
+
+describe("confirmDevChannelsPrompt — auto-answer the dev-channels consent gate (channel#70)", () => {
+  /**
+   * A recording spawnFn whose `tmux capture-pane` returns configurable pane text and
+   * whose `tmux send-keys` is recorded. Mirrors the `recordingSpawn` shape above but
+   * with a per-argv stdout (capture must return the pane content).
+   */
+  function recordingSpawn(paneText: string): {
+    fn: typeof Bun.spawn;
+    calls: string[][];
+  } {
+    const calls: string[][] = [];
+    const fn = ((argv: string[]) => {
+      calls.push(argv);
+      const isCapture = argv.includes("capture-pane");
+      return {
+        exited: Promise.resolve(0),
+        stdout: new Response(isCapture ? paneText : "").body,
+        stderr: new Response("").body,
+      };
+    }) as unknown as typeof Bun.spawn;
+    return { fn, calls };
+  }
+
+  const noSleep = async () => {};
+
+  test("prompt marker present → returns 'confirmed' AND sends Enter to the pane", async () => {
+    const pane = `WARNING: Loading development channels\n❯ 1. ${DEV_CHANNELS_PROMPT_MARKER}\n  2. Exit`;
+    const { fn, calls } = recordingSpawn(pane);
+    const result = await confirmDevChannelsPrompt("aaron-agent", {
+      spawnFn: fn,
+      timeoutMs: 5_000,
+      intervalMs: 10,
+      sleepFn: noSleep,
+    });
+    expect(result).toBe("confirmed");
+    // A `tmux send-keys -t aaron-agent Enter` call was recorded.
+    const sendKeys = calls.find((c) => c.includes("send-keys"));
+    expect(sendKeys).toBeDefined();
+    expect(sendKeys).toEqual(["tmux", "send-keys", "-t", "aaron-agent", "Enter"]);
+  });
+
+  test("ready marker present (no prompt) → returns 'already-running', NO send-keys", async () => {
+    const pane = `Welcome to Claude Code\n  ${DEV_CHANNELS_READY_MARKER} · /help for help`;
+    const { fn, calls } = recordingSpawn(pane);
+    const result = await confirmDevChannelsPrompt("aaron-agent", {
+      spawnFn: fn,
+      timeoutMs: 5_000,
+      intervalMs: 10,
+      sleepFn: noSleep,
+    });
+    expect(result).toBe("already-running");
+    expect(calls.some((c) => c.includes("send-keys"))).toBe(false);
+  });
+
+  test("neither marker, tiny timeout + no-op sleep → returns 'timeout', NO throw, NO send-keys", async () => {
+    const { fn, calls } = recordingSpawn("just some unrelated pane output\n$ ");
+    const result = await confirmDevChannelsPrompt("aaron-agent", {
+      spawnFn: fn,
+      timeoutMs: 1,
+      intervalMs: 1,
+      sleepFn: noSleep,
+    });
+    expect(result).toBe("timeout");
+    expect(calls.some((c) => c.includes("send-keys"))).toBe(false);
+    // It DID poll at least once (the do-while guarantees a capture even at timeoutMs<=interval).
+    expect(calls.some((c) => c.includes("capture-pane"))).toBe(true);
+  });
+
+  test("a capture subprocess that throws degrades to timeout, never throws", async () => {
+    const fn = (() => {
+      throw new Error("tmux not found");
+    }) as unknown as typeof Bun.spawn;
+    const result = await confirmDevChannelsPrompt("aaron-agent", {
+      spawnFn: fn,
+      timeoutMs: 1,
+      intervalMs: 1,
+      sleepFn: noSleep,
+    });
+    expect(result).toBe("timeout");
+  });
+
+  test("prompt seen but send-keys throws → degrades to timeout (does NOT lie 'confirmed'), never throws", async () => {
+    const pane = `❯ 1. ${DEV_CHANNELS_PROMPT_MARKER}\n  2. Exit`;
+    // capture-pane succeeds (returns the prompt); send-keys throws.
+    const fn = ((argv: string[]) => {
+      if (argv.includes("send-keys")) throw new Error("send-keys failed");
+      return {
+        exited: Promise.resolve(0),
+        stdout: new Response(pane).body,
+        stderr: new Response("").body,
+      };
+    }) as unknown as typeof Bun.spawn;
+    const result = await confirmDevChannelsPrompt("aaron-agent", {
+      spawnFn: fn,
+      timeoutMs: 1,
+      intervalMs: 1,
+      sleepFn: noSleep,
+    });
+    expect(result).toBe("timeout");
   });
 });
 

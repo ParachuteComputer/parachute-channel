@@ -17,16 +17,18 @@ fragility class we've spent real effort taming:
   auto-reconnect a dropped streamable-HTTP MCP server → the no-loss high-water-mark
   + backlog replay (channel#67) and the per-session restart (channel#68);
 - the `--dangerously-load-development-channels` **interactive consent gate** hangs
-  a headless spawn → the poll-and-`send-keys` auto-confirm (channel#70/#71).
+  a headless spawn → the poll-and-`send-keys` auto-confirm (#71, fixes #70).
 
 All of that exists *because* we drive an **idle interactive** session. It is, as the
 operator put it, "hacking a bunch of weird things in."
 
 A second path is now viable: **`claude -p` / the Claude Agent SDK on the
 subscription.** Anthropic had gated programmatic use behind a separate metered
-credit pool (announced 2026-05-13, effective 2026-06-15) and then **paused it on
+credit pool (announced 2026-05-14, effective 2026-06-15) and then **paused it on
 2026-06-15** — *"for now, nothing has changed; Agent SDK / `claude -p` / third-party
-app usage still draw from your subscription's usage limits."* So programmatic agents
+app usage still draw from your subscription's usage limits"* — with an explicit
+commitment to give advance notice before any revised version takes effect. So
+programmatic agents
 can run on `CLAUDE_CODE_OAUTH_TOKEN` today, with full MCP + tool support and session
 continuity (`resume=session_id` / streaming input).
 
@@ -68,7 +70,7 @@ Everything *above* the seam is shared and strategy-agnostic; only the
 
 ### What's backend-specific
 - **Interactive:** the tmux launch, the dev-channels MCP wiring, the consent-gate
-  auto-confirm (#70/#71), the deaf-on-restart no-loss/replay/restart machinery
+  auto-confirm (#71, fixes #70), the deaf-on-restart no-loss/replay/restart machinery
   (#67/#68). Keep it for "I want to watch/drive a live session."
 - **Programmatic:** an Agent SDK session per channel (streaming input, persisted
   `session_id`), MCP wired via the SDK's `mcp_servers` option, tools pre-approved
@@ -87,6 +89,13 @@ interface AgentBackend {
 Interactive `start` = the current tmux spawn; `deliver` = push onto the MCP GET
 stream. Programmatic `start` = open an SDK session; `deliver` = next streaming-input
 turn (`resume=session_id`).
+
+Note the **delivery guarantee is asymmetric**: the interactive `deliver` (push onto
+the MCP GET stream) can silently fail if the session is deaf — which is exactly why
+`Promise<void>` is safe there only because the #67 high-water-mark + backlog replay
+catches the gap. The programmatic `deliver` is a direct turn into a live SDK session,
+so failure is observable inline. Whatever the final seam, it must not let the
+interactive side's silent-loss footgun leak into the programmatic contract.
 
 ## Billing — the load-bearing caveat
 

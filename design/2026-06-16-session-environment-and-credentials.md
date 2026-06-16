@@ -12,7 +12,8 @@ have **two subsystems doing one shape**:
 
 - the `claude` credential slice (`resolveClaudeCredential` → inject
   `CLAUDE_CODE_OAUTH_TOKEN`), and
-- the generic `env` slice (`resolveChannelEnv` → inject arbitrary env vars).
+- the generic `env` slice (`resolveChannelEnv` → inject operator-scoped env vars;
+  denylisted keys are already stripped at resolve).
 
 Both are literally: *resolve a value (operator-default ?? per-channel-override) →
 inject it as an environment variable into the spawned session.* `CLAUDE_CODE_OAUTH_TOKEN`
@@ -28,8 +29,8 @@ small **policy table** over a handful of keys — not a separate mechanism:
 | Policy | Keys | Behavior |
 |---|---|---|
 | **Required (as a set)** | a valid auth path | spawn fails loud only if *no* recognized auth resolves |
-| **Guarded** | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, … | not injected by default (no *silent* billing/provider switch); deliberately enable-able per channel, with the implication surfaced |
-| **Reserved** | `PATH`, `HOME`, `XDG_*` | system-controlled for sandbox stability |
+| **Guarded** | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, … | not injected by default (no *silent* billing/provider switch); deliberately enable-able per channel, with the implication surfaced |
+| **Reserved** | `PATH`, `HOME`, `XDG_*` | set by the system via structural passthrough + the seeded home — *not* denylisted (see `DENYLISTED_ENV` docblock: keeping the denylist focused on billing keys is deliberate), but an operator value for these won't survive the layering |
 | **Free** | `GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, … | operator's to set |
 
 ### Two refinements that matter
@@ -37,7 +38,8 @@ small **policy table** over a handful of keys — not a separate mechanism:
 1. **"Required" is a set, not a key.** The default auth path is the subscription
    OAuth token, but a channel could instead carry a direct Anthropic API key, a
    custom gateway (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`, e.g. a LiteLLM
-   proxy), or Bedrock/Vertex (`CLAUDE_CODE_USE_BEDROCK`/`_VERTEX`). The spawn
+   proxy), or Bedrock/Vertex/Foundry (`CLAUDE_CODE_USE_BEDROCK`/`_VERTEX`/`_FOUNDRY`).
+   The spawn
    validates that *some* recognized path resolves — it does not bless one key.
 
 2. **"Guarded" ≠ "forbidden."** The danger with `ANTHROPIC_API_KEY` was never that

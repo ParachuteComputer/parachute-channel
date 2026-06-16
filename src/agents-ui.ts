@@ -229,6 +229,21 @@ ${THEME_CSS}
         </details>
       </div>
 
+      <div style="margin-top:12px;">
+        <label for="spawn-system-prompt">System prompt <span class="muted">(optional — the channel's role)</span></label>
+        <textarea id="spawn-system-prompt" rows="3" placeholder="e.g. You are the eng channel's release assistant. Keep replies terse and action-oriented." style="width:100%; box-sizing:border-box; font:inherit; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--card); color:var(--fg); resize:vertical;"></textarea>
+        <div class="row" style="margin-top:8px; align-items:center;">
+          <div>
+            <label for="spawn-prompt-mode" style="display:inline; margin-right:6px;">Mode</label>
+            <select id="spawn-prompt-mode">
+              <option value="append" selected>Append (default)</option>
+              <option value="replace">Replace</option>
+            </select>
+          </div>
+          <span class="muted" style="font-size:12px;">Append keeps Claude Code's capable base and adds your channel's role; Replace gives full control.</span>
+        </div>
+      </div>
+
       <details id="advanced">
         <summary>Advanced — extra channels, vault, network, mounts</summary>
         <div class="sub">
@@ -616,6 +631,14 @@ ${SHELL_JS}
     // new request), but interactive MUST be passed explicitly to opt out of that
     // default, so send the value either way for clarity.
     spec.backend = backendMode.value === "interactive" ? "interactive" : "programmatic";
+    // System prompt (the channel's role). Only send when non-blank — the server
+    // treats a blank prompt as unset (CC's default, untouched). The mode rides
+    // along so append (default) vs replace is the operator's choice.
+    var sysPrompt = document.getElementById("spawn-system-prompt").value.trim();
+    if (sysPrompt) {
+      spec.systemPrompt = sysPrompt;
+      spec.systemPromptMode = document.getElementById("spawn-prompt-mode").value === "replace" ? "replace" : "append";
+    }
     return spec;
   }
 
@@ -727,8 +750,14 @@ ${SHELL_JS}
           (prog ? "Reset the conversation (next message starts fresh)" : "Re-source env + reconnect this session") + "'>" +
           (prog ? "reset" : "restart / reconnect") + "</button>" +
           "<button class='ghost danger' data-kill='" + esc(a.name) + "' type='button'>" + (prog ? "deregister" : "kill") + "</button>";
+        // A small badge when the agent carries a per-channel system prompt (the role),
+        // showing the composition mode (append/replace) — the text itself isn't surfaced.
+        var promptBadge = a.systemPromptMode
+          ? " <span class='pill' title='system prompt set (" + esc(a.systemPromptMode) +
+            " mode)' style='font-size:11px;'>role: " + esc(a.systemPromptMode) + "</span>"
+          : "";
         return "<tr>" +
-          "<td><strong>" + esc(a.name) + "</strong></td>" +
+          "<td><strong>" + esc(a.name) + "</strong>" + promptBadge + "</td>" +
           "<td>" + backendCell + "</td>" +
           "<td>" + stateCell + "</td>" +
           "<td>" + connCell + "</td>" +

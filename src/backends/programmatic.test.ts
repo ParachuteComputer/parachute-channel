@@ -20,7 +20,7 @@
  *  - stop() clears the resume id; status() is live.
  */
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, statSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -175,6 +175,20 @@ function specWithVault(name = "eng"): AgentSpec {
   };
 }
 
+function specWithSystemPrompt(
+  prompt: string,
+  mode: "append" | "replace" | undefined,
+  name = "eng",
+): AgentSpec {
+  return {
+    name,
+    channels: [name],
+    vault: { name: "default", access: "read", tags: ["#channel-message"] },
+    systemPrompt: prompt,
+    ...(mode ? { systemPromptMode: mode } : {}),
+  };
+}
+
 function mkDirs(tag: string): void {
   sessionsDir = mkdtempSync(join(tmpdir(), `prog-sessions-${tag}-`));
   stateDir = mkdtempSync(join(tmpdir(), `prog-state-${tag}-`));
@@ -207,6 +221,45 @@ describe("buildProgrammaticClaudeArgs", () => {
     });
     expect(argv).toContain("--resume");
     expect(argv[argv.indexOf("--resume") + 1]).toBe("sess-xyz");
+  });
+
+  test("system prompt (append, default): --append-system-prompt-file <path>", () => {
+    const argv = buildProgrammaticClaudeArgs({
+      message: "hi",
+      mcpConfigPath: "/ws/.mcp.json",
+      systemPromptFile: "/ws/system-prompt.txt",
+      systemPromptMode: "append",
+    });
+    expect(argv).toContain("--append-system-prompt-file");
+    expect(argv[argv.indexOf("--append-system-prompt-file") + 1]).toBe("/ws/system-prompt.txt");
+    expect(argv).not.toContain("--system-prompt-file");
+  });
+
+  test("system prompt (replace): --system-prompt-file <path>", () => {
+    const argv = buildProgrammaticClaudeArgs({
+      message: "hi",
+      mcpConfigPath: "/ws/.mcp.json",
+      systemPromptFile: "/ws/system-prompt.txt",
+      systemPromptMode: "replace",
+    });
+    expect(argv).toContain("--system-prompt-file");
+    expect(argv[argv.indexOf("--system-prompt-file") + 1]).toBe("/ws/system-prompt.txt");
+    expect(argv).not.toContain("--append-system-prompt-file");
+  });
+
+  test("system prompt with no mode → append (the -file flag defaults to append)", () => {
+    const argv = buildProgrammaticClaudeArgs({
+      message: "hi",
+      mcpConfigPath: "/ws/.mcp.json",
+      systemPromptFile: "/ws/system-prompt.txt",
+    });
+    expect(argv).toContain("--append-system-prompt-file");
+  });
+
+  test("no systemPromptFile → neither system-prompt flag", () => {
+    const argv = buildProgrammaticClaudeArgs({ message: "hi", mcpConfigPath: "/ws/.mcp.json" });
+    expect(argv).not.toContain("--append-system-prompt-file");
+    expect(argv).not.toContain("--system-prompt-file");
   });
 });
 
@@ -385,6 +438,80 @@ describe("ProgrammaticBackend.deliver — argv + env shape", () => {
     const env = calls[0]!.env;
     expect(env.GH_TOKEN).toBe("ghp_INJECTED");
     expect(env.ANTHROPIC_API_KEY).toBeUndefined(); // denylist drops it defensively
+  });
+});
+
+describe("ProgrammaticBackend.deliver — system prompt (file-backed, per-turn)", () => {
+  test("append mode → --append-system-prompt-file <path> + the file is written 0600 with the prompt", async () => {
+    mkDirs("sysprompt-append");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithSystemPrompt("You are the eng release bot.", "append", "eng"));
+    await backend.deliver(handle, "hello");
+
+    const promptPath = join(sessionsDir, "eng", "system-prompt.txt");
+    // The file exists, is 0600, and carries the EXACT prompt text.
+    expect(statSync(promptPath).mode & 0o777).toBe(0o600);
+    expect(readFileSync(promptPath, "utf8")).toBe("You are the eng release bot.");
+    // The wrapped claude command (engine echoes it in argv[2]) carries the -file flag.
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain("--append-system-prompt-file");
+    expect(cmd).toContain(promptPath);
+    // `--system-prompt-file` is a substring of `--append-system-prompt-file`, so a
+    // bare `not.toContain("--system-prompt-file")` would always fail. Assert the
+    // replace-mode flag was NOT the one applied to the prompt path instead.
+    expect(cmd).not.toContain("--system-prompt-file " + promptPath);
+  });
+
+  test("replace mode → --system-prompt-file <path>", async () => {
+    mkDirs("sysprompt-replace");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithSystemPrompt("Full custom persona.", "replace", "eng"));
+    await backend.deliver(handle, "hello");
+
+    const promptPath = join(sessionsDir, "eng", "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe("Full custom persona.");
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain("--system-prompt-file");
+    expect(cmd).not.toContain("--append-system-prompt-file");
+  });
+
+  test("no systemPrompt → no file, no system-prompt flag (today's behavior)", async () => {
+    mkDirs("sysprompt-none");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "hello");
+
+    expect(existsSync(join(sessionsDir, "eng", "system-prompt.txt"))).toBe(false);
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).not.toContain("system-prompt-file");
+  });
+
+  test("the prompt file is (re)written + the flag re-passed on EVERY turn — incl. a resume turn", async () => {
+    mkDirs("sysprompt-perturn");
+    const state = new AgentSessionState({ stateDir });
+    const { fn, calls } = sequencedSpawn([
+      successTurn("sess-SP", "turn one reply"),
+      successTurn("sess-SP", "turn two reply"),
+    ]);
+    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const handle = await backend.start(specWithSystemPrompt("Per-turn role.", "append", "eng"));
+
+    await backend.deliver(handle, "turn one");
+    await backend.deliver(handle, "turn two");
+
+    const promptPath = join(sessionsDir, "eng", "system-prompt.txt");
+    // The file is present after the resume turn too (re-written each deliver).
+    expect(readFileSync(promptPath, "utf8")).toBe("Per-turn role.");
+    // Turn 1: -file flag, NO --resume. Turn 2 (resume): -file flag AND --resume.
+    const cmd1 = calls[0]!.argv[2]!;
+    const cmd2 = calls[1]!.argv[2]!;
+    expect(cmd1).toContain("--append-system-prompt-file");
+    expect(cmd1).not.toContain("--resume");
+    expect(cmd2).toContain("--append-system-prompt-file"); // re-passed on the resume turn
+    expect(cmd2).toContain("--resume sess-SP");
   });
 });
 

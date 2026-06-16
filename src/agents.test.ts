@@ -105,6 +105,33 @@ describe("agentInfoFromSessions", () => {
   test("a bare `-agent` (empty slug) is dropped", () => {
     expect(agentInfoFromSessions([{ name: "-agent", attached: false }], "/tmp/s")).toEqual([]);
   });
+  test("surfaces systemPromptMode from the persisted spec when a prompt is set; absent otherwise", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-info-sysprompt-"));
+    try {
+      // "withprompt" has a persisted spec carrying a systemPrompt; "noprompt" has one without.
+      persistSpec(sessionWorkspace(dir, "withprompt"), {
+        name: "withprompt",
+        channels: ["withprompt"],
+        systemPrompt: "You are a focused bot.",
+        systemPromptMode: "replace",
+      } as AgentSpec);
+      persistSpec(sessionWorkspace(dir, "noprompt"), { name: "noprompt", channels: ["noprompt"] } as AgentSpec);
+      const infos = agentInfoFromSessions(
+        [
+          { name: "withprompt-agent", attached: false },
+          { name: "noprompt-agent", attached: false },
+        ],
+        dir,
+      );
+      const byName = Object.fromEntries(infos.map((i) => [i.name, i]));
+      // The mode is surfaced for the prompted agent…
+      expect(byName.withprompt!.systemPromptMode).toBe("replace");
+      // …and absent for the one with no prompt.
+      expect(byName.noprompt!.systemPromptMode).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("buildSpecFromBody", () => {
@@ -188,6 +215,54 @@ describe("buildSpecFromBody", () => {
   });
   test("rejects an invalid backend value", () => {
     expect(() => buildSpecFromBody({ name: "a", channels: ["c"], backend: "weird" })).toThrow(/backend/);
+  });
+
+  // Per-channel system prompt (design 2026-06-16-channel-system-prompt.md):
+  // systemPrompt + mode parsed; default mode = append; invalid mode rejected;
+  // absent → undefined.
+  test("systemPrompt parsed + default mode is append", () => {
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], systemPrompt: "You are the eng bot." });
+    expect(spec.systemPrompt).toBe("You are the eng bot.");
+    expect(spec.systemPromptMode).toBe("append"); // default
+  });
+  test("explicit systemPromptMode:\"replace\" is honored", () => {
+    const spec = buildSpecFromBody({
+      name: "a",
+      channels: ["c"],
+      systemPrompt: "Full custom persona.",
+      systemPromptMode: "replace",
+    });
+    expect(spec.systemPrompt).toBe("Full custom persona.");
+    expect(spec.systemPromptMode).toBe("replace");
+  });
+  test("absent systemPrompt → both fields undefined", () => {
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"] });
+    expect(spec.systemPrompt).toBeUndefined();
+    expect(spec.systemPromptMode).toBeUndefined();
+  });
+  test("blank / whitespace-only systemPrompt is treated as unset (no flag)", () => {
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], systemPrompt: "   \n  " });
+    expect(spec.systemPrompt).toBeUndefined();
+    expect(spec.systemPromptMode).toBeUndefined();
+  });
+  test("an orphan systemPromptMode with no prompt is dropped (no-op)", () => {
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], systemPromptMode: "replace" });
+    expect(spec.systemPrompt).toBeUndefined();
+    expect(spec.systemPromptMode).toBeUndefined();
+  });
+  test("rejects an invalid systemPromptMode value", () => {
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], systemPrompt: "x", systemPromptMode: "merge" }),
+    ).toThrow(/systemPromptMode/);
+  });
+  test("rejects a non-string systemPrompt", () => {
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], systemPrompt: 42 }),
+    ).toThrow(/systemPrompt must be a string/);
+  });
+  test("systemPrompt is trimmed", () => {
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], systemPrompt: "  hi  " });
+    expect(spec.systemPrompt).toBe("hi");
   });
 });
 
@@ -480,6 +555,23 @@ describe("GET /agents — the management page (loads open)", () => {
       srv.stop(true);
     }
   });
+
+  // Per-channel system prompt (design 2026-06-16-channel-system-prompt.md): the
+  // spawn form carries a System prompt textarea + an Append (default)/Replace mode
+  // control with the one-line hint.
+  test("spawn form has a System prompt textarea + Append(default)/Replace mode control", async () => {
+    const { srv, base } = buildServer();
+    try {
+      const html = await (await fetch(`${base}/agents`)).text();
+      expect(html).toContain('id="spawn-system-prompt"');
+      expect(html).toContain("System prompt");
+      expect(html).toContain('<option value="append" selected>Append (default)</option>');
+      expect(html).toContain('<option value="replace">Replace</option>');
+      expect(html).toContain("Append keeps Claude Code's capable base");
+    } finally {
+      srv.stop(true);
+    }
+  });
 });
 
 describe("/api/agents — operator-gated on channel:admin", () => {
@@ -517,6 +609,40 @@ describe("/api/agents — operator-gated on channel:admin", () => {
       const body = (await res.json()) as { agents: { name: string }[] };
       expect(body.agents).toHaveLength(1);
       expect(body.agents[0]!.name).toBe("aaron");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  // The /api/agents response surfaces the system-prompt MODE but NEVER the prompt
+  // text (the AgentInfo contract carries mode only — design 2026-06-16). A raw-body
+  // scan proves the text can't leak through the list endpoint.
+  test("GET surfaces systemPromptMode but never the prompt text", async () => {
+    const secretPrompt = "TOP-SECRET-PROMPT-TEXT-do-not-leak";
+    const { srv, base } = buildServer({
+      async list() {
+        return [
+          {
+            name: "aaron",
+            session: "aaron-agent",
+            attached: true,
+            workspace: "/s/aaron",
+            hasWorkspace: true,
+            backend: "interactive" as const,
+            systemPromptMode: "replace" as const,
+          },
+        ];
+      },
+    });
+    try {
+      const res = await fetch(`${base}/api/agents`, { headers: adminAuth });
+      expect(res.status).toBe(200);
+      const raw = await res.text();
+      // The mode IS surfaced…
+      expect(raw).toContain("systemPromptMode");
+      expect(raw).toContain("replace");
+      // …and the prompt TEXT never appears in the response (it isn't on AgentInfo).
+      expect(raw).not.toContain(secretPrompt);
     } finally {
       srv.stop(true);
     }

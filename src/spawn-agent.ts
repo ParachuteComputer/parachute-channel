@@ -531,14 +531,24 @@ export function seedAgentHome(
  * for local development"), which has no skip flag and which `--channels` (the
  * allowlist path) doesn't satisfy for custom `server:` channels. That gate is
  * auto-answered post-launch by `confirmDevChannelsPrompt` (channel#70), not here.
+ *
+ * SYSTEM PROMPT (design 2026-06-16-channel-system-prompt.md): for backend-parity
+ * with the programmatic path, when the spec carries a `systemPrompt` the per-session
+ * prompt FILE is passed via the `-file` variant — `--append-system-prompt-file`
+ * (append, keeps CC's default) or `--system-prompt-file` (replace). Interactive is a
+ * long-lived session, so one-time at launch is sufficient (no per-turn re-pass).
  */
 export function buildAgentClaudeArgs(opts: {
   mcpConfigPath: string;
   firstChannelEntryKey: string;
   claudeBin?: string;
+  /** Path to the per-session system-prompt file (omitted = no system-prompt flag). */
+  systemPromptFile?: string;
+  /** How the system prompt composes — append (default) keeps CC's base; replace overrides it. */
+  systemPromptMode?: "append" | "replace";
 }): string[] {
   const bin = opts.claudeBin ?? "claude";
-  return [
+  const argv = [
     bin,
     "--dangerously-skip-permissions",
     "--strict-mcp-config",
@@ -546,6 +556,11 @@ export function buildAgentClaudeArgs(opts: {
     opts.mcpConfigPath,
     `--dangerously-load-development-channels=server:${opts.firstChannelEntryKey}`,
   ];
+  if (opts.systemPromptFile) {
+    const flag = opts.systemPromptMode === "replace" ? "--system-prompt-file" : "--append-system-prompt-file";
+    argv.push(flag, opts.systemPromptFile);
+  }
+  return argv;
 }
 
 /**
@@ -680,6 +695,17 @@ export async function spawnAgent(
   // looser-perms file to tighten (unlike registry.ts's read-modify-write).
   writeFileSync(mcpConfigPath, mcpConfigJson, { mode: 0o600 });
 
+  // Per-channel system prompt (design 2026-06-16-channel-system-prompt.md). When the
+  // spec carries one, write it 0600 to a per-session file and pass the `-file` flag.
+  // The interactive session is long-lived, so this is one-time at launch (the
+  // programmatic backend re-writes + re-passes per turn). Unset → no flag, no file.
+  // The file's lifecycle is tied to the workspace (like .mcp.json), 0600 alike.
+  let systemPromptFile: string | undefined;
+  if (typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0) {
+    systemPromptFile = join(workspace, "system-prompt.txt");
+    writeFileSync(systemPromptFile, spec.systemPrompt, { mode: 0o600 });
+  }
+
   // 3. Build the claude argv, sandbox-wrap it, launch in tmux with scrubbed env.
   // `wakeChannel` (resolved above) is the first channel — the dev-channel flag's
   // server name + the key the credential was resolved under.
@@ -687,6 +713,9 @@ export async function spawnAgent(
     mcpConfigPath,
     firstChannelEntryKey: `channel-${wakeChannel}`,
     ...(deps.claudeBin ? { claudeBin: deps.claudeBin } : {}),
+    ...(systemPromptFile
+      ? { systemPromptFile, systemPromptMode: spec.systemPromptMode ?? "append" }
+      : {}),
   });
 
   // Sandbox-wrap via the shared seam (also used by the programmatic backend) so

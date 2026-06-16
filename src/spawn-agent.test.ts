@@ -1,5 +1,5 @@
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -234,6 +234,32 @@ describe("buildAgentClaudeArgs", () => {
     // NOT headless: no `-p`.
     expect(argv).not.toContain("-p");
   });
+  test("no systemPromptFile → neither system-prompt flag (today's behavior)", () => {
+    const argv = buildAgentClaudeArgs({ mcpConfigPath: "/ws/.mcp.json", firstChannelEntryKey: "channel-c" });
+    expect(argv).not.toContain("--append-system-prompt-file");
+    expect(argv).not.toContain("--system-prompt-file");
+  });
+  test("systemPromptFile (append, default) → --append-system-prompt-file <path>", () => {
+    const argv = buildAgentClaudeArgs({
+      mcpConfigPath: "/ws/.mcp.json",
+      firstChannelEntryKey: "channel-c",
+      systemPromptFile: "/ws/system-prompt.txt",
+      systemPromptMode: "append",
+    });
+    expect(argv).toContain("--append-system-prompt-file");
+    expect(argv[argv.indexOf("--append-system-prompt-file") + 1]).toBe("/ws/system-prompt.txt");
+    expect(argv).not.toContain("--system-prompt-file");
+  });
+  test("systemPromptFile (replace) → --system-prompt-file <path>", () => {
+    const argv = buildAgentClaudeArgs({
+      mcpConfigPath: "/ws/.mcp.json",
+      firstChannelEntryKey: "channel-c",
+      systemPromptFile: "/ws/system-prompt.txt",
+      systemPromptMode: "replace",
+    });
+    expect(argv).toContain("--system-prompt-file");
+    expect(argv).not.toContain("--append-system-prompt-file");
+  });
 });
 
 describe("shellJoin", () => {
@@ -391,6 +417,35 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     expect(engine.initializedWith!.network.allowedDomains).toContain("api.anthropic.com");
     expect(engine.initializedWith!.network.allowedDomains).toContain("hub.example.com");
     expect(engine.initializedWith!.filesystem.allowWrite).toContain(res.workspace);
+  });
+
+  test("a spec with systemPrompt writes system-prompt.txt 0600 + passes the -file flag in the launch argv", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-sysprompt-"));
+    const tmux = recordingTmux();
+    const spec: AgentSpec = {
+      name: "eng",
+      channels: ["eng"],
+      systemPrompt: "You are the eng channel's assistant.",
+      systemPromptMode: "append",
+    };
+    const res = await spawnAgent(spec, baseDeps({ tmux }));
+
+    // The prompt file is written 0600 with the exact text.
+    const promptPath = join(res.workspace, "system-prompt.txt");
+    expect(statSync(promptPath).mode & 0o777).toBe(0o600);
+    expect(readFileSync(promptPath, "utf8")).toBe("You are the eng channel's assistant.");
+    // The launched claude command carries --append-system-prompt-file <path>.
+    const cmd = tmux.launched[0]!.argv[2]!;
+    expect(cmd).toContain("--append-system-prompt-file");
+    expect(cmd).toContain(promptPath);
+  });
+
+  test("a spec with NO systemPrompt writes no prompt file + no system-prompt flag", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-nosysprompt-"));
+    const tmux = recordingTmux();
+    const res = await spawnAgent({ name: "bare", channels: ["bare"] }, baseDeps({ tmux }));
+    expect(existsSync(join(res.workspace, "system-prompt.txt"))).toBe(false);
+    expect(tmux.launched[0]!.argv[2]!).not.toContain("system-prompt-file");
   });
 
   test("mints ONE token per channel for a multi-channel spec", async () => {

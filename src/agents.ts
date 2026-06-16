@@ -77,6 +77,14 @@ export interface AgentInfo {
    * /health's `mcp_sessions`). Present for programmatic agents in place of those.
    */
   status?: string;
+  /**
+   * The agent's system-prompt COMPOSITION mode when a per-channel system prompt is
+   * set (design 2026-06-16-channel-system-prompt.md) — `"append"` (kept CC's base +
+   * the role) or `"replace"` (full custom persona). Absent = no system prompt (CC's
+   * default, untouched). The prompt TEXT itself is deliberately NOT surfaced here
+   * (it can be long / role-sensitive) — only that one is set + how it composes.
+   */
+  systemPromptMode?: "append" | "replace";
 }
 
 /** A redacted mint summary — scope + audience + expiry, NEVER the token value. */
@@ -176,6 +184,10 @@ export function agentInfoFromSessions(
     const name = s.name.slice(0, -AGENT_SESSION_SUFFIX.length);
     if (name.length === 0) continue;
     const workspace = sessionWorkspace(sessionsDirPath, name);
+    // Surface the system-prompt composition mode (not the text) from the persisted
+    // spec when one is set — so the list shows the agent carries a role.
+    const persisted = readPersistedSpec(workspace);
+    const hasPrompt = typeof persisted?.systemPrompt === "string" && persisted.systemPrompt.length > 0;
     agents.push({
       name,
       session: s.name,
@@ -183,6 +195,7 @@ export function agentInfoFromSessions(
       workspace,
       hasWorkspace: existsSync(join(workspace, ".mcp.json")),
       backend: "interactive",
+      ...(hasPrompt ? { systemPromptMode: persisted!.systemPromptMode ?? "append" } : {}),
     });
   }
   agents.sort((a, b) => a.name.localeCompare(b.name));
@@ -309,6 +322,31 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
     spec.backend = b.backend;
   } else {
     spec.backend = "programmatic";
+  }
+
+  // Per-channel system prompt — the operator gives the channel a role (design
+  // 2026-06-16-channel-system-prompt.md). It is passed (file-backed) on every
+  // `claude -p` turn. `systemPromptMode` decides composition with CC's default:
+  // "append" (default — keep CC's base + add the role) or "replace" (full custom
+  // persona). The mode is validated to the two allowed values; anything else 400s.
+  // A blank/whitespace-only prompt is treated as unset (no flag). The mode is only
+  // recorded when there's a prompt to qualify (an orphan mode with no prompt is a
+  // no-op, so we drop it to keep the spec minimal).
+  if (b.systemPrompt !== undefined && b.systemPrompt !== null) {
+    if (typeof b.systemPrompt !== "string") {
+      throw new SpawnRequestError("body.systemPrompt must be a string");
+    }
+  }
+  if (b.systemPromptMode !== undefined && b.systemPromptMode !== null) {
+    if (b.systemPromptMode !== "append" && b.systemPromptMode !== "replace") {
+      throw new SpawnRequestError('body.systemPromptMode must be "append" or "replace"');
+    }
+  }
+  const promptText = typeof b.systemPrompt === "string" ? b.systemPrompt.trim() : "";
+  if (promptText.length > 0) {
+    spec.systemPrompt = promptText;
+    // Default mode is "append" — keep CC's capable base, add the channel's role.
+    spec.systemPromptMode = b.systemPromptMode === "replace" ? "replace" : "append";
   }
 
   return spec;

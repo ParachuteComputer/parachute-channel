@@ -122,6 +122,26 @@ export type AgentChannel = string | AgentChannelSpec;
  */
 export type AgentBackendKind = "interactive" | "programmatic";
 
+/**
+ * How a channel's {@link AgentSpec.systemPrompt} composes with Claude Code's own
+ * default system prompt (design 2026-06-16-channel-system-prompt.md):
+ *
+ *   - `"append"` (DEFAULT): KEEP Claude Code's capable default system prompt
+ *     (~2.4k tokens of tool/agentic instruction) and ADD the channel's role on top
+ *     — `claude -p --append-system-prompt(-file) <X>`. The right default: the
+ *     channel gets strong specificity without losing CC's base competence.
+ *   - `"replace"`: REPLACE the default entirely with the channel's prompt —
+ *     `claude -p --system-prompt(-file) <X>`. A fully-custom persona for an
+ *     operator who wants total control of the system layer (and leanness on the
+ *     subscription — fewer base tokens per turn).
+ *
+ * Either mode is orthogonal to CLAUDE.md, which is a SEPARATE context layer
+ * unaffected by both flags (only `--bare` would drop it — and `--bare` is
+ * deliberately NOT implemented; see the design note: it is API-key-only by design
+ * and would force metered billing off the subscription).
+ */
+export type SystemPromptMode = "append" | "replace";
+
 export interface AgentSpec {
   /** Human-readable arm name; used as the tmux session + workspace slug. */
   name: string;
@@ -206,6 +226,23 @@ export interface AgentSpec {
    * spec.json so a daemon restart re-registers a programmatic agent on boot.
    */
   backend?: AgentBackendKind;
+  /**
+   * Per-channel system prompt — the operator gives the channel a specific role,
+   * backend-visible, so the agent gets strong specificity decoupled from the
+   * workspace + CLAUDE.md (design 2026-06-16-channel-system-prompt.md). Set when
+   * creating/configuring the channel; written to a per-session file and passed on
+   * EVERY `claude -p` turn (the flags are per-invocation, not persistent — a
+   * `--resume` turn re-passes it too). Unset → today's behavior (CC's default
+   * prompt, untouched). Persisted in spec.json.
+   */
+  systemPrompt?: string;
+  /**
+   * How {@link systemPrompt} composes with Claude Code's default system prompt —
+   * `"append"` (DEFAULT, keep CC's base + add the role) or `"replace"` (full
+   * custom persona). Only meaningful when `systemPrompt` is set. See
+   * {@link SystemPromptMode}.
+   */
+  systemPromptMode?: SystemPromptMode;
 }
 
 /**

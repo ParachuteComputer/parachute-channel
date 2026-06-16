@@ -148,12 +148,25 @@ export interface ProgrammaticBackendDeps {
  *
  * DELIBERATELY ABSENT: `--dangerously-load-development-channels` (no channel MCP in
  * this backend — the daemon mediates messaging), and any TUI flag (`-p` has none).
+ *
+ * SYSTEM PROMPT (design 2026-06-16-channel-system-prompt.md): when the spec carries
+ * a `systemPrompt`, the per-session prompt FILE path is passed via the `-file`
+ * variant — `--append-system-prompt-file <path>` (append mode, keeps CC's default)
+ * or `--system-prompt-file <path>` (replace mode). The flags are PER-INVOCATION, so
+ * this is added on EVERY turn (including `--resume` turns) — the argv is rebuilt per
+ * `deliver`, and the file is (re)written each turn (see {@link ProgrammaticBackend.deliver}).
+ * The `-file` form (over the inline string form) is robust to long/multiline prompts
+ * and keeps the prompt visible-on-disk to the backend.
  */
 export function buildProgrammaticClaudeArgs(opts: {
   message: string;
   mcpConfigPath: string;
   resumeSessionId?: string;
   claudeBin?: string;
+  /** Path to the per-session system-prompt file (omitted = no system-prompt flag). */
+  systemPromptFile?: string;
+  /** How the system prompt composes — append (default) keeps CC's base; replace overrides it. */
+  systemPromptMode?: "append" | "replace";
 }): string[] {
   const bin = opts.claudeBin ?? "claude";
   const argv = [
@@ -168,6 +181,12 @@ export function buildProgrammaticClaudeArgs(opts: {
     opts.mcpConfigPath,
     "--dangerously-skip-permissions",
   ];
+  // System prompt (file-backed). Append KEEPS CC's capable default + adds the role;
+  // replace overrides it entirely. Re-passed every turn (the flag isn't persistent).
+  if (opts.systemPromptFile) {
+    const flag = opts.systemPromptMode === "replace" ? "--system-prompt-file" : "--append-system-prompt-file";
+    argv.push(flag, opts.systemPromptFile);
+  }
   if (opts.resumeSessionId) {
     argv.push("--resume", opts.resumeSessionId);
   }
@@ -298,6 +317,19 @@ export class ProgrammaticBackend implements AgentBackend {
     const mcpConfigPath = join(workspace, ".mcp.json");
     writeFileSync(mcpConfigPath, mcpConfigJson, { mode: 0o600 });
 
+    // System prompt (design 2026-06-16-channel-system-prompt.md). When the spec
+    // carries one, write it to a per-session file (0600) and pass the `-file` flag.
+    // The flag is PER-INVOCATION (not persistent), so we (re)write the file + pass
+    // it EVERY turn — including a `--resume` turn — so the role is always applied.
+    // Unset → no flag, no file (today's behavior unchanged). The `-file` form is
+    // robust to long/multiline prompts and keeps the prompt visible-on-disk. Its
+    // lifecycle is tied to the workspace (like .mcp.json) — it disappears with it.
+    let systemPromptFile: string | undefined;
+    if (typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0) {
+      systemPromptFile = join(workspace, "system-prompt.txt");
+      writeFileSync(systemPromptFile, spec.systemPrompt, { mode: 0o600 });
+    }
+
     // Build the -p argv with --resume when a session id is stored for this channel.
     const resumeSessionId = this.deps.sessionState.get(channel);
     const argv = buildProgrammaticClaudeArgs({
@@ -305,6 +337,9 @@ export class ProgrammaticBackend implements AgentBackend {
       mcpConfigPath,
       ...(resumeSessionId ? { resumeSessionId } : {}),
       ...(this.deps.claudeBin ? { claudeBin: this.deps.claudeBin } : {}),
+      ...(systemPromptFile
+        ? { systemPromptFile, systemPromptMode: spec.systemPromptMode ?? "append" }
+        : {}),
     });
 
     // Sandbox-wrap via the SHARED seam — same egress floor + scoped-read

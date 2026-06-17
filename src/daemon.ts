@@ -2906,12 +2906,17 @@ function main(): void {
   }
 
   if (channels.size === 0) {
-    console.error(
-      `parachute-agent: no channels configured.\n` +
-        `  Add ${join(STATE_DIR, "channels.json")} (or use the admin UI at /agent/admin)\n` +
-        `  to define a channel. Telegram channels carry a per-channel bot token in config.`,
+    // Zero channels is a valid STARTING state, not a fatal error. The daemon must
+    // stay up and serve its HTTP surface so an operator can create the first agent
+    // (the /agent/admin + create-agent UI POST to this very daemon — exiting here is
+    // a chicken-and-egg: you couldn't define the first channel), and so future
+    // vault-defined agents can appear into a running module. Channels added live
+    // (via the API/UI, or hot-added) are picked up immediately. So: warn + idle.
+    console.warn(
+      `parachute-agent: no channels configured yet — starting idle.\n` +
+        `  Create an agent via the admin UI at /agent/admin (or add ${join(STATE_DIR, "channels.json")}).\n` +
+        `  The daemon stays up; channels added live are picked up immediately.`,
     );
-    process.exit(1);
   }
 
   const registry = new ClientRegistry();

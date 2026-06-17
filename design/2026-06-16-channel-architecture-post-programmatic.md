@@ -5,7 +5,8 @@ from **interactive** (a live Claude Code in tmux you attach to) to **programmati
 (each message answered by a sandboxed `claude -p --resume` turn). Companion to
 [`2026-06-16-pluggable-agent-backend.md`](./2026-06-16-pluggable-agent-backend.md),
 [`2026-06-16-agent-filesystem-and-sharing.md`](./2026-06-16-agent-filesystem-and-sharing.md),
-[`2026-06-16-channel-system-prompt.md`](./2026-06-16-channel-system-prompt.md).
+[`2026-06-16-session-environment-and-credentials.md`](./2026-06-16-session-environment-and-credentials.md),
+and `2026-06-16-channel-system-prompt.md` (lands with #79).
 
 ## What a channel IS now
 
@@ -26,8 +27,10 @@ for the default programmatic path anymore:
 
 - no-loss high-water-mark + backlog replay (#67)
 - per-session restart (#68)
-- the `--dangerously-load-development-channels` consent auto-confirm (#70/#71)
-- the MCP idle-wake / reconnect transport
+- the `--dangerously-load-development-channels` consent auto-confirm (#71, fixing issue #70)
+- the MCP idle-wake / reconnect transport (the `notifications/claude/channel` push to an
+  idle HTTP-MCP session; serves the interactive path — the programmatic backend is
+  stateless per turn and needs none of it)
 
 **Keep them** — interactive is the billing hedge (if Anthropic moves programmatic
 `-p`/SDK off the subscription, interactive human-driven CC is the durable fallback) —

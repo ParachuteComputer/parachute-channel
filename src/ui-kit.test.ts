@@ -39,8 +39,15 @@ describe("appShell", () => {
     expect(appShell({ active: "terminal" })).not.toContain("app-controls");
   });
 
-  test("nav covers exactly home/chat/agents/terminal/config, Home first", () => {
-    expect(NAV_VIEWS.map((v) => v.view)).toEqual(["home", "chat", "agents", "terminal", "config"]);
+  test("nav covers exactly home/chat/agents/schedules/terminal/config, Home first", () => {
+    expect(NAV_VIEWS.map((v) => v.view)).toEqual([
+      "home",
+      "chat",
+      "agents",
+      "schedules",
+      "terminal",
+      "config",
+    ]);
   });
 });
 

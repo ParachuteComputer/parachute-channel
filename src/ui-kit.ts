@@ -59,6 +59,7 @@ export const NAV_VIEWS = [
   { view: "home", label: "Home", path: "/home" },
   { view: "chat", label: "Chat", path: "/ui" },
   { view: "agents", label: "Agents", path: "/agents" },
+  { view: "schedules", label: "Schedules", path: "/jobs" },
   { view: "terminal", label: "Terminal", path: "/terminal" },
   { view: "config", label: "Config", path: "/admin" },
 ] as const;
@@ -263,8 +264,8 @@ export function appShell(opts: { active: ShellView; controls?: string; status?: 
  */
 export const SHELL_JS = `
   // Public mount prefix: "" on loopback, "/channel" behind the hub proxy.
-  var MOUNT = window.location.pathname.replace(/\\/(home|ui|admin|agents|terminal)(\\/[^?]*)?\\/?$/, "");
-  var NAV_MAP = { home: "/home", chat: "/ui", agents: "/agents", terminal: "/terminal", config: "/admin" };
+  var MOUNT = window.location.pathname.replace(/\\/(home|ui|admin|agents|jobs|terminal)(\\/[^?]*)?\\/?$/, "");
+  var NAV_MAP = { home: "/home", chat: "/ui", agents: "/agents", schedules: "/jobs", terminal: "/terminal", config: "/admin" };
   function wireShell(active) {
     var links = document.querySelectorAll(".app-nav a[data-view]");
     for (var i = 0; i < links.length; i++) {

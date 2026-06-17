@@ -1,12 +1,35 @@
 /**
- * Static HTML for `/channel/agents` — the in-page agent management surface
- * (design `design/2026-06-14-sandboxed-agent-sessions.md` §4/§5; the web spawn
- * flow Aaron asked for: "this needs to work through the web interface since
- * that's really the default way of operating").
+ * Static HTML for `/channel/agents` — the PRIMARY "Agents" surface: the unified
+ * **create-an-agent** flow (Phase-1 consolidation,
+ * `design/2026-06-17-parachute-agent-blueprint.md` §Sequencing step 1).
  *
- * Self-contained document (HTML + inline CSS + inline JS, no build step — the
- * same shape as `terminal-ui.ts` and `daemon.ts`'s chat UI). It drives the
- * daemon's `channel:admin`-gated JSON API:
+ * The blueprint collapses today's TWO steps — create-channel (the Config page),
+ * then spawn-agent-on-it (this page) — into ONE form: you "configure an agent,
+ * then talk to it" (agent ≡ channel, 1:1). The default UX is minimal:
+ *
+ *     Agent name → Vault (auto-selected if exactly one) → optional System prompt → Create
+ *
+ * One submit (a) provisions the (vault) channel of that name if it doesn't already
+ * exist, then (b) spawns a PROGRAMMATIC agent on it, then (c) lands the operator in
+ * chat (`/ui?channel=<name>`). Vault is the default transport; programmatic is the
+ * default backend.
+ *
+ * CLIENT-SIDE ORCHESTRATION (the load-bearing decision): the channel half reuses
+ * the EXISTING provisioning paths via the shared `PROVISION_JS`
+ * (`src/provision-channel.ts`) — the SAME hub-mediated `/admin/connections` vault
+ * flow + `/api/channels` telegram/http-ui flow the Config page runs. The channel
+ * daemon does NOT mint vault tokens (it lacks hub authority); the hub does, exactly
+ * as on the Config page. No new `/api/agents` fields — the form posts the same body
+ * `buildSpecFromBody` already accepts.
+ *
+ * Advanced disclosure reveals the dynamic cases: use an EXISTING channel (skip
+ * provisioning), transport telegram / http-ui (with config), the interactive
+ * backend, system-prompt mode, extra channels, vault tags/access, filesystem,
+ * network, egress, working directory, mounts.
+ *
+ * Self-contained document (HTML + inline CSS + inline JS, no build step — the same
+ * shape as `terminal-ui.ts` / `home-ui.ts` / `daemon.ts`'s chat UI). It drives the
+ * daemon's `channel:admin`-gated JSON API + the hub Connections engine:
  *
  *   - GET    /api/credentials/claude   → credential status (default set? overrides?)
  *   - POST   /api/credentials/claude[/:channel]  → set default / per-channel token
@@ -18,21 +41,27 @@
  *   - POST   /api/agents               → spawn a sandboxed agent from a spec
  *   - POST   /api/agents/:name/restart → per-session restart (re-source env + reconnect)
  *   - DELETE /api/agents/:name         → kill a session
- *   - GET    /api/vaults               → installed vault instances (the picker)
- *   - GET    /.parachute/config        → channel list (the picker)
+ *   - GET    /api/vaults               → installed vault instances (advanced vault binding)
+ *   - GET    /api/channels             → existing channels (the Advanced "use existing" picker + idempotency)
+ *   - POST   <origin>/admin/connections → hub-mediated vault-channel provisioning
+ *   - GET    <origin>/.well-known/parachute.json → installed vaults (the default Vault picker)
+ *   - GET    /.parachute/config        → channel list
  *   - GET    /health                   → live per-channel connection status (mcp_sessions)
  *
- * UX: the DEFAULT flow is one-agent-one-channel — pick a channel, the agent name
- * auto-fills from it, click Spawn. Everything else (extra channels, vault binding,
- * network mode, mounts) lives under "Advanced" for the dynamic cases.
- *
  * Auth: loads OPEN (like /ui, /admin, /terminal), then fetches a hub-minted
- * `channel:admin` Bearer from `<origin>/admin/channel-token` and attaches it to
- * every /api call. Token hygiene: the pasted Claude token is POSTed once and never
- * read back; the spawn result shows scopes but never minted token values.
+ * `channel:admin` Bearer from `<origin>/admin/channel-token` and attaches it to the
+ * daemon `/api` calls; the vault provisioning path uses the operator's hub SESSION
+ * COOKIE (credentials:"include"), not this token. Token hygiene: the pasted Claude
+ * token is POSTed once and never read back; the spawn result shows scopes but never
+ * minted token values.
+ *
+ * Vocabulary: an AGENT is the configured, vault-backed Claude actor; a CHANNEL is
+ * the messaging pipe it wakes on. In the default vault flow they are 1:1 (the agent
+ * IS its channel) — the blueprint's "agent ≡ channel".
  */
 
 import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
+import { PROVISION_JS } from "./provision-channel.ts";
 
 export const AGENTS_UI_HTML = `<!doctype html>
 <html lang="en">
@@ -73,6 +102,8 @@ ${THEME_CSS}
   button.danger:hover { border-color: var(--danger); background: var(--danger-soft); }
   button.ghost { padding: 4px 9px; font-size: 12px; background: transparent; border-color: transparent; color: var(--fg-muted); }
   button.ghost:hover { background: var(--bg-soft); color: var(--fg); }
+  /* The primary Create button — a touch larger than the page's default button. */
+  button.create { padding: 10px 22px; font-size: 0.95rem; }
   .pill.detached { color: var(--fg-dim); }
   table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
@@ -83,6 +114,8 @@ ${THEME_CSS}
   details summary { cursor: pointer; color: var(--fg-muted); font-size: 0.85rem; user-select: none; }
   details[open] summary { color: var(--fg); margin-bottom: 12px; }
   .sub { display: grid; gap: 12px; }
+  .sub-group { border: 1px solid var(--border-light); border-radius: 8px; padding: 12px 14px; display: grid; gap: 12px; }
+  .sub-group > .sub-title { font-size: 0.82rem; font-weight: 600; color: var(--fg); margin: 0; }
   .extra-channels { display: grid; gap: 8px; }
   .extra-channels .crow, .mounts-rows .mrow { display: flex; gap: 8px; align-items: center; }
   .extra-channels .crow select.ch-name { flex: 1 1 auto; }
@@ -105,17 +138,220 @@ ${THEME_CSS}
   /* Connection-status pill on the running-agents list (mcp_sessions from /health). */
   .pill.connected { color: var(--success); }
   .pill.idle-conn { color: var(--fg-dim); }
+  .field-row { margin-top: 12px; }
+  .field-row textarea {
+    width: 100%; box-sizing: border-box; font: inherit; padding: 8px 10px;
+    border: 1px solid var(--border); border-radius: 6px; background: var(--card);
+    color: var(--fg); resize: vertical;
+  }
 </style>
 </head>
 <body>
   ${appShell({ active: "agents", tag: "agents" })}
 
   <main>
+    <!-- Create an agent (the unified flow — primary surface) -->
+    <section id="create-section">
+      <h2>Create an agent</h2>
+      <p class="hint">Configure an agent, then talk to it. The default is one agent on its own
+        vault-backed channel running the reliable <strong>Programmatic</strong> backend — name it,
+        pick a vault, add an optional role, and Create. We provision the channel (if needed) and the
+        agent in one step, then drop you into its chat. Open <strong>Advanced</strong> for an existing
+        channel, Telegram / HTTP-UI transports, the interactive backend, extra channels, vault scope,
+        filesystem, network, working directory, or mounts.</p>
+
+      <div class="grid2">
+        <div>
+          <label for="agent-name">Agent name</label>
+          <input type="text" id="agent-name" placeholder="e.g. release-bot" autocomplete="off" />
+        </div>
+        <div>
+          <label for="agent-vault">Vault <span class="muted">(the channel's backing store)</span></label>
+          <select id="agent-vault"><option value="">(loading vaults…)</option></select>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label for="agent-system-prompt">System prompt <span class="muted">(optional — the agent's role)</span></label>
+        <textarea id="agent-system-prompt" rows="3" placeholder="e.g. You are the release assistant. Keep replies terse and action-oriented."></textarea>
+      </div>
+
+      <details id="advanced">
+        <summary>Advanced — existing channel, transport, backend, isolation, mounts</summary>
+        <div class="sub">
+          <!-- Existing channel vs. provision a new one -->
+          <div class="sub-group">
+            <p class="sub-title">Channel</p>
+            <div>
+              <label for="use-existing">Channel source</label>
+              <select id="use-existing">
+                <option value="new" selected>Create a new channel named after the agent (default)</option>
+                <option value="existing">Use an existing channel</option>
+              </select>
+            </div>
+            <div id="existing-wrap" style="display:none;">
+              <label for="existing-channel">Existing channel <span class="muted">(the wake channel)</span></label>
+              <select id="existing-channel"></select>
+              <div class="muted" style="font-size:12px; margin-top:6px;">
+                The agent wakes on this channel; no new channel is provisioned.
+              </div>
+            </div>
+            <div id="new-transport-wrap">
+              <div class="grid2">
+                <div>
+                  <label for="agent-transport">Transport <span class="muted">(of the new channel)</span></label>
+                  <select id="agent-transport">
+                    <option value="vault" selected>Vault — durable, queryable (default)</option>
+                    <option value="telegram">Telegram — a bot with its own token</option>
+                    <option value="http-ui">HTTP-UI — built-in chat (testing / backup)</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="agent-access">Channel access</label>
+                  <select id="agent-access">
+                    <option value="write" selected>read+write</option>
+                    <option value="read">read only</option>
+                  </select>
+                </div>
+              </div>
+              <div id="telegram-token-wrap" style="display:none; margin-top:8px;">
+                <label for="agent-telegram-token">Telegram bot token <span class="muted">(required)</span></label>
+                <input type="password" id="agent-telegram-token" placeholder="123456:ABC-…" autocomplete="off" />
+                <div class="muted" style="font-size:12px; margin-top:6px;">
+                  Each Telegram channel carries its own per-channel bot token (no daemon-global fallback).
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Backend -->
+          <div class="sub-group">
+            <p class="sub-title">Backend</p>
+            <div>
+              <label for="agent-backend">Backend</label>
+              <select id="agent-backend">
+                <option value="programmatic" selected>Programmatic — clean per-message turns, reliable (recommended)</option>
+                <option value="interactive">Interactive — watch / drive a live tmux session (advanced)</option>
+              </select>
+              <div id="backend-note" class="muted" style="font-size:12px; margin-top:8px;"></div>
+            </div>
+          </div>
+
+          <!-- System-prompt mode -->
+          <div class="sub-group">
+            <p class="sub-title">System prompt mode</p>
+            <div class="row" style="align-items:center;">
+              <div>
+                <label for="agent-prompt-mode" style="display:inline; margin-right:6px;">Mode</label>
+                <select id="agent-prompt-mode">
+                  <option value="append" selected>Append (default)</option>
+                  <option value="replace">Replace</option>
+                </select>
+              </div>
+              <span class="muted" style="font-size:12px;">Append keeps Claude Code's capable base and adds your role; Replace gives full control.</span>
+            </div>
+          </div>
+
+          <!-- Extra channels -->
+          <div class="sub-group">
+            <p class="sub-title">Additional channels <span class="muted" style="font-weight:400;">(beyond the wake channel)</span></p>
+            <div id="extra-channels" class="extra-channels"></div>
+            <button id="add-channel" class="ghost" type="button" style="justify-self:start;">+ channel</button>
+          </div>
+
+          <!-- Vault binding (extra: tags / access for the agent's vault scope) -->
+          <div class="sub-group">
+            <p class="sub-title">Vault binding <span class="muted" style="font-weight:400;">(the agent's vault read/write scope)</span></p>
+            <div class="grid3">
+              <div>
+                <label for="vault-name">Vault</label>
+                <select id="vault-name"><option value="">(channel's vault)</option></select>
+              </div>
+              <div>
+                <label for="vault-access">Vault access</label>
+                <select id="vault-access">
+                  <option value="read">read</option>
+                  <option value="write" selected>write</option>
+                  <option value="admin">admin</option>
+                </select>
+              </div>
+              <div>
+                <label for="vault-tags">Tag scope (optional)</label>
+                <input type="text" id="vault-tags" placeholder="#channel-message, …" autocomplete="off" />
+              </div>
+            </div>
+            <div class="muted" style="font-size:12px;">
+              Leave the Vault blank to grant the agent the same vault that backs its channel. Set it to
+              scope the agent's vault access explicitly.
+            </div>
+          </div>
+
+          <!-- Isolation -->
+          <div class="sub-group">
+            <p class="sub-title">Isolation</p>
+            <div>
+              <label for="fs-mode">Filesystem</label>
+              <select id="fs-mode">
+                <option value="workspace" selected>Sandboxed to its workspace (default) — can't read your files or secrets</option>
+                <option value="full">Full read access — can read your whole disk (use with care)</option>
+              </select>
+              <div id="fs-warn" class="muted" style="display:none; font-size:12px; margin-top:8px;">
+                Default: the agent reads only its own workspace + mounts + the claude runtime. Your home
+                tree (including <code>~/.parachute/operator.token</code>, SSH keys, other projects) is
+                unreadable. Writes are always confined to the workspace. Switch to Full read only when an
+                agent genuinely needs to see across your disk and you trust it not to leak.
+              </div>
+            </div>
+
+            <div>
+              <label for="net-mode">Network</label>
+              <select id="net-mode">
+                <option value="open" selected>Open — full internet (default)</option>
+                <option value="restricted">Restricted — Anthropic + hub/vault + listed hosts only (untrusted input)</option>
+              </select>
+              <div id="egress-wrap" style="display:none; margin-top:8px;">
+                <label for="egress">Additional allowed hosts (comma-separated)</label>
+                <input type="text" id="egress" placeholder="registry.npmjs.org, github.com" autocomplete="off" />
+              </div>
+              <div id="net-note" class="muted" style="display:none; font-size:12px; margin-top:8px;">
+                Open is safe as the default because the workspace filesystem sandbox already keeps your
+                secrets unreadable — open network can't exfiltrate what the agent can't see. Choose
+                Restricted to also bound where an agent fed untrusted input can reach.
+              </div>
+            </div>
+
+            <div>
+              <label for="agent-workspace">Working directory <span class="muted">(optional — absolute host path)</span></label>
+              <input type="text" id="agent-workspace" placeholder="/Users/you/Code/my-repo" autocomplete="off" />
+              <div class="muted" style="font-size:12px; margin-top:8px;">
+                The directory the agent works in (its cwd, read-write). Leave blank and it works in its own
+                private session dir. Set a real repo path to have it work there — that dir can be shared with
+                other agents, runner jobs, or scripts. Its private config &amp; tokens (<code>.mcp.json</code>)
+                always stay in the per-agent session dir, never written here.
+              </div>
+            </div>
+
+            <div>
+              <label>Filesystem mounts</label>
+              <div id="mounts-rows" class="mounts-rows"></div>
+              <button id="add-mount" class="ghost" type="button" style="justify-self:start;">+ mount</button>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <div class="row" style="margin-top:16px;">
+        <button id="create-go" class="primary create" type="button">Create agent</button>
+        <span class="muted" id="create-note" style="font-size:12px;"></span>
+      </div>
+      <div id="create-msg" class="msg"></div>
+    </section>
+
     <!-- Claude credential -->
     <section id="cred-section">
       <h2>Claude credential</h2>
-      <p class="hint">A launched session runs on a Claude subscription token from
-        <code>claude setup-token</code> — injected per session, never your CLI login.
+      <p class="hint">A launched agent runs on a Claude subscription token from
+        <code>claude setup-token</code> — injected per agent, never your CLI login.
         Set a default once; override per channel if needed.</p>
       <div class="row">
         <span>Default credential: <span id="cred-default" class="pill off">checking…</span></span>
@@ -146,14 +382,14 @@ ${THEME_CSS}
     <!-- Per-channel env / credentials (GH_TOKEN, CLOUDFLARE_API_TOKEN, …) -->
     <section id="env-section">
       <h2>Channel env / credentials</h2>
-      <p class="hint">Scope a channel's spawned agent extra secrets &mdash; a
+      <p class="hint">Scope a channel's agent extra secrets &mdash; a
         <code>GH_TOKEN</code>, <code>CLOUDFLARE_API_TOKEN</code>, etc. These are injected
-        into the session's shell (its <code>gh</code>/<code>git</code>/build tooling) &mdash;
+        into the agent's shell (its <code>gh</code>/<code>git</code>/build tooling) &mdash;
         Claude's own login is never touched. Set a default for every channel, or override per
-        channel. After setting one, hit <strong>Restart / reconnect</strong> on a running session
+        channel. After setting one, hit <strong>Restart / reconnect</strong> on a running agent
         to apply it.</p>
       <div id="env-list" class="scopes"></div>
-      <details open>
+      <details>
         <summary>Set an env var</summary>
         <div class="sub">
           <div class="grid3">
@@ -179,156 +415,6 @@ ${THEME_CSS}
       <div id="env-msg" class="msg"></div>
     </section>
 
-    <!-- Spawn -->
-    <section id="spawn-section">
-      <h2>Spawn an agent</h2>
-      <p class="hint">Launches a sandboxed Claude agent wired to a channel. The default backend is
-        Programmatic (reliable per-message turns); the live-terminal Interactive backend is under
-        Advanced. The common case is one agent per channel — pick a channel and spawn. Open the
-        lower Advanced section for extra channels, a vault, network, or mounts.</p>
-
-      <div class="grid3">
-        <div>
-          <label for="spawn-channel">Channel <span class="muted">(wake)</span></label>
-          <select id="spawn-channel"></select>
-        </div>
-        <div>
-          <label for="spawn-access">Access</label>
-          <select id="spawn-access">
-            <option value="write" selected>read+write</option>
-            <option value="read">read only</option>
-          </select>
-        </div>
-        <div>
-          <label for="spawn-name">Agent name</label>
-          <input type="text" id="spawn-name" placeholder="(defaults to channel)" autocomplete="off" />
-        </div>
-      </div>
-
-      <div style="margin-top:12px;">
-        <label for="spawn-backend">Backend</label>
-        <select id="spawn-backend">
-          <option value="programmatic" selected>Programmatic — clean per-message turns, reliable (recommended)</option>
-          <option value="interactive">Interactive — watch / drive a live tmux session (advanced)</option>
-        </select>
-        <div id="backend-note" class="muted" style="font-size:12px; margin-top:8px;"></div>
-        <details id="backend-advanced" style="margin-top:10px;">
-          <summary>Advanced — interactive (live terminal) backend</summary>
-          <div class="sub">
-            <p class="muted" style="font-size:12px; margin:0;">
-              Interactive runs a live Claude Code in a terminal you can attach to —
-              currently less stable (the deaf-on-restart / reconnect class). Use
-              Programmatic unless you specifically want to watch / drive a live session.
-              Selecting it below switches the backend to interactive.
-            </p>
-            <div class="row" style="margin-top:8px;">
-              <button id="backend-use-interactive" class="ghost" type="button">Use interactive backend</button>
-              <span class="muted" id="backend-current" style="font-size:12px;"></span>
-            </div>
-          </div>
-        </details>
-      </div>
-
-      <div style="margin-top:12px;">
-        <label for="spawn-system-prompt">System prompt <span class="muted">(optional — the channel's role)</span></label>
-        <textarea id="spawn-system-prompt" rows="3" placeholder="e.g. You are the eng channel's release assistant. Keep replies terse and action-oriented." style="width:100%; box-sizing:border-box; font:inherit; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--card); color:var(--fg); resize:vertical;"></textarea>
-        <div class="row" style="margin-top:8px; align-items:center;">
-          <div>
-            <label for="spawn-prompt-mode" style="display:inline; margin-right:6px;">Mode</label>
-            <select id="spawn-prompt-mode">
-              <option value="append" selected>Append (default)</option>
-              <option value="replace">Replace</option>
-            </select>
-          </div>
-          <span class="muted" style="font-size:12px;">Append keeps Claude Code's capable base and adds your channel's role; Replace gives full control.</span>
-        </div>
-      </div>
-
-      <details id="advanced">
-        <summary>Advanced — extra channels, vault, network, mounts</summary>
-        <div class="sub">
-          <div>
-            <label>Additional channels <span class="muted">(beyond the wake channel above)</span></label>
-            <div id="extra-channels" class="extra-channels"></div>
-            <button id="add-channel" class="ghost" type="button" style="margin-top:8px;">+ channel</button>
-          </div>
-
-          <div class="grid3">
-            <div>
-              <label for="vault-name">Vault</label>
-              <select id="vault-name"><option value="">(no vault)</option></select>
-            </div>
-            <div>
-              <label for="vault-access">Vault access</label>
-              <select id="vault-access">
-                <option value="read">read</option>
-                <option value="write">write</option>
-                <option value="admin">admin</option>
-              </select>
-            </div>
-            <div>
-              <label for="vault-tags">Tag scope (optional)</label>
-              <input type="text" id="vault-tags" placeholder="#channel-message, …" autocomplete="off" />
-            </div>
-          </div>
-
-          <div>
-            <label for="fs-mode">Filesystem</label>
-            <select id="fs-mode">
-              <option value="workspace" selected>Sandboxed to its workspace (default) — can't read your files or secrets</option>
-              <option value="full">Full read access — can read your whole disk (use with care)</option>
-            </select>
-            <div id="fs-warn" class="muted" style="display:none; font-size:12px; margin-top:8px;">
-              Default: the agent reads only its own workspace + mounts + the claude runtime. Your home
-              tree (including <code>~/.parachute/operator.token</code>, SSH keys, other projects) is
-              unreadable. Writes are always confined to the workspace. Switch to Full read only when an
-              agent genuinely needs to see across your disk and you trust it not to leak.
-            </div>
-          </div>
-
-          <div>
-            <label for="net-mode">Network</label>
-            <select id="net-mode">
-              <option value="open" selected>Open — full internet (default)</option>
-              <option value="restricted">Restricted — Anthropic + hub/vault + listed hosts only (untrusted input)</option>
-            </select>
-            <div id="egress-wrap" style="display:none; margin-top:8px;">
-              <label for="egress">Additional allowed hosts (comma-separated)</label>
-              <input type="text" id="egress" placeholder="registry.npmjs.org, github.com" autocomplete="off" />
-            </div>
-            <div id="net-note" class="muted" style="display:none; font-size:12px; margin-top:8px;">
-              Open is safe as the default because the workspace filesystem sandbox already keeps your
-              secrets unreadable — open network can't exfiltrate what the agent can't see. Choose
-              Restricted to also bound where an agent fed untrusted input can reach.
-            </div>
-          </div>
-
-          <div>
-            <label for="spawn-workspace">Working directory <span class="muted">(optional — absolute host path)</span></label>
-            <input type="text" id="spawn-workspace" placeholder="/Users/you/Code/my-repo" autocomplete="off" />
-            <div class="muted" style="font-size:12px; margin-top:8px;">
-              The directory the agent works in (its cwd, read-write). Leave blank and it works in its own
-              private session dir. Set a real repo path to have it work there — that dir can be shared with
-              other agents, runner jobs, or scripts. Its private config &amp; tokens (<code>.mcp.json</code>)
-              always stay in the per-agent session dir, never written here.
-            </div>
-          </div>
-
-          <div>
-            <label>Filesystem mounts</label>
-            <div id="mounts-rows" class="mounts-rows"></div>
-            <button id="add-mount" class="ghost" type="button" style="margin-top:8px;">+ mount</button>
-          </div>
-        </div>
-      </details>
-
-      <div class="row" style="margin-top:16px;">
-        <button id="spawn-go" class="primary" type="button">Spawn agent</button>
-        <span class="muted" id="spawn-note" style="font-size:12px;"></span>
-      </div>
-      <div id="spawn-msg" class="msg"></div>
-    </section>
-
     <!-- Running agents -->
     <section id="agents-section">
       <div class="row" style="margin-bottom:10px;">
@@ -342,10 +428,13 @@ ${THEME_CSS}
 
 <script>
 ${SHELL_JS}
+${PROVISION_JS}
 (function () {
   // MOUNT, setStatus, escapeHtml, fetchToken (caches on window.__token),
-  // authedFetch all come from SHELL_JS. Wire the shared nav for the agents view.
+  // authedFetch all come from SHELL_JS. ChannelProvision (the shared
+  // provisioning client) comes from PROVISION_JS. Wire the shared nav.
   wireShell("agents");
+  var Provision = window.ChannelProvision;
   var knownChannels = [];
 
   // esc is the page-local name for the shared escapeHtml (used widely below).
@@ -401,17 +490,17 @@ ${SHELL_JS}
           btn.addEventListener("click", function () { removeCred(btn.getAttribute("data-cred-rm")); });
         });
       } else { ov.innerHTML = ""; }
-      updateSpawnNote(j.defaultSet, j.channels || []);
+      updateCreateNote(j.defaultSet, j.channels || []);
       return j;
     }).catch(function (err) {
       document.getElementById("cred-default").textContent = "unknown (" + err.message + ")";
     });
   }
 
-  function updateSpawnNote(defaultSet, overrides) {
-    var note = document.getElementById("spawn-note");
+  function updateCreateNote(defaultSet, overrides) {
+    var note = document.getElementById("create-note");
     if (!defaultSet && (!overrides || !overrides.length)) {
-      note.textContent = "⚠ no Claude credential set — set one above before spawning.";
+      note.textContent = "⚠ no Claude credential set — set one below before creating.";
       note.style.color = "var(--warn)";
     } else { note.textContent = ""; }
   }
@@ -493,7 +582,7 @@ ${SHELL_JS}
       document.getElementById("env-name").value = "";
       document.getElementById("env-value").value = "";
       showMsg(msg, "Saved " + name + (channel ? (" for channel " + channel) : " (default)") +
-        ". Restart a session to apply it.", false);
+        ". Restart an agent to apply it.", false);
       loadEnv();
     }).catch(function (err) { showMsg(msg, "Failed: " + err.message, true); });
   });
@@ -508,21 +597,37 @@ ${SHELL_JS}
     }).catch(function (err) { showMsg(msg, "Failed: " + err.message, true); });
   }
 
-  // --- spawn form ---------------------------------------------------------
+  // --- create-agent form: dynamic UI --------------------------------------
   function channelOptions(selected) {
     return knownChannels.map(function (c) {
       return "<option value='" + esc(c) + "'" + (c === selected ? " selected" : "") + ">" + esc(c) + "</option>";
     }).join("");
   }
 
-  // Auto-fill the name from the chosen wake channel until the operator edits it.
-  var nameEdited = false;
-  var nameEl = document.getElementById("spawn-name");
-  var chanEl = document.getElementById("spawn-channel");
-  nameEl.addEventListener("input", function () { nameEdited = true; });
-  chanEl.addEventListener("change", function () {
-    if (!nameEdited) nameEl.value = chanEl.value;
-  });
+  var nameEl = document.getElementById("agent-name");
+  var useExistingEl = document.getElementById("use-existing");
+  var existingChannelEl = document.getElementById("existing-channel");
+  var transportEl = document.getElementById("agent-transport");
+
+  // Channel source toggle: "new" provisions a channel named after the agent;
+  // "existing" reuses one from the list (skips provisioning).
+  function syncChannelSource() {
+    var existing = useExistingEl.value === "existing";
+    document.getElementById("existing-wrap").style.display = existing ? "" : "none";
+    document.getElementById("new-transport-wrap").style.display = existing ? "none" : "";
+  }
+  useExistingEl.addEventListener("change", syncChannelSource);
+  syncChannelSource();
+
+  // Transport toggle (new-channel path): reveal the Telegram bot-token field only
+  // for telegram. vault + http-ui need no extra field here (vault picks the vault
+  // up top; http-ui is self-contained).
+  function syncTransport() {
+    document.getElementById("telegram-token-wrap").style.display =
+      transportEl.value === "telegram" ? "" : "none";
+  }
+  transportEl.addEventListener("change", syncTransport);
+  syncTransport();
 
   function extraChannelRow() {
     var div = document.createElement("div");
@@ -568,44 +673,41 @@ ${SHELL_JS}
   netMode.addEventListener("change", syncNetMode);
   syncNetMode(); // default is open → show the note, hide the hosts field
 
-  // Backend toggle. PROGRAMMATIC is the default + recommended path (reliable — no
-  // deaf-on-restart / reconnect class). INTERACTIVE (the original tmux session you
-  // watch/drive via terminal attach) is the buggier opt-in, gated behind the
-  // "Advanced — interactive" disclosure; it stays fully selectable once expanded.
-  // The note updates on change; the advanced button switches to interactive.
-  var backendMode = document.getElementById("spawn-backend");
+  // Backend toggle (under Advanced). PROGRAMMATIC is the default + recommended path
+  // (reliable — no deaf-on-restart / reconnect class). INTERACTIVE (the original
+  // tmux session you watch/drive via terminal attach) is the buggier opt-in.
+  var backendMode = document.getElementById("agent-backend");
   function syncBackendMode() {
     var note = document.getElementById("backend-note");
-    var cur = document.getElementById("backend-current");
     if (backendMode.value === "programmatic") {
       note.textContent = "Programmatic (default): no live terminal. Each message runs one on-demand claude -p turn " +
         "(resumes the prior conversation) and its reply is posted back to the channel. No idle session to go " +
-        "deaf, no reconnect — reliable, ideal for fire-and-forget 'do a task, report back'. The Terminal link won't apply.";
-      if (cur) cur.textContent = "Current: programmatic.";
+        "deaf, no reconnect — reliable, ideal for fire-and-forget 'do a task, report back'.";
     } else {
       note.textContent = "Interactive (advanced): an idle Claude Code session in a tmux pane you can attach to (Terminal ↗). " +
         "Messages inject into the live session; you watch it work — but it's currently less stable (deaf-on-restart / " +
         "reconnect class). Use Programmatic unless you specifically want a live session.";
-      if (cur) cur.textContent = "Current: interactive (advanced).";
     }
   }
   backendMode.addEventListener("change", syncBackendMode);
-  // The Advanced disclosure's button switches the selector to interactive (and
-  // updates the note) — interactive stays fully selectable, just opt-in.
-  var useInteractiveBtn = document.getElementById("backend-use-interactive");
-  if (useInteractiveBtn) {
-    useInteractiveBtn.addEventListener("click", function () {
-      backendMode.value = "interactive";
-      syncBackendMode();
-    });
-  }
   syncBackendMode(); // default is programmatic
 
-  function collectSpec() {
-    var wake = chanEl.value;
-    if (!wake) throw new Error("pick a channel");
-    var name = nameEl.value.trim() || wake;
-    var channels = [{ name: wake, access: document.getElementById("spawn-access").value }];
+  // --- create-agent form: spec shaping ------------------------------------
+  // Resolve the wake channel: in "existing" mode it's the picked channel; in
+  // "new" mode it's the agent name (the channel is provisioned under that name).
+  function resolveWakeChannel(name) {
+    if (useExistingEl.value === "existing") {
+      var ch = existingChannelEl.value;
+      if (!ch) throw new Error("pick an existing channel (Advanced → Channel)");
+      return ch;
+    }
+    return name;
+  }
+
+  // Build the /api/agents spec — the SAME body buildSpecFromBody() accepts (no new
+  // fields). Throws Error on a validation miss. wake is the resolved wake channel.
+  function collectSpec(name, wake) {
+    var channels = [{ name: wake, access: document.getElementById("agent-access").value }];
     document.querySelectorAll("#extra-channels .crow").forEach(function (row) {
       var n = row.querySelector(".ch-name").value;
       if (!n) return;
@@ -629,10 +731,9 @@ ${SHELL_JS}
     }
     // defaults (omitted): filesystem "workspace" (scoped reads) + network "open".
 
-    // Working directory (the working-directory axis). Only send when non-blank —
-    // the server treats a blank value as unset (the agent works in its private
-    // session dir). An absolute path is required server-side; we send as-is.
-    var workspace = document.getElementById("spawn-workspace").value.trim();
+    // Working directory. Only send when non-blank — the server treats a blank value
+    // as unset (the agent works in its private session dir).
+    var workspace = document.getElementById("agent-workspace").value.trim();
     if (workspace) spec.workspace = workspace;
 
     var mounts = [];
@@ -643,80 +744,192 @@ ${SHELL_JS}
       mounts.push({ hostPath: host, mountPath: mount, mode: row.querySelector(".mt-mode").value });
     });
     if (mounts.length) spec.mounts = mounts;
-    // Backend selector — programmatic is the default; send the selected backend
-    // EXPLICITLY. Programmatic could be omitted (it's now the server default for a
-    // new request), but interactive MUST be passed explicitly to opt out of that
-    // default, so send the value either way for clarity.
+
+    // Backend — programmatic is the default; send the selected backend EXPLICITLY.
     spec.backend = backendMode.value === "interactive" ? "interactive" : "programmatic";
-    // System prompt (the channel's role). Only send when non-blank — the server
-    // treats a blank prompt as unset (CC's default, untouched). The mode rides
-    // along so append (default) vs replace is the operator's choice.
-    var sysPrompt = document.getElementById("spawn-system-prompt").value.trim();
+
+    // System prompt (the agent's role). Only send when non-blank.
+    var sysPrompt = document.getElementById("agent-system-prompt").value.trim();
     if (sysPrompt) {
       spec.systemPrompt = sysPrompt;
-      spec.systemPromptMode = document.getElementById("spawn-prompt-mode").value === "replace" ? "replace" : "append";
+      spec.systemPromptMode = document.getElementById("agent-prompt-mode").value === "replace" ? "replace" : "append";
     }
     return spec;
   }
 
-  document.getElementById("spawn-go").addEventListener("click", function () {
-    var msg = document.getElementById("spawn-msg");
-    clearMsg(msg);
-    var spec;
-    try { spec = collectSpec(); } catch (e) { showMsg(msg, e.message, true); return; }
-    var btn = document.getElementById("spawn-go");
-    btn.disabled = true; btn.textContent = "Spawning…";
-    apiJson("/api/agents", { method: "POST", body: JSON.stringify(spec) }).then(function (r) {
-      var lines = [];
-      if (r.backend === "programmatic") {
-        // Programmatic spawn returns { name, channel, backend, workspace, alreadyRunning }.
-        lines.push((r.alreadyRunning ? "Re-registered" : "Registered") + " programmatic agent " + r.name + ".");
-        lines.push("channel: " + r.channel);
-        lines.push("workspace: " + r.workspace);
-        lines.push("No tmux session — inbound messages run on-demand claude -p turns; replies post back to the channel.");
-      } else if (r.alreadyRunning) {
-        lines.push("Session " + r.session + " is already running (no-op).");
-      } else {
-        lines.push("Launched " + r.session + ".");
-        lines.push("workspace: " + r.workspace);
-        if (r.tokens && r.tokens.length) {
-          lines.push("scopes:");
-          r.tokens.forEach(function (t) { lines.push("  " + t.resource + " → " + t.scope); });
+  // --- create-agent form: orchestration -----------------------------------
+  // ONE submit: (1) provision the channel if it doesn't already exist (reusing the
+  // shared ChannelProvision client — the SAME hub-mediated vault flow + daemon
+  // telegram/http-ui flow the Config page runs), then (2) POST /api/agents to spawn
+  // the agent on it, then (3) land in chat. Idempotent: an existing channel is
+  // REUSED (no error, no double-provision). A spawn failure after provisioning
+  // surfaces a clear error — the channel may remain (acceptable; retry or manage on
+  // Config).
+  function setCreating(on) {
+    var btn = document.getElementById("create-go");
+    btn.disabled = on;
+    btn.textContent = on ? "Creating…" : "Create agent";
+  }
+
+  // Provision the wake channel for a NEW-channel create. Returns a Promise resolving
+  // { ok:true } when the channel exists (created now or already present), else
+  // { ok:false, message }. Uses ChannelProvision throughout.
+  function ensureChannel(name, transport) {
+    // First, idempotency: does a channel with this name already exist? If so, REUSE
+    // it regardless of transport (don't double-provision, don't error).
+    return Provision.channelExists({ apiUrl: MOUNT + "/api/channels", token: window.__token, name: name })
+      .then(function (chk) {
+        if (chk.ok && chk.exists) {
+          return { ok: true, reused: true, transport: chk.transport };
         }
-        if (r.mcpServers && r.mcpServers.length) lines.push("MCP servers: " + r.mcpServers.join(", "));
-        lines.push("filesystem: " + (r.filesystem || "workspace") +
-          (r.filesystem === "full" ? " (reads whole disk)" : " (sandboxed to workspace)"));
-        lines.push("network: " + (r.network || "open") +
-          (r.network === "restricted" ? " (egress: " + ((r.egress || []).join(", ") || "base only") + ")" : " (full internet)"));
+        // If the existence check itself failed with auth (the channel:admin list
+        // 401/403'd), we can't know whether the channel already exists — so for the
+        // DAEMON transports we must NOT blindly re-POST (that could 409 a duplicate
+        // or overwrite an existing channel's config). Surface the auth error and let
+        // the operator sign in + retry; the idempotent reuse path needs a readable
+        // list. The VAULT path is exempt: it uses the hub session cookie (not this
+        // token), so a list 401 doesn't predict a hub-cookie failure — fall through
+        // and let provisionVaultChannel report its own auth state.
+        if (chk.auth && transport !== "vault") {
+          return { ok: false, message: "not signed in — the page needs a channel:admin token to check/create the channel (open it through the hub portal, signed in)." };
+        }
+        // Provision per transport:
+        if (transport === "vault") {
+          var vault = document.getElementById("agent-vault").value;
+          if (!vault) return { ok: false, message: "pick a vault for the new channel" };
+          return Provision.provisionVaultChannel({ origin: window.location.origin, name: name, vault: vault })
+            .then(function (res) {
+              if (res.ok) return { ok: true, connect: res.connect, connection: res.connection };
+              if (res.auth) return { ok: false, message: "not signed in to the hub — open this page through the hub portal (signed in) to provision a vault channel." };
+              if (res.forbidden) return { ok: false, message: "not permitted to link a vault: " + (res.error || "") };
+              return { ok: false, message: "vault channel provisioning failed: " + (res.error || "unknown error") };
+            });
+        }
+        if (transport === "telegram") {
+          var tgToken = document.getElementById("agent-telegram-token").value.trim();
+          if (!tgToken) return { ok: false, message: "a Telegram channel needs its own bot token (Advanced → Channel)" };
+          return Provision.provisionDaemonChannel({ apiUrl: MOUNT + "/api/channels", token: window.__token, name: name, transport: "telegram", config: { token: tgToken } })
+            .then(daemonProvisionResult);
+        }
+        // http-ui
+        return Provision.provisionDaemonChannel({ apiUrl: MOUNT + "/api/channels", token: window.__token, name: name, transport: "http-ui" })
+          .then(daemonProvisionResult);
+      });
+  }
+  function daemonProvisionResult(res) {
+    if (res.ok) return { ok: true, restart_needed: res.restart_needed, restart_error: res.error };
+    if (res.auth) return { ok: false, message: "not signed in — the page needs a channel:admin token (open it through the hub portal, signed in)." };
+    return { ok: false, message: "channel provisioning failed: " + (res.error || "unknown error") };
+  }
+
+  function createAgent() {
+    var msg = document.getElementById("create-msg");
+    clearMsg(msg);
+    var name = nameEl.value.trim();
+    if (!name) { showMsg(msg, "Enter an agent name.", true); return; }
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+      showMsg(msg, "Agent name: letters, numbers, dash, underscore only.", true);
+      return;
+    }
+
+    var existing = useExistingEl.value === "existing";
+    var transport = transportEl.value;
+    var wake;
+    var spec;
+    try {
+      wake = resolveWakeChannel(name);
+      spec = collectSpec(name, wake);
+    } catch (e) { showMsg(msg, e.message, true); return; }
+
+    setCreating(true);
+
+    // Step 1 — channel. Existing-channel mode skips provisioning entirely.
+    var channelStep = existing
+      ? Promise.resolve({ ok: true, reused: true })
+      : ensureChannel(wake, transport);
+
+    channelStep.then(function (chRes) {
+      if (!chRes.ok) {
+        showMsg(msg, chRes.message || "could not provision the channel.", true);
+        setCreating(false);
+        return;
       }
-      showMsg(msg, lines.join("\\n"), false);
-      loadAgents();
+      // Step 2 — spawn the agent (the SAME /api/agents body as before). On a
+      // post-provision spawn failure, surface a clear error (the channel may
+      // remain; that's acceptable — retry or manage it on Config).
+      return apiJson("/api/agents", { method: "POST", body: JSON.stringify(spec) }).then(function (r) {
+        var lines = [];
+        var prog = r.backend === "programmatic";
+        // On REUSE, name the existing channel's transport — it may differ from the
+        // one selected (the operator picked vault but a same-named telegram channel
+        // already existed). Reuse is intended (don't double-provision), but the
+        // transport divergence must be VISIBLE so it isn't a silent surprise.
+        var verb = chRes.reused
+          ? ("Reused existing channel" + (chRes.transport ? " (transport: " + chRes.transport + ")" : ""))
+          : "Provisioned channel";
+        lines.push(verb + " " + wake + (chRes.restart_needed ? " (restart needed: " + (chRes.restart_error || "") + ")" : "") + ".");
+        if (prog) {
+          lines.push((r.alreadyRunning ? "Re-registered" : "Created") + " programmatic agent " + r.name + ".");
+          lines.push("workspace: " + r.workspace);
+          lines.push("Opening chat…");
+        } else if (r.alreadyRunning) {
+          lines.push("Agent " + (r.session || r.name) + " is already running (no-op).");
+        } else {
+          // Interactive launch — surface the agent's SANDBOX POSTURE so the operator
+          // can verify the isolation matches what they selected (security-relevant).
+          lines.push("Launched " + (r.session || r.name) + " (interactive).");
+          lines.push("workspace: " + r.workspace);
+          if (r.tokens && r.tokens.length) {
+            lines.push("scopes:");
+            r.tokens.forEach(function (t) { lines.push("  " + t.resource + " → " + t.scope); });
+          }
+          if (r.mcpServers && r.mcpServers.length) lines.push("MCP servers: " + r.mcpServers.join(", "));
+          lines.push("filesystem: " + (r.filesystem || "workspace") +
+            (r.filesystem === "full" ? " (reads whole disk)" : " (sandboxed to workspace)"));
+          lines.push("network: " + (r.network || "open") +
+            (r.network === "restricted" ? " (egress: " + ((r.egress || []).join(", ") || "base only") + ")" : " (full internet)"));
+          lines.push("Open the agent's chat or attach via Terminal ↗ (Running agents, below).");
+        }
+        showMsg(msg, lines.join("\\n"), false);
+        loadAgents();
+        if (prog) {
+          // Step 3 (programmatic only) — land the operator in the agent's chat. A
+          // short beat so the success banner is visible, then navigate. INTERACTIVE
+          // agents are NOT auto-navigated: the sandbox-posture lines above + the
+          // Terminal-attach affordance stay on screen for the operator to verify.
+          setTimeout(function () { window.location.href = chatUrl(wake); }, 900);
+        } else {
+          setCreating(false);
+        }
+      }).catch(function (err) {
+        showMsg(msg,
+          "Channel is ready, but the agent spawn failed: " + err.message +
+          (existing ? "" : "\\nThe channel \\"" + wake + "\\" may remain — retry, or manage it on Config."),
+          true);
+        loadAgents();
+        setCreating(false);
+      });
     }).catch(function (err) {
-      showMsg(msg, "Spawn failed: " + err.message, true);
-    }).then(function () {
-      btn.disabled = false; btn.textContent = "Spawn agent";
+      showMsg(msg, "Create failed: " + (err && err.message ? err.message : String(err)), true);
+      setCreating(false);
     });
-  });
+  }
+  document.getElementById("create-go").addEventListener("click", createAgent);
 
   // --- running agents list ------------------------------------------------
   // The terminal attaches to an AGENT (its tmux session), so the link carries the
   // agent name as ?agent= (the terminal page also accepts the legacy ?channel=).
+  // Surfaced only for INTERACTIVE agents (programmatic has no tmux to attach).
   function terminalUrl(agent) { return MOUNT + "/terminal?agent=" + encodeURIComponent(agent); }
   // /api/agents returns { name, session, attached } — it does NOT carry the
-  // agent's wake channel(s). The default is one-agent-one-channel (the spawn form
-  // auto-names the agent after its wake channel), so the Chat link uses the agent
-  // name as the channel (?channel=<name>). When an agent was custom-named off its
-  // channel, the chat page still loads on its picker — no fabricated data.
+  // agent's wake channel(s). The default is one-agent-one-channel (the agent name
+  // IS its wake channel), so the Chat link uses the agent name as the channel.
   function chatUrl(channel) { return MOUNT + "/ui?channel=" + encodeURIComponent(channel); }
   // /health is OPEN (no token) and carries per-channel { mcp_sessions, clients }.
-  // The default is one-agent-one-channel (the agent name IS its wake channel), so we
-  // key live connection status by the agent name. An agent custom-named off its
-  // channel shows "—" (no fabricated data), which is honest.
   function fetchHealth() {
     return fetch(MOUNT + "/health").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
   }
   function connectionCell(h) {
-    // h is the channel's /health row ({ mcp_sessions, clients }) or undefined.
     if (!h) return "<span class='pill idle-conn' title='no matching channel in /health'>—</span>";
     var sessions = (typeof h.mcp_sessions === "number") ? h.mcp_sessions : 0;
     var clients = (typeof h.clients === "number") ? h.clients : 0;
@@ -736,8 +949,12 @@ ${SHELL_JS}
       }
       var host = document.getElementById("agents-table");
       var agents = j.agents || [];
+      // Reveal the Terminal nav link only when an INTERACTIVE agent exists (it's
+      // the only backend with a live terminal to attach). Programmatic-only → the
+      // standalone Terminal entry stays hidden (Phase-1 nav cleanup).
+      setTerminalNavVisible(agents.some(function (a) { return a.backend !== "programmatic"; }));
       if (!agents.length) {
-        host.innerHTML = "<div class='empty'>No agent sessions running. Spawn one above.</div>";
+        host.innerHTML = "<div class='empty'>No agents running. Create one above.</div>";
         return;
       }
       var rows = agents.map(function (a) {
@@ -756,9 +973,9 @@ ${SHELL_JS}
         var connCell = prog
           ? "<span class='pill connected'>● " + esc(a.status || "idle") + "</span>"
           : connectionCell(liveByChannel[a.name]);
-        // Actions: programmatic has no terminal to attach (no tmux). "restart" maps
-        // to a conversation reset server-side. Chat link still applies (the channel
-        // transcript shows its replies).
+        // Actions: programmatic has no terminal to attach (no tmux) — the terminal
+        // link is surfaced ONLY for interactive agents (Phase-1 cleanup). Chat link
+        // always applies (the channel transcript shows its replies).
         var actions = "<a href='" + esc(chatUrl(a.name)) + "'>chat →</a>";
         if (!prog) {
           actions += "<a href='" + esc(terminalUrl(a.name)) + "' target='_blank' rel='noopener'>terminal ↗</a>";
@@ -802,7 +1019,7 @@ ${SHELL_JS}
   function killAgent(name) {
     // name is a server-enforced slug (alphanumeric/dash/underscore, agents.ts), so
     // it carries no HTML/JS-special chars in the confirm string; encodeURI'd anyway.
-    if (!confirm("Kill agent " + name + "? This ends its tmux session.")) return;
+    if (!confirm("Kill agent " + name + "? This ends its session.")) return;
     apiJson("/api/agents/" + encodeURIComponent(name), { method: "DELETE" }).then(function () {
       loadAgents();
     }).catch(function (err) { alert("Kill failed: " + err.message); });
@@ -818,7 +1035,7 @@ ${SHELL_JS}
     var orig = btn ? btn.textContent : "";
     if (btn) { btn.disabled = true; btn.textContent = "restarting…"; }
     apiJson("/api/agents/" + encodeURIComponent(name) + "/restart", { method: "POST" }).then(function (r) {
-      var msg = document.getElementById("spawn-msg");
+      var msg = document.getElementById("create-msg");
       clearMsg(msg);
       showMsg(msg, "Restarted " + (r.session || (name + "-agent")) + " — env re-sourced, session reconnected.", false);
       loadAgents();
@@ -831,9 +1048,9 @@ ${SHELL_JS}
   document.getElementById("refresh").addEventListener("click", function () { loadAgents(); });
 
   // --- pickers: channels + vaults -----------------------------------------
-  // A ?channel=<name> query param (from a "Spawn agent" link on another surface)
-  // pre-selects that channel + auto-fills the agent name, so the form lands
-  // ready-to-go. Only honored when the channel actually exists in the list.
+  // A ?channel=<name> query param (from a "Create agent" link on another surface)
+  // pre-fills the agent name AND switches Advanced → Channel to that existing
+  // channel, so the form lands ready-to-go. Only honored when the channel exists.
   function requestedChannel() {
     try { return new URL(window.location.href).searchParams.get("channel") || ""; }
     catch (_e) { return ""; }
@@ -841,52 +1058,75 @@ ${SHELL_JS}
   function loadChannels() {
     return fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
       knownChannels = (cfg.channels || []).map(function (c) { return c.name; });
+      // Populate the Advanced "existing channel" picker.
       if (!knownChannels.length) {
-        // No channels configured: don't dead-end. Show a CTA to Config in the
-        // picker AND surface it on the spawn form (a channel is required first).
-        chanEl.innerHTML = "<option value=''>(no channels — add one in Config)</option>";
-        showMsg(document.getElementById("spawn-msg"),
-          "No channels configured yet — configure a channel first, then spawn an agent on it.", true);
-        var sm = document.getElementById("spawn-msg");
-        // Append a real link (showMsg uses textContent; add the link after it).
-        var a = document.createElement("a");
-        a.href = MOUNT + "/admin";
-        a.textContent = " Configure a channel first →";
-        a.style.display = "inline-block";
-        a.style.marginTop = "6px";
-        sm.appendChild(document.createElement("br"));
-        sm.appendChild(a);
-        return;
+        existingChannelEl.innerHTML = "<option value=''>(no channels yet)</option>";
+      } else {
+        existingChannelEl.innerHTML = channelOptions(knownChannels[0]);
       }
+      // If arrived with ?channel=<name> for an EXISTING channel, pre-fill the name +
+      // switch to the existing-channel path (the deep-link from Config/Home/Chat).
       var want = requestedChannel();
-      var pre = (want && knownChannels.indexOf(want) >= 0) ? want : knownChannels[0];
-      chanEl.innerHTML = channelOptions(pre);
-      if (!nameEdited) nameEl.value = pre;
+      if (want && knownChannels.indexOf(want) >= 0) {
+        if (!nameEl.value) nameEl.value = want;
+        useExistingEl.value = "existing";
+        existingChannelEl.value = want;
+        syncChannelSource();
+      }
     }).catch(function () {
-      chanEl.innerHTML = "<option value=''>(channel list failed)</option>";
+      existingChannelEl.innerHTML = "<option value=''>(channel list failed)</option>";
     });
   }
-  function loadVaults() {
+  // The DEFAULT Vault picker (the primary create flow) reads the hub's PUBLIC
+  // discovery doc via ChannelProvision.listVaults. Per the blueprint: auto-select
+  // when exactly one vault exists (no real choice — it's pre-chosen); with several,
+  // the first is the default but the operator picks. Either way the FIRST option is
+  // selected (a <select> defaults to its first option regardless); the explicit
+  // selected attribute on index 0 just makes that intent visible in the markup.
+  function loadDefaultVaults() {
+    return Provision.listVaults({ origin: window.location.origin }).then(function (res) {
+      var sel = document.getElementById("agent-vault");
+      var vaults = (res && res.ok && res.vaults) ? res.vaults : [];
+      if (!vaults.length) {
+        sel.innerHTML = "<option value=''>(no vaults — create one in the hub portal)</option>";
+        return;
+      }
+      sel.innerHTML = vaults.map(function (v, i) {
+        return "<option value='" + esc(v) + "'" + (i === 0 ? " selected" : "") + ">" + esc(v) + "</option>";
+      }).join("");
+    }).catch(function () {
+      document.getElementById("agent-vault").innerHTML = "<option value=''>(could not load vaults)</option>";
+    });
+  }
+  // The Advanced vault-BINDING picker (the agent's own vault scope) reads the
+  // daemon's installed-vaults endpoint (channel:admin). Distinct from the channel's
+  // backing vault — this is the vault the agent itself reads/writes.
+  function loadBindingVaults() {
     return apiJson("/api/vaults").then(function (j) {
       var vaults = j.vaults || [];
       var sel = document.getElementById("vault-name");
-      sel.innerHTML = "<option value=''>(no vault)</option>" +
+      sel.innerHTML = "<option value=''>(channel's vault)</option>" +
         vaults.map(function (v) { return "<option value='" + esc(v) + "'>" + esc(v) + "</option>"; }).join("");
-    }).catch(function () { /* leave the (no vault) default */ });
+    }).catch(function () { /* leave the (channel's vault) default */ });
   }
 
   // --- boot ---------------------------------------------------------------
   setStatus("authenticating…");
   fetchToken().then(function () {
     setStatus("● ready", "live");
-    return Promise.all([loadChannels(), loadVaults(), loadCreds(), loadEnv(), loadAgents()]);
+    return Promise.all([loadChannels(), loadDefaultVaults(), loadBindingVaults(), loadCreds(), loadEnv(), loadAgents()]);
   }).then(function () {
     setInterval(loadAgents, 5000);
   }).catch(function (err) {
     setStatus("not authenticated", "err");
-    showMsg(document.getElementById("spawn-msg"),
+    // Even unauthenticated, the public vault picker + channel list can load (the
+    // vault provisioning path uses the hub cookie). Surface the auth note but still
+    // populate what we can so the form isn't a dead-end.
+    loadChannels();
+    loadDefaultVaults();
+    showMsg(document.getElementById("create-msg"),
       "Open this page through the hub portal, signed in as the operator. " +
-      "The agents surface needs a channel:admin token (" + err.message + ").", true);
+      "Creating an agent needs a channel:admin token (" + err.message + ").", true);
   });
 })();
 </script>

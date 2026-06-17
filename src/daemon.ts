@@ -840,6 +840,10 @@ ${SHELL_JS}
   var turnEs = null;
   var liveTurn = null; // { el, textEl, toolsEl, toolNames:{}, statusEl } | null
   wireShell("chat");
+  // Reveal the Terminal nav entry if a live interactive agent exists (the chat page
+  // doesn't otherwise list agents, so without this it would strand a user who wants
+  // to attach to their live session). Best-effort; default-hidden on failure.
+  revealTerminalNavIfInteractive();
 
   function transportFor(ch) { return channelTransports[ch] || ""; }
   function isVault(ch) { return transportFor(ch) === "vault"; }

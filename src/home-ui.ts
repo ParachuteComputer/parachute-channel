@@ -78,7 +78,12 @@ ${THEME_CSS}
   <main class="page">
     <div class="page-head">
       <h1>Home</h1>
-      <p class="subtitle">Your channels and the agents running on them.</p>
+      <p class="subtitle">Configure an agent, then talk to it. Below: your agents and the channels they run on.</p>
+    </div>
+
+    <div class="quick-actions" style="margin: 0 0 1.5rem;">
+      <a id="qa-create" class="btn btn-primary" href="#">Create an agent</a>
+      <a id="qa-chat-top" class="btn" href="#">Open chat</a>
     </div>
 
     <div class="overview-grid">
@@ -103,14 +108,14 @@ ${THEME_CSS}
         <div id="agents-list" class="ov-list">
           <div class="ov-empty">Loading agents…</div>
         </div>
-        <p class="card-foot"><a id="agents-spawn" href="#">Spawn an agent →</a></p>
+        <p class="card-foot"><a id="agents-spawn" href="#">Create an agent →</a></p>
       </section>
     </div>
 
     <div class="quick-actions">
-      <a id="qa-spawn" class="btn btn-primary" href="#">Spawn agent</a>
+      <a id="qa-create-2" class="btn btn-primary" href="#">Create an agent</a>
       <a id="qa-chat" class="btn" href="#">Open chat</a>
-      <a id="qa-config" class="btn" href="#">Configure</a>
+      <a id="qa-config" class="btn" href="#">Manage channels</a>
       <span class="spacer"></span>
       <button id="refresh" class="btn btn-sm" type="button">Refresh</button>
     </div>
@@ -129,11 +134,15 @@ ${SHELL_JS}
   var agentsList = document.getElementById("agents-list");
   var agentsCount = document.getElementById("agents-count");
 
-  // Static cross-surface links (resolved under the runtime mount prefix).
+  // Static cross-surface links (resolved under the runtime mount prefix). The
+  // landing leads with "Create an agent" (→ /agents, the unified create flow);
+  // channel management stays reachable as a secondary "Manage channels" link.
   function wireLinks() {
     document.getElementById("channels-config").href = MOUNT + "/admin";
     document.getElementById("agents-spawn").href = MOUNT + "/agents";
-    document.getElementById("qa-spawn").href = MOUNT + "/agents";
+    document.getElementById("qa-create").href = MOUNT + "/agents";
+    document.getElementById("qa-create-2").href = MOUNT + "/agents";
+    document.getElementById("qa-chat-top").href = MOUNT + "/ui";
     document.getElementById("qa-chat").href = MOUNT + "/ui";
     document.getElementById("qa-config").href = MOUNT + "/admin";
   }
@@ -175,7 +184,7 @@ ${SHELL_JS}
             "<span class='spacer'></span>" +
             clients +
             "<span class='links'>" +
-              "<a href='" + esc(spawnUrl(c.name)) + "'>spawn →</a>" +
+              "<a href='" + esc(spawnUrl(c.name)) + "'>create agent →</a>" +
               "<a href='" + esc(chatUrl(c.name)) + "'>chat →</a>" +
             "</span>" +
           "</div>";
@@ -194,21 +203,31 @@ ${SHELL_JS}
       .then(function (j) {
         var agents = j.agents || [];
         agentsCount.textContent = agents.length ? String(agents.length) : "";
+        // Reveal the Terminal nav entry only when an INTERACTIVE agent exists — it's
+        // the only backend with a live terminal to attach (Phase-1 nav cleanup).
+        setTerminalNavVisible(agents.some(function (a) { return a.backend !== "programmatic"; }));
         if (!agents.length) {
           agentsList.innerHTML = "<div class='ov-empty'>No agents running — " +
-            "<a href='" + MOUNT + "/agents'>Spawn one →</a></div>";
+            "<a href='" + MOUNT + "/agents'>Create one →</a></div>";
           return;
         }
         agentsList.innerHTML = agents.map(function (a) {
-          var state = a.attached
-            ? "<span class='pill attached'>attached</span>"
-            : "<span class='pill'>running</span>";
+          // Programmatic agents have no tmux session — show their turn status, not
+          // an "attached" pill, and drop the dead terminal link. Interactive agents
+          // keep the terminal link (a live session you can attach to).
+          var prog = a.backend === "programmatic";
+          var state = prog
+            ? "<span class='pill'>" + esc(a.status || "idle") + "</span>"
+            : (a.attached ? "<span class='pill attached'>attached</span>" : "<span class='pill'>running</span>");
+          var termLink = prog
+            ? ""
+            : "<a href='" + esc(terminalUrl(a.name)) + "'>terminal →</a>";
           return "<div class='ov-row'>" +
             "<span class='name'>" + esc(a.name) + "</span>" +
             state +
             "<span class='spacer'></span>" +
             "<span class='links'>" +
-              "<a href='" + esc(terminalUrl(a.name)) + "'>terminal →</a>" +
+              termLink +
               "<a href='" + esc(chatUrl(a.name)) + "'>chat →</a>" +
             "</span>" +
           "</div>";

@@ -182,6 +182,14 @@ describe("UI-facing + discovery endpoints stay open (no token, 200)", () => {
     expect(res.headers.get("content-type")).toContain("text/html");
   });
 
+  test("GET /ui reveals the Terminal nav if an interactive agent exists (no stranding)", async () => {
+    // Phase-1 terminal-nav cleanup hides the standalone Terminal entry by default;
+    // the chat page doesn't list agents, so it must call the shared reveal helper or
+    // it would strand an operator with a live interactive session.
+    const body = await (await fetch(`${base}/ui`)).text();
+    expect(body).toContain("revealTerminalNavIfInteractive()");
+  });
+
   test("GET /home → 200 (html) — the overview landing (uiUrl points here)", async () => {
     const res = await fetch(`${base}/home`);
     expect(res.status).toBe(200);

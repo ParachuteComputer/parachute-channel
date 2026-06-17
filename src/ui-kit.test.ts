@@ -65,12 +65,22 @@ describe("THEME_CSS", () => {
 
 describe("SHELL_JS", () => {
   test("provides MOUNT derivation, nav wiring, token fetch, and helpers", () => {
-    for (const sym of ["var MOUNT", "function wireShell", "function escapeHtml", "function setStatus", "function fetchToken", "function authedFetch"]) {
+    for (const sym of ["var MOUNT", "function wireShell", "function escapeHtml", "function setStatus", "function fetchToken", "function authedFetch", "function setTerminalNavVisible"]) {
       expect(SHELL_JS).toContain(sym);
     }
     // It hits the hub channel-token endpoint with the operator cookie.
     expect(SHELL_JS).toContain("/admin/channel-token");
     expect(SHELL_JS).toContain('credentials: "include"');
+  });
+
+  // Terminal-nav cleanup (Parachute Agent Phase 1): wireShell hides the standalone
+  // Terminal nav entry by default (programmatic backend has no terminal); pages
+  // reveal it via setTerminalNavVisible when an interactive agent exists. The
+  // Terminal page itself (active === "terminal") shows it.
+  test("wireShell gates the Terminal nav link via setTerminalNavVisible", () => {
+    expect(SHELL_JS).toContain('a[data-view="terminal"]');
+    // wireShell defaults the terminal entry to its own-page-only visibility.
+    expect(SHELL_JS).toContain('setTerminalNavVisible(active === "terminal")');
   });
   test("is safe to interpolate — no naked backtick that could break a host literal", () => {
     expect(SHELL_JS.includes("`")).toBe(false);

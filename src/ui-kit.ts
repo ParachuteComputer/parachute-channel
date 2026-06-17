@@ -273,6 +273,38 @@ export const SHELL_JS = `
       if (v === active) links[i].classList.add("active");
       else links[i].classList.remove("active");
     }
+    // Terminal-nav cleanup (Parachute Agent Phase 1): programmatic is the default
+    // backend, which has no live terminal — so the standalone Terminal nav entry is
+    // HIDDEN by default. It's only meaningful when an INTERACTIVE agent exists.
+    // Pages that know the interactive-agent count call setTerminalNavVisible(true)
+    // to reveal it; the Terminal page itself reveals it (you're already on it). The
+    // /terminal ROUTE + page stay fully functional regardless — only the nav chrome
+    // is gated, never the capability.
+    setTerminalNavVisible(active === "terminal");
+  }
+  // Show/hide the standalone Terminal nav link. Default hidden (see wireShell);
+  // a page reveals it once it learns an interactive agent is running. Idempotent.
+  function setTerminalNavVisible(show) {
+    var link = document.querySelector('.app-nav a[data-view="terminal"]');
+    if (link) link.style.display = show ? "" : "none";
+  }
+  // Reveal the Terminal nav entry IFF ≥1 interactive agent is running. Pages that
+  // don't otherwise list agents (chat, config) call this on boot so they don't
+  // STRAND an operator who has a live interactive session: GET /api/agents
+  // (channel:admin via authedFetch) and reveal when any agent's backend isn't
+  // programmatic. Best-effort + never throws — a failed/401 fetch leaves the
+  // default-hidden state (the /terminal route still works regardless). The agents
+  // + home pages drive the link directly from their own list and don't need this.
+  function revealTerminalNavIfInteractive() {
+    return authedFetch(MOUNT + "/api/agents")
+      .then(function (r) { return r && r.ok ? r.json() : null; })
+      .then(function (j) {
+        var agents = (j && j.agents) || [];
+        if (agents.some(function (a) { return a.backend !== "programmatic"; })) {
+          setTerminalNavVisible(true);
+        }
+      })
+      .catch(function () { /* leave default-hidden */ });
   }
   function escapeHtml(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");

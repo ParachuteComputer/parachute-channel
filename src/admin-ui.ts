@@ -66,6 +66,7 @@
  */
 
 import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
+import { PROVISION_JS } from "./provision-channel.ts";
 
 const PALETTE = {
   bg: "#faf8f4",
@@ -258,7 +259,7 @@ export function renderAdminPage(mount = ""): string {
       }
     })();
   </script>
-  <script>${SHELL_JS}${PAGE_SCRIPT}</script>
+  <script>${SHELL_JS}${PROVISION_JS}${PAGE_SCRIPT}</script>
 </body>
 </html>`;
 }
@@ -650,7 +651,7 @@ const PAGE_SCRIPT = String.raw`
       var spawn = document.createElement("a");
       spawn.className = "btn btn-sm btn-ghost";
       spawn.href = MOUNT + "/agents?channel=" + encodeURIComponent(c.name);
-      spawn.textContent = "Spawn agent";
+      spawn.textContent = "Create agent";
       actions.appendChild(spawn);
       var chat = document.createElement("a");
       chat.className = "btn btn-sm btn-ghost";
@@ -751,40 +752,37 @@ const PAGE_SCRIPT = String.raw`
     btn.disabled = true;
     var prev = btn.textContent;
     btn.textContent = "Adding...";
-    var postBody = { name: name, transport: transport };
-    if (config) postBody.config = config;
-    fetch(API_URL, {
-      method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify(postBody),
+    // Provision via the SHARED provisioning client (ChannelProvision). It POSTs
+    // <mount>/api/channels (channel:admin Bearer) and resolves a structured result;
+    // never rejects. Same code the create-agent flow runs for telegram/http-ui.
+    ChannelProvision.provisionDaemonChannel({
+      apiUrl: API_URL, token: window.__token, name: name, transport: transport, config: config,
     }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (payload) {
-        if (res.status === 401 || res.status === 403) { noAuthBanner(); return; }
+      if (res.auth) { noAuthBanner(); return; }
+      if (!res.ok) {
+        // Preserve the request-rejection (400) vs infrastructure-failure wording —
+        // provisionDaemonChannel carries the status so we keep the distinction.
         if (res.status === 400) {
-          setBanner("error", "<strong>Could not add channel.</strong> " + escapeHtml((payload && payload.error) || "invalid request"));
-          return;
-        }
-        if (!res.ok) {
-          setBanner("error", "<strong>Add failed.</strong> " + escapeHtml((payload && payload.error) || ("HTTP " + res.status)));
-          return;
-        }
-        // 200 may still carry restart_needed: true (persisted, hot-add failed).
-        if (payload && payload.restart_needed) {
-          setBanner(
-            "warn",
-            "<strong>Saved &mdash; restart needed.</strong> Channel <code>" + escapeHtml(name) +
-              "</code> was written to disk but didn't start live: " + escapeHtml(payload.error || "") +
-              " Run <code>parachute restart channel</code>."
-          );
+          setBanner("error", "<strong>Could not add channel.</strong> " + escapeHtml(res.error || "invalid request"));
         } else {
-          setBanner("success", "<strong>Channel added.</strong> <code>" + escapeHtml(name) + "</code> (" + escapeHtml(transport) + ") is live.");
+          setBanner("error", "<strong>Add failed.</strong> " + escapeHtml(res.error || ("HTTP " + (res.status || "?"))));
         }
-        el("f-name").value = "";
-        if (el("f-telegram-token")) el("f-telegram-token").value = "";
-        loadChannels();
-      });
-    }).catch(function (err) {
-      setBanner("error", "<strong>Network error.</strong> " + escapeHtml(err && err.message ? err.message : String(err)));
+        return;
+      }
+      // A successful add may still carry restart_needed (persisted, hot-add failed).
+      if (res.restart_needed) {
+        setBanner(
+          "warn",
+          "<strong>Saved &mdash; restart needed.</strong> Channel <code>" + escapeHtml(name) +
+            "</code> was written to disk but didn't start live: " + escapeHtml(res.error || "") +
+            " Run <code>parachute restart channel</code>."
+        );
+      } else {
+        setBanner("success", "<strong>Channel added.</strong> <code>" + escapeHtml(name) + "</code> (" + escapeHtml(transport) + ") is live.");
+      }
+      el("f-name").value = "";
+      if (el("f-telegram-token")) el("f-telegram-token").value = "";
+      loadChannels();
     }).then(function () {
       btn.disabled = false;
       btn.textContent = prev;
@@ -1056,16 +1054,27 @@ const PAGE_SCRIPT = String.raw`
   // transport is selected); a no-vaults / load-error state disables the add
   // button only WHILE vault is the selected transport (see applyTransportUI).
   window.__vaultsAvailable = false;
+  // Populate the vault dropdown via the shared provisioning client
+  // (ChannelProvision.listVaults — the hub's PUBLIC discovery doc). The fetch is
+  // shared with the create-agent flow so the two surfaces read vaults identically;
+  // the admin page keeps its own DOM rendering + __vaultsAvailable gate.
   function loadVaults() {
-    return fetch(window.location.origin + "/.well-known/parachute.json", {
-      headers: { accept: "application/json" },
-      credentials: "include",
-    })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (doc) {
+    return ChannelProvision.listVaults({ origin: window.location.origin })
+      .then(function (res) {
         var sel = el("f-vault");
-        var vaults = (doc && Array.isArray(doc.vaults)) ? doc.vaults : [];
+        var vaults = (res && res.ok && Array.isArray(res.vaults)) ? res.vaults : [];
         sel.innerHTML = "";
+        if (!res || !res.ok) {
+          var optErr = document.createElement("option");
+          optErr.value = "";
+          optErr.disabled = true;
+          optErr.selected = true;
+          optErr.textContent = "Could not load vaults";
+          sel.appendChild(optErr);
+          window.__vaultsAvailable = false;
+          applyTransportUI();
+          return;
+        }
         if (!vaults.length) {
           var opt = document.createElement("option");
           opt.value = "";
@@ -1079,26 +1088,14 @@ const PAGE_SCRIPT = String.raw`
           applyTransportUI();
           return;
         }
-        vaults.forEach(function (v, i) {
+        vaults.forEach(function (name, i) {
           var opt = document.createElement("option");
-          opt.value = v.name;
-          opt.textContent = v.name;
+          opt.value = name;
+          opt.textContent = name;
           if (i === 0) opt.selected = true;
           sel.appendChild(opt);
         });
         window.__vaultsAvailable = true;
-        applyTransportUI();
-      })
-      .catch(function () {
-        var sel = el("f-vault");
-        sel.innerHTML = "";
-        var opt = document.createElement("option");
-        opt.value = "";
-        opt.disabled = true;
-        opt.selected = true;
-        opt.textContent = "Could not load vaults";
-        sel.appendChild(opt);
-        window.__vaultsAvailable = false;
         applyTransportUI();
       });
   }
@@ -1147,34 +1144,16 @@ const PAGE_SCRIPT = String.raw`
     btn.disabled = true;
     var prev = btn.textContent;
     btn.textContent = "Linking...";
-    // POST to the HUB's general Connections engine. The page is same-origin
-    // under the /channel proxy, so the operator's hub session cookie flows with
-    // credentials:"include" -- the click IS the approval. We label provenance
-    // requestedBy:"channel" so the hub's Connections view shows it as
-    // module-initiated. The body is the canonical vault-backed-channel shape:
-    // vault.note.created (filtered to the inbound tag) -> channel.message.deliver.
-    var body = {
-      requestedBy: "channel",
-      source: {
-        module: "vault",
-        vault: vault,
-        event: "note.created",
-        filter: {
-          tags: ["#channel-message/inbound"],
-          has_metadata: ["channel"],
-          missing_metadata: ["channel_inbound_rendered_at"]
-        }
-      },
-      sink: { module: "channel", action: "message.deliver", params: { channel: name } }
-    };
-    fetch(window.location.origin + "/admin/connections", {
-      method: "POST",
-      credentials: "include",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(body)
-    }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (payload) {
-        if (res.status === 401) {
+    // Provision via the SHARED provisioning client (ChannelProvision —
+    // src/provision-channel.ts). It POSTs the canonical vault-backed-channel body
+    // (vault.note.created filtered to the inbound tag -> channel.message.deliver)
+    // to the HUB's Connections engine with the operator's hub session cookie
+    // (credentials:"include" -- the click IS the approval). Same code the
+    // create-agent flow runs, so the two surfaces register identical triggers.
+    // Resolves a structured result; never rejects -- the page owns the banners.
+    ChannelProvision.provisionVaultChannel({ origin: window.location.origin, name: name, vault: vault })
+      .then(function (res) {
+        if (res.auth) {
           setBanner(
             "warn",
             "<strong>Not signed in to the hub.</strong> Linking a vault uses your hub admin session. " +
@@ -1183,33 +1162,30 @@ const PAGE_SCRIPT = String.raw`
           );
           return;
         }
-        if (res.status === 403) {
+        if (res.forbidden) {
           setBanner(
             "error",
             "<strong>Not permitted.</strong> Only the hub admin can link a vault. " +
-              escapeHtml((payload && payload.error_description) || "")
+              escapeHtml(res.error || "")
           );
           return;
         }
         if (!res.ok) {
           setBanner(
             "error",
-            "<strong>Link failed.</strong> " +
-              escapeHtml((payload && (payload.error_description || payload.error)) || ("HTTP " + res.status))
+            "<strong>Link failed.</strong> " + escapeHtml(res.error || ("HTTP " + (res.status || "?")))
           );
           return;
         }
         setBanner("success", "<strong>Vault linked.</strong> Channel <code>" + escapeHtml(name) + "</code> is backed by vault <code>" + escapeHtml(vault) + "</code>.");
-        renderConnectResult(payload && payload.connection, payload && payload.connect);
+        renderConnectResult(res.connection, res.connect);
         el("f-name").value = "";
         loadChannels();
+      })
+      .then(function () {
+        btn.disabled = false;
+        btn.textContent = prev;
       });
-    }).catch(function (err) {
-      setBanner("error", "<strong>Network error.</strong> " + escapeHtml(err && err.message ? err.message : String(err)));
-    }).then(function () {
-      btn.disabled = false;
-      btn.textContent = prev;
-    });
   }
 
   document.addEventListener("DOMContentLoaded", function () {
@@ -1223,7 +1199,13 @@ const PAGE_SCRIPT = String.raw`
     // list. A token failure still proceeds to loadChannels -- which surfaces the
     // no-auth banner on the resulting 401, so the operator sees one clear notice.
     // The vault dropdown loads in parallel (public discovery doc, no token).
-    ensureToken().then(loadChannels);
+    ensureToken().then(function () {
+      loadChannels();
+      // Reveal the Terminal nav entry if a live interactive agent exists (the config
+      // page doesn't list agents, so without this it would strand a user with a live
+      // interactive session). Best-effort; default-hidden on failure.
+      revealTerminalNavIfInteractive();
+    });
     loadVaults();
   });
 `;

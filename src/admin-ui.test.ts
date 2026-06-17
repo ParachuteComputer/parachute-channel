@@ -138,20 +138,30 @@ describe("unified transport select drives fields + submit path", () => {
     expect(html).toContain('el("f-telegram-token").value');
     expect(html).toContain("config = { token: tgToken }");
     expect(html).toContain('setFieldError("f-telegram-token"');
-    // The POST body carries config when present.
-    expect(html).toContain("if (config) postBody.config = config;");
+    // The daemon-transport submit goes through the SHARED provisioning client
+    // (ChannelProvision.provisionDaemonChannel — src/provision-channel.ts), which
+    // attaches config when present. The page hands it the assembled config.
+    expect(html).toContain("ChannelProvision.provisionDaemonChannel");
+    // provisionDaemonChannel builds the POST body (name + transport + optional
+    // config) internally; the shared client carries config only when given.
+    expect(html).toContain("if (opts.config) postBody.config = opts.config;");
     expect(html).toContain('method: "POST"');
   });
 
   test("the http-ui transport posts just name + transport (no config)", () => {
     const html = renderAdminPage("");
-    // The base POST body is name + transport; config is only attached for telegram.
-    expect(html).toContain("var postBody = { name: name, transport: transport };");
+    // The shared provisioning client's base POST body is name + transport; config
+    // is only attached when the caller supplies it (telegram). http-ui passes no
+    // config, so the body stays name + transport.
+    expect(html).toContain("var postBody = { name: opts.name, transport: opts.transport };");
   });
 
   test("loads the vault list from the hub's public discovery doc (same-origin)", () => {
     const html = renderAdminPage("");
+    // loadVaults delegates the fetch to the shared ChannelProvision.listVaults,
+    // which reads the hub's public discovery doc.
     expect(html).toContain("function loadVaults");
+    expect(html).toContain("ChannelProvision.listVaults");
     expect(html).toContain("/.well-known/parachute.json");
   });
 
@@ -167,6 +177,22 @@ describe("unified transport select drives fields + submit path", () => {
     // The vault submit handler distinguishes 401 (not signed in to the hub) from
     // other failures with a specific, actionable banner.
     expect(html).toContain("Not signed in to the hub");
+  });
+
+  test("reveals the Terminal nav if an interactive agent exists (no stranding)", () => {
+    const html = renderAdminPage("");
+    // The config page hides the standalone Terminal entry by default (Phase-1 nav
+    // cleanup) but doesn't list agents — so it calls the shared reveal helper to
+    // avoid stranding an operator who has a live interactive session.
+    expect(html).toContain("revealTerminalNavIfInteractive()");
+  });
+
+  test("preserves the 400-vs-other add-channel banner distinction", () => {
+    const html = renderAdminPage("");
+    // Even after routing through the shared provisioning client, a request
+    // rejection (400) keeps its distinct copy from an infrastructure failure.
+    expect(html).toContain("Could not add channel");
+    expect(html).toContain("Add failed");
   });
 });
 

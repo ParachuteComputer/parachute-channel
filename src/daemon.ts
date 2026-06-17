@@ -1036,6 +1036,9 @@ ${SHELL_JS}
   // we don't duplicate the refresh dance here (the live view is best-effort progress).
   function connectTurnEvents(ch) {
     if (turnEs) { turnEs.close(); turnEs = null; }
+    // Live turn streaming is for programmatic agents, which are always vault-transport
+    // channels today; gate the EventSource subscription on that. (The server-side SSE
+    // is transport-agnostic, so revisit if programmatic ever runs on a non-vault channel.)
     if (!ch || !isVault(ch)) return;
     var url = MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/turn-events";
     if (window.__token) url += "?token=" + encodeURIComponent(window.__token);
@@ -2468,7 +2471,11 @@ export function createFetchHandler(
     {
       const turnMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/turn-events$/);
       if (req.method === "GET" && turnMatch) {
-        const denied = await requireScope(req, url, SCOPE_READ);
+        // allowQueryParam=true: this SSE is consumed by a browser EventSource, which
+        // cannot set an Authorization header — it authenticates via ?token=. Without
+        // this the live-streaming view 401s in the browser and never connects. (The
+        // stdio-bridge /events SSE uses a Bearer header, so it doesn't need this.)
+        const denied = await requireScope(req, url, SCOPE_READ, true);
         if (denied) return denied;
         const channelName = decodeURIComponent(turnMatch[1]!);
         const clientId = crypto.randomUUID();

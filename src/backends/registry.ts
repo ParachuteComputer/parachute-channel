@@ -364,15 +364,24 @@ export class ProgrammaticAgentRegistry {
         try {
           await this.writeOutbound(channel, result.reply, msg.inReplyTo);
         } catch (err) {
+          const reason = (err as Error).message;
           console.error(
-            `parachute-channel: programmatic outbound write for channel "${channel}" failed: ${(err as Error).message}`,
+            `parachute-channel: programmatic outbound write for channel "${channel}" failed: ${reason}`,
           );
+          // The reply was produced but NOT persisted. Resolve the live view to ERROR,
+          // not `done` — a `done` would drop the in-progress bubble and trigger a poll
+          // that finds no note, leaving the user with a silently vanished reply.
+          // (reviewer nit, PR #83)
+          this.emitTurnEvent(channel, { kind: "error", error: `reply produced but not saved: ${reason}` });
+          continue;
         }
       }
 
       // Resolve the live view: `done` carries the final reply text (empty when the
       // turn produced none) so the UI finalizes the in-progress bubble — the durable
       // note (written above) is what actually persists; this just ends the spinner.
+      // Reached only when the outbound write SUCCEEDED, or there was no reply to write
+      // (empty/tool-only turn → clean resolve, no note expected).
       this.emitTurnEvent(channel, { kind: "done", reply: result.reply ?? "" });
     }
   }

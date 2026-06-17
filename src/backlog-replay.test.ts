@@ -494,3 +494,48 @@ describe("end-to-end deaf window", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// turn-events SSE auth — a browser EventSource cannot send an Authorization
+// header, so the live-streaming SSE MUST authenticate via ?token=. Regression
+// guard for the allowQueryParam bug: the handler defaulted to header-only, which
+// 401'd every browser EventSource connection → the live view never opened.
+// ---------------------------------------------------------------------------
+
+describe("turn-events SSE authenticates via ?token= (browser EventSource has no Bearer)", () => {
+  test("GET /api/channels/<ch>/turn-events?token= with NO Authorization header → 200 text/event-stream", async () => {
+    const ds = new DeliveryState({ stateDir, defaultMark: "2026-01-01T00:00:00.000Z" });
+    const t = stubVault("eng", []);
+    const channels = vaultChannels("eng", t);
+    const handler = createFetchHandler(channels, new ClientRegistry(), { deliveryState: ds });
+    const srv = Bun.serve({ port: 0, hostname: "127.0.0.1", idleTimeout: 0, fetch: handler });
+    const base = `http://127.0.0.1:${srv.port}`;
+    try {
+      // NO `headers: auth` — only the query-param token, exactly as a browser
+      // EventSource sends it. Without allowQueryParam=true on the handler this 401s.
+      const res = await fetch(`${base}/api/channels/eng/turn-events?token=${RW_TOKEN}`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+      const reader = res.body!.getReader();
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toContain(": connected");
+      await reader.cancel();
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("turn-events with neither Authorization header nor ?token= → 401", async () => {
+    const ds = new DeliveryState({ stateDir, defaultMark: "2026-01-01T00:00:00.000Z" });
+    const channels = vaultChannels("eng", stubVault("eng", []));
+    const handler = createFetchHandler(channels, new ClientRegistry(), { deliveryState: ds });
+    const srv = Bun.serve({ port: 0, hostname: "127.0.0.1", idleTimeout: 0, fetch: handler });
+    const base = `http://127.0.0.1:${srv.port}`;
+    try {
+      const res = await fetch(`${base}/api/channels/eng/turn-events`);
+      expect(res.status).toBe(401);
+    } finally {
+      srv.stop(true);
+    }
+  });
+});

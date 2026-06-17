@@ -101,6 +101,7 @@ import {
 import {
   ProgrammaticAgentRegistry,
   type WriteOutbound,
+  type TurnEventSink,
 } from "./backends/registry.ts";
 import { AgentSessionState } from "./agent-session-state.ts";
 import { readPersistedSpec, interpretPersistedBackend, sessionWorkspace } from "./spawn-agent.ts";
@@ -512,6 +513,7 @@ export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutboun
  */
 export function createDefaultProgrammaticRegistry(
   channels: Map<string, Channel>,
+  onTurnEvent?: TurnEventSink,
 ): ProgrammaticAgentRegistry {
   const stateDir = defaultStateDir();
   const sessionState = new AgentSessionState({ stateDir });
@@ -548,7 +550,36 @@ export function createDefaultProgrammaticRegistry(
   return new ProgrammaticAgentRegistry({
     backend,
     writeOutbound: buildWriteOutbound(channels),
+    ...(onTurnEvent ? { onTurnEvent } : {}),
   });
+}
+
+/**
+ * Build the {@link TurnEventSink} that pushes a programmatic turn's live progress
+ * (interim assistant text + tool_use, plus the registry's done/error lifecycle
+ * events) to the channel's turn-event SSE subscribers — the chat UI's "watch it
+ * work" view (design 2026-06-16 build item #1).
+ *
+ * Transport choice (documented in the PR): a DEDICATED per-channel SSE stream
+ * (`/api/channels/<ch>/turn-events`) over the existing {@link ClientRegistry},
+ * NOT the durable-message poll. Rationale — the chat already POLLs vault channels
+ * for their DURABLE transcript (the `#channel-message` notes, the record of truth);
+ * turn progress is EPHEMERAL and chunk-frequent, so polling would be coarse + would
+ * surface partial state as if durable. An SSE stream is the clean real-time fit and
+ * reuses the registry/`sseFrame` infra already in the daemon. The durable path is
+ * untouched: the final `result` still becomes the `#channel-message/outbound` note,
+ * and the live stream is purely additive progress that the UI finalizes against it.
+ *
+ * Keyed by channel; fans out to every subscriber on that channel. A 0-subscriber
+ * turn is a clean no-op (the events drop; the durable note still lands) — there is
+ * no high-water-mark / replay for live progress (it's ephemeral by design).
+ */
+export function buildTurnEventSink(turnEvents: ClientRegistry): TurnEventSink {
+  return (channel, event) => {
+    // routeToChannel swallows dead-stream enqueues (drops the client); a 0-subscriber
+    // channel returns 0 delivered — both are fine, progress is best-effort.
+    turnEvents.routeToChannel(channel, "turn", event);
+  };
 }
 
 /**
@@ -720,6 +751,19 @@ ${THEME_CSS}
   .msg.you a { color: #fff; }
   .files { margin-top: 4px; font-size: 0.8rem; opacity: .85; }
   .files .file-name { font-family: var(--font-mono); }
+  /* Live turn view ("watch it work"): an in-progress "them" bubble that streams the
+     agent's interim text + shows which tools it's using, finalized when the durable
+     reply note arrives. A subtle pulsing border marks it as still-working. */
+  .msg.live { border-style: dashed; animation: livePulse 1.4s ease-in-out infinite; }
+  @keyframes livePulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+  .msg .live-text { white-space: normal; }
+  .msg .live-tools { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+  .msg .tool-chip {
+    font-family: var(--font-mono); font-size: 0.72rem; padding: 1px 7px; border-radius: 10px;
+    background: var(--bg-soft); color: var(--fg-muted); border: 1px solid var(--border);
+  }
+  .msg .live-working { margin-top: 6px; font-size: 0.75rem; color: var(--fg-muted); font-style: italic; }
+  .msg.live.errored { border-color: var(--warn); color: var(--warn); animation: none; }
   /* Permission bubble: Approve/Deny row + the follow-up note. */
   .perm-actions { display: flex; gap: 8px; margin-top: 8px; }
   .perm-note { margin-top: 8px; font-size: 0.78rem; color: var(--fg-muted); font-style: italic; }
@@ -788,6 +832,13 @@ ${SHELL_JS}
   var pollTimer = null;
   var seenIds = {}; // note id -> true, for the vault poll dedup
   var POLL_MS = 3500;
+  // Streaming turn view ("watch it work", design build item #1): a per-channel SSE
+  // (/api/channels/<ch>/turn-events) that streams a PROGRAMMATIC turn's interim
+  // assistant text + tool_use, finalized when the durable reply note arrives via the
+  // poll. turnEs is the EventSource; liveTurn holds the in-progress bubble's DOM
+  // refs while a turn runs.
+  var turnEs = null;
+  var liveTurn = null; // { el, textEl, toolsEl, toolNames:{}, statusEl } | null
   wireShell("chat");
 
   function transportFor(ch) { return channelTransports[ch] || ""; }
@@ -795,6 +846,13 @@ ${SHELL_JS}
 
   function stopPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  // Tear down the live turn view (SSE + any in-progress bubble). Called on a channel
+  // switch / a reconnect so a stale stream + bubble can't leak across channels.
+  function stopTurnEvents() {
+    if (turnEs) { turnEs.close(); turnEs = null; }
+    clearLiveTurn();
   }
 
   // ----- Layer 2 auth -----------------------------------------------------
@@ -893,6 +951,103 @@ ${SHELL_JS}
     return true;
   }
 
+  // ----- Streaming turn view ("watch it work") ----------------------------
+  // Render a PROGRAMMATIC turn's live progress in an in-progress bubble: streaming
+  // assistant text + "using <tool>" chips, finalized to the durable outbound note
+  // (rendered by the poll) when the turn completes. The live bubble is EPHEMERAL —
+  // it's removed on 'done' (the durable note shows the real reply) or shown as an
+  // error on 'error', so the view never gets stuck "working".
+
+  // Tear down any in-progress live bubble (channel switch / fresh turn / cleanup).
+  function clearLiveTurn() {
+    if (liveTurn && liveTurn.el && liveTurn.el.parentNode) {
+      liveTurn.el.parentNode.removeChild(liveTurn.el);
+    }
+    liveTurn = null;
+  }
+
+  // Start a fresh in-progress bubble for a new turn (on the turn's 'init' event).
+  function startLiveTurn() {
+    clearLiveTurn();
+    var el = document.createElement("div");
+    el.className = "msg them live";
+    var textEl = document.createElement("div");
+    textEl.className = "live-text";
+    var toolsEl = document.createElement("div");
+    toolsEl.className = "live-tools";
+    var statusEl = document.createElement("div");
+    statusEl.className = "live-working";
+    statusEl.textContent = "working…";
+    el.appendChild(textEl);
+    el.appendChild(toolsEl);
+    el.appendChild(statusEl);
+    transcript.appendChild(el);
+    transcript.scrollTop = transcript.scrollHeight;
+    liveTurn = { el: el, textEl: textEl, toolsEl: toolsEl, toolNames: {}, statusEl: statusEl, text: "" };
+  }
+
+  // Append a chunk of streamed assistant text into the live bubble (render Markdown
+  // over the accumulated text so partial formatting still reads well).
+  function appendLiveText(chunk) {
+    if (!liveTurn) startLiveTurn();
+    liveTurn.text += chunk;
+    liveTurn.textEl.innerHTML = renderMarkdown(liveTurn.text);
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  // Show a "using <tool>" chip (deduped — one chip per distinct tool this turn).
+  function addLiveTool(tool) {
+    if (!liveTurn) startLiveTurn();
+    if (liveTurn.toolNames[tool]) return;
+    liveTurn.toolNames[tool] = true;
+    var chip = document.createElement("span");
+    chip.className = "tool-chip";
+    chip.textContent = "⚙ " + tool;
+    liveTurn.toolsEl.appendChild(chip);
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  // Handle one turn event from the SSE stream.
+  function onTurnEvent(d) {
+    if (!d || !d.kind) return;
+    if (d.kind === "init") { startLiveTurn(); return; }
+    if (d.kind === "text") { appendLiveText(d.text || ""); return; }
+    if (d.kind === "tool") { addLiveTool(d.tool || "tool"); return; }
+    if (d.kind === "done") {
+      // The turn finished. Drop the live bubble; the durable outbound note carries
+      // the real reply — poll once NOW so it appears immediately (not after up to a
+      // full POLL_MS). An empty reply leaves the chat clean (no note written).
+      clearLiveTurn();
+      pollVault(currentChannel());
+      return;
+    }
+    if (d.kind === "error") {
+      // The turn failed — resolve the live view to an error state (no stuck spinner).
+      if (!liveTurn) startLiveTurn();
+      liveTurn.el.className = "msg them live errored";
+      liveTurn.statusEl.textContent = "turn failed: " + (d.error || "unknown error");
+      liveTurn = null; // leave the errored bubble in place; stop treating it as live
+      return;
+    }
+  }
+
+  // Open the turn-event SSE for a vault channel. EPHEMERAL: a transient error just
+  // lets EventSource auto-reconnect; a 401 is handled by the poll's re-auth path, so
+  // we don't duplicate the refresh dance here (the live view is best-effort progress).
+  function connectTurnEvents(ch) {
+    if (turnEs) { turnEs.close(); turnEs = null; }
+    if (!ch || !isVault(ch)) return;
+    var url = MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/turn-events";
+    if (window.__token) url += "?token=" + encodeURIComponent(window.__token);
+    turnEs = new EventSource(url);
+    turnEs.addEventListener("turn", function (e) {
+      // Ignore events that arrive after a channel switch (stale stream still closing).
+      if (ch !== currentChannel()) return;
+      try { onTurnEvent(JSON.parse(e.data)); } catch (_) {}
+    });
+    // No onerror handling beyond the browser's auto-reconnect — progress is additive.
+  }
+
   // Poll a vault channel's transcript: re-query, append only unseen ids. This is
   // how a session's replies + messages from other clients (Telegram, other
   // browsers) show up. Reconciles optimistic echoes too — an echo we already
@@ -922,8 +1077,12 @@ ${SHELL_JS}
   // start polling. Sets the composer live. authedFetch attaches the bearer.
   function connectVault(ch) {
     stopPolling();
+    stopTurnEvents();
     if (es) { es.close(); es = null; }
     seenIds = {};
+    // Open the live turn-event stream alongside the durable poll — watch programmatic
+    // turns work in real time; the poll renders the durable record when they finish.
+    connectTurnEvents(ch);
     setStatus("loading history…", "");
     authedFetch(MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/messages").then(function (r) {
       if (ch !== currentChannel()) return;
@@ -1010,6 +1169,7 @@ ${SHELL_JS}
   function connect() {
     if (es) { es.close(); es = null; }
     stopPolling();
+    stopTurnEvents();
     var ch = currentChannel();
     if (!ch) { setStatus("no channel", ""); sendBtn.disabled = true; return; }
     updateSetup(ch);
@@ -1297,6 +1457,14 @@ export function createFetchHandler(
     agentOps?: AgentOps;
     deliveryState?: DeliveryState;
     programmatic?: ProgrammaticAgentRegistry;
+    /**
+     * The per-channel turn-event SSE registry (the streaming view, design build
+     * item #1). The `/api/channels/<ch>/turn-events` SSE route registers subscribers
+     * here; the programmatic registry's turn-event sink fans out to them. `main`
+     * passes the boot instance (the SAME one the lazily-defaulted programmatic
+     * registry pushes to); tests inject one to assert the live-progress fan-out.
+     */
+    turnEvents?: ClientRegistry;
   },
 ): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
   // Spawn/list/kill operations behind the web agents surface. Lazily defaulted to
@@ -1304,13 +1472,20 @@ export function createFetchHandler(
   // exercised without a hub, a sandbox, or a tmux server. Built once per handler.
   const agentOps: AgentOps = opts?.agentOps ?? createRealAgentOps();
 
+  // The per-channel turn-event SSE registry — subscribers of the live "watch it
+  // work" stream. Defaulted to a fresh instance so a plain createFetchHandler still
+  // serves the route; `main` shares its boot instance so the lazily-defaulted
+  // programmatic registry below pushes to the SAME subscribers the route registers.
+  const turnEvents: ClientRegistry = opts?.turnEvents ?? new ClientRegistry();
+
   // The programmatic-agent registry (design 2026-06-16) — inbound for a registered
   // channel routes to an on-demand `claude -p` turn instead of a push. `main`
   // constructs the real one (with the real backend + the outbound-write wiring);
   // tests inject a fake-backed instance. Defaulted lazily to the real registry so a
-  // plain `createFetchHandler(channels, registry)` still wires programmatic agents.
+  // plain `createFetchHandler(channels, registry)` still wires programmatic agents —
+  // and threads the turn-event sink so its turns stream to this handler's `turnEvents`.
   const programmatic: ProgrammaticAgentRegistry =
-    opts?.programmatic ?? createDefaultProgrammaticRegistry(channels);
+    opts?.programmatic ?? createDefaultProgrammaticRegistry(channels, buildTurnEventSink(turnEvents));
 
   // Per-channel delivery high-water-mark store (the no-silent-loss spine). The
   // daemon's `main` passes the boot-time instance; tests that don't care get a
@@ -2280,6 +2455,45 @@ export function createFetchHandler(
       return json({ ok: true });
     }
 
+    // Turn-event SSE — GET /api/channels/<ch>/turn-events (chat-facing; gated on
+    // `channel:read`, same scope as the transcript poll + /ui/events). The streaming
+    // view (design 2026-06-16 build item #1): the chat subscribes here to watch a
+    // PROGRAMMATIC turn work in real time — interim assistant text + tool_use, then a
+    // done/error lifecycle event. EPHEMERAL by design: no backlog/replay (the durable
+    // record is the `#channel-message/outbound` note the turn still writes). A channel
+    // with no programmatic agent simply never receives a `turn` frame (the stream
+    // stays open + idle). Open to any live channel — unknown channel still opens the
+    // stream (it just never emits), matching the low-stakes ephemeral contract.
+    // Externally `<hub>/channel/api/channels/<ch>/turn-events`.
+    {
+      const turnMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/turn-events$/);
+      if (req.method === "GET" && turnMatch) {
+        const denied = await requireScope(req, url, SCOPE_READ);
+        if (denied) return denied;
+        const channelName = decodeURIComponent(turnMatch[1]!);
+        const clientId = crypto.randomUUID();
+        const stream = new ReadableStream<string>({
+          start(controller) {
+            turnEvents.add(clientId, {
+              channel: channelName,
+              enqueue: (payload) => controller.enqueue(payload),
+            });
+            controller.enqueue(": connected\n\n");
+          },
+          cancel() {
+            turnEvents.remove(clientId);
+          },
+        });
+        return new Response(stream, {
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+          },
+        });
+      }
+    }
+
     // Transcript read — GET /api/channels/<ch>/messages (chat-facing; gated on
     // `channel:read`, same as /ui/events). The built-in chat polls this to render
     // a channel's durable history and pick up replies + messages from other
@@ -2540,13 +2754,21 @@ function main(): void {
     defaultMark: new Date().toISOString(),
   });
 
+  // The per-channel turn-event SSE registry (the streaming view, design build item
+  // #1), constructed ONCE at boot and shared by the fetch handler's
+  // `/api/channels/<ch>/turn-events` route (subscriber registration) and the
+  // programmatic registry's turn-event sink (live-progress fan-out) — so a turn's
+  // interim events reach the chat subscribers the route registered.
+  const turnEvents = new ClientRegistry();
+
   // The PROGRAMMATIC-agent registry (design 2026-06-16), constructed ONCE at boot
   // and shared by the fetch handler (the /api/agents + /health routes), the
   // transports' `contextFor` (inbound enqueue), and the boot re-register below — so
   // the SAME instance the routes operate on is the one inbound enqueues onto. Built
   // here (not lazily in createFetchHandler) precisely so the transports started
-  // below route inbound to it.
-  const programmatic = createDefaultProgrammaticRegistry(channels);
+  // below route inbound to it. Threaded with the turn-event sink so each turn streams
+  // its interim progress to `turnEvents` (the chat's live view).
+  const programmatic = createDefaultProgrammaticRegistry(channels, buildTurnEventSink(turnEvents));
 
   // The terminal WS handler set (pty↔socket relay + backpressure flow control,
   // src/terminal.ts). One handler object serves every terminal connection;
@@ -2554,7 +2776,7 @@ function main(): void {
   // upgrades into these via `server.upgrade(req, { data })`.
   const terminalWs = createTerminalWsHandlers();
 
-  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic });
+  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, turnEvents });
   const server = Bun.serve<TerminalWsData, never>({
     port: PORT,
     hostname: "127.0.0.1",

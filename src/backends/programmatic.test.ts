@@ -655,6 +655,96 @@ describe("ProgrammaticBackend.deliver — robustness", () => {
   });
 });
 
+describe("ProgrammaticBackend.deliver — streaming interim events (the watch-it-work view)", () => {
+  /** A spawnFn whose stdout emits the given byte CHUNKS in order (multi-chunk stream). */
+  function chunkedSpawn(chunks: string[]): ProgrammaticSpawnFn {
+    const enc = new TextEncoder();
+    return () => ({
+      stdout: new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const c of chunks) controller.enqueue(enc.encode(c));
+          controller.close();
+        },
+      }),
+      stderr: new Response("").body,
+      exited: Promise.resolve(0),
+    });
+  }
+
+  test("onInterim receives init + text + tool_use; the durable result is unchanged", async () => {
+    mkDirs("stream");
+    const blob =
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-STREAM", apiKeySource: "none" }) + "\n" +
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "looking…" }] }, session_id: "sess-STREAM" }) + "\n" +
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Grep" }] }, session_id: "sess-STREAM" }) + "\n" +
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "looking… found it", session_id: "sess-STREAM" }) + "\n";
+    // Split into two chunks at a mid-line boundary to exercise incremental decoding.
+    const cut = Math.floor(blob.length / 2);
+    const backend = new ProgrammaticBackend(
+      baseDeps(chunkedSpawn([blob.slice(0, cut), blob.slice(cut)]), {
+        sessionState: new AgentSessionState({ stateDir }),
+      }),
+    );
+    const handle = await backend.start(specWithVault("eng"));
+
+    const events: unknown[] = [];
+    const result = await backend.deliver(handle, "where is X", (e) => events.push(e));
+
+    expect(events).toEqual([
+      { kind: "init", sessionId: "sess-STREAM" },
+      { kind: "text", text: "looking…" },
+      { kind: "tool", tool: "Grep" },
+    ]);
+    // The DURABLE final result is exactly as the non-streaming path would produce it.
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.reply).toBe("looking… found it");
+      expect(result.sessionId).toBe("sess-STREAM");
+    }
+  });
+
+  test("a turn with NO onInterim runs identically (durable reply intact, no throw)", async () => {
+    mkDirs("nostream");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-NS", "plain reply") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: new AgentSessionState({ stateDir }) }));
+    const handle = await backend.start(specWithVault("eng"));
+    const result = await backend.deliver(handle, "hi"); // no sink
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.reply).toBe("plain reply");
+  });
+
+  test("a THROWING onInterim sink cannot break the turn (durable result still returned)", async () => {
+    mkDirs("sinkthrow");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-THROW", "survives") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: new AgentSessionState({ stateDir }) }));
+    const handle = await backend.start(specWithVault("eng"));
+    const result = await backend.deliver(handle, "hi", () => {
+      throw new Error("dead SSE stream");
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.reply).toBe("survives");
+  });
+
+  test("an ERROR turn still streams its init then returns { ok:false } (live view can resolve)", async () => {
+    mkDirs("streamerr");
+    const blob =
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ERR" }) + "\n" +
+      JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, result: "boom", session_id: "sess-ERR" }) + "\n";
+    const backend = new ProgrammaticBackend(
+      baseDeps(chunkedSpawn([blob]), { sessionState: new AgentSessionState({ stateDir }) }),
+    );
+    const handle = await backend.start(specWithVault("eng"));
+    const events: unknown[] = [];
+    const result = await backend.deliver(handle, "go", (e) => events.push(e));
+    expect(events).toEqual([{ kind: "init", sessionId: "sess-ERR" }]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("boom");
+      expect(result.sessionId).toBe("sess-ERR");
+    }
+  });
+});
+
 describe("ProgrammaticBackend.deliver — credential / mint failures (value, not throw)", () => {
   test("a missing Claude credential returns { ok:false } and never spawns", async () => {
     mkDirs("nocred");

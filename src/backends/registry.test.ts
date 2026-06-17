@@ -10,8 +10,13 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { ProgrammaticAgentRegistry, type WriteOutbound } from "./registry.ts";
-import type { AgentBackend, AgentHandle, AgentStatus, DeliverResult } from "./types.ts";
+import {
+  ProgrammaticAgentRegistry,
+  type WriteOutbound,
+  type TurnEventSink,
+  type TurnLifecycleEvent,
+} from "./registry.ts";
+import type { AgentBackend, AgentHandle, AgentStatus, DeliverResult, InterimSink } from "./types.ts";
 import type { AgentSpec } from "../sandbox/types.ts";
 
 /** A deferred promise — resolve it externally to release a gated turn. */
@@ -43,16 +48,21 @@ class FakeBackend implements AgentBackend {
   resultFor: (message: string) => DeliverResult = (m) => ({ ok: true, reply: "reply:" + m });
   /** If set, `deliver` THROWS this (to test the defensive catch). */
   throwOnce: Error | null = null;
+  /** Interim events to emit (via `onInterim`) during the next turn — set per test. */
+  interimToEmit: Parameters<InterimSink>[0][] = [];
 
   async start(spec: AgentSpec): Promise<AgentHandle> {
     return { backend: this.kind, channel: spec.channels[0] as string, name: spec.name, spec };
   }
 
-  async deliver(handle: AgentHandle, message: string): Promise<DeliverResult> {
+  async deliver(handle: AgentHandle, message: string, onInterim?: InterimSink): Promise<DeliverResult> {
     this.calls.push({ channel: handle.channel, message });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);
     try {
+      // Emit any configured interim events (mirrors the real backend streaming text +
+      // tool_use as the turn runs) so the registry's forwarding can be asserted.
+      if (onInterim) for (const e of this.interimToEmit) onInterim(e);
       if (this.gate) await this.gate.promise;
       if (this.throwOnce) {
         const e = this.throwOnce;
@@ -81,6 +91,15 @@ function recorder(): { calls: { channel: string; reply: string; inReplyTo?: stri
     calls.push({ channel, reply, ...(inReplyTo ? { inReplyTo } : {}) });
   };
   return { calls, fn };
+}
+
+/** A recorder TurnEventSink — captures every (channel, event) the registry emits. */
+function turnRecorder(): { events: { channel: string; event: TurnLifecycleEvent }[]; fn: TurnEventSink } {
+  const events: { channel: string; event: TurnLifecycleEvent }[] = [];
+  const fn: TurnEventSink = (channel, event) => {
+    events.push({ channel, event });
+  };
+  return { events, fn };
 }
 
 const specFor = (name: string, channel = name): AgentSpec => ({ name, channels: [channel] });
@@ -256,5 +275,112 @@ describe("ProgrammaticAgentRegistry — serial queue (the hard invariant)", () =
     gate.resolve();
     await until(() => rec.calls.length === 2);
     expect(reg.statusOf("eng")).toEqual({ state: "idle", queued: 0 });
+  });
+});
+
+describe("ProgrammaticAgentRegistry — streaming turn view (onTurnEvent)", () => {
+  test("forwards the backend's interim events + a final 'done' (keyed by channel)", async () => {
+    const backend = new FakeBackend();
+    backend.interimToEmit = [
+      { kind: "init", sessionId: "s-1" },
+      { kind: "text", text: "thinking…" },
+      { kind: "tool", tool: "Read" },
+    ];
+    backend.resultFor = () => ({ ok: true, reply: "final answer" });
+    const rec = recorder();
+    const turns = turnRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, onTurnEvent: turns.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hi" });
+    await until(() => rec.calls.length === 1);
+    // Let the trailing 'done' (emitted after the outbound write) land.
+    await until(() => turns.events.some((e) => e.event.kind === "done"));
+
+    expect(turns.events.map((e) => e.channel)).toEqual(["eng", "eng", "eng", "eng"]);
+    expect(turns.events.map((e) => e.event)).toEqual([
+      { kind: "init", sessionId: "s-1" },
+      { kind: "text", text: "thinking…" },
+      { kind: "tool", tool: "Read" },
+      { kind: "done", reply: "final answer" },
+    ]);
+    // The durable outbound write is unchanged by the live view.
+    expect(rec.calls).toEqual([{ channel: "eng", reply: "final answer" }]);
+  });
+
+  test("an ok:false turn emits a 'error' lifecycle event (no stuck working state)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: false, error: "mint refused" });
+    const rec = recorder();
+    const turns = turnRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, onTurnEvent: turns.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "x" });
+    await until(() => turns.events.some((e) => e.event.kind === "error"));
+
+    expect(turns.events).toEqual([{ channel: "eng", event: { kind: "error", error: "mint refused" } }]);
+    // No outbound note for a failed turn.
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  test("a backend THROW also emits 'error' (the defensive catch resolves the live view)", async () => {
+    const backend = new FakeBackend();
+    backend.throwOnce = new Error("boom");
+    const rec = recorder();
+    const turns = turnRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, onTurnEvent: turns.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "x" });
+    await until(() => turns.events.some((e) => e.event.kind === "error"));
+
+    expect(turns.events).toEqual([{ channel: "eng", event: { kind: "error", error: "boom" } }]);
+  });
+
+  test("an empty reply still emits 'done' (with reply '') so the live view finalizes", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: true, reply: "" });
+    const rec = recorder();
+    const turns = turnRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, onTurnEvent: turns.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "tool-only" });
+    await until(() => turns.events.some((e) => e.event.kind === "done"));
+
+    expect(turns.events).toEqual([{ channel: "eng", event: { kind: "done", reply: "" } }]);
+    // No durable note for an empty reply (the existing contract), but the view finalizes.
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  test("a throwing sink can't break the worker (the durable write still lands)", async () => {
+    const backend = new FakeBackend();
+    backend.interimToEmit = [{ kind: "text", text: "hi" }];
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      onTurnEvent: () => {
+        throw new Error("dead stream");
+      },
+    });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hi" });
+    await until(() => rec.calls.length === 1);
+    expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:hi" }]);
+  });
+
+  test("with NO sink wired, turns run exactly as before (no throw, durable write lands)", async () => {
+    const backend = new FakeBackend();
+    backend.interimToEmit = [{ kind: "text", text: "ignored" }];
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hi" });
+    await until(() => rec.calls.length === 1);
+    expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:hi" }]);
   });
 });

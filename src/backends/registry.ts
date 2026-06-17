@@ -34,7 +34,31 @@
 
 import type { AgentSpec } from "../sandbox/types.ts";
 import { normalizeChannel } from "../sandbox/types.ts";
-import type { AgentBackend, AgentHandle } from "./types.ts";
+import type { AgentBackend, AgentHandle, InterimTurnEvent } from "./types.ts";
+
+/**
+ * The streaming-view sink (design 2026-06-16 build item #1): the daemon wires this
+ * to push a turn's interim progress (assistant text chunks + tool_use) to the
+ * channel's live chat subscribers (the per-channel turn-event SSE). The registry's
+ * worker calls it per channel as the turn runs, plus a synthesized `done`/`error`
+ * lifecycle event so the live view can finalize cleanly even on an empty/failed
+ * turn. ADDITIVE: when omitted the worker behaves exactly as before (no live view).
+ */
+export type TurnEventSink = (channel: string, event: TurnLifecycleEvent) => void;
+
+/**
+ * A per-channel turn event the daemon fans out to the live chat. It's the backend's
+ * {@link InterimTurnEvent} (text / tool / init) PLUS two registry-synthesized
+ * lifecycle events that bracket every turn so the UI never gets stuck "working":
+ *  - `done`  — the turn finished; `reply` is the final outbound text (empty when the
+ *              turn produced no text). The UI finalizes the live bubble.
+ *  - `error` — the turn failed; `error` is the reason. The UI resolves the live view
+ *              to an error state rather than leaving a hung spinner.
+ */
+export type TurnLifecycleEvent =
+  | InterimTurnEvent
+  | { kind: "done"; reply: string }
+  | { kind: "error"; error: string };
 
 /**
  * Write an outbound reply for a channel — the seam the registry posts a turn's
@@ -96,10 +120,27 @@ export class ProgrammaticAgentRegistry {
 
   private readonly backend: AgentBackend;
   private readonly writeOutbound: WriteOutbound;
+  /** Optional streaming-view sink — push interim + lifecycle turn events per channel. */
+  private readonly onTurnEvent?: TurnEventSink;
 
-  constructor(deps: { backend: AgentBackend; writeOutbound: WriteOutbound }) {
+  constructor(deps: { backend: AgentBackend; writeOutbound: WriteOutbound; onTurnEvent?: TurnEventSink }) {
     this.backend = deps.backend;
     this.writeOutbound = deps.writeOutbound;
+    if (deps.onTurnEvent) this.onTurnEvent = deps.onTurnEvent;
+  }
+
+  /**
+   * Emit a turn event to the streaming-view sink, swallowing any throw — a live-view
+   * push must NEVER break the serial worker (the durable note path is what matters).
+   * A no-op when no sink is wired.
+   */
+  private emitTurnEvent(channel: string, event: TurnLifecycleEvent): void {
+    if (!this.onTurnEvent) return;
+    try {
+      this.onTurnEvent(channel, event);
+    } catch {
+      // A dead-stream / sink fault must not strand the queue.
+    }
   }
 
   /** The wake channel for a spec (its first channel, normalized). */
@@ -287,24 +328,33 @@ export class ProgrammaticAgentRegistry {
 
       let result;
       try {
-        result = await this.backend.deliver(handle.backendHandle, msg.content);
+        // Forward each interim event to the streaming-view sink (keyed by channel)
+        // as the turn runs — the "watch it work" live progress. The sink swallows
+        // its own throws (emitTurnEvent), so a dead live stream can't break the turn.
+        result = await this.backend.deliver(handle.backendHandle, msg.content, (e) =>
+          this.emitTurnEvent(channel, e),
+        );
       } catch (err) {
         // The backend contract is failure-as-VALUE, never a throw — but defend so a
-        // surprise throw can't kill the worker and strand the queue.
+        // surprise throw can't kill the worker and strand the queue. Resolve the live
+        // view to an error state (no stuck "working" spinner).
+        const reason = (err as Error).message;
         console.error(
           `parachute-channel: programmatic turn for channel "${channel}" threw ` +
-            `(should be a value): ${(err as Error).message}`,
+            `(should be a value): ${reason}`,
         );
+        this.emitTurnEvent(channel, { kind: "error", error: reason });
         continue;
       }
 
       if (!result.ok) {
         // Logged + dropped — no retry, no loop. The backend already persisted the
         // session id (a turn can fail after establishing a session), so the next
-        // message resumes the conversation.
+        // message resumes the conversation. Resolve the live view to an error state.
         console.warn(
           `parachute-channel: programmatic turn for channel "${channel}" failed: ${result.error}`,
         );
+        this.emitTurnEvent(channel, { kind: "error", error: result.error });
         continue;
       }
 
@@ -319,6 +369,11 @@ export class ProgrammaticAgentRegistry {
           );
         }
       }
+
+      // Resolve the live view: `done` carries the final reply text (empty when the
+      // turn produced none) so the UI finalizes the in-progress bubble — the durable
+      // note (written above) is what actually persists; this just ends the spinner.
+      this.emitTurnEvent(channel, { kind: "done", reply: result.reply ?? "" });
     }
   }
 }

@@ -13,7 +13,7 @@
  * no-token reject is wired in front of the guarded handlers.
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { createFetchHandler, resolveStartCmd } from "./daemon.ts";
+import { createFetchHandler, resolveStartCmd, buildTurnEventSink } from "./daemon.ts";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -134,6 +134,14 @@ describe("bridge-facing endpoints require a bearer token (401 with none)", () =>
       body: JSON.stringify({ channel: "ui1", file_id: "f1" }),
     });
     expect(res.status).toBe(401);
+  });
+
+  test("GET /api/channels/<ch>/turn-events with no Authorization → 401 (channel:read gated)", async () => {
+    const res = await fetch(`${base}/api/channels/ui1/turn-events`);
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: string }).error).toBe("unauthorized");
+    // The SSE stream must NOT open on a 401 — the gate short-circuits to JSON.
+    expect(res.headers.get("content-type")).toContain("application/json");
   });
 
   test("an invalid bearer is also rejected (401, no JWKS needed for a non-JWT)", async () => {
@@ -608,5 +616,48 @@ describe("resolveStartCmd (hub-supervisor start command)", () => {
     // INSTALL_DIR at runtime is the repo root; src/.. is that root in this checkout.
     const repoRoot = join(import.meta.dir, "..");
     expect(resolveStartCmd(repoRoot)).toEqual(["parachute-channel"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Turn-event sink — the streaming-view fan-out (design build item #1).
+// ---------------------------------------------------------------------------
+
+describe("buildTurnEventSink (streaming-view fan-out)", () => {
+  test("routes a turn event to ONLY the channel's subscribers, as a 'turn' SSE frame", () => {
+    const turnEvents = new ClientRegistry();
+    const engFrames: string[] = [];
+    const opsFrames: string[] = [];
+    turnEvents.add("c-eng", { channel: "eng", enqueue: (p) => engFrames.push(p) });
+    turnEvents.add("c-ops", { channel: "ops", enqueue: (p) => opsFrames.push(p) });
+
+    const sink = buildTurnEventSink(turnEvents);
+    sink("eng", { kind: "text", text: "hi" });
+
+    // The eng subscriber got it; the ops subscriber did not (channel isolation).
+    expect(engFrames).toHaveLength(1);
+    expect(opsFrames).toHaveLength(0);
+    expect(engFrames[0]).toContain("event: turn");
+    expect(engFrames[0]).toContain(JSON.stringify({ kind: "text", text: "hi" }));
+  });
+
+  test("a 0-subscriber channel is a clean no-op (events drop; no throw)", () => {
+    const turnEvents = new ClientRegistry();
+    const sink = buildTurnEventSink(turnEvents);
+    expect(() => sink("ghost", { kind: "done", reply: "x" })).not.toThrow();
+  });
+
+  test("a dead (throwing) subscriber is dropped, not fatal", () => {
+    const turnEvents = new ClientRegistry();
+    turnEvents.add("dead", {
+      channel: "eng",
+      enqueue: () => {
+        throw new Error("stream closed");
+      },
+    });
+    const sink = buildTurnEventSink(turnEvents);
+    expect(() => sink("eng", { kind: "tool", tool: "Read" })).not.toThrow();
+    // routeToChannel drops the dead client; a follow-up emit finds no subscribers.
+    expect(turnEvents.countForChannel("eng")).toBe(0);
   });
 });

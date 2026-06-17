@@ -12,11 +12,31 @@
  *  - blank/garbage input → an empty parse, never a throw.
  */
 import { describe, test, expect } from "bun:test";
-import { parseStreamJson } from "./stream-json.ts";
+import { parseStreamJson, parseStreamJsonStream, type InterimTurnEvent } from "./stream-json.ts";
 
 /** Join NDJSON event objects into the line-delimited blob claude emits. */
 function ndjson(...events: unknown[]): string {
   return events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+}
+
+/** A ReadableStream<Uint8Array> that emits the given byte chunks in order (then closes). */
+function streamOf(...chunks: string[]): ReadableStream<Uint8Array> {
+  const enc = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const c of chunks) controller.enqueue(enc.encode(c));
+      controller.close();
+    },
+  });
+}
+
+/** Collect the interim events parseStreamJsonStream emits while parsing `chunks`. */
+async function collectInterim(
+  ...chunks: string[]
+): Promise<{ events: InterimTurnEvent[]; turn: Awaited<ReturnType<typeof parseStreamJsonStream>> }> {
+  const events: InterimTurnEvent[] = [];
+  const turn = await parseStreamJsonStream(streamOf(...chunks), (e) => events.push(e));
+  return { events, turn };
 }
 
 describe("parseStreamJson — success turn", () => {
@@ -155,5 +175,136 @@ describe("parseStreamJson — robustness", () => {
     expect(parseStreamJson("")).toEqual({});
     expect(parseStreamJson("   \n  \n")).toEqual({});
     expect(parseStreamJson("not json at all\nmore noise")).toEqual({});
+  });
+});
+
+describe("parseStreamJsonStream — interim events + final turn", () => {
+  test("emits init (session) + text chunks + tool_use, and returns the same final turn", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "sess-1", apiKeySource: "none", mcp_servers: [] },
+      { type: "assistant", message: { content: [{ type: "text", text: "let me check" }] }, session_id: "sess-1" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "tool_use", name: "Read", input: {} }] },
+        session_id: "sess-1",
+      },
+      { type: "assistant", message: { content: [{ type: "text", text: " — done." }] }, session_id: "sess-1" },
+      {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "let me check — done.",
+        session_id: "sess-1",
+        usage: { input_tokens: 9, output_tokens: 4 },
+        total_cost_usd: 0.0009,
+      },
+    );
+    const { events, turn } = await collectInterim(blob);
+
+    expect(events).toEqual([
+      { kind: "init", sessionId: "sess-1" },
+      { kind: "text", text: "let me check" },
+      { kind: "tool", tool: "Read" },
+      { kind: "text", text: " — done." },
+    ]);
+    // The FINAL turn is exactly what the blob parser would compute — durable path intact.
+    expect(turn).toEqual(parseStreamJson(blob));
+    expect(turn.reply).toBe("let me check — done.");
+    expect(turn.success).toBe(true);
+    expect(turn.sessionId).toBe("sess-1");
+  });
+
+  test("a SINGLE assistant event with multiple blocks emits each in order", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "assistant",
+        message: {
+          content: [
+            { type: "text", text: "first" },
+            { type: "tool_use", name: "Bash" },
+            { type: "text", text: "second" },
+          ],
+        },
+        session_id: "s",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "ok", session_id: "s" },
+    );
+    const { events } = await collectInterim(blob);
+    expect(events).toEqual([
+      { kind: "init", sessionId: "s" },
+      { kind: "text", text: "first" },
+      { kind: "tool", tool: "Bash" },
+      { kind: "text", text: "second" },
+    ]);
+  });
+
+  test("chunk boundaries SPLIT mid-line still parse + emit correctly", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "split-1" },
+      { type: "assistant", message: { content: [{ type: "text", text: "streamed" }] }, session_id: "split-1" },
+      { type: "result", subtype: "success", is_error: false, result: "streamed", session_id: "split-1" },
+    );
+    // Split the blob at an arbitrary mid-line byte offset into two chunks.
+    const cut = Math.floor(blob.length / 2);
+    const { events, turn } = await collectInterim(blob.slice(0, cut), blob.slice(cut));
+    expect(events).toEqual([
+      { kind: "init", sessionId: "split-1" },
+      { kind: "text", text: "streamed" },
+    ]);
+    expect(turn).toEqual(parseStreamJson(blob));
+  });
+
+  test("a final result line with NO trailing newline is still folded (pipe close)", async () => {
+    // The result line is emitted WITHOUT a terminating \n (the pipe closed) — it must
+    // still be parsed (folded once at end-of-stream).
+    const init = JSON.stringify({ type: "system", subtype: "init", session_id: "no-nl" }) + "\n";
+    const result = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "tail reply",
+      session_id: "no-nl",
+    });
+    const { turn } = await collectInterim(init, result);
+    expect(turn.reply).toBe("tail reply");
+    expect(turn.success).toBe(true);
+  });
+
+  test("interim sink is NEVER called for the result event (final-only), and tolerates noise", async () => {
+    const blob =
+      "PreToolUse hook running...\n" +
+      ndjson({ type: "system", subtype: "init", session_id: "noise" }).trimEnd() +
+      "\n" +
+      ndjson({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] }, session_id: "noise" }).trimEnd() +
+      "\n" +
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "hi", session_id: "noise" }) +
+      "\n";
+    const { events, turn } = await collectInterim(blob);
+    // init + the one text chunk only — the result event produces no interim event.
+    expect(events).toEqual([
+      { kind: "init", sessionId: "noise" },
+      { kind: "text", text: "hi" },
+    ]);
+    expect(turn.reply).toBe("hi");
+  });
+
+  test("a null stream yields an empty turn with no events (no stdout)", async () => {
+    const events: InterimTurnEvent[] = [];
+    const turn = await parseStreamJsonStream(null, (e) => events.push(e));
+    expect(turn).toEqual({});
+    expect(events).toHaveLength(0);
+  });
+
+  test("an error turn streams nothing-but-init then the final turn carries the failure", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "err-1" },
+      { type: "result", subtype: "error_during_execution", is_error: true, result: "kaboom", session_id: "err-1" },
+    );
+    const { events, turn } = await collectInterim(blob);
+    expect(events).toEqual([{ kind: "init", sessionId: "err-1" }]);
+    expect(turn.success).toBe(false);
+    expect(turn.errorMessage).toBe("kaboom");
+    expect(turn.sessionId).toBe("err-1");
   });
 });

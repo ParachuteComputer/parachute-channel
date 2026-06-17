@@ -72,13 +72,14 @@ import {
 import { buildAgentMcpConfigJson, vaultEntryKey } from "../agent-mcp-config.ts";
 import { resolveClaudeCredential, resolveChannelEnv } from "../credentials.ts";
 import { AgentSessionState } from "../agent-session-state.ts";
-import { parseStreamJson } from "./stream-json.ts";
+import { parseStreamJsonStream } from "./stream-json.ts";
 import type {
   AgentBackend,
   AgentHandle,
   AgentStatus,
   DeliverResult,
   DeliverUsage,
+  InterimSink,
 } from "./types.ts";
 
 /** Same slug shape `spawnAgent` enforces — a name lands in a path segment. */
@@ -245,14 +246,21 @@ export class ProgrammaticBackend implements AgentBackend {
    * Order: resolve the Claude credential (throws → the daemon surfaces it) → mint
    * the VAULT token (if the spec binds a vault) → write the vault-only `.mcp.json`
    * → build the `-p` argv (with `--resume <sid>` when a session id is stored) →
-   * sandbox-wrap via the shared seam → spawn → drain + parse the stream-json →
+   * sandbox-wrap via the shared seam → spawn → STREAM + parse the stream-json →
    * persist the captured session id → return the DeliverResult.
+   *
+   * STREAMING (design build item #1): the stdout stream-json is read INCREMENTALLY
+   * via {@link parseStreamJsonStream}. When `onInterim` is given, interim events
+   * (assistant text chunks + tool_use) are emitted as the turn runs so the daemon
+   * can render "watch it work" live; the FINAL parse (the authoritative `result`)
+   * is identical whether or not a sink is wired — the durable outbound note path is
+   * unchanged. `onInterim` is best-effort and must not throw.
    *
    * A failure (mint refused, non-zero exit, `is_error: true`, non-success subtype,
    * empty output) returns `{ ok: false, error }` — it does NOT throw, so the daemon
    * always learns the outcome inline.
    */
-  async deliver(handle: AgentHandle, message: string): Promise<DeliverResult> {
+  async deliver(handle: AgentHandle, message: string, onInterim?: InterimSink): Promise<DeliverResult> {
     const spec = handle.spec;
     if (!spec) {
       return { ok: false, error: `ProgrammaticBackend.deliver: handle for "${handle.name}" carries no spec` };
@@ -388,18 +396,33 @@ export class ProgrammaticBackend implements AgentBackend {
     };
 
     // Run the turn. A spawn/IO fault is a value (not a throw) — the daemon learns it.
-    let stdout: string;
+    // STREAM stdout incrementally (interim events for the live view) while draining
+    // stderr in parallel. The interim sink is best-effort + must not throw: wrap the
+    // caller's `onInterim` so a dead-stream error from the daemon's push can't abort
+    // the drain (which would strand the durable final-result parse). A no-sink turn
+    // passes a no-op, so the stream is still parsed incrementally with zero overhead
+    // beyond the (cheap) per-line dispatch.
+    let parsed;
     let stderr: string;
     let code: number;
+    const safeInterim: InterimSink = (e) => {
+      if (!onInterim) return;
+      try {
+        onInterim(e);
+      } catch {
+        // A push to a closed SSE stream / a sink fault must never break the turn.
+      }
+    };
     try {
       const proc = this.deps.spawnFn(wrapped.argv, { env: launchEnv, cwd });
-      [stdout, stderr] = await Promise.all([drainStream(proc.stdout), drainStream(proc.stderr)]);
+      [parsed, stderr] = await Promise.all([
+        parseStreamJsonStream(proc.stdout, safeInterim),
+        drainStream(proc.stderr),
+      ]);
       code = await proc.exited;
     } catch (err) {
       return { ok: false, error: `claude -p spawn failed: ${(err as Error).message}` };
     }
-
-    const parsed = parseStreamJson(stdout);
 
     // Persist the captured session id so the NEXT turn resumes it — even on a
     // failed turn (a turn can fail AFTER establishing a session; the id is still

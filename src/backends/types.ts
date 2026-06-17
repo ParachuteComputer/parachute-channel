@@ -44,6 +44,22 @@
  */
 
 import type { AgentSpec } from "../sandbox/types.ts";
+import type { InterimTurnEvent } from "./stream-json.ts";
+
+export type { InterimTurnEvent } from "./stream-json.ts";
+
+/**
+ * A sink for interim turn progress (the streaming view, design
+ * 2026-06-16-channel-architecture-post-programmatic.md build item #1). The backend
+ * calls this as a turn runs — assistant text chunks, which tool the agent is using,
+ * the session-establishing init — so the daemon can push live progress to the chat
+ * UI WHILE the turn is in flight. It is ADDITIVE: the durable record is still the
+ * final {@link DeliverResult} the backend returns. Optional on `deliver` — a backend
+ * that can't stream (or a caller that doesn't want live progress) omits it and the
+ * turn behaves exactly as before. MUST NOT throw (a throw would abort the drain);
+ * the daemon's implementation swallows dead-stream errors.
+ */
+export type InterimSink = (event: InterimTurnEvent) => void;
 
 /**
  * An opaque handle to a started agent, returned by {@link AgentBackend.start} and
@@ -140,8 +156,15 @@ export interface AgentBackend {
    * {@link DeliverResult} — a failure is a value (`{ ok: false, error }`), NEVER a
    * throw, so the caller always learns the outcome inline (the asymmetric-guarantee
    * fix). The daemon serializes deliveries per channel (one turn at a time).
+   *
+   * `onInterim` (optional) is the streaming-view sink: the backend calls it with
+   * interim progress (assistant text chunks + tool_use) AS the turn runs, so the
+   * daemon can render "watch it work" live in the chat UI. ADDITIVE — when omitted,
+   * the turn behaves exactly as before; the final {@link DeliverResult} is the
+   * durable record either way. (Only the programmatic backend streams today; an
+   * interactive retrofit may ignore it.)
    */
-  deliver(handle: AgentHandle, message: string): Promise<DeliverResult>;
+  deliver(handle: AgentHandle, message: string, onInterim?: InterimSink): Promise<DeliverResult>;
 
   /**
    * Tear the agent down. For the programmatic backend this clears the persisted

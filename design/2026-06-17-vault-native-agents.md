@@ -31,9 +31,33 @@ substrate:
 
 | Note tag | Is | Who writes it |
 |---|---|---|
-| `#agent` | the agent definition (role + config) | a human/agent in any vault chat |
-| `#agent-message/{inbound,outbound}` | a turn of conversation | humans (in) / the agent (out) |
-| `#agent-job` | a scheduled trigger | the Schedules UI / any vault writer |
+| `#agent/definition` | the agent definition (role + config) | a human/agent in any vault chat |
+| `#agent/message/{inbound,outbound}` | a turn of conversation | humans (in) / the agent (out) |
+| `#agent/job` | a scheduled trigger | the Schedules UI / any vault writer |
+
+**Namespacing (decided with Aaron 2026-06-17):** the `#agent/*` namespace is
+**owned by the agent module** — every vault object the module manages hangs off it
+(`#agent/definition`, `#agent/message`, `#agent/job`). This is a general pattern:
+the next module to define vault-native objects (e.g. a surfaces module) gets its own
+`#surface/*` namespace. Clean, collision-free, and "what does the agent module own?"
+is one prefix.
+
+**The Parachute-vault gotcha (load-bearing):** a slash in a tag *name* is a
+namespace convention — it does **NOT** by itself confer query inheritance
+(`query-notes { tag: "#agent" }` does NOT match `#agent/definition` unless the
+`parent_names` graph says so). So we do two things the module already does for
+`#channel-message`/`/inbound`:
+1. **Tag the queryable level literally.** The module queries each type by its exact
+   tag (`#agent/definition`, `#agent/job`, `#agent/message/inbound`) — no reliance
+   on prefix magic.
+2. **Declare `parent_names` in the module's tag schema** (`ensureSchema`, via
+   `update-tag`) so `#agent/definition` → parent `#agent`, `#agent/message/inbound`
+   → parent `#agent/message` → parent `#agent`. That makes `tag:#agent` roll up to
+   *everything the module owns* (the nice human query) and `tag:#agent/message` roll
+   up to both directions — without depending on per-vault setup for the module's own
+   exact-tag queries. Messages still tag both the queryable parent (`#agent/message`)
+   and the directional child (`#agent/message/inbound`) literally, as today, so loop
+   avoidance + transcript listing work with zero schema dependency.
 
 The agent module becomes a **near-stateless executor** bound to a vault: read the
 defs, watch for inbound + jobs, run turns, write outbound. Everything durable +
@@ -42,7 +66,7 @@ queryable + editable from anywhere with vault access.
 ## The `#agent` note shape
 ```
 ---
-tags: [#agent]
+tags: [#agent/definition]       # + parent #agent declared via parent_names for the rollup
 metadata:
   name: uni-dev                 # slug; the agent's identity + wake-channel key
   backend: programmatic         # programmatic (default) | interactive
@@ -132,9 +156,16 @@ moves from `spec.json` to a vault note. So the core is "parse a note into an
 AgentSpec" + "reload on trigger" — a contained addition on top of the now-landed
 agent module.
 
+## Decided
+- **Tag namespace:** `#agent/*`, module-owned (`#agent/definition`, `#agent/message`,
+  `#agent/job`), with `parent_names` declared for the `#agent` rollup. General pattern
+  for future modules (`#surface/*`, …). *(Implication: the just-landed flat
+  `#agent-message` / `#agent-job` tags move to `#agent/message` / `#agent/job` as part
+  of this build — cheap, since the current data is disposable test state.)*
+- **Secrets stay OUT of the vault** in a local secret file, as today — until a
+  dedicated secrets-integration story emerges. (Aaron, 2026-06-17.)
+
 ## Open questions
-- **Tag name:** `#agent` (cleanest, completes the `#agent` / `#agent-message` /
-  `#agent-job` family) vs `#agent-config`. Leaning `#agent`.
 - **Which vault holds the defs:** the agent module binds one "home" vault for defs;
   do an agent's conversation/jobs live in that same vault (simplest) or can an agent
   be defined in vault A while operating on vault B? Start single-vault.

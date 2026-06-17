@@ -54,6 +54,7 @@ import {
 import { VaultTransport, CHANNEL_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
 import { Runner, realTickDriver } from "./runner.ts";
+import { nextRunAfter } from "./cron.ts";
 import { JOBS_UI_HTML } from "./jobs-ui.ts";
 import {
   setDefaultClaudeCredential,
@@ -1881,7 +1882,22 @@ export function createFetchHandler(
         // 502 (not a silently-empty list that looks like "no jobs").
         try {
           const jobs = await jobStore.listAll();
-          return json({ jobs });
+          // `nextRunAt` is computed-in-memory (the stored note never carries it —
+          // see the Job docblock), so the persisted list lacks it and the UI's
+          // "Next run" column would always be "—". Derive it here for ENABLED jobs
+          // (a disabled job isn't scheduled → no next run). Per-job guard: a bad tz
+          // (a RangeError out of nextRunAfter) must not 502 the whole list.
+          const now = new Date();
+          const withNext = jobs.map((j) => {
+            if (!j.enabled) return j;
+            try {
+              const next = nextRunAfter(j.schedule.cron, j.schedule.tz, now);
+              return next ? { ...j, nextRunAt: next.toISOString() } : j;
+            } catch {
+              return j;
+            }
+          });
+          return json({ jobs: withNext });
         } catch (err) {
           return json({ error: `failed to list jobs: ${(err as Error).message}` }, 502);
         }

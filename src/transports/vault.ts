@@ -216,6 +216,10 @@ export const CHANNEL_VAULT_TAG_SCHEMA: ReadonlyArray<{
     parent_names: [CHANNEL_MESSAGE_TAG],
     description: "Session→human reply.",
   },
+  {
+    name: AGENT_JOB_TAG,
+    description: "A scheduled job — the runner injects this note's message on its cron schedule.",
+  },
 ];
 
 /**

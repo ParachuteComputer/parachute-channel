@@ -250,7 +250,7 @@ ${SHELL_JS}
         "<td><code>" + esc(j.id) + "</code></td>" +
         "<td>" + esc(j.channel) + "</td>" +
         "<td><code>" + cron + "</code>" + (tz ? "<br><span class='muted-cell'>" + esc(tz) + "</span>" : "") + "</td>" +
-        "<td>" + fmtTime(j.nextRunAt) + "</td>" +
+        "<td>" + esc(fmtTime(j.nextRunAt)) + "</td>" +
         "<td>" + statusCell(j.lastStatus) + (j.lastRunAt ? "<br><span class='muted-cell'>" + esc(fmtTime(j.lastRunAt)) + "</span>" : "") + "</td>" +
         "<td class='actions'>" +
           "<button class='ghost' data-toggle='" + esc(j.id) + "'>" + (enabled ? "disable" : "enable") + "</button>" +

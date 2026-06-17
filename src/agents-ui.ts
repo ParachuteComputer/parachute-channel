@@ -304,6 +304,17 @@ ${THEME_CSS}
           </div>
 
           <div>
+            <label for="spawn-workspace">Working directory <span class="muted">(optional — absolute host path)</span></label>
+            <input type="text" id="spawn-workspace" placeholder="/Users/you/Code/my-repo" autocomplete="off" />
+            <div class="muted" style="font-size:12px; margin-top:8px;">
+              The directory the agent works in (its cwd, read-write). Leave blank and it works in its own
+              private session dir. Set a real repo path to have it work there — that dir can be shared with
+              other agents, runner jobs, or scripts. Its private config &amp; tokens (<code>.mcp.json</code>)
+              always stay in the per-agent session dir, never written here.
+            </div>
+          </div>
+
+          <div>
             <label>Filesystem mounts</label>
             <div id="mounts-rows" class="mounts-rows"></div>
             <button id="add-mount" class="ghost" type="button" style="margin-top:8px;">+ mount</button>
@@ -618,6 +629,12 @@ ${SHELL_JS}
     }
     // defaults (omitted): filesystem "workspace" (scoped reads) + network "open".
 
+    // Working directory (the working-directory axis). Only send when non-blank —
+    // the server treats a blank value as unset (the agent works in its private
+    // session dir). An absolute path is required server-side; we send as-is.
+    var workspace = document.getElementById("spawn-workspace").value.trim();
+    if (workspace) spec.workspace = workspace;
+
     var mounts = [];
     document.querySelectorAll("#mounts-rows .mrow").forEach(function (row) {
       var host = row.querySelector(".mt-host").value.trim();
@@ -756,8 +773,14 @@ ${SHELL_JS}
           ? " <span class='pill' title='system prompt set (" + esc(a.systemPromptMode) +
             " mode)' style='font-size:11px;'>role: " + esc(a.systemPromptMode) + "</span>"
           : "";
+        // A badge when the agent works from a shared working dir (the workspace
+        // seam) — the path is the title so it's visible on hover without crowding.
+        var wdBadge = a.workingDir
+          ? " <span class='pill' title='working dir: " + esc(a.workingDir) +
+            "' style='font-size:11px;'>workdir</span>"
+          : "";
         return "<tr>" +
-          "<td><strong>" + esc(a.name) + "</strong>" + promptBadge + "</td>" +
+          "<td><strong>" + esc(a.name) + "</strong>" + promptBadge + wdBadge + "</td>" +
           "<td>" + backendCell + "</td>" +
           "<td>" + stateCell + "</td>" +
           "<td>" + connCell + "</td>" +

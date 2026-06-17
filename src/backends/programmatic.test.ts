@@ -515,6 +515,90 @@ describe("ProgrammaticBackend.deliver — system prompt (file-backed, per-turn)"
   });
 });
 
+// ---- the workspace seam (working-directory axis) ---------------------------
+// design 2026-06-16-agent-filesystem-and-sharing.md — `workspace` is the agent's
+// cwd + an rw working-root; .mcp.json (scoped vault token = secret) /
+// system-prompt.txt / seeded home STAY in the per-agent private sessions/<name> dir.
+
+function specWithWorkspace(workspace: string, name = "eng"): AgentSpec {
+  return {
+    name,
+    channels: [name],
+    vault: { name: "default", access: "read", tags: ["#channel-message"] },
+    workspace,
+  };
+}
+
+describe("ProgrammaticBackend.deliver — workspace seam: cwd = workspace, secrets stay private", () => {
+  test("workspace SET → the turn's cwd is the workspace; the workspace is the sandbox rw working-root", async () => {
+    mkDirs("ws-set");
+    const workspaceDir = mkdtempSync(join(tmpdir(), "prog-shared-workdir-"));
+    try {
+      const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+      const engine = fakeEngine();
+      const backend = new ProgrammaticBackend(baseDeps(fn, { sandboxEngine: engine }));
+      const handle = await backend.start(specWithWorkspace(workspaceDir, "eng"));
+      await backend.deliver(handle, "hello");
+
+      const privateDir = join(sessionsDir, "eng");
+      // The spawned turn's cwd is the SHARED workspace, NOT the private dir.
+      expect(calls[0]!.cwd).toBe(workspaceDir);
+      // The workspace is an rw working-root in the sandbox (read + write); the
+      // private dir stays writable too (it holds .mcp.json/home/tmp).
+      expect(engine.initializedWith!.filesystem.allowWrite).toContain(workspaceDir);
+      expect(engine.initializedWith!.filesystem.allowWrite).toContain(privateDir);
+      expect(engine.initializedWith!.filesystem.allowRead).toContain(workspaceDir);
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  test("SECRETS-STAY-PRIVATE: .mcp.json / system-prompt.txt live in the PRIVATE dir, NEVER the shared workspace", async () => {
+    mkDirs("ws-private");
+    const workspaceDir = mkdtempSync(join(tmpdir(), "prog-shared-secrets-"));
+    try {
+      const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
+      const backend = new ProgrammaticBackend(baseDeps(fn));
+      const spec: AgentSpec = {
+        name: "eng",
+        channels: ["eng"],
+        vault: { name: "default", access: "read", tags: ["#channel-message"] },
+        workspace: workspaceDir,
+        systemPrompt: "Work in the repo.",
+      };
+      const handle = await backend.start(spec);
+      await backend.deliver(handle, "hello");
+
+      const privateDir = join(sessionsDir, "eng");
+      // Private artifacts are under the per-agent dir…
+      expect(statSync(join(privateDir, ".mcp.json")).mode & 0o777).toBe(0o600);
+      expect(existsSync(join(privateDir, "system-prompt.txt"))).toBe(true);
+      // …and the shared workspace has NONE of them (no secrets crossing the boundary).
+      expect(existsSync(join(workspaceDir, ".mcp.json"))).toBe(false);
+      expect(existsSync(join(workspaceDir, "system-prompt.txt"))).toBe(false);
+      expect(existsSync(join(workspaceDir, "home"))).toBe(false);
+      // The private .mcp.json DOES carry the minted vault token; the shared dir does not.
+      const privateMcp = readFileSync(join(privateDir, ".mcp.json"), "utf8");
+      expect(privateMcp).toContain("Bearer TOK-");
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  test("workspace UNSET → the turn's cwd is the private dir (unchanged); only the private dir is writable", async () => {
+    mkDirs("ws-unset");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const engine = fakeEngine();
+    const backend = new ProgrammaticBackend(baseDeps(fn, { sandboxEngine: engine }));
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "hello");
+
+    const privateDir = join(sessionsDir, "eng");
+    expect(calls[0]!.cwd).toBe(privateDir);
+    expect(engine.initializedWith!.filesystem.allowWrite).toEqual([privateDir]);
+  });
+});
+
 describe("ProgrammaticBackend.deliver — MCP config (vault only, no channel)", () => {
   test("writes a vault-only .mcp.json 0600 — NO channel MCP entry (daemon mediates messaging)", async () => {
     mkDirs("mcp");

@@ -58,6 +58,7 @@ import { normalizeChannel } from "../sandbox/types.ts";
 import type { SandboxEngine } from "../sandbox/index.ts";
 import {
   buildAgentChildEnv,
+  resolveAgentCwd,
   seedAgentHome,
   sessionWorkspace,
   shellJoin,
@@ -355,12 +356,22 @@ export class ProgrammaticBackend implements AgentBackend {
       ...(this.deps.ripgrep ? { ripgrep: this.deps.ripgrep } : {}),
     });
 
+    // The agent's WORKING dir (design 2026-06-16-agent-filesystem-and-sharing.md):
+    // the spec's `workspace` (a shared real dir) when set, else the private session
+    // dir (today's behavior). The cwd is decoupled from the private dir —
+    // `.mcp.json`/`system-prompt.txt`/seeded home stay PRIVATE under the session
+    // dir (passed by absolute path), so a shared workspace never receives the
+    // agent's secrets even when two agents point at the same dir.
+    const cwd = resolveAgentCwd(spec, workspace);
+
     // The agent's private, writable, pre-seeded HOME + temp dirs (stability
-    // keystone). The vault MCP server name is pre-approved so claude doesn't prompt.
+    // keystone) — always UNDER the private workspace, regardless of the cwd. The
+    // vault MCP server name is pre-approved so claude doesn't prompt; the pre-trusted
+    // project is the agent's actual cwd (the shared working dir when set).
     const mcpServerNames = Object.keys(
       (JSON.parse(mcpConfigJson) as { mcpServers?: Record<string, unknown> }).mcpServers ?? {},
     );
-    const homeEnv = seedAgentHome(workspace, { mcpServers: mcpServerNames });
+    const homeEnv = seedAgentHome(workspace, { mcpServers: mcpServerNames, projectRoot: cwd });
 
     // Layer the scrubbed agent env UNDER the sandbox wrapper's env; the HOME/config/
     // temp vars layer LAST so they win. CLAUDE_CODE_OAUTH_TOKEN injected;
@@ -381,7 +392,7 @@ export class ProgrammaticBackend implements AgentBackend {
     let stderr: string;
     let code: number;
     try {
-      const proc = this.deps.spawnFn(wrapped.argv, { env: launchEnv, cwd: workspace });
+      const proc = this.deps.spawnFn(wrapped.argv, { env: launchEnv, cwd });
       [stdout, stderr] = await Promise.all([drainStream(proc.stdout), drainStream(proc.stderr)]);
       code = await proc.exited;
     } catch (err) {

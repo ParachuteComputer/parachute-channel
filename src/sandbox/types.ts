@@ -150,6 +150,28 @@ export interface AgentSpec {
    * back-compat) or `{ name, access: "read" }` to scope a channel read-only.
    */
   channels: AgentChannel[];
+  /**
+   * WORKING DIRECTORY — a real host path the agent operates from (design
+   * 2026-06-16-agent-filesystem-and-sharing.md, the working-directory axis). When
+   * set, this absolute path becomes the agent's CWD and an rw working-root in the
+   * sandbox (it's bound rw + readable, exactly like an `rw` mount that is also the
+   * cwd). It is SHAREABLE — two agents (or a runner job, or a plain script) can
+   * point at the same dir (shared-rw concurrency is a known, deferred caveat; the
+   * agents step on each other like humans in a repo without git discipline).
+   *
+   * CRITICAL — the working dir is DECOUPLED from the agent's PRIVATE RUNTIME HOME.
+   * The seeded `CLAUDE_CONFIG_DIR` (`seedAgentHome`), `tmp`, `spec.json`,
+   * `system-prompt.txt`, and ESPECIALLY `.mcp.json` (which inlines the scoped
+   * vault/channel tokens — secrets) STAY in the per-agent private `sessions/<name>/`
+   * dir, 0600, NEVER written into this shared `workspace`. The governing principle
+   * (the design note's "line"): capability/credential/state is per-agent private;
+   * the working dir is shareable. `--mcp-config` / `--system-prompt-file` point at
+   * the private dir by ABSOLUTE path, so they're unaffected by the cwd change.
+   *
+   * Unset → today's behavior EXACTLY: the cwd is the private `sessions/<name>` dir
+   * (which is also the synthetic workspace).
+   */
+  workspace?: string;
   /** Optional vault binding. */
   vault?: AgentVaultSpec;
   /** Additional MCP servers, by URL. */

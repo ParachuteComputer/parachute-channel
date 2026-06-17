@@ -46,25 +46,44 @@ export interface FilesystemView {
  * Compose the filesystem view for an arm from the always-present base binds and
  * the spec's additive mounts.
  *
- * Read surface  = workspace (rw) + runtime/config (ro) + every declared mount
- *                 (ro and rw alike — you can read what you can write).
- * Write surface = workspace (rw) + every `rw` mount.
+ * Read surface  = private home (rw) + the working dir (rw, when set) + runtime/
+ *                 config (ro) + every declared mount (ro and rw alike — you can
+ *                 read what you can write).
+ * Write surface = private home (rw) + the working dir (rw, when set) + every
+ *                 `rw` mount.
+ *
+ * `base.workspace` is the agent's PRIVATE per-session home (always rw — it holds
+ * `.mcp.json`/`tmp`/seeded `CLAUDE_CONFIG_DIR`). `workingRoot` is the OPTIONAL
+ * shared real dir the agent works from (the `workspace` spec field, design
+ * 2026-06-16-agent-filesystem-and-sharing.md): when set it's bound rw + readable,
+ * so writes are confined to (private home + working dir + rw mounts). Both are
+ * decoupled — the private home is never the shared dir, so `.mcp.json`'s secrets
+ * stay per-agent even when the working dir is shared.
  *
  * The home tree is denied and the read surface re-allowed within it, giving the
  * scoped-read policy (§4.5). The base binds are always included regardless of
- * the spec, so a spec cannot strip its own workspace or the runtime/config.
+ * the spec, so a spec cannot strip its own private home or the runtime/config.
  */
 export function composeFilesystemView(
   base: BaseBinds,
   mounts: readonly AgentMount[] | undefined,
   platform: SandboxPlatform,
   scopedReads = true,
+  workingRoot?: string,
 ): FilesystemView {
   const declared = mounts ?? [];
 
-  // Every bind is readable; only workspace + rw mounts are writable.
+  // The private home + the (optional) working dir are readable AND writable;
+  // every other bind is readable, and only rw mounts add to the write surface.
   const readPaths: string[] = [base.workspace, ...base.runtimeReadOnly];
   const writePaths: string[] = [base.workspace];
+  if (workingRoot && workingRoot.length > 0) {
+    // The shared working dir is bound rw — the agent's cwd lives here AND it can
+    // write to it (it's effectively an rw mount that is also the cwd). dedupe
+    // below handles the case where it coincides with the private home / a mount.
+    readPaths.push(workingRoot);
+    writePaths.push(workingRoot);
+  }
 
   for (const m of declared) {
     readPaths.push(m.hostPath);

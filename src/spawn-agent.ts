@@ -146,12 +146,20 @@ export interface TmuxLauncher {
   /**
    * Create a detached tmux session `name` that runs `argv` with `env` from `cwd`.
    * Returns the spawned argv (for assertion). Must not block on the session.
+   *
+   * `cwd` is the agent's WORKING dir (the spec's `workspace` when set, else the
+   * private session dir). `scriptDir` is the agent's PRIVATE session dir, where the
+   * per-session `.launch.sh` is written 0600 — kept separate so a SHARED working
+   * dir is never littered with the (private) launch script. When `scriptDir` is
+   * omitted it defaults to `cwd` (back-compat: today's callers that don't set a
+   * `workspace` pass the private dir as the cwd anyway).
    */
   newSession(opts: {
     name: string;
     argv: string[];
     env: Record<string, string | undefined>;
     cwd: string;
+    scriptDir?: string;
   }): Promise<void>;
   /** Whether a session by this name already exists (idempotency). */
   hasSession(name: string): Promise<boolean>;
@@ -248,6 +256,25 @@ export function sessionName(specName: string): string {
 /** Per-session workspace dir under the sessions base. */
 export function sessionWorkspace(sessionsDir: string, specName: string): string {
   return join(sessionsDir, specName);
+}
+
+/**
+ * Resolve an agent's CWD (the working-directory axis, design
+ * 2026-06-16-agent-filesystem-and-sharing.md). When the spec sets `workspace`
+ * (the shared real dir the agent works from) the cwd is that dir; otherwise it's
+ * the agent's PRIVATE per-session dir (today's behavior, exactly).
+ *
+ * This is ONLY the cwd. The private dir always remains the home for `.mcp.json`,
+ * `spec.json`, `system-prompt.txt`, the seeded `CLAUDE_CONFIG_DIR`, and `tmp` —
+ * those are passed to `claude` by ABSOLUTE path (`--mcp-config`,
+ * `--system-prompt-file`, `CLAUDE_CONFIG_DIR`/`TMPDIR` env) so they're unaffected
+ * by the cwd change. The decoupling keeps the working dir shareable while the
+ * credential-bearing private home stays per-agent.
+ */
+export function resolveAgentCwd(spec: AgentSpec, privateWorkspace: string): string {
+  return typeof spec.workspace === "string" && spec.workspace.length > 0
+    ? spec.workspace
+    : privateWorkspace;
 }
 
 /** Path to the persisted spawn-spec for a session (recovered by restart). */
@@ -429,10 +456,17 @@ export function buildAgentChildEnv(
  */
 export function seedAgentHome(
   workspace: string,
-  opts: { mcpServers?: string[]; operatorConfigPath?: string } = {},
+  opts: { mcpServers?: string[]; operatorConfigPath?: string; projectRoot?: string } = {},
 ): Record<string, string> {
   const mcpServerNames = opts.mcpServers ?? [];
   const operatorConfigPath = opts.operatorConfigPath ?? join(homedir(), ".claude.json");
+  // The project root claude pre-trusts in the seed. Defaults to the private
+  // workspace (today's behavior), but when the agent's CWD is a shared working dir
+  // (the spec's `workspace`), the CALLER passes that path here so claude's project
+  // (= its cwd) is pre-trusted + its MCP servers pre-approved — otherwise the agent
+  // would hit the per-folder trust / "new MCP server" prompts for the shared dir.
+  // The seeded HOME/config/tmp still live UNDER the private `workspace` regardless.
+  const projectRoot = opts.projectRoot ?? workspace;
   const home = join(workspace, "home");
   const claudeDir = join(home, ".claude");
   const tmp = join(workspace, "tmp");
@@ -456,12 +490,14 @@ export function seedAgentHome(
     const seed = {
       ...base,
       hasCompletedOnboarding: true,
-      // Replace the operator's project history with ONLY this workspace, pre-trusted
-      // AND with our own configured MCP servers pre-approved (claude otherwise
-      // prompts "New MCP server found in this project" for the workspace .mcp.json
-      // we wrote — these are operator-configured, not foreign, so pre-approve them).
+      // Replace the operator's project history with ONLY the agent's project root
+      // (its cwd — the private workspace by default, or the shared working dir when
+      // the spec sets one), pre-trusted AND with our own configured MCP servers
+      // pre-approved (claude otherwise prompts "New MCP server found in this
+      // project" / the per-folder trust dialog — these are operator-configured, not
+      // foreign, so pre-approve them).
       projects: {
-        [workspace]: {
+        [projectRoot]: {
           hasTrustDialogAccepted: true,
           hasCompletedProjectOnboarding: true,
           enabledMcpjsonServers: mcpServerNames,
@@ -734,15 +770,23 @@ export async function spawnAgent(
     ...(deps.ripgrep ? { ripgrep: deps.ripgrep } : {}),
   });
 
+  // The agent's WORKING dir: the spec's `workspace` (a shared real dir) when set,
+  // else the private session dir (today's behavior). The cwd is decoupled from the
+  // private session dir — `.mcp.json`/`system-prompt.txt`/seeded home all stay in
+  // the private dir (passed by absolute path), so a shared workspace never receives
+  // the agent's secrets. The launch script also stays private via `scriptDir`.
+  const cwd = resolveAgentCwd(spec, workspace);
+
   // The agent's private, writable, pre-seeded HOME + temp dirs (the stability
-  // keystone — see seedAgentHome). Everything claude reads/writes about itself
-  // lives here, inside the workspace (the sandbox's writable region). The MCP
-  // server names (from the config we just wrote) are pre-approved in the seed so
-  // claude doesn't prompt to trust the project's .mcp.json.
+  // keystone — see seedAgentHome). Everything claude reads/writes about ITSELF
+  // lives under the PRIVATE workspace (the sandbox's writable region) regardless of
+  // the cwd. The MCP server names (from the config we just wrote) are pre-approved
+  // in the seed so claude doesn't prompt to trust the project's .mcp.json — and the
+  // pre-trusted project is the agent's actual cwd (the shared working dir when set).
   const mcpServerNames = Object.keys(
     (JSON.parse(mcpConfigJson) as { mcpServers?: Record<string, unknown> }).mcpServers ?? {},
   );
-  const homeEnv = seedAgentHome(workspace, { mcpServers: mcpServerNames });
+  const homeEnv = seedAgentHome(workspace, { mcpServers: mcpServerNames, projectRoot: cwd });
 
   // Layer the scrubbed agent env UNDER the sandbox wrapper's env: the engine's
   // proxy vars / sandbox markers win over our childEnv on conflict;
@@ -762,7 +806,8 @@ export async function spawnAgent(
     name: session,
     argv: wrapped.argv,
     env: launchEnv,
-    cwd: workspace,
+    cwd,
+    scriptDir: workspace,
   });
 
   // Auto-answer claude's `--dangerously-load-development-channels` consent gate
@@ -981,10 +1026,10 @@ export function realTmuxLauncher(spawnFn: typeof Bun.spawn = Bun.spawn): TmuxLau
     async newSession(opts): Promise<void> {
       // Write the wrapped command to a per-session launch script so tmux receives
       // a short argv (the ~84 KB macOS Seatbelt profile would overrun tmux's
-      // command buffer if passed inline). The script lives in the session
-      // workspace alongside .mcp.json, 0600 — it carries no secret (the OAuth
-      // token rides the env via `-e`, below).
-      const scriptPath = launchScriptPath(opts.cwd);
+      // command buffer if passed inline). The script lives in the agent's PRIVATE
+      // session dir alongside .mcp.json, 0600 — NEVER in a shared working dir — and
+      // it carries no secret (the OAuth token rides the env via `-e`, below).
+      const scriptPath = launchScriptPath(opts.scriptDir ?? opts.cwd);
       writeFileSync(scriptPath, buildLaunchScript(opts.argv), { mode: 0o600 });
       // Defensive: guarantee 0600 even under a permissive umask (the file is
       // freshly created per-launch, so there's no looser-perms predecessor).

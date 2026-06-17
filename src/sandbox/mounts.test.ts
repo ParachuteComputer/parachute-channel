@@ -85,6 +85,47 @@ describe("composeFilesystemView — scoped reads + write confinement", () => {
     const fs = composeFilesystemView(BASE, mounts, "darwin");
     expect(fs.allowWrite.filter((p) => p === "/state/sessions/arm")).toHaveLength(1);
   });
+
+  // The working-directory axis (design 2026-06-16-agent-filesystem-and-sharing.md):
+  // the spec's `workspace` (a shared real dir) is bound rw — readable + writable —
+  // decoupled from the private home (which stays the per-agent session dir).
+  describe("the working dir (workspace) as an rw working-root", () => {
+    test("a working dir is BOTH readable and writable (an rw working-root)", () => {
+      const fs = composeFilesystemView(BASE, undefined, "darwin", true, "/Users/op/Code/repo");
+      expect(fs.allowRead).toContain("/Users/op/Code/repo");
+      expect(fs.allowWrite).toContain("/Users/op/Code/repo");
+    });
+
+    test("the PRIVATE home is ALSO writable alongside the working dir (decoupled, both rw)", () => {
+      const fs = composeFilesystemView(BASE, undefined, "darwin", true, "/Users/op/Code/repo");
+      // The private session dir stays in the write surface (it holds .mcp.json/home/tmp).
+      expect(fs.allowWrite).toContain("/state/sessions/arm");
+      expect(fs.allowWrite).toContain("/Users/op/Code/repo");
+    });
+
+    test("unset working dir → only the private home is writable (today's behavior)", () => {
+      const fs = composeFilesystemView(BASE, undefined, "darwin", true, undefined);
+      expect(fs.allowWrite).toEqual(["/state/sessions/arm"]);
+    });
+
+    test("a blank working dir is ignored (treated as unset)", () => {
+      const fs = composeFilesystemView(BASE, undefined, "darwin", true, "");
+      expect(fs.allowWrite).toEqual(["/state/sessions/arm"]);
+    });
+
+    test("under filesystem 'full' (broad reads) the working dir is still in the write surface", () => {
+      const fs = composeFilesystemView(BASE, undefined, "darwin", false, "/Users/op/Code/repo");
+      expect(fs.denyRead).toEqual([]); // broad reads — no home-tree deny
+      expect(fs.allowWrite).toContain("/Users/op/Code/repo");
+      expect(fs.allowWrite).toContain("/state/sessions/arm");
+    });
+
+    test("a working dir equal to a declared mount dedupes in the write surface", () => {
+      const mounts: AgentMount[] = [{ hostPath: "/Users/op/Code/repo", mountPath: "/repo", mode: "rw" }];
+      const fs = composeFilesystemView(BASE, mounts, "darwin", true, "/Users/op/Code/repo");
+      expect(fs.allowWrite.filter((p) => p === "/Users/op/Code/repo")).toHaveLength(1);
+    });
+  });
 });
 
 describe("sharedMounts — the named cross-session relaxation", () => {

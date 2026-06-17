@@ -11,8 +11,10 @@ import {
   DEV_CHANNELS_PROMPT_MARKER,
   DEV_CHANNELS_READY_MARKER,
   realTmuxLauncher,
+  resolveAgentCwd,
   seedAgentHome,
   sessionName,
+  sessionWorkspace,
   shellJoin,
   persistSpec,
   readPersistedSpec,
@@ -39,7 +41,13 @@ afterEach(() => {
 
 /** A recording tmux launcher. */
 function recordingTmux(existing = new Set<string>()): TmuxLauncher & {
-  launched: Array<{ name: string; argv: string[]; env: Record<string, string | undefined>; cwd: string }>;
+  launched: Array<{
+    name: string;
+    argv: string[];
+    env: Record<string, string | undefined>;
+    cwd: string;
+    scriptDir?: string;
+  }>;
   confirmed: string[];
 } {
   const launched: Array<{
@@ -47,6 +55,7 @@ function recordingTmux(existing = new Set<string>()): TmuxLauncher & {
     argv: string[];
     env: Record<string, string | undefined>;
     cwd: string;
+    scriptDir?: string;
   }> = [];
   const confirmed: string[] = [];
   return {
@@ -323,6 +332,23 @@ describe("seedAgentHome — the per-session writable HOME (stability keystone)",
       };
       expect(seed.hasCompletedOnboarding).toBe(true);
       expect(seed.projects[ws]!.hasTrustDialogAccepted).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  test("projectRoot override → the SHARED working dir is the pre-trusted project, not the private home", () => {
+    const ws = mkdtempSync(join(tmpdir(), "seed-home-projroot-"));
+    const noop = join(ws, "no-operator.json");
+    try {
+      // The cwd (a shared working dir) is pre-trusted; the seed still lives UNDER ws.
+      seedAgentHome(ws, { operatorConfigPath: noop, projectRoot: "/Users/op/Code/repo", mcpServers: ["vault-default"] });
+      const seed = JSON.parse(readFileSync(join(ws, "home", ".claude", ".claude.json"), "utf8")) as {
+        projects: Record<string, { hasTrustDialogAccepted: boolean }>;
+      };
+      // The PROJECT (pre-trusted) is the shared working dir, NOT the private ws.
+      expect(Object.keys(seed.projects)).toEqual(["/Users/op/Code/repo"]);
+      expect(seed.projects["/Users/op/Code/repo"]!.hasTrustDialogAccepted).toBe(true);
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
@@ -681,6 +707,154 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
       spawnAgent({ name: "s-c", channels: ["c"] }, baseDeps({ sandboxEngine: slowEngine(), tmux: recordingTmux() })),
     ]);
     expect(maxActive).toBe(1);
+  });
+});
+
+// ---- the workspace seam (working-directory axis) ---------------------------
+// design 2026-06-16-agent-filesystem-and-sharing.md — a `workspace` host path is
+// the agent's cwd + an rw working-root; the credential-bearing private home
+// (.mcp.json / system-prompt.txt / spec.json / seeded CLAUDE_CONFIG_DIR) STAYS in
+// the per-agent sessions/<name> dir, never written into the shared workspace.
+
+describe("resolveAgentCwd — cwd is the workspace when set, else the private dir", () => {
+  test("workspace set → that path; the private dir is untouched as the cwd", () => {
+    expect(resolveAgentCwd({ name: "a", channels: ["c"], workspace: "/ws/repo" }, "/private/a")).toBe("/ws/repo");
+  });
+  test("workspace unset → the private dir (today's behavior)", () => {
+    expect(resolveAgentCwd({ name: "a", channels: ["c"] }, "/private/a")).toBe("/private/a");
+  });
+  test("a blank workspace falls back to the private dir", () => {
+    expect(resolveAgentCwd({ name: "a", channels: ["c"], workspace: "" }, "/private/a")).toBe("/private/a");
+  });
+});
+
+describe("spawnAgent — workspace seam (interactive): cwd = workspace, secrets stay private", () => {
+  test("workspace SET → tmux cwd is the workspace; .mcp.json/system-prompt/spec/home stay in the PRIVATE dir; workspace is in the sandbox rw set", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-ws-set-"));
+    const workspaceDir = mkdtempSync(join(tmpdir(), "shared-workdir-"));
+    const tmux = recordingTmux();
+    const engine = fakeEngine();
+    try {
+      const spec: AgentSpec = {
+        name: "worker",
+        channels: ["worker"],
+        workspace: workspaceDir,
+        systemPrompt: "You work in the repo.",
+      };
+      const res = await spawnAgent(spec, baseDeps({ tmux, sandboxEngine: engine }));
+      const privateDir = sessionWorkspace(sessionsDir, "worker");
+      // res.workspace is still the PRIVATE session dir (the home of secrets).
+      expect(res.workspace).toBe(privateDir);
+
+      // 1. The tmux session's cwd is the SHARED workspace, NOT the private dir.
+      const launch = tmux.launched[0]!;
+      expect(launch.cwd).toBe(workspaceDir);
+      // …and the launch script (private) is written to the PRIVATE dir, never the shared one.
+      expect(launch.scriptDir).toBe(privateDir);
+
+      // 2. SECRETS-STAY-PRIVATE invariant: .mcp.json / system-prompt.txt / spec.json /
+      // the seeded home all live UNDER the private dir, and NONE under the workspace.
+      expect(existsSync(join(privateDir, ".mcp.json"))).toBe(true);
+      expect(existsSync(join(privateDir, "system-prompt.txt"))).toBe(true);
+      expect(existsSync(join(privateDir, "spec.json"))).toBe(true);
+      expect(existsSync(join(privateDir, "home", ".claude", ".claude.json"))).toBe(true);
+      // The workspace dir is NOT littered with any private artifact.
+      expect(existsSync(join(workspaceDir, ".mcp.json"))).toBe(false);
+      expect(existsSync(join(workspaceDir, "system-prompt.txt"))).toBe(false);
+      expect(existsSync(join(workspaceDir, "spec.json"))).toBe(false);
+      expect(existsSync(join(workspaceDir, ".launch.sh"))).toBe(false);
+      expect(existsSync(join(workspaceDir, "home"))).toBe(false);
+
+      // 3. --mcp-config / --append-system-prompt-file point at the PRIVATE absolute
+      // paths (unaffected by the cwd change).
+      const cmd = launch.argv[2]!;
+      expect(cmd).toContain(join(privateDir, ".mcp.json"));
+      expect(cmd).toContain(join(privateDir, "system-prompt.txt"));
+
+      // 4. The workspace IS an rw working-root in the sandbox (read + write).
+      expect(engine.initializedWith!.filesystem.allowWrite).toContain(workspaceDir);
+      expect(engine.initializedWith!.filesystem.allowWrite).toContain(privateDir);
+      expect(engine.initializedWith!.filesystem.allowRead).toContain(workspaceDir);
+
+      // 5. CLAUDE_CONFIG_DIR / TMPDIR still point at the PRIVATE home (not the workspace).
+      expect(launch.env.CLAUDE_CONFIG_DIR).toBe(join(privateDir, "home", ".claude"));
+      expect(launch.env.TMPDIR).toBe(join(privateDir, "tmp"));
+
+      // 6. The seeded project (pre-trusted) is the agent's CWD (the shared workspace).
+      const seed = JSON.parse(
+        readFileSync(join(privateDir, "home", ".claude", ".claude.json"), "utf8"),
+      ) as { projects: Record<string, unknown> };
+      expect(Object.keys(seed.projects)).toEqual([workspaceDir]);
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  test("workspace UNSET → cwd is the private dir (unchanged); workspace not in the rw set beyond the private dir", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-ws-unset-"));
+    const tmux = recordingTmux();
+    const engine = fakeEngine();
+    const res = await spawnAgent({ name: "plain", channels: ["plain"] }, baseDeps({ tmux, sandboxEngine: engine }));
+    const launch = tmux.launched[0]!;
+    // The cwd is the private session dir (today's behavior, exactly).
+    expect(launch.cwd).toBe(res.workspace);
+    expect(launch.scriptDir).toBe(res.workspace);
+    // The only writable dir is the private session dir.
+    expect(engine.initializedWith!.filesystem.allowWrite).toEqual([res.workspace]);
+    // The pre-trusted project is the private dir (no shared working dir).
+    const seed = JSON.parse(
+      readFileSync(join(res.workspace, "home", ".claude", ".claude.json"), "utf8"),
+    ) as { projects: Record<string, unknown> };
+    expect(Object.keys(seed.projects)).toEqual([res.workspace]);
+  });
+
+  test("SECRETS-STAY-PRIVATE: .mcp.json (scoped tokens) is NEVER written into a shared workspace dir", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-ws-secrets-"));
+    const workspaceDir = mkdtempSync(join(tmpdir(), "shared-secrets-"));
+    try {
+      const spec: AgentSpec = {
+        name: "secretkeeper",
+        channels: ["secretkeeper"],
+        vault: { name: "default", access: "read" },
+        workspace: workspaceDir,
+      };
+      await spawnAgent(spec, baseDeps({ tmux: recordingTmux() }));
+      // The shared workspace holds NO .mcp.json (the file that inlines the minted
+      // vault/channel tokens). It only ever lives in the per-agent private dir.
+      expect(existsSync(join(workspaceDir, ".mcp.json"))).toBe(false);
+      // Belt-and-suspenders: no file under the shared workspace contains the minted
+      // token marker the fake hub stamps (TOK-).
+      const privateMcp = readFileSync(join(sessionWorkspace(sessionsDir, "secretkeeper"), ".mcp.json"), "utf8");
+      expect(privateMcp).toContain("Bearer TOK-"); // the secret IS in the private file…
+      // …and the shared dir has no such file at all (asserted above) — so the token
+      // never crosses into the shareable dir.
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  test("two agents can SHARE one workspace dir (allowed, not solved) — each keeps its OWN private home", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-ws-shared-"));
+    const shared = mkdtempSync(join(tmpdir(), "shared-by-two-"));
+    try {
+      const tmuxA = recordingTmux();
+      const tmuxB = recordingTmux();
+      await spawnAgent({ name: "agent-a", channels: ["a"], workspace: shared }, baseDeps({ tmux: tmuxA }));
+      await spawnAgent({ name: "agent-b", channels: ["b"], workspace: shared }, baseDeps({ tmux: tmuxB }));
+      // Both cwd into the SAME shared dir…
+      expect(tmuxA.launched[0]!.cwd).toBe(shared);
+      expect(tmuxB.launched[0]!.cwd).toBe(shared);
+      // …but each has its OWN private home (distinct .mcp.json under distinct dirs).
+      const aPriv = sessionWorkspace(sessionsDir, "agent-a");
+      const bPriv = sessionWorkspace(sessionsDir, "agent-b");
+      expect(aPriv).not.toBe(bPriv);
+      expect(existsSync(join(aPriv, ".mcp.json"))).toBe(true);
+      expect(existsSync(join(bPriv, ".mcp.json"))).toBe(true);
+      // The shared dir holds NEITHER agent's secrets.
+      expect(existsSync(join(shared, ".mcp.json"))).toBe(false);
+    } finally {
+      rmSync(shared, { recursive: true, force: true });
+    }
   });
 });
 

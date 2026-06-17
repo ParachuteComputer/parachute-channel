@@ -13,7 +13,7 @@
  *      and every error→status mapping, without a hub, a sandbox, or tmux.
  */
 
-import { describe, test, expect, mock } from "bun:test";
+import { describe, test, expect, mock, afterEach } from "bun:test";
 // Re-export the REAL error class + helper in the mock below so this process-wide
 // `mock.module` doesn't break hub-jwt.test.ts's assertions on the genuine shapes
 // (same discipline daemon-config-api.test.ts keeps).
@@ -35,7 +35,7 @@ mock.module("./hub-jwt.ts", () => ({
   resetRevocationCache() {},
 }));
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -132,6 +132,41 @@ describe("agentInfoFromSessions", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  test("surfaces workingDir from the persisted spec when the workspace is set AND exists; absent otherwise", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-info-workdir-"));
+    // A REAL working dir on disk — the badge is gated on existence (a deleted dir
+    // post-spawn shouldn't surface a dead-path badge).
+    const workdir = mkdtempSync(join(tmpdir(), "agent-info-real-workdir-"));
+    try {
+      persistSpec(sessionWorkspace(dir, "withdir"), {
+        name: "withdir",
+        channels: ["withdir"],
+        workspace: workdir,
+      } as AgentSpec);
+      persistSpec(sessionWorkspace(dir, "nodir"), { name: "nodir", channels: ["nodir"] } as AgentSpec);
+      // A spec whose working dir no longer exists on disk → NOT surfaced.
+      persistSpec(sessionWorkspace(dir, "gonedir"), {
+        name: "gonedir",
+        channels: ["gonedir"],
+        workspace: "/Users/op/Code/deleted-repo",
+      } as AgentSpec);
+      const infos = agentInfoFromSessions(
+        [
+          { name: "withdir-agent", attached: false },
+          { name: "nodir-agent", attached: false },
+          { name: "gonedir-agent", attached: false },
+        ],
+        dir,
+      );
+      const byName = Object.fromEntries(infos.map((i) => [i.name, i]));
+      expect(byName.withdir!.workingDir).toBe(workdir);
+      expect(byName.nodir!.workingDir).toBeUndefined();
+      expect(byName.gonedir!.workingDir).toBeUndefined(); // path gone → no dead-path badge
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("buildSpecFromBody", () => {
@@ -198,6 +233,55 @@ describe("buildSpecFromBody", () => {
     expect(() =>
       buildSpecFromBody({ name: "a", channels: ["c"], mounts: [{ hostPath: "/h", mountPath: "rel", mode: "ro" }] }),
     ).toThrow(/mountPath must be an absolute path/);
+  });
+
+  // Working-directory axis (design 2026-06-16-agent-filesystem-and-sharing.md):
+  // an absolute, EXISTING `workspace` dir is parsed; a relative path 400s; a
+  // non-existent path / a file 400s; absent / blank → undefined (private-dir cwd).
+  // The real-dir cases use a temp dir (the spawn cwd must pre-exist).
+  let wsDir: string;
+  afterEach(() => {
+    if (wsDir) rmSync(wsDir, { recursive: true, force: true });
+    wsDir = "";
+  });
+  test("workspace (absolute, existing dir) is parsed onto the spec", () => {
+    wsDir = mkdtempSync(join(tmpdir(), "buildspec-ws-"));
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], workspace: wsDir });
+    expect(spec.workspace).toBe(wsDir);
+  });
+  test("workspace is trimmed", () => {
+    wsDir = mkdtempSync(join(tmpdir(), "buildspec-ws-trim-"));
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], workspace: `  ${wsDir}  ` });
+    expect(spec.workspace).toBe(wsDir);
+  });
+  test("a relative workspace is rejected (must be absolute)", () => {
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], workspace: "Code/repo" }),
+    ).toThrow(/workspace must be an absolute path/);
+  });
+  test("a non-existent workspace is rejected (cwd must pre-exist)", () => {
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], workspace: "/Users/op/Code/does-not-exist-xyz" }),
+    ).toThrow(/does not exist/);
+  });
+  test("a workspace pointing at a FILE (not a dir) is rejected", () => {
+    wsDir = mkdtempSync(join(tmpdir(), "buildspec-ws-file-"));
+    const filePath = join(wsDir, "afile.txt");
+    writeFileSync(filePath, "x");
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], workspace: filePath }),
+    ).toThrow(/is not a directory/);
+  });
+  test("absent workspace → undefined (private-dir cwd default)", () => {
+    expect(buildSpecFromBody({ name: "a", channels: ["c"] }).workspace).toBeUndefined();
+  });
+  test("a blank / whitespace-only workspace is treated as unset", () => {
+    expect(buildSpecFromBody({ name: "a", channels: ["c"], workspace: "   " }).workspace).toBeUndefined();
+  });
+  test("a non-string workspace is rejected", () => {
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], workspace: 42 }),
+    ).toThrow(/workspace must be a string/);
   });
   // Backend default flip (design 2026-06-16 + Aaron's gating decision): a NEW
   // request that OMITS `backend` now defaults to "programmatic" (the reliable

@@ -18,7 +18,7 @@
  * list/kill logic is unit-testable without a real tmux server.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type {
   AgentSpec,
@@ -85,6 +85,15 @@ export interface AgentInfo {
    * (it can be long / role-sensitive) — only that one is set + how it composes.
    */
   systemPromptMode?: "append" | "replace";
+  /**
+   * The agent's WORKING directory when the spec sets one (design
+   * 2026-06-16-agent-filesystem-and-sharing.md — the working-directory axis): the
+   * shared host path it operates from (its cwd + rw working-root). Absent = the
+   * agent works in its private session dir (today's default). This is the WORKING
+   * dir, NOT the private `workspace` field above (which is always the per-agent
+   * session dir on disk).
+   */
+  workingDir?: string;
 }
 
 /** A redacted mint summary — scope + audience + expiry, NEVER the token value. */
@@ -188,6 +197,13 @@ export function agentInfoFromSessions(
     // spec when one is set — so the list shows the agent carries a role.
     const persisted = readPersistedSpec(workspace);
     const hasPrompt = typeof persisted?.systemPrompt === "string" && persisted.systemPrompt.length > 0;
+    // Surface the working dir only when it's set AND still present on disk — an
+    // operator who deleted the dir post-spawn shouldn't see a dead-path badge
+    // (mirrors how `hasWorkspace` gates on existence rather than the bare path).
+    const hasWorkingDir =
+      typeof persisted?.workspace === "string" &&
+      persisted.workspace.length > 0 &&
+      existsSync(persisted.workspace);
     agents.push({
       name,
       session: s.name,
@@ -196,6 +212,7 @@ export function agentInfoFromSessions(
       hasWorkspace: existsSync(join(workspace, ".mcp.json")),
       backend: "interactive",
       ...(hasPrompt ? { systemPromptMode: persisted!.systemPromptMode ?? "append" } : {}),
+      ...(hasWorkingDir ? { workingDir: persisted!.workspace } : {}),
     });
   }
   agents.sort((a, b) => a.name.localeCompare(b.name));
@@ -300,6 +317,44 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
     }
     const mounts = b.mounts.map((raw, i) => parseMountEntry(raw, i));
     if (mounts.length > 0) spec.mounts = mounts;
+  }
+
+  // Working directory — the WORKING-DIRECTORY axis (design
+  // 2026-06-16-agent-filesystem-and-sharing.md). When set, this absolute host path
+  // is the agent's cwd + an rw working-root; it's shareable across agents. Require
+  // an ABSOLUTE path (mirrors parseMountEntry's guard — a relative path would
+  // resolve against the daemon's cwd in surprising ways; the trust boundary stays
+  // explicit). Trimmed. A blank/whitespace-only value is treated as unset (today's
+  // private-dir cwd). The credential-bearing private home (`.mcp.json` etc.) is
+  // NEVER this dir — it stays per-agent under sessions/<name>/.
+  if (b.workspace !== undefined && b.workspace !== null) {
+    if (typeof b.workspace !== "string") {
+      throw new SpawnRequestError("body.workspace must be a string (an absolute host path)");
+    }
+    const workspace = b.workspace.trim();
+    if (workspace.length > 0) {
+      if (!workspace.startsWith("/")) {
+        throw new SpawnRequestError('body.workspace must be an absolute path (start with "/")');
+      }
+      // The working dir becomes the agent's cwd — it MUST pre-exist as a directory,
+      // or the spawn would boot the agent into a missing dir (tmux `-c` / Bun.spawn
+      // `cwd` fault) with a confusing downstream error. A clean 400 at parse time is
+      // friendlier than that runtime failure. This endpoint is channel:admin-gated,
+      // so the operator owns the path they pass; we only assert it's a real dir.
+      let st: ReturnType<typeof statSync> | undefined;
+      try {
+        st = statSync(workspace);
+      } catch {
+        throw new SpawnRequestError(
+          `body.workspace "${workspace}" does not exist — the working directory must be a real ` +
+            `directory on disk (the agent's cwd).`,
+        );
+      }
+      if (!st.isDirectory()) {
+        throw new SpawnRequestError(`body.workspace "${workspace}" is not a directory.`);
+      }
+      spec.workspace = workspace;
+    }
   }
 
   // Backend selector — the pluggable agent backend (design 2026-06-16). A NEW

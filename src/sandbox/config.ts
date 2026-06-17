@@ -61,11 +61,22 @@ export function buildSandboxConfig(input: BuildSandboxConfigInput): SandboxRunti
   const scopedReads = input.spec.filesystem !== "full"; // default "workspace" = scoped
   const restrictedNet = input.spec.network === "restricted"; // default "open"
 
-  // Filesystem: scoped reads (deny home tree, re-allow workspace + claude runtime +
-  // mounts) unless explicitly "full". Writes are confined to the workspace + rw
-  // mounts in BOTH cases. The scoped default is what keeps the operator's secrets
-  // (e.g. ~/.parachute/operator.token) unreadable even with the network open.
-  const fs = composeFilesystemView(input.baseBinds, input.spec.mounts, platform, scopedReads);
+  // Filesystem: scoped reads (deny home tree, re-allow private home + claude
+  // runtime + the working dir + mounts) unless explicitly "full". Writes are
+  // confined to the private home + the working dir + rw mounts in BOTH cases. The
+  // scoped default is what keeps the operator's secrets (e.g.
+  // ~/.parachute/operator.token) unreadable even with the network open. The spec's
+  // `workspace` (the shared real dir the agent works from) is threaded in as an rw
+  // working-root — decoupled from the private home, so `.mcp.json`'s secrets stay
+  // per-agent even when the working dir is shared (design
+  // 2026-06-16-agent-filesystem-and-sharing.md).
+  const fs = composeFilesystemView(
+    input.baseBinds,
+    input.spec.mounts,
+    platform,
+    scopedReads,
+    input.spec.workspace,
+  );
 
   // Network: "open" (default) OMITS `allowedDomains` — the runtime treats an absent
   // allowedDomains as "no restriction" (verified: present-but-empty = block all,

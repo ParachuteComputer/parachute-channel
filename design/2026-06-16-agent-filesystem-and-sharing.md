@@ -1,6 +1,8 @@
 # Agent filesystem & sharing — workspace, shared library, private runtime
 
-**Status:** direction (not yet built). 2026-06-16. Companion to
+**Status:** the **working-directory axis (seam #1) SHIPPED 2026-06-16** (the
+`workspace` spec field — PR #82); the shared-library axis (#2) + step-up auth (#3)
+remain direction (not yet built). Companion to
 [`2026-06-14-sandboxed-agent-sessions.md`](./2026-06-14-sandboxed-agent-sessions.md)
 (sandbox/isolation), [`2026-06-16-pluggable-agent-backend.md`](./2026-06-16-pluggable-agent-backend.md)
 (how an agent is driven), and
@@ -92,10 +94,14 @@ reinvent them.
 
 ## Minimal seams to land (good-enough-now — don't over-build)
 
-1. **`workspace` (host path) on the agent spec** — decouple the working dir from the
-   private runtime home. Set → that dir is the cwd (mounted rw), private home still
-   per-agent at `sessions/<name>/`. Unset → today's private synthetic workspace. Small;
-   unblocks shared real-dir work + runner.
+1. **`workspace` (host path) on the agent spec** — ✅ **SHIPPED (PR #82, 2026-06-16).**
+   Decouples the working dir from the private runtime home. Set → that dir is the cwd
+   + an rw working-root in the sandbox; the private home (`.mcp.json`/`spec.json`/
+   `system-prompt.txt`/seeded `CLAUDE_CONFIG_DIR`/`tmp`) stays per-agent at
+   `sessions/<name>/`, 0600, never written into the shared dir. Unset → today's
+   private synthetic workspace. Both backends honor it via a shared `resolveAgentCwd`;
+   `buildSpecFromBody` requires an absolute, existing directory. Unblocks shared
+   real-dir work + runner.
 2. **A shared-library dir** — an operator-curated `skills/` (+ commands/agents) path,
    mounted **read-only** into agents that opt in. Could start as a single configurable
    shared-skills path that `seedAgentHome` layers in read-only.

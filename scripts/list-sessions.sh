@@ -6,7 +6,7 @@
 #
 set -euo pipefail
 
-DAEMON_URL="${PARACHUTE_CHANNEL_URL:-http://127.0.0.1:1941}"
+DAEMON_URL="${PARACHUTE_AGENT_URL:-http://127.0.0.1:1941}"
 
 echo "channel sessions (tmux):"
 sessions="$(tmux ls 2>/dev/null | grep -E '^[^:]+-agent:' || true)"

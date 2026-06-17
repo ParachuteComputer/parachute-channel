@@ -27,9 +27,9 @@
  * Environment:
  *   PARACHUTE_HOME              base for operator.token (default ~/.parachute).
  *   PARACHUTE_HUB_ORIGIN       hub public origin (else expose-state self-heal → loopback).
- *   PARACHUTE_CHANNEL_URL      daemon base URL (default http://127.0.0.1:<port>).
- *   PARACHUTE_CHANNEL_PORT     daemon port for the default channel URL (default 1941).
- *   PARACHUTE_CHANNEL_STATE_DIR  state dir (sessions, credentials.json) — default ~/.parachute/channel.
+ *   PARACHUTE_AGENT_URL      daemon base URL (default http://127.0.0.1:<port>).
+ *   PARACHUTE_AGENT_PORT     daemon port for the default channel URL (default 1941).
+ *   PARACHUTE_AGENT_STATE_DIR  state dir (sessions, credentials.json) — default ~/.parachute/agent.
  *   PARACHUTE_VAULT_URL        vault base URL when a --vault is bound (default http://127.0.0.1:1940).
  *   CLAUDE_CONFIG_DIR          claude config dir bound read-only into the sandbox (default ~/.claude).
  */
@@ -73,7 +73,7 @@ Flags:
   --help                          show this help.
 
 Example:
-  bun scripts/spawn-agent.ts aaron --channel aaron --vault default:read:#channel-message
+  bun scripts/spawn-agent.ts aaron --channel aaron --vault default:read:#agent-message
 `;
 
 /** Parsed CLI request: the spec plus the `--help` short-circuit flag. */
@@ -300,12 +300,12 @@ async function main(): Promise<number> {
         `error: ${err.message}\n\n` +
           `Set the operator Claude credential (get a token with \`claude setup-token\`), then re-run:\n` +
           `  curl -X POST ${deps.channelUrl}/api/credentials/claude \\\n` +
-          `    -H 'authorization: Bearer <channel:admin JWT>' \\\n` +
+          `    -H 'authorization: Bearer <agent:admin JWT>' \\\n` +
           `    -H 'content-type: application/json' \\\n` +
           `    -d '{"token":"<oat_… from claude setup-token>"}'\n\n` +
           `Or scope it to just the wake channel "${wakeChannel}":\n` +
           `  curl -X POST ${deps.channelUrl}/api/credentials/claude/${encodeURIComponent(wakeChannel)} \\\n` +
-          `    -H 'authorization: Bearer <channel:admin JWT>' \\\n` +
+          `    -H 'authorization: Bearer <agent:admin JWT>' \\\n` +
           `    -H 'content-type: application/json' \\\n` +
           `    -d '{"token":"<oat_…>"}'\n`,
       );

@@ -1,14 +1,14 @@
-# parachute-channel — the channel fabric
+# parachute-agent — the channel fabric
 
 **Status:** in progress · started 2026-06-07 · steward: Uni (for Aaron)
 
-The plan to evolve `parachute-channel` from a single Telegram→Claude bridge into a
+The plan to evolve `parachute-agent` from a single Telegram→Claude bridge into a
 **channel fabric**: multiple named channels, each routable to a specific Claude Code
 session, with the module's own built-in chat UI to prove messaging, scripts to stand
 up sessions wired to their channel, and — later — deep vault integration so messages
 persist as notes and a UI/runner can drive sessions through the vault.
 
-This redefines the module from the workspace CLAUDE.md's "Channel — webhook fan-out,
+This redefines the module from the workspace CLAUDE.md's "Agent — webhook fan-out,
 exploration, may retire" line into **the agent-session gateway / the vault's nervous
 system**. When this firms up, that table row and the committed-core map get updated
 (architectural-shift discipline → `parachute-patterns/migrations/`).
@@ -19,14 +19,14 @@ The June 15 2026 billing change meters `claude -p` / Agent SDK usage on subscrip
 plans against a small separate credit pool ($20 Pro / $100 Max5x / $200 Max20x at API
 rates), while **interactive sessions stay on subscription limits, unchanged**. Our
 weave/automation pattern (long-running interactive sessions per vault) is exactly the
-shape that survives. The channel is how those resident sessions get a real UI and how
+shape that survives. Agent is how those resident sessions get a real UI and how
 recurring jobs reach them — replacing the `claude -p`-per-job model (which runner keeps
 as a second executor for API-key users).
 
 ## The architecture
 
 ```
-                  parachute-channel daemon (one, many channels)
+                  parachute-agent daemon (one, many channels)
    ┌──────────────────────────────────────────────────────────────┐
    │  named channels, each bound to a transport                    │
    │   • "aaron-dev"    transport: http-ui   (built-in chat page)   │
@@ -55,7 +55,7 @@ as a second executor for API-key users).
   subscription, not a daemon-side map.)**
 - **One daemon, many channels.** Matches the multi-session design already in the code and
   keeps the built-in UI a single place. **(Decision 2 — resolved.)**
-- **MCP channel mechanism is primary.** The existing `notifications/claude/channel` wake is
+- **MCP agent mechanism is primary.** The existing `notifications/claude/agent` wake is
   the standard, simple path. We verify it works on our Claude Code version up front (Stage 0)
   and do NOT build hook-based workarounds unless that check proves it necessary.
 - **Agent-agnostic by construction.** The contract with a session is "read/write the channel
@@ -85,14 +85,14 @@ Two tiers, mirroring hub's `e2e/` but realizing the deferred Tier 2:
 
 - [x] **Idle-wake confirmed on Claude Code v2.1.166 (Opus 4.8, Max).** Method: an
       isolated standalone MCP server (no Telegram dependency) declaring the same
-      `claude/channel` capability the real bridge uses, attached to a real interactive
+      `claude/agent` capability the real bridge uses, attached to a real interactive
       `claude` session in tmux launched with `--dangerously-load-development-channels=server:probe`.
       With the session sitting **idle at the prompt**, an unsolicited
-      `notifications/claude/channel` was fired; the session woke ~6s later, called the
-      ack tool, replied, and returned to idle — zero human input. The `notifications/claude/channel`
+      `notifications/claude/agent` was fired; the session woke ~6s later, called the
+      ack tool, replied, and returned to idle — zero human input. The `notifications/claude/agent`
       wake mechanism is the primary path (D4 confirmed); no hook workarounds needed.
 - [x] CC version pinned: **2.1.166**. Note: the client echoes `experimental caps: {}`
-      (does not advertise `claude/channel` back), but the channel banner shows active and
+      (does not advertise `claude/agent` back), but the channel banner shows active and
       delivery works — the empty echo is cosmetic, matching the real bridge's known
       degrade-warning edge (#9). Watch this if a future CC version changes behavior.
 
@@ -102,7 +102,7 @@ Two tiers, mirroring hub's `e2e/` but realizing the deferred Tier 2:
 - [ ] Extract a `Transport` interface (inbound → `{channel, content, meta}`; outbound:
       `reply/react/edit/download`). Telegram becomes `transports/telegram.ts`.
 - [ ] Daemon hosts a **channel registry** (name → transport + config), loaded from
-      `~/.parachute/channel/channels.json` and exposed via `/.parachute/config[/schema]`
+      `~/.parachute/agent/channels.json` and exposed via `/.parachute/config[/schema]`
       (runner's self-describing-config pattern, so a UI can manage it later).
 - [ ] Routing: `/events?channel=<name>` subscribes a bridge; `broadcastEvent` filters by
       channel. Outbound carries channel context.
@@ -140,29 +140,29 @@ Two tiers, mirroring hub's `e2e/` but realizing the deferred Tier 2:
 - [ ] Reviewer subagent + merge.
 
 **Stage 1 done =** launch a session in one command, open the chat UI (locally or over the
-hub expose at `/channel/ui`), type a casual message, watch the session answer. Multi-channel
+hub expose at `/agent/ui`), type a casual message, watch the session answer. Multi-channel
 → multi-session is config-driven. ✅ Demo achieved; both test tiers green.
 
 ### Hub integration (pulled forward from Stage 3 — merged #21)
 - [x] `.parachute/module.json` + boot self-registration into `services.json` (PARACHUTE_HOME-sandboxed).
-- [x] Mount-aware UI (`/channel/ui` behind hub, `/ui` locally). `stripPrefix:true`.
-- [x] Verified live: hub proxies `<expose>/channel/*`, SSE survives the proxy, casual prompts round-trip.
-- [ ] **Channel auth — hub-scoped JWT (HIGH PRIORITY, Aaron):** session has full machine access,
+- [x] Mount-aware UI (`/agent/ui` behind hub, `/ui` locally). `stripPrefix:true`.
+- [x] Verified live: hub proxies `<expose>/agent/*`, SSE survives the proxy, casual prompts round-trip.
+- [ ] **Agent auth — hub-scoped JWT (HIGH PRIORITY, Aaron):** session has full machine access,
       so auth matters more than vault's. Gate daemon endpoints on a hub-issued JWT (scope-guard +
       JWKS); UI obtains a token. NEXT after PR 1.3.
 - [ ] Future: VM/Docker session isolation for the launcher (trust-gradient at the session layer).
 
 ## Stage 2 — vault integration (vault as another transport)  ·  ☐
 
-- [ ] `#channel-message` note schema: `direction` (inbound|outbound), `thread`, `sender`,
+- [ ] `#agent-message` note schema: `direction` (inbound|outbound), `thread`, `sender`,
       `body`, `handled_at`. Trigger fires **inbound-only** (loop avoidance via direction
       predicate + existing `_pending_at`/`_rendered_at` idempotency markers).
 - [ ] `transports/vault.ts`: activated by a vault trigger webhook on new inbound
-      `#channel-message`; writes replies back as outbound notes via the vault REST API.
+      `#agent-message`; writes replies back as outbound notes via the vault REST API.
 - [ ] Generalize the vault trigger system from scribe-flavored → inter-module event bus,
       exposed via config-schema so the **vault config UI** grows a Triggers section.
       (Coordinated PR in parachute-vault.)
-- [ ] Tag-scoped vault token for the channel (read/write only `#channel-message`).
+- [ ] Tag-scoped vault token for agent (read/write only `#agent-message`).
 - [ ] External surface (my-vault-ui) goes dumb: talks only to the vault; persistence +
       offline come free. (Coordinated PR in my-vault-ui.)
 - [ ] **Tests:** Tier 1 (trigger fires inbound-only, no reply-loop; note round-trip through
@@ -172,13 +172,13 @@ hub expose at `/channel/ui`), type a casual message, watch the session answer. M
 
 ## Stage 3 — bulk: runner on the bus + hub registration  ·  ☐
 
-- [ ] Runner gains a `channel` executor: a scheduled job writes a recurring inbound
-      `#channel-message` note addressed to a session. Falls out of Stage 2's schema; the
+- [ ] Runner gains an `agent` executor: a scheduled job writes a recurring inbound
+      `#agent-message` note addressed to a session. Falls out of Stage 2's schema; the
       `claude -p` executor stays for API-key users.
-- [ ] Channel self-registers with hub (module.json + scope-guard JWT), like runner did.
+- [ ] Agent self-registers with hub (module.json + scope-guard JWT), like runner did.
 - [ ] Session lifecycle/supervision: graduate the launcher scripts to a small module or
       fold into hub-as-supervisor **only if the scripts prove insufficient** (decide then).
-- [ ] **Tests:** Tier 1 + Tier 2 across the runner→channel→session→vault path.
+- [ ] **Tests:** Tier 1 + Tier 2 across the runner→agent→session→vault path.
 - [ ] Reviewer subagent. Architectural-shift migration file in `parachute-patterns/migrations/`.
 
 ---
@@ -187,7 +187,7 @@ hub expose at `/channel/ui`), type a casual message, watch the session answer. M
 - **D1 routing** — session-side subscription by channel name (not daemon-side map). Resolved 2026-06-07.
 - **D2 topology** — one daemon, many channels. Resolved 2026-06-07.
 - **D3 http-ui auth** — none in Stage 1 (loopback only); hub-JWT when exposed. Resolved 2026-06-07.
-- **D4 wake mechanism** — MCP channel notification is primary; no hook workarounds unless Stage 0 proves necessary. Resolved 2026-06-07 (Aaron).
+- **D4 wake mechanism** — MCP agent notification is primary; no hook workarounds unless Stage 0 proves necessary. Resolved 2026-06-07 (Aaron).
 - **D5 Tier 2 e2e** — does not pre-exist; built here, modeled on hub Tier 1. Resolved 2026-06-07.
 
 ## Open questions (non-blocking, revisit at the stage that needs them)
@@ -195,4 +195,4 @@ hub expose at `/channel/ui`), type a casual message, watch the session answer. M
   transport-specific; the registry may need a per-channel access block).
 - Multi-machine: one daemon per vault-host vs. a hub catalog entry routing to the right
   daemon. (Stage 3.)
-- Thread/conversation modeling depth for `#channel-message` (flat vs. nested). (Stage 2.)
+- Thread/conversation modeling depth for `#agent-message` (flat vs. nested). (Stage 2.)

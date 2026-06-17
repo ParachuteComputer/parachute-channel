@@ -1,5 +1,5 @@
 /**
- * Static HTML for `/channel/terminal` — the in-page xterm.js terminal (design
+ * Static HTML for `/agent/terminal` — the in-page xterm.js terminal (design
  * `design/2026-06-14-sandboxed-agent-sessions.md` §5).
  *
  * Single self-contained document: HTML + inline CSS + inline JS, no build step
@@ -14,9 +14,9 @@
  *      assets (CSS + JS), THEN boot — the `<script src>`/`<link>` can't be static
  *      because their correct URL depends on the runtime mount prefix.
  *   2. Fetch the channel list (`<mount>/.parachute/config`) → a picker.
- *   3. Fetch a hub-minted `channel:admin` Bearer (`<origin>/admin/channel-token`).
+ *   3. Fetch a hub-minted `agent:admin` Bearer (`<origin>/admin/agent-token`).
  *   4. Open a WebSocket to `<mount>/terminal/<channel>?token=…&cols=…&rows=…`.
- *      The daemon's upgrade gate validates channel:admin BEFORE upgrading.
+ *      The daemon's upgrade gate validates agent:admin BEFORE upgrading.
  *   5. Relay xterm ↔ WS: keystrokes → BINARY frames; pty output (BINARY) →
  *      `term.write`; resize → a JSON control frame `{type:"resize",cols,rows}`.
  *   6. Reconnect: the backend attaches to TMUX, so a dropped socket re-attaches to
@@ -31,7 +31,7 @@ export const TERMINAL_UI_HTML = `<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="referrer" content="no-referrer" />
-<title>parachute-channel · terminal</title>
+<title>parachute-agent · terminal</title>
 <style>
 ${THEME_CSS}
   /* ---- Terminal-pane layout (page-specific, layered after the shared kit) -- */
@@ -151,7 +151,7 @@ ${SHELL_JS}
     try { fit.fit(); } catch (_e) {}
   }
 
-  // --- token (operator channel:admin, minted by the hub) ------------------
+  // --- token (operator agent:admin, minted by the hub) ------------------
   // The shared fetchToken (SHELL_JS) does the mint + caches it on window.__token,
   // and REJECTS on failure. ensureToken wraps it with the terminal's own notice
   // affordance so a not-authenticated load explains itself, then resolves to null
@@ -159,7 +159,7 @@ ${SHELL_JS}
   function ensureToken() {
     return fetchToken().catch(function (err) {
       showNotice("Not authenticated — open this page through the hub portal, signed in " +
-        "as the operator. The terminal needs a <code>channel:admin</code> token (" + err + ").", true);
+        "as the operator. The terminal needs an <code>agent:admin</code> token (" + err + ").", true);
       return null;
     });
   }

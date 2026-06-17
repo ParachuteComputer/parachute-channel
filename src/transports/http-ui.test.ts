@@ -19,22 +19,27 @@ import { describe, test, expect, mock } from "bun:test";
 // a hub JWT against the hub's JWKS. The no-token path short-circuits to 401
 // before any JWKS fetch (asserted below). To exercise the *delivery* paths
 // (routing, SSE fan-out) without a live hub, stub the JWT validator so a single
-// sentinel token validates with the channel scopes. A request with no token (or
+// sentinel token validates with the agent scopes. A request with no token (or
 // any other token) still hits the real no-token / shape-first reject. This keeps
 // the round-trip coverage genuine while staying hub-free.
 const VALID_TOKEN = "test-valid-token";
-// A token carrying ONLY channel:write (a session/bridge token) — must be
-// REJECTED on the UI send endpoint, which requires channel:send. Locks the
+// A token carrying ONLY agent:write (a session/bridge token) — must be
+// REJECTED on the UI send endpoint, which requires agent:send. Locks the
 // privilege separation (a session token can't post as a human).
 const WRITE_ONLY_TOKEN = "test-write-only-token";
 mock.module("../hub-jwt.ts", () => ({
+  // New tokens carry aud "agent" (channel→agent rename); CHANNEL_AUDIENCE stays a
+  // deprecated alias. ACCEPTED_AUDIENCES is the dual-accept set the real adapter
+  // checks — included so the mock matches the renamed module surface.
+  AGENT_AUDIENCE: "agent",
   CHANNEL_AUDIENCE: "channel",
+  ACCEPTED_AUDIENCES: ["agent", "channel"],
   async validateHubJwt(token: string) {
     if (token === VALID_TOKEN) {
       return {
         sub: "test",
-        scopes: ["channel:read", "channel:send", "channel:write"],
-        aud: "channel",
+        scopes: ["agent:read", "agent:send", "agent:write"],
+        aud: "agent",
         jti: undefined,
         clientId: undefined,
         vaultScope: undefined,
@@ -43,8 +48,8 @@ mock.module("../hub-jwt.ts", () => ({
     if (token === WRITE_ONLY_TOKEN) {
       return {
         sub: "test",
-        scopes: ["channel:write"],
-        aud: "channel",
+        scopes: ["agent:write"],
+        aud: "agent",
         jti: undefined,
         clientId: undefined,
         vaultScope: undefined,
@@ -145,9 +150,9 @@ describe("HttpUiTransport — direct", () => {
     expect(ctx.emitted).toHaveLength(0);
   });
 
-  test("ingestHttp send with a channel:write-only (session) token → 403, no emit", async () => {
-    // Privilege separation: a session/bridge token (channel:write) must NOT be
-    // usable to post a human message through the UI send endpoint (channel:send).
+  test("ingestHttp send with an agent:write-only (session) token → 403, no emit", async () => {
+    // Privilege separation: a session/bridge token (agent:write) must NOT be
+    // usable to post a human message through the UI send endpoint (agent:send).
     const t = new HttpUiTransport();
     const ctx = fakeCtx("dev");
     await t.start(ctx);

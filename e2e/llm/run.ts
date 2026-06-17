@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Tier 2 — LLM-run end-to-end test for parachute-channel.
+ * Tier 2 — LLM-run end-to-end test for parachute-agent.
  *
  * This is the headline test of the channel fabric: it exercises the REAL
  * wake → act → reply loop against a REAL interactive Claude Code session, the
@@ -33,8 +33,8 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PORT = parseInt(process.env.E2E_PORT ?? "19471", 10);
 const BASE = `http://127.0.0.1:${PORT}`;
 const CHANNEL = "e2e";
-const SESSION = "parachute-channel-e2e";
-const STATE_DIR = `/tmp/parachute-channel-e2e-${PORT}`;
+const SESSION = "parachute-agent-e2e";
+const STATE_DIR = `/tmp/parachute-agent-e2e-${PORT}`;
 const WORKDIR = join(STATE_DIR, "workdir");
 const KEEP = process.env.E2E_KEEP === "1";
 const JUDGE_MODEL = process.env.E2E_JUDGE_MODEL ?? "claude-haiku-4-5-20251001";
@@ -166,10 +166,10 @@ async function main(): Promise<void> {
     JSON.stringify(
       {
         mcpServers: {
-          "parachute-channel": {
+          "parachute-agent": {
             command: "bun",
             args: [join(REPO_ROOT, "src", "bridge.ts")],
-            env: { PARACHUTE_CHANNEL_URL: BASE, PARACHUTE_CHANNEL_NAME: CHANNEL },
+            env: { PARACHUTE_AGENT_URL: BASE, PARACHUTE_CHANNEL_NAME: CHANNEL },
           },
         },
       },
@@ -186,8 +186,8 @@ async function main(): Promise<void> {
     env: {
       ...process.env,
       PARACHUTE_HOME: STATE_DIR,
-      PARACHUTE_CHANNEL_STATE_DIR: STATE_DIR,
-      PARACHUTE_CHANNEL_PORT: String(PORT),
+      PARACHUTE_AGENT_STATE_DIR: STATE_DIR,
+      PARACHUTE_AGENT_PORT: String(PORT),
     },
     stdout: Bun.file(join(STATE_DIR, "daemon.log")),
     stderr: Bun.file(join(STATE_DIR, "daemon.log")),
@@ -204,7 +204,7 @@ async function main(): Promise<void> {
   tmux("kill-session", "-t", SESSION);
   tmux(
     "new-session", "-d", "-s", SESSION, "-x", "220", "-y", "50",
-    `cd ${WORKDIR} && exec claude --dangerously-load-development-channels=server:parachute-channel --dangerously-skip-permissions`,
+    `cd ${WORKDIR} && exec claude --dangerously-load-development-channels=server:parachute-agent --dangerously-skip-permissions`,
   );
 
   // handle the one-time channels-dev-mode confirmation prompt. It renders a beat

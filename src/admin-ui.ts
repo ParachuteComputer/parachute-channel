@@ -1,5 +1,5 @@
 /**
- * Static HTML for `/channel/admin` — the module-owned channel config/admin
+ * Static HTML for `/agent/admin` — the module-owned channel config/admin
  * surface. Part of the modular-UI architecture (P4): modules OWN their config
  * UI; the hub frames/links it via `configUiUrl` in `.parachute/module.json`.
  *
@@ -10,9 +10,9 @@
  * I/O.
  *
  * What the page does on load:
- *   1. Fetch a `channel:admin` Bearer from the hub (cookie-gated mint endpoint,
- *      mirroring the chat UI's `fetchToken()` against `/admin/channel-token`).
- *   2. `GET <mount>/api/channels` (channel:admin) — list configured channels.
+ *   1. Fetch an `agent:admin` Bearer from the hub (cookie-gated mint endpoint,
+ *      mirroring the chat UI's `fetchToken()` against `/admin/agent-token`).
+ *   2. `GET <mount>/api/channels` (agent:admin) — list configured channels.
  *   3. Render each with name + transport + live status (`GET <mount>/health`).
  *   4. ONE unified add-form with a single transport select. Vault is just
  *      another transport option (the primary/expected one), alongside
@@ -20,7 +20,7 @@
  *      transport drives which config fields show AND which submit path runs:
  *        - `vault`    → vault picker → the hub-orchestrated link flow:
  *                       `POST <hub-origin>/admin/connections`
- *                       (`credentials: "include"`, `requestedBy: "channel"`).
+ *                       (`credentials: "include"`, `requestedBy: "agent"`).
  *                       The operator clicking the button IS the approval; the
  *                       hub mints the cross-module tokens + registers the vault
  *                       trigger and returns the `claude mcp add` connect lines,
@@ -46,11 +46,11 @@
  *
  * Auth posture (mirrors scribe's stateless design):
  *   - When loaded through the hub's reverse proxy to a logged-in operator, the
- *     page fetches a hub-minted `channel:admin` Bearer (cookie-gated) and
+ *     page fetches a hub-minted `agent:admin` Bearer (cookie-gated) and
  *     attaches it to every `/api/channels` call. The operator never sees it.
  *   - When loaded directly off the daemon (no hub in front, not logged in), the
  *     token fetch fails; the page surfaces a "no auth" banner pointing the
- *     operator at the hub. The channel daemon's `requireScope` gate always
+ *     operator at the hub. The agent daemon's `requireScope` gate always
  *     requires a hub JWT — there is no loopback-open fallback (unlike scribe),
  *     so a token is mandatory for the API calls (the PAGE itself still loads
  *     open so it can bootstrap the token fetch).
@@ -61,12 +61,12 @@
  * flows (`credentials: "include"`) and the hub — the only thing with
  * cross-module authority — mints the tokens + registers the vault trigger on
  * their behalf. The telegram/http-ui adds (which need no cross-module wiring)
- * POST straight to the channel daemon's `/api/channels`. Both paths live in the
+ * POST straight to the agent daemon's `/api/channels`. Both paths live in the
  * one add-form, switched by the transport select.
  */
 
 import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
-import { PROVISION_JS } from "./provision-channel.ts";
+import { PROVISION_JS } from "./provision-agent.ts";
 
 const PALETTE = {
   bg: "#faf8f4",
@@ -116,11 +116,11 @@ export function escapeHtml(s: string): string {
  * rendered HTML is the same across requests for a given mount.
  *
  * `mount` is the path prefix the in-page fetches must use to reach the daemon's
- * `/api/channels`, `/health`, and the hub's `/admin/channel-token`. When the
- * channel daemon is launched bare (no `--mount`) but accessed through the hub's
- * `/channel` proxy (the hub strips `/channel` before forwarding, so the
+ * `/api/channels`, `/health`, and the hub's `/admin/agent-token`. When the
+ * agent daemon is launched bare (no `--mount`) but accessed through the hub's
+ * `/agent` proxy (the hub strips `/agent` before forwarding, so the
  * daemon's request-level path is bare `/admin` even though the public mount is
- * `/channel`), the server-side `mount` is empty. The page ALSO detects the
+ * `/agent`), the server-side `mount` is empty. The page ALSO detects the
  * mount at runtime from `window.location.pathname` so the in-page fetches
  * resolve under the public prefix regardless of how the daemon was launched —
  * the same fix scribe shipped (admin#39). Default `""` preserves the bare shape
@@ -133,7 +133,7 @@ export function renderAdminPage(mount = ""): string {
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Channel — Configuration</title>
+  <title>Agent — Configuration</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="no-referrer" />
   <style>${THEME_CSS}${STYLES}</style>
@@ -215,7 +215,7 @@ export function renderAdminPage(mount = ""): string {
       <footer class="card-footer">
         <p class="footer-hint">
           Live config (resolved, no secrets): <a href="${escapeHtml(configUrl)}">${escapeHtml(configUrl)}</a>.
-          Channels file on disk: <code>~/.parachute/channel/channels.json</code>.
+          Channels file on disk: <code>~/.parachute/agent/channels.json</code>.
         </p>
       </footer>
     </div>
@@ -228,15 +228,15 @@ export function renderAdminPage(mount = ""): string {
     //   1. RUNTIME detection from window.location.pathname (load-bearing). The
     //      admin page is served at \`<mount>/admin\`. Strip the trailing
     //      "/admin" to recover \`<mount>\`. Works regardless of launch shape:
-    //      direct loopback (mount = ""), through a hub mounted at /channel
-    //      (mount = "/channel"), or any custom prefix.
+    //      direct loopback (mount = ""), through a hub mounted at /agent
+    //      (mount = "/agent"), or any custom prefix.
     //
     //   2. SERVER-rendered fallback (the \`${channelsUrl}\` the server
     //      interpolated) — used only when window.location is unavailable.
     //
-    // Same shape scribe ships. The hub strips /channel before forwarding, so
+    // Same shape scribe ships. The hub strips /agent before forwarding, so
     // the daemon's server-side mount is "" even though the browser page URL is
-    // /channel/admin and the API lives at /channel/api/channels. Runtime
+    // /agent/admin and the API lives at /agent/api/channels. Runtime
     // detection captures this without the launcher passing --mount.
     (function () {
       function detectMount() {
@@ -457,10 +457,10 @@ const PAGE_SCRIPT = String.raw`
   // above, which wireShell then reads.
   wireShell("config");
 
-  // --- Auth: a channel:admin Bearer minted by the hub --------------------
+  // --- Auth: an agent:admin Bearer minted by the hub --------------------
   // The channel config API (/api/channels) requires a hub JWT with
-  // channel:admin. fetchToken (SHELL_JS) mints one for the logged-in portal
-  // operator at <origin>/admin/channel-token (cookie-gated) and caches it on
+  // agent:admin. fetchToken (SHELL_JS) mints one for the logged-in portal
+  // operator at <origin>/admin/agent-token (cookie-gated) and caches it on
   // window.__token; it REJECTS on failure. ensureToken wraps it to resolve to
   // null instead, so boot still proceeds to loadChannels -- which surfaces the
   // no-auth banner on the resulting 401 (one clear notice, not two).
@@ -489,21 +489,21 @@ const PAGE_SCRIPT = String.raw`
   function noAuthBanner() {
     setBanner(
       "warn",
-      "<strong>Not authenticated.</strong> This page needs a <code>channel:admin</code> token, " +
+      "<strong>Not authenticated.</strong> This page needs an <code>agent:admin</code> token, " +
         "minted for the logged-in operator by the hub. Open it through the Parachute hub portal " +
-        "(at <code>/channel/admin</code>, signed in) rather than hitting the daemon directly."
+        "(at <code>/agent/admin</code>, signed in) rather than hitting the daemon directly."
     );
   }
 
-  // Reflect whether we hold a channel:admin token in the add-form's affordance,
+  // Reflect whether we hold an agent:admin token in the add-form's affordance,
   // so the operator gets a CLEAR actionable state rather than an Add button that
   // silently 401s. When not authed: disable + relabel the button and explain.
   //
-  // Caveat: the channel:admin token gates the telegram + http-ui submit path
+  // Caveat: the agent:admin token gates the telegram + http-ui submit path
   // (POST /api/channels). The VAULT path instead POSTs to the hub's
   // /admin/connections with the hub SESSION COOKIE (not this token), so it can
-  // succeed even without a channel:admin token. We keep the disabled/relabel
-  // affordance off the channel:admin token (the common case + the clearest
+  // succeed even without an agent:admin token. We keep the disabled/relabel
+  // affordance off the agent:admin token (the common case + the clearest
   // signal); the vault path's own 401 handler surfaces a hub-session-specific
   // message if the cookie is what's missing. Called after the list load resolves.
   window.__authed = false;
@@ -518,7 +518,7 @@ const PAGE_SCRIPT = String.raw`
   // Show only the config fields the selected transport needs, and adjust the
   // button label. Single-select drives one submit path (see addChannel). The
   // add-button's enabled state is per-transport: telegram/http-ui gate on the
-  // channel:admin token (__authed); vault gates on vault-availability
+  // agent:admin token (__authed); vault gates on vault-availability
   // (__vaultsAvailable) instead, because its submit goes to the hub's
   // Connections engine under the hub SESSION COOKIE (not this token) and
   // handles its own hub-session 401. (See the inner button block.)
@@ -547,7 +547,7 @@ const PAGE_SCRIPT = String.raw`
     if (hint) {
       if (transport === "vault") {
         hint.innerHTML =
-          "Inbound messages become <code>#channel-message</code> notes; a session replies by writing notes. " +
+          "Inbound messages become <code>#agent-message</code> notes; a session replies by writing notes. " +
           "Clicking <strong>Add channel</strong> is your approval &mdash; the hub mints the cross-module tokens " +
           "and registers the vault trigger.";
       } else if (transport === "telegram") {
@@ -559,7 +559,7 @@ const PAGE_SCRIPT = String.raw`
       }
     }
     if (btn) {
-      // The add button's enabled state: telegram/http-ui need the channel:admin
+      // The add button's enabled state: telegram/http-ui need the agent:admin
       // token (__authed); vault needs at least one vault to exist (the vault
       // submit uses the hub session cookie, validated server-side, so we don't
       // gate it on __authed). Relabel to match the selected path.
@@ -577,7 +577,7 @@ const PAGE_SCRIPT = String.raw`
   // setBanner(...) interpolations reuse it, one escaping discipline page-wide.
 
   // --- List + render ------------------------------------------------------
-  // Two reads: /api/channels (channel:admin, the authoritative config list:
+  // Two reads: /api/channels (agent:admin, the authoritative config list:
   // name + transport + vault) and /health (open: live-status + client counts).
   // We join them by name so each row shows config + liveness.
   function fetchHealth() {
@@ -735,7 +735,7 @@ const PAGE_SCRIPT = String.raw`
     // plain POST /api/channels path. Branch on the selected transport.
     if (transport === "vault") { return addVaultChannel(name); }
 
-    // telegram + http-ui POST straight to the channel daemon. http-ui is fully
+    // telegram + http-ui POST straight to the agent daemon. http-ui is fully
     // self-contained (no config). telegram REQUIRES a per-channel bot token in
     // config.token -- there is no daemon-global env fallback anymore, so a blank
     // token can't succeed. Block the submit with a clear field error.
@@ -753,7 +753,7 @@ const PAGE_SCRIPT = String.raw`
     var prev = btn.textContent;
     btn.textContent = "Adding...";
     // Provision via the SHARED provisioning client (ChannelProvision). It POSTs
-    // <mount>/api/channels (channel:admin Bearer) and resolves a structured result;
+    // <mount>/api/channels (agent:admin Bearer) and resolves a structured result;
     // never rejects. Same code the create-agent flow runs for telegram/http-ui.
     ChannelProvision.provisionDaemonChannel({
       apiUrl: API_URL, token: window.__token, name: name, transport: transport, config: config,
@@ -775,7 +775,7 @@ const PAGE_SCRIPT = String.raw`
           "warn",
           "<strong>Saved &mdash; restart needed.</strong> Channel <code>" + escapeHtml(name) +
             "</code> was written to disk but didn't start live: " + escapeHtml(res.error || "") +
-            " Run <code>parachute restart channel</code>."
+            " Run <code>parachute restart agent</code>."
         );
       } else {
         setBanner("success", "<strong>Channel added.</strong> <code>" + escapeHtml(name) + "</code> (" + escapeHtml(transport) + ") is live.");
@@ -803,7 +803,7 @@ const PAGE_SCRIPT = String.raw`
   //       delivers to this channel;
   //   (b) DELETE <origin>/admin/connections/<id> -- the hub deregisters the
   //       vault trigger + revokes the registered token mints (post-B0);
-  //   (c) DELETE <mount>/api/channels/<name> (Bearer channel:admin) -- the
+  //   (c) DELETE <mount>/api/channels/<name> (Bearer agent:admin) -- the
   //       daemon mechanics, as today.
   //
   // A hub-side failure surfaces an explicit two-step ask (proceed with the
@@ -815,7 +815,7 @@ const PAGE_SCRIPT = String.raw`
     if (btn) { btn.disabled = false; btn.textContent = "Remove"; }
   }
 
-  // The daemon mechanics: DELETE <mount>/api/channels/<name> (channel:admin
+  // The daemon mechanics: DELETE <mount>/api/channels/<name> (agent:admin
   // Bearer via authHeaders). Promise-shaped, never rejects -- resolves
   // { ok:true } | { ok:false, auth:true } | { ok:false, error }. The daemon's
   // DELETE is idempotent (a missing channel still 200s with removed:false);
@@ -859,12 +859,12 @@ const PAGE_SCRIPT = String.raw`
   }
 
   // A hub connection record belongs to this channel when its SINK delivers to
-  // it: sink.module === "channel" with sink.params.channel === name. The hub's
+  // it: sink.module === "agent" with sink.params.channel === name. The hub's
   // own teardown falls back to the record id as the channel name when
   // params.channel is absent -- mirror that fallback so this match agrees with
   // what the hub would tear down.
   function connectionMatchesChannel(c, name) {
-    if (!c || !c.sink || c.sink.module !== "channel") return false;
+    if (!c || !c.sink || c.sink.module !== "agent") return false;
     var p = c.sink.params;
     if (p && typeof p.channel === "string") return p.channel === name;
     return c.id === name;
@@ -872,7 +872,7 @@ const PAGE_SCRIPT = String.raw`
 
   // (a)+(b) of the composed delete: find + tear down the channel's hub
   // connection record(s), then hand off to the daemon mechanics. Same-origin
-  // under the /channel proxy, so the operator's hub session cookie flows with
+  // under the /agent proxy, so the operator's hub session cookie flows with
   // credentials:"include" and the fetch carries a matching Origin header --
   // the hub's CSRF Origin check on /admin/* mutations (C1) passes
   // automatically; no token dance needed. Mirrors the link-vault flow above.
@@ -996,8 +996,8 @@ const PAGE_SCRIPT = String.raw`
           setBanner(
             "warn",
             "<strong>Not authenticated.</strong> The hub connection teardown already completed " +
-              "(vault trigger deregistered, tokens revoked), but removing the channel entry needs a " +
-              "<code>channel:admin</code> token, minted for the logged-in operator by the hub. " +
+              "(vault trigger deregistered, tokens revoked), but removing the channel entry needs an " +
+              "<code>agent:admin</code> token, minted for the logged-in operator by the hub. " +
               "The channel entry remains &mdash; open this page through the Parachute hub portal " +
               "(signed in) and retry the remove."
           );
@@ -1048,7 +1048,7 @@ const PAGE_SCRIPT = String.raw`
 
   // --- Vault transport: populate the vault picker (modular-UI R2) ----------
   // Populate the vault dropdown from the hub's PUBLIC discovery doc. The page
-  // is same-origin with the hub under the /channel proxy, so /.well-known/
+  // is same-origin with the hub under the /agent proxy, so /.well-known/
   // parachute.json resolves at the hub origin. No token needed -- it's public.
   // The vault picker lives inside the unified add-form (revealed when the vault
   // transport is selected); a no-vaults / load-error state disables the add
@@ -1145,7 +1145,7 @@ const PAGE_SCRIPT = String.raw`
     var prev = btn.textContent;
     btn.textContent = "Linking...";
     // Provision via the SHARED provisioning client (ChannelProvision —
-    // src/provision-channel.ts). It POSTs the canonical vault-backed-channel body
+    // src/provision-agent.ts). It POSTs the canonical vault-backed-channel body
     // (vault.note.created filtered to the inbound tag -> channel.message.deliver)
     // to the HUB's Connections engine with the operator's hub session cookie
     // (credentials:"include" -- the click IS the approval). Same code the
@@ -1157,7 +1157,7 @@ const PAGE_SCRIPT = String.raw`
           setBanner(
             "warn",
             "<strong>Not signed in to the hub.</strong> Linking a vault uses your hub admin session. " +
-              "Open this page through the Parachute hub portal (signed in) at <code>/channel/admin</code>, " +
+              "Open this page through the Parachute hub portal (signed in) at <code>/agent/admin</code>, " +
               "then try again."
           );
           return;

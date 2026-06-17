@@ -5,8 +5,8 @@
  *
  * `renderAdminPage` is a pure function — these assert the rendered HTML carries
  * the right mount-aware shape (the load-bearing fix for the "hub strips
- * /channel before forwarding" case where server-side `mount` is empty but the
- * browser page URL is `/channel/admin`), and that the page targets the right
+ * /agent before forwarding" case where server-side `mount` is empty but the
+ * browser page URL is `/agent/admin`), and that the page targets the right
  * endpoints. No DOM tests — just verify the served strings.
  */
 import { describe, expect, test } from "bun:test";
@@ -16,7 +16,7 @@ import { renderAdminPage, escapeHtml } from "./admin-ui.ts";
 describe("renderAdminPage", () => {
   test("renders the channel config chrome", () => {
     const html = renderAdminPage("");
-    expect(html).toContain("<title>Channel — Configuration</title>");
+    expect(html).toContain("<title>Agent — Configuration</title>");
     expect(html).toContain("Manage channels");
     // ONE unified add-form, single transport <select>, with vault as a first-
     // class option alongside telegram + http-ui (Aaron: vault is just another
@@ -40,11 +40,11 @@ describe("renderAdminPage", () => {
   });
 
   test("server-side mount appears in the visible chrome links (proxied)", () => {
-    const html = renderAdminPage("/channel");
+    const html = renderAdminPage("/agent");
     // Footer "live config" link is built from the server-side mount.
-    expect(html).toContain('href="/channel/.parachute/config"');
+    expect(html).toContain('href="/agent/.parachute/config"');
     // The bootstrap fallback API URL is the JSON-encoded mounted path.
-    expect(html).toContain('"/channel/api/channels"');
+    expect(html).toContain('"/agent/api/channels"');
   });
 
   test("empty server-side mount → bare-root links (direct loopback)", () => {
@@ -56,7 +56,7 @@ describe("renderAdminPage", () => {
   test("inline script carries runtime mount detection", () => {
     const html = renderAdminPage("");
     // Strips the trailing /admin to recover the public mount at runtime, so the
-    // page works at /admin (direct) AND /channel/admin (proxied) regardless of
+    // page works at /admin (direct) AND /agent/admin (proxied) regardless of
     // how the daemon was launched.
     expect(html).toContain("window.location.pathname");
     expect(html).toContain('"/admin"');
@@ -74,23 +74,23 @@ describe("renderAdminPage", () => {
     expect(html).toContain('method: "POST"');
   });
 
-  test("obtains a channel:admin Bearer from the hub's cookie-gated mint", () => {
+  test("obtains an agent:admin Bearer from the hub's cookie-gated mint", () => {
     const html = renderAdminPage("");
-    // Mirrors the chat UI's fetchToken(): GET <origin>/admin/channel-token with
+    // Mirrors the chat UI's fetchToken(): GET <origin>/admin/agent-token with
     // credentials so the hub mints from the operator's session cookie.
-    expect(html).toContain("/admin/channel-token");
+    expect(html).toContain("/admin/agent-token");
     expect(html).toContain('credentials: "include"');
     expect(html).toContain("Bearer ");
   });
 
   test("surfaces a no-auth banner pointing at the hub", () => {
     const html = renderAdminPage("");
-    expect(html).toContain("channel:admin");
+    expect(html).toContain("agent:admin");
     expect(html).toContain("Parachute hub portal");
   });
 
   test("renders the same HTML for a given mount (pure function)", () => {
-    expect(renderAdminPage("/channel")).toBe(renderAdminPage("/channel"));
+    expect(renderAdminPage("/agent")).toBe(renderAdminPage("/agent"));
     expect(renderAdminPage("")).toBe(renderAdminPage(""));
   });
 });
@@ -117,13 +117,13 @@ describe("unified transport select drives fields + submit path", () => {
     expect(html).toContain("function addVaultChannel");
     // POSTs to the HUB origin's /admin/connections (NOT a channel path).
     expect(html).toContain('window.location.origin + "/admin/connections"');
-    // Same-origin cookie flows because the page is proxied under /channel.
+    // Same-origin cookie flows because the page is proxied under /agent.
     expect(html).toContain('credentials: "include"');
     // Provenance labels the connection module-initiated.
-    expect(html).toContain('requestedBy: "channel"');
-    // The canonical source/sink: vault.note.created (inbound tag) → channel.message.deliver.
+    expect(html).toContain('requestedBy: "agent"');
+    // The canonical source/sink: vault.note.created (inbound tag) → agent.message.deliver.
     expect(html).toContain('event: "note.created"');
-    expect(html).toContain("#channel-message/inbound");
+    expect(html).toContain("#agent-message/inbound");
     expect(html).toContain('action: "message.deliver"');
     // The chosen channel name (the shared #f-name input) rides as the sink param.
     expect(html).toContain("params: { channel: name }");
@@ -139,7 +139,7 @@ describe("unified transport select drives fields + submit path", () => {
     expect(html).toContain("config = { token: tgToken }");
     expect(html).toContain('setFieldError("f-telegram-token"');
     // The daemon-transport submit goes through the SHARED provisioning client
-    // (ChannelProvision.provisionDaemonChannel — src/provision-channel.ts), which
+    // (ChannelProvision.provisionDaemonChannel — src/provision-agent.ts), which
     // attaches config when present. The page hands it the assembled config.
     expect(html).toContain("ChannelProvision.provisionDaemonChannel");
     // provisionDaemonChannel builds the POST body (name + transport + optional
@@ -236,11 +236,12 @@ describe("telegram per-channel config copy (Aaron's feedback)", () => {
 });
 
 describe("add-channel affordance (the unusable-add fix)", () => {
-  test("disables + relabels the Add button when there is no channel:admin token", () => {
+  test("disables + relabels the Add button when there is no agent:admin token", () => {
     const html = renderAdminPage("");
     // The add-form is reflected as authed/not-authed so the operator never sees
     // an Add button that silently 401s — the core of the 'no way to add' fix.
     // For telegram/http-ui, applyTransportUI gates the button on __authed.
+    // (Auth = an agent:admin token from the hub.)
     expect(html).toContain("function setAddFormAuthState");
     expect(html).toContain("Sign in to the hub to add");
     // It's driven off the channel-list load resolving (authed) or 401 (not).
@@ -274,8 +275,8 @@ describe("escape hardening (channel#37)", () => {
   });
 
   test("a normal mount still renders a clean, working footer link", () => {
-    const html = renderAdminPage("/channel");
-    expect(html).toContain('href="/channel/.parachute/config"');
+    const html = renderAdminPage("/agent");
+    expect(html).toContain('href="/agent/.parachute/config"');
   });
 
   test("the remove-confirm interpolates the channel name through escapeHtml", () => {
@@ -330,7 +331,7 @@ describe("vault-backed delete composes hub connection teardown (boundary C2)", (
     expect(tdFn).toContain('method: "DELETE"');
     expect(tdFn).toContain('credentials: "include"');
     // (c) The daemon mechanics run in finishMechanics, AFTER the hub side —
-    // through the same DELETE /api/channels path as before (channel:admin
+    // through the same DELETE /api/channels path as before (agent:admin
     // Bearer), tolerating already-gone (the hub's channel-sink step may have
     // removed the entry first).
     const fmFn = html.slice(
@@ -341,12 +342,12 @@ describe("vault-backed delete composes hub connection teardown (boundary C2)", (
   });
 
   test("identifies the channel's record by its sink, with the hub's id fallback", () => {
-    // Match: sink.module === "channel" && sink.params.channel === name; when
+    // Match: sink.module === "agent" && sink.params.channel === name; when
     // params.channel is absent, fall back to record-id-as-channel-name — the
     // exact fallback the hub's own teardownConnection applies, so the page
     // tears down precisely what the hub would.
     expect(html).toContain("function connectionMatchesChannel");
-    expect(html).toContain('c.sink.module !== "channel"');
+    expect(html).toContain('c.sink.module !== "agent"');
     expect(html).toContain("p.channel === name");
     expect(html).toContain("return c.id === name");
   });
@@ -415,7 +416,7 @@ describe("vault-backed delete composes hub connection teardown (boundary C2)", (
     expect(html).toContain("deleteChannelConfig(name, {}).then(function (out)");
     expect(html).toContain("</code> is gone.");
     // The daemon DELETE still targets <mount>/api/channels/<name> with the
-    // channel:admin Bearer (authHeaders), exactly as today.
+    // agent:admin Bearer (authHeaders), exactly as today.
     expect(html).toContain('API_URL + "/" + encodeURIComponent(name)');
     expect(html).toContain("headers: authHeaders()");
   });
@@ -438,7 +439,7 @@ describe("module.json — modular-UI (P4) declaration", () => {
   test("parses as JSON and carries the new fields", async () => {
     const raw = await Bun.file(manifestPath).text();
     const m = JSON.parse(raw) as Record<string, unknown>;
-    expect(m.configUiUrl).toBe("/channel/admin");
+    expect(m.configUiUrl).toBe("/agent/admin");
     expect(m.focus).toBe("experimental");
     expect(m.adminCapabilities).toEqual(["config"]);
   });
@@ -473,7 +474,7 @@ describe("module.json — modular-UI (P4) declaration", () => {
     };
     const deliver = (m.actions ?? []).find((a) => a.key === "message.deliver");
     expect(deliver?.endpoint).toBe("/api/vault/inbound");
-    expect(deliver?.scope).toBe("channel:send");
+    expect(deliver?.scope).toBe("agent:send");
   });
 
   test("declares a connectionTemplate for the parameterized link-to-vault connection (R2)", async () => {
@@ -489,12 +490,12 @@ describe("module.json — modular-UI (P4) declaration", () => {
     const tmpl = (m.connectionTemplates ?? []).find((t) => t.key === "link-to-vault");
     expect(tmpl).toBeDefined();
     // The module declares WHAT it wants: vault.note.created (inbound tag) →
-    // channel.message.deliver, labeled module-initiated.
-    expect(tmpl?.requestedBy).toBe("channel");
+    // agent.message.deliver, labeled module-initiated.
+    expect(tmpl?.requestedBy).toBe("agent");
     expect(tmpl?.source?.module).toBe("vault");
     expect(tmpl?.source?.event).toBe("note.created");
-    expect(tmpl?.source?.filter?.tags).toContain("#channel-message/inbound");
-    expect(tmpl?.sink?.module).toBe("channel");
+    expect(tmpl?.source?.filter?.tags).toContain("#agent-message/inbound");
+    expect(tmpl?.sink?.module).toBe("agent");
     expect(tmpl?.sink?.action).toBe("message.deliver");
     // It's PARAMETERIZED — the operator picks the vault + names the channel.
     const paramKeys = (tmpl?.parameters ?? []).map((p) => p.key);
@@ -509,10 +510,10 @@ describe("module.json — modular-UI (P4) declaration", () => {
 
   test("preserves the existing manifest contract (name, port, scopes)", async () => {
     const m = JSON.parse(await Bun.file(manifestPath).text()) as Record<string, unknown>;
-    expect(m.name).toBe("channel");
+    expect(m.name).toBe("agent");
     expect(m.port).toBe(1941);
-    expect(m.uiUrl).toBe("/channel/home");
+    expect(m.uiUrl).toBe("/agent/home");
     const scopes = m.scopes as { defines?: string[] } | undefined;
-    expect(scopes?.defines).toContain("channel:admin");
+    expect(scopes?.defines).toContain("agent:admin");
   });
 });

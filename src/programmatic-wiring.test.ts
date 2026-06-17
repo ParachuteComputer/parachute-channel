@@ -5,7 +5,7 @@
  * Exercises the REAL daemon fetch handler + a real {@link ProgrammaticAgentRegistry}
  * backed by a FAKE {@link AgentBackend} (no `claude -p`) + a recorder outbound write
  * (no vault). The hub-jwt validator is mocked (the sentinel-token harness the other
- * daemon tests use) so a known Bearer carries channel:admin/send WITHOUT a live hub.
+ * daemon tests use) so a known Bearer carries agent:admin/send WITHOUT a live hub.
  *
  * Covered (the prompt's test list):
  *   - spawn with backend:"programmatic" → no tmux session, agent registered,
@@ -23,13 +23,14 @@
 
 import { describe, test, expect, mock, afterEach } from "bun:test";
 
-const ADMIN_TOKEN = "test-admin-token"; // channel:read + send + admin
+const ADMIN_TOKEN = "test-admin-token"; // agent:read + send + admin
 import { HubJwtError, looksLikeJwt } from "@openparachute/scope-guard";
 mock.module("./hub-jwt.ts", () => ({
+  AGENT_AUDIENCE: "agent",
   CHANNEL_AUDIENCE: "channel",
   async validateHubJwt(token: string) {
-    const base = { sub: "test", aud: "channel", jti: undefined, clientId: undefined, vaultScope: undefined };
-    if (token === ADMIN_TOKEN) return { ...base, scopes: ["channel:read", "channel:send", "channel:admin"] };
+    const base = { sub: "test", aud: "agent", jti: undefined, clientId: undefined, vaultScope: undefined };
+    if (token === ADMIN_TOKEN) return { ...base, scopes: ["agent:read", "agent:send", "agent:admin"] };
     throw new HubJwtError("issuer", "invalid token");
   },
   HubJwtError,
@@ -60,25 +61,25 @@ import type { AgentOps, AgentInfo, SpawnRequestError } from "./agents.ts";
 const adminAuth = { authorization: "Bearer " + ADMIN_TOKEN };
 
 // ---------------------------------------------------------------------------
-// Real-home safety guard (channel#75)
+// Real-home safety guard (agent#75)
 //
 // A phantom `eng` programmatic agent appeared on a LIVE box because a test write
-// escaped isolation into the real `~/.parachute/channel/sessions/`. Boot re-register
+// escaped isolation into the real `~/.parachute/agent/sessions/`. Boot re-register
 // then scanned it and resurrected the agent. Every test here that persists a spec /
-// touches the channel state dir MUST write ONLY to a per-test temp dir. The `afterEach`
+// touches the agent state dir MUST write ONLY to a per-test temp dir. The `afterEach`
 // real-home assertion below is the backstop; `withTempStateDir` is the easy-path helper
 // future state-touching tests should reach for.
 //
 // `realSessionsDir()` is the operator's REAL sessions dir, derived the SAME way the
-// daemon derives it (`~/.parachute/channel/sessions`) but WITHOUT honoring
-// PARACHUTE_CHANNEL_STATE_DIR — so it's the genuine home even while a test has the env
+// daemon derives it (`~/.parachute/agent/sessions`) but WITHOUT honoring
+// PARACHUTE_AGENT_STATE_DIR — so it's the genuine home even while a test has the env
 // var pointed at a temp dir. A new test session/spec dir appearing under it is the
 // leak signature.
 import { homedir } from "node:os";
 import { readdirSync } from "node:fs";
 
 function realSessionsDir(): string {
-  return join(homedir(), ".parachute", "channel", "sessions");
+  return join(homedir(), ".parachute", "agent", "sessions");
 }
 
 function listRealSessions(): string[] {
@@ -107,12 +108,12 @@ afterEach(() => {
     leaked,
     `test wrote ${leaked.length} new session dir(s) into the REAL ${realSessionsDir()} ` +
       `(${leaked.join(", ")}) — every spec/state write must be inside a temp dir ` +
-      `(PARACHUTE_CHANNEL_STATE_DIR + mkdtemp). See channel#75.`,
+      `(PARACHUTE_AGENT_STATE_DIR + mkdtemp). See agent#75.`,
   ).toEqual([]);
 });
 
 /**
- * Run `fn` with PARACHUTE_CHANNEL_STATE_DIR pointed at a fresh mkdtemp dir, so
+ * Run `fn` with PARACHUTE_AGENT_STATE_DIR pointed at a fresh mkdtemp dir, so
  * `defaultStateDir()` / `defaultSessionsDir()` (and anything that derives from them —
  * `setupProgrammaticSpawn`, the credentials store, boot re-register's default arg)
  * resolve UNDER the temp dir, never the operator's real home. Restores the prior env
@@ -121,13 +122,13 @@ afterEach(() => {
  */
 async function withTempStateDir<T>(fn: (dir: string) => Promise<T> | T): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "channel-state-"));
-  const prev = process.env.PARACHUTE_CHANNEL_STATE_DIR;
-  process.env.PARACHUTE_CHANNEL_STATE_DIR = dir;
+  const prev = process.env.PARACHUTE_AGENT_STATE_DIR;
+  process.env.PARACHUTE_AGENT_STATE_DIR = dir;
   try {
     return await fn(dir);
   } finally {
-    if (prev === undefined) delete process.env.PARACHUTE_CHANNEL_STATE_DIR;
-    else process.env.PARACHUTE_CHANNEL_STATE_DIR = prev;
+    if (prev === undefined) delete process.env.PARACHUTE_AGENT_STATE_DIR;
+    else process.env.PARACHUTE_AGENT_STATE_DIR = prev;
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -229,10 +230,10 @@ async function until(pred: () => boolean, tries = 200): Promise<void> {
 
 describe("spawn with backend:'programmatic'", () => {
   test("→ no tmux spawn, agent registered, spec.json carries backend", async () => {
-    // withTempStateDir points PARACHUTE_CHANNEL_STATE_DIR at a fresh mkdtemp dir so
+    // withTempStateDir points PARACHUTE_AGENT_STATE_DIR at a fresh mkdtemp dir so
     // defaultStateDir/defaultSessionsDir resolve under <dir> (NOT the operator's real
     // ~/.parachute) and restores + cleans up on exit — the temp-dir discipline a
-    // state-touching test must follow (channel#75). The afterEach backstop double-checks.
+    // state-touching test must follow (agent#75). The afterEach backstop double-checks.
     await withTempStateDir(async (dir) => {
       const backend = new FakeBackend();
       const rec = recorder();
@@ -286,7 +287,7 @@ describe("inbound for a programmatic channel → deliver → outbound note", () 
         note: {
           id: noteId,
           content,
-          tags: ["#channel-message", "#channel-message/inbound"],
+          tags: ["#agent-message", "#agent-message/inbound"],
           metadata: { channel, direction: "inbound", sender: "aaron", ts: "2026-06-16T00:00:01Z" },
         },
       }),
@@ -595,7 +596,7 @@ describe("backend default flip + interactive path", () => {
   // OMITS `backend` now routes to the PROGRAMMATIC registry, not the interactive
   // tmux AgentOps. Interactive is still fully reachable by passing it explicitly.
   test("a default (no backend) spawn now hits the PROGRAMMATIC registry (not tmux)", async () => {
-    // Temp-dir isolation via withTempStateDir (channel#75) — the spawn persists a
+    // Temp-dir isolation via withTempStateDir (agent#75) — the spawn persists a
     // spec.json under defaultSessionsDir, which must resolve under the temp dir.
     await withTempStateDir(async (dir) => {
       const backend = new FakeBackend();

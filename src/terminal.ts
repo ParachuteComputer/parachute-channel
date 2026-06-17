@@ -1,8 +1,8 @@
 /**
- * In-page terminal backend for parachute-channel (design
+ * In-page terminal backend for parachute-agent (design
  * `design/2026-06-14-sandboxed-agent-sessions.md` §5).
  *
- * Bridges a browser xterm.js terminal ↔ the channel daemon's own Bun WebSocket
+ * Bridges a browser xterm.js terminal ↔ the agent daemon's own Bun WebSocket
  * server ↔ a session's tmux pane. The pty is **Bun's native terminal**
  * (`new Bun.Terminal({...})` + `Bun.spawn({ terminal })`), spawned to run
  * `tmux attach -t <name>-agent` — the SAME tmux session `scripts/launch-session.sh`
@@ -16,7 +16,7 @@
  * that closes BOTH sides on overflow and is NOT per-connection tunable. A
  * terminal legitimately floods it (a big build log, `yes`, `cat` of a large
  * file). The bridge is a blind pipe with no flow-control hook, so the flow
- * control MUST live here: the channel daemon holds the upstream end of the
+ * control MUST live here: the agent daemon holds the upstream end of the
  * terminal socket as a `ServerWebSocket` and so has `ws.getBufferedAmount()`
  * natively. We watch our OWN send-buffer depth and PAUSE reading from the pty
  * (Bun.Terminal supports this implicitly — we stop forwarding its `data` and
@@ -36,7 +36,7 @@
  *   does NOT parse as a control object is forwarded to the pty as input.
  *
  * Auth is NOT in this module — it runs in the daemon's upgrade gate (operator-
- * grade `channel:admin`, token via `?token=`, BEFORE `server.upgrade`). By the
+ * grade `agent:admin`, token via `?token=`, BEFORE `server.upgrade`). By the
  * time `open()` runs the socket is already authorized. This module owns the
  * pty↔WS relay + flow control only.
  */

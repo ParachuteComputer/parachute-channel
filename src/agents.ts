@@ -339,7 +339,7 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
       // The working dir becomes the agent's cwd — it MUST pre-exist as a directory,
       // or the spawn would boot the agent into a missing dir (tmux `-c` / Bun.spawn
       // `cwd` fault) with a confusing downstream error. A clean 400 at parse time is
-      // friendlier than that runtime failure. This endpoint is channel:admin-gated,
+      // friendlier than that runtime failure. This endpoint is agent:admin-gated,
       // so the operator owns the path they pass; we only assert it's a real dir.
       let st: ReturnType<typeof statSync> | undefined;
       try {
@@ -472,7 +472,7 @@ function parseMountEntry(raw: unknown, i: number): AgentMount {
   // `filesystem: "workspace"` home-tree deny. So an operator who mounts a
   // home-tree path (e.g. ~/.parachute) deliberately re-opens that path to the
   // agent even under the scoped default. That's intentional (this endpoint is
-  // channel:admin-gated; the operator is choosing it), not an injection bypass —
+  // agent:admin-gated; the operator is choosing it), not an injection bypass —
   // but weigh it before mounting sensitive home-tree paths.
   if (!m.hostPath.startsWith("/")) {
     throw new SpawnRequestError(`body.mounts[${i}].hostPath must be an absolute path (start with "/")`);

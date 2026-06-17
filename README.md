@@ -1,14 +1,14 @@
-# Channel
+# Agent
 
 **Chat with your Claude Code sessions — a channel per session.**
 
-> ⚠️ **Experimental (v0.1.0).** Channel is a preview, evolving quickly. It runs
+> ⚠️ **Experimental (v0.1.0).** Agent is a preview, evolving quickly. It runs
 > today on an owner-operated, trusted machine — it is **not yet hardened for
 > untrusted or multi-tenant use**. Read [Status & safety](#status--safety) before
 > you rely on it. (Part of [Parachute](https://parachute.computer); conventions in
 > [`parachute-patterns`](https://github.com/ParachuteComputer/parachute-patterns).)
 
-Channel is a **messaging fabric for Claude Code**. One daemon hosts named
+Agent is a **messaging fabric for Claude Code**. One daemon hosts named
 *channels*; a Claude Code session connects to a channel, and you talk to it — from
 Telegram, from a Parachute vault, or from the built-in web chat. The session
 replies on the same channel. It also lets you **spawn and watch sandboxed agent
@@ -17,12 +17,12 @@ sessions from the browser**.
 ## What you get
 
 - **Talk to a session over any transport.** A channel is bound to one transport:
-  - `vault` — messages are durable [`#channel-message`](#vault-backed-channels)
+  - `vault` — messages are durable [`#agent-message`](#vault-backed-channels)
     notes in a Parachute vault, so the conversation is queryable and renders in any
     vault surface (this is the recommended transport).
   - `telegram` — a Telegram bot, one per channel.
   - `http-ui` — an ephemeral in-memory transport for quick local testing.
-- **A built-in web surface** at `<hub-origin>/channel/` — Home, Chat, Agents,
+- **A built-in web surface** at `<hub-origin>/agent/` — Home, Chat, Agents,
   Terminal, and Config, on the Parachute brand. Chat over a `vault` channel shows
   the durable transcript and writes your messages back as notes.
 - **Sandboxed agent sessions.** Spawn a Claude Code session in a sandbox (scoped
@@ -53,13 +53,13 @@ Deeper design + operational detail live in [`CLAUDE.md`](./CLAUDE.md) and
 
 ## Status & safety
 
-Channel is `focus: experimental` and pre-1.0. What's solid vs. early:
+Agent is `focus: experimental` and pre-1.0. What's solid vs. early:
 
 - **Solid:** the daemon/bridge fabric, the vault + Telegram + http-ui transports,
   hub registration + reverse-proxy, the web surface (Home/Chat/Agents/Terminal/
   Config), and vault-backed durable chat.
 - **Early / changing:** the npm package isn't published yet (run from source —
-  tracked in [#16](https://github.com/ParachuteComputer/parachute-channel/issues/16));
+  tracked in [#16](https://github.com/ParachuteComputer/parachute-agent/issues/16));
   agent-session isolation is real but young; APIs may shift.
 
 **Read this about agent sessions.** A spawned agent runs `claude` with
@@ -84,33 +84,33 @@ full multi-tenant isolation is future work.
 
 ## Running it
 
-Channel runs alongside the rest of a Parachute install (the
+Agent runs alongside the rest of a Parachute install (the
 [hub](https://github.com/ParachuteComputer/parachute-hub) is the portal + OAuth
 issuer). Until the npm package ships, run it from source:
 
 ```bash
-git clone https://github.com/ParachuteComputer/parachute-channel
-cd parachute-channel
+git clone https://github.com/ParachuteComputer/parachute-agent
+cd parachute-agent
 bun install
-bun link            # so `parachute start channel` follows this checkout
+bun link            # so `parachute start agent` follows this checkout
 ```
 
 The daemon self-registers into `~/.parachute/services.json` and ships
 `.parachute/module.json`, so the hub lists it in the portal and reverse-proxies
-`<hub-origin>/channel/*` → the loopback daemon. Reach the web surface at
-`<hub-origin>/channel/` (or `http://127.0.0.1:1941/` locally).
+`<hub-origin>/agent/*` → the loopback daemon. Reach the web surface at
+`<hub-origin>/agent/` (or `http://127.0.0.1:1941/` locally).
 
 | | |
 |---|---|
-| npm | `@openparachute/channel` (publish pending [#16](https://github.com/ParachuteComputer/parachute-channel/issues/16)) |
-| bins | `parachute-channel` (daemon), `parachute-channel-bridge` (session bridge) |
-| port | `1941` · paths `/channel` |
-| scopes | `channel:read` · `channel:write` · `channel:send` · `channel:admin` |
-| state | `~/.parachute/channel/` (`channels.json`, `access.json`, `inbox/`) |
+| npm | `@openparachute/agent` (publish pending [#16](https://github.com/ParachuteComputer/parachute-agent/issues/16)) |
+| bins | `parachute-agent` (daemon), `parachute-agent-bridge` (session bridge) |
+| port | `1941` · paths `/agent` |
+| scopes | `agent:read` · `agent:write` · `agent:send` · `agent:admin` |
+| state | `~/.parachute/agent/` (`channels.json`, `access.json`, `inbox/`) |
 
 ## The web surface
 
-Reachable at `<hub-origin>/channel/`:
+Reachable at `<hub-origin>/agent/`:
 
 - **Home** — your channels + any running agents at a glance.
 - **Chat** — talk to a channel. Over a `vault` channel you see the durable
@@ -123,14 +123,14 @@ Reachable at `<hub-origin>/channel/`:
 ## Vault-backed channels
 
 A `vault` channel stores every message as a note carrying **two tags**: the parent
-`#channel-message` (queryable membership — list a channel's whole transcript with
-one `tag: "#channel-message"` + `metadata.channel` query) and a directional child
-`#channel-message/inbound` (human→session) or `#channel-message/outbound`
+`#agent-message` (queryable membership — list a channel's whole transcript with
+one `tag: "#agent-message"` + `metadata.channel` query) and a directional child
+`#agent-message/inbound` (human→session) or `#agent-message/outbound`
 (session→human). Inbound notes wake the session via a vault trigger; replies are
 written as outbound notes. Because the conversation lives in the vault, it's
 durable, queryable, and renders in any vault surface — the built-in chat and a
 custom surface show the same thread. Full note shape + the trigger setup are in
-[`CLAUDE.md`](./CLAUDE.md#vault-integration-stage-2--channels-backed-by-channel-message-notes).
+[`CLAUDE.md`](./CLAUDE.md#vault-integration-stage-2--channels-backed-by-agent-message-notes).
 
 ## Connecting a session
 
@@ -138,7 +138,7 @@ A Claude Code session connects to a channel as a pure HTTP MCP server — by URL
 OAuth, like adding the vault:
 
 ```bash
-claude mcp add --transport http channel <hub-origin>/channel/mcp/<channel>
+claude mcp add --transport http agent <hub-origin>/agent/mcp/<channel>
 ```
 
 It prompts for OAuth the first time. The session wakes on inbound messages and

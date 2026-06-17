@@ -11,7 +11,7 @@
  *  - a corrupt file is tolerated (starts empty).
  *
  * Each test points the store at a throwaway temp dir — no shared global state, no
- * touch of the real `~/.parachute/channel/`.
+ * touch of the real `~/.parachute/agent/`.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, statSync } from "fs";

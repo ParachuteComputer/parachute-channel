@@ -24,6 +24,7 @@ import {
 } from "./spawn-agent.ts";
 import { resolveClaudeCredential, resolveChannelEnv } from "./credentials.ts";
 import { defaultStateDir } from "./registry.ts";
+import { agentEnv } from "./env-compat.ts";
 import { getHubOrigin } from "./hub-jwt.ts";
 
 const DEFAULT_CHANNEL_PORT = 1941;
@@ -62,11 +63,11 @@ function readManagerBearer(): string | null {
   }
 }
 
-/** Default channel daemon base URL: PARACHUTE_CHANNEL_URL, else loopback:<port>. */
+/** Default channel daemon base URL: PARACHUTE_AGENT_URL, else loopback:<port>. */
 function resolveChannelUrl(): string {
-  const explicit = process.env.PARACHUTE_CHANNEL_URL?.replace(/\/$/, "");
+  const explicit = agentEnv("URL")?.replace(/\/$/, "");
   if (explicit) return explicit;
-  const port = parseInt(process.env.PARACHUTE_CHANNEL_PORT ?? "", 10) || DEFAULT_CHANNEL_PORT;
+  const port = parseInt(agentEnv("PORT") ?? "", 10) || DEFAULT_CHANNEL_PORT;
   return `http://127.0.0.1:${port}`;
 }
 

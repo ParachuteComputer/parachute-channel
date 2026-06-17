@@ -232,26 +232,26 @@ describe("buildAgentClaudeArgs", () => {
   test("interactive claude (no -p) with strict MCP config + dev-channels for the first channel", () => {
     const argv = buildAgentClaudeArgs({
       mcpConfigPath: "/ws/.mcp.json",
-      firstChannelEntryKey: "channel-aaron-dev",
+      firstChannelEntryKey: "agent-aaron-dev",
     });
     expect(argv).toContain("--strict-mcp-config");
     expect(argv).toContain("--mcp-config");
     expect(argv).toContain("/ws/.mcp.json");
-    expect(argv).toContain("--dangerously-load-development-channels=server:channel-aaron-dev");
+    expect(argv).toContain("--dangerously-load-development-channels=server:agent-aaron-dev");
     // Autonomous: no human answers tool prompts; the sandbox is the containment.
     expect(argv).toContain("--dangerously-skip-permissions");
     // NOT headless: no `-p`.
     expect(argv).not.toContain("-p");
   });
   test("no systemPromptFile → neither system-prompt flag (today's behavior)", () => {
-    const argv = buildAgentClaudeArgs({ mcpConfigPath: "/ws/.mcp.json", firstChannelEntryKey: "channel-c" });
+    const argv = buildAgentClaudeArgs({ mcpConfigPath: "/ws/.mcp.json", firstChannelEntryKey: "agent-c" });
     expect(argv).not.toContain("--append-system-prompt-file");
     expect(argv).not.toContain("--system-prompt-file");
   });
   test("systemPromptFile (append, default) → --append-system-prompt-file <path>", () => {
     const argv = buildAgentClaudeArgs({
       mcpConfigPath: "/ws/.mcp.json",
-      firstChannelEntryKey: "channel-c",
+      firstChannelEntryKey: "agent-c",
       systemPromptFile: "/ws/system-prompt.txt",
       systemPromptMode: "append",
     });
@@ -262,7 +262,7 @@ describe("buildAgentClaudeArgs", () => {
   test("systemPromptFile (replace) → --system-prompt-file <path>", () => {
     const argv = buildAgentClaudeArgs({
       mcpConfigPath: "/ws/.mcp.json",
-      firstChannelEntryKey: "channel-c",
+      firstChannelEntryKey: "agent-c",
       systemPromptFile: "/ws/system-prompt.txt",
       systemPromptMode: "replace",
     });
@@ -293,7 +293,7 @@ describe("seedAgentHome — the per-session writable HOME (stability keystone)",
       projects: { "/some/other/proj": { hasTrustDialogAccepted: true } },
     }));
     try {
-      const env = seedAgentHome(ws, { mcpServers: ["channel-uni-dev", "vault-default"], operatorConfigPath: opPath });
+      const env = seedAgentHome(ws, { mcpServers: ["agent-uni-dev", "vault-default"], operatorConfigPath: opPath });
       // Config + temp are redirected to per-session dirs INSIDE the workspace.
       // (HOME is deliberately NOT overridden — claude finds its real install there.)
       expect(env.HOME).toBeUndefined();
@@ -313,7 +313,7 @@ describe("seedAgentHome — the per-session writable HOME (stability keystone)",
       expect(projects[ws]!.hasCompletedProjectOnboarding).toBe(true);
       // Our configured MCP servers are pre-approved (no "trust this MCP server" prompt).
       expect((projects[ws] as { enabledMcpjsonServers?: string[] }).enabledMcpjsonServers).toEqual([
-        "channel-uni-dev",
+        "agent-uni-dev",
         "vault-default",
       ]);
     } finally {
@@ -379,7 +379,7 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     const spec: AgentSpec = {
       name: "aaron-dev",
       channels: ["aaron-dev"],
-      vault: { name: "default", access: "read", tags: ["#channel-message"] },
+      vault: { name: "default", access: "read", tags: ["#agent-message"] },
       network: "restricted", // exercise the egress floor; scoped reads are the default (step 6)
     };
     const res = await spawnAgent(spec, baseDeps({ tmux, sandboxEngine: engine }));
@@ -501,13 +501,13 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     const spec: AgentSpec = {
       name: "weaver",
       channels: ["c"],
-      vault: { name: "default", access: "read", tags: ["#channel-message"] },
+      vault: { name: "default", access: "read", tags: ["#agent-message"] },
     };
     await spawnAgent(spec, baseDeps({ fetchFn }));
     const vaultCall = calls.find((c) => String(c.scope).startsWith("vault:"));
     expect(vaultCall).toBeDefined();
     expect(vaultCall!.scope).toBe("vault:default:read");
-    expect(vaultCall!.permissions).toEqual({ scoped_tags: ["#channel-message"] });
+    expect(vaultCall!.permissions).toEqual({ scoped_tags: ["#agent-message"] });
   });
 
   test("idempotent: an already-running session is a no-op", async () => {
@@ -605,7 +605,7 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     const spec: AgentSpec = {
       name: "weaver",
       channels: [{ name: "weave", access: "read" }],
-      vault: { name: "default", access: "read", tags: ["#channel-message"] },
+      vault: { name: "default", access: "read", tags: ["#agent-message"] },
       network: "restricted",
       egress: ["registry.npmjs.org"],
     };
@@ -617,7 +617,7 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     expect(specFilePath(res.workspace)).toBe(join(res.workspace, "spec.json"));
   });
 
-  test("read-only channel mints channel:read ONLY (not read+write)", async () => {
+  test("read-only channel mints agent:read ONLY (not read+write)", async () => {
     sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-roch-"));
     const scopes: string[] = [];
     const fetchFn = (async (_u: string | URL | Request, init?: RequestInit) => {
@@ -638,9 +638,9 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
       ],
     };
     await spawnAgent(spec, baseDeps({ fetchFn }));
-    expect(scopes).toContain("channel:read"); // the read-only channel
-    expect(scopes.filter((s) => s === "channel:read")).toHaveLength(1);
-    expect(scopes.filter((s) => s === "channel:read channel:write")).toHaveLength(2); // rw + bare
+    expect(scopes).toContain("agent:read"); // the read-only channel
+    expect(scopes.filter((s) => s === "agent:read")).toHaveLength(1);
+    expect(scopes.filter((s) => s === "agent:read agent:write")).toHaveLength(2); // rw + bare
   });
 
   test("CONCURRENCY: two concurrent spawnAgent calls produce correct, independent MCP configs + wrapping", async () => {

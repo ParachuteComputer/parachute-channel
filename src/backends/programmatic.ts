@@ -27,7 +27,7 @@
  * ── What's deliberately ABSENT vs the interactive spawn ─────────────────────────
  *   - NO channel MCP entry. The daemon mediates messaging in this backend: it
  *     hands the agent the inbound text as the `-p` prompt, and turns the returned
- *     reply into an outbound `#channel-message/outbound` note itself (the wiring
+ *     reply into an outbound `#agent-message/outbound` note itself (the wiring
  *     follow-up). The agent's `.mcp.json` carries the VAULT MCP only — so the agent
  *     has memory + tools, but inbound/outbound is the daemon's job, not the agent's.
  *   - NO `--dangerously-load-development-channels`, NO consent-gate auto-confirm.
@@ -109,7 +109,7 @@ export interface ProgrammaticBackendDeps {
   managerBearer: string;
   /** Vault base URL (if the spec binds a vault). Defaults to hubOrigin. */
   vaultUrl?: string;
-  /** Base for session workspaces (e.g. `~/.parachute/channel/sessions`). */
+  /** Base for session workspaces (e.g. `~/.parachute/agent/sessions`). */
   sessionsDir: string;
   /** Read-only runtime/config binds the sandbox always grants (the claude config dir, …). */
   runtimeReadOnly: string[];

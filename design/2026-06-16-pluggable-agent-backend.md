@@ -15,7 +15,7 @@ fragility class we've spent real effort taming:
 
 - the session goes **deaf on any daemon restart** and Claude Code doesn't
   auto-reconnect a dropped streamable-HTTP MCP server → the no-loss high-water-mark
-  + backlog replay (channel#67) and the per-session restart (channel#68);
+  + backlog replay (agent#67) and the per-session restart (agent#68);
 - the `--dangerously-load-development-channels` **interactive consent gate** hangs
   a headless spawn → the poll-and-`send-keys` auto-confirm (#71, fixes #70).
 
@@ -63,7 +63,7 @@ Everything *above* the seam is shared and strategy-agnostic; only the
 - **Vault message transport** (`#channel-message/{inbound,outbound}`) + the chat UI —
   the durable conversation store is independent of how the agent is driven.
 - **Sandbox/isolation** — the agent runs tools + edits files in either backend.
-- **Per-channel env/credential injection** (channel#68) — the SDK process needs
+- **Per-channel env/credential injection** (agent#68) — the SDK process needs
   `GH_TOKEN` etc. exactly as the interactive process does. The
   `ANTHROPIC_API_KEY`/`CLAUDE_API_KEY` denylist becomes *more* load-bearing here
   (see Billing).

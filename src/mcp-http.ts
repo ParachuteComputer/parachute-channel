@@ -1,19 +1,19 @@
 /**
- * Stateful HTTP MCP endpoint for parachute-channel.
+ * Stateful HTTP MCP endpoint for parachute-agent.
  *
  * A second, additive way for a Claude Code session to connect to a channel:
  * instead of spawning the stdio `bridge.ts` and consuming the daemon's SSE
  * `/events`, the session adds the channel as a *pure HTTP MCP server* (URL +
  * OAuth) — exactly like the vault. No local file, works on any machine.
  *
- * Why STATEFUL (not stateless like vault's mcp-http.ts): the channel's headline
- * feature is the IDLE WAKE — Claude Code's `notifications/claude/channel` must
+ * Why STATEFUL (not stateless like vault's mcp-http.ts): the module's headline
+ * feature is the IDLE WAKE — Claude Code's `notifications/claude/agent` must
  * fire on an idle session when an inbound message arrives. That requires the
  * server to PUSH a notification to a *persistent* connection. Stateful
  * Streamable HTTP (a `sessionIdGenerator` + `enableJsonResponse:false`) gives
  * each session an SSE GET stream the server can push onto. The probe at
  * /tmp/http-mcp-probe/probe-server.ts proved CC opens that GET stream and acts
- * on server-pushed `notifications/claude/channel` while idle. This file is that
+ * on server-pushed `notifications/claude/agent` while idle. This file is that
  * probe's structure, productionized: per-channel session registry, the real
  * tool surface ported from bridge.ts, and read-vs-write scope enforcement.
  *
@@ -26,10 +26,10 @@
  *   - DELETE /mcp/<channel> (or transport.onclose) → tear the session down and
  *     drop it from the channel's set.
  *
- * Auth: the daemon validates `channel:read` BEFORE calling handleMcp (a session
+ * Auth: the daemon validates `agent:read` BEFORE calling handleMcp (a session
  * needs read to connect + receive the wake). The validated scopes are threaded
  * in and stored ON the session, so the reply/react/edit/download tool handlers
- * can additionally require `channel:write` — a read-only token connects and is
+ * can additionally require `agent:write` — a read-only token connects and is
  * woken but cannot send.
  */
 
@@ -46,7 +46,7 @@ import type {
   EditArgs,
   DownloadArgs,
 } from "./transport.ts";
-import { SCOPE_WRITE } from "./auth.ts";
+import { SCOPE_WRITE, grantsScope } from "./auth.ts";
 
 // ---------------------------------------------------------------------------
 // Per-channel session registry
@@ -92,13 +92,13 @@ export function setOnSessionConnect(hook: OnSessionConnect | undefined): void {
   onSessionConnect = hook;
 }
 
-/** Push a `notifications/claude/channel` wake to ONE session (used by backlog replay,
+/** Push a `notifications/claude/agent` wake to ONE session (used by backlog replay,
  *  so a reconnecting session gets its missed messages without re-waking the others). */
 function pushToSession(session: McpSession, content: string, meta: Record<string, string>): void {
   try {
     void session.server.notification({
-      method: "notifications/claude/channel",
-      params: { content, meta: { source: "parachute-channel", ...meta } },
+      method: "notifications/claude/agent",
+      params: { content, meta: { source: "parachute-agent", ...meta } },
     });
   } catch {
     // Dead session — its onclose handler removes it from the set; nothing to do.
@@ -126,7 +126,7 @@ function registerSession(channel: string, id: string, session: McpSession): void
 
 /**
  * Whether a session has a LIVE standalone GET SSE push stream — the stream the
- * SDK writes `notifications/claude/channel` onto. A session that has only POSTed
+ * SDK writes `notifications/claude/agent` onto. A session that has only POSTed
  * `initialize` (registered) but not yet opened — or has since dropped — its GET
  * stream is NOT deliverable: `transport.send()` silently no-ops for it (no event
  * store is configured, so the message is dropped, not buffered). We read the SAME
@@ -190,7 +190,7 @@ export function assertMcpSdkStreamContract(): boolean {
       (probe as unknown as { _streamMapping?: unknown })._streamMapping instanceof Map;
     if (id === "_GET_stream" && hasMap) return true;
     console.error(
-      "parachute-channel: FATAL CONTRACT DRIFT — the MCP SDK's standalone-GET-stream " +
+      "parachute-agent: FATAL CONTRACT DRIFT — the MCP SDK's standalone-GET-stream " +
         `internals changed (expected _standaloneSseStreamId="_GET_stream" + a _streamMapping Map; ` +
         `got id=${JSON.stringify(id)}, map=${hasMap}). sessionHasLivePushStream() can no longer ` +
         "detect a live push stream, so HTTP-MCP channel delivery (live wake AND backlog replay) is " +
@@ -199,7 +199,7 @@ export function assertMcpSdkStreamContract(): boolean {
     return false;
   } catch (err) {
     console.error(
-      `parachute-channel: could not verify MCP SDK stream contract (${(err as Error).message}); ` +
+      `parachute-agent: could not verify MCP SDK stream contract (${(err as Error).message}); ` +
         "HTTP-MCP delivery may be unreliable.",
     );
     return false;
@@ -254,7 +254,7 @@ export function _unregisterSessionForTest(channel: string, id: string): void {
 
 /**
  * Push an inbound message to every MCP session on `channel` as a
- * `notifications/claude/channel` — the wake that pulls an idle session in to
+ * `notifications/claude/agent` — the wake that pulls an idle session in to
  * answer. The daemon calls this alongside the existing SSE `routeToChannel`, so
  * both stdio bridges and HTTP MCP sessions receive the same inbound traffic.
  */
@@ -275,8 +275,8 @@ export function pushToChannel(
     if (!sessionHasLivePushStream(session)) continue;
     try {
       void session.server.notification({
-        method: "notifications/claude/channel",
-        params: { content, meta: { source: "parachute-channel", ...meta } },
+        method: "notifications/claude/agent",
+        params: { content, meta: { source: "parachute-agent", ...meta } },
       });
       delivered++;
     } catch {
@@ -290,7 +290,7 @@ export function pushToChannel(
 
 /**
  * Push a permission verdict to a channel's MCP sessions (mirrors the SSE
- * `permission_verdict` route → bridge's `notifications/claude/channel/permission`).
+ * `permission_verdict` route → bridge's `notifications/claude/agent/permission`).
  */
 export function pushPermissionVerdict(
   channel: string,
@@ -305,7 +305,7 @@ export function pushPermissionVerdict(
     if (!sessionHasLivePushStream(session)) continue;
     try {
       void session.server.notification({
-        method: "notifications/claude/channel/permission",
+        method: "notifications/claude/agent/permission",
         params: { request_id: verdict.request_id, behavior: verdict.behavior },
       });
       delivered++;
@@ -323,7 +323,7 @@ const INSTRUCTIONS = [
   "",
   "CRITICAL — HOW THE HUMAN SEES YOU: they read ONLY what you send via the `reply` tool. Your normal assistant/transcript text is INVISIBLE to them. So for EVERY message that arrives on this channel you MUST call the `reply` tool to answer — even a one-word reply. Never answer only in your transcript: if you don't call `reply`, the human sees nothing at all.",
   "",
-  'Inbound messages arrive as <channel source="parachute-channel" ...> with metadata attributes describing the sender. Treat each as a chat message from the human and respond by calling the reply tool — the daemon routes it back out the same channel. Pass back any addressing fields the inbound tag carried (e.g. chat_id) if present; omit them otherwise. Use reply_to (message_id) to thread a specific message; omit it for normal responses.',
+  'Inbound messages arrive as <channel source="parachute-agent" ...> with metadata attributes describing the sender. Treat each as a chat message from the human and respond by calling the reply tool — the daemon routes it back out the same channel. Pass back any addressing fields the inbound tag carried (e.g. chat_id) if present; omit them otherwise. Use reply_to (message_id) to thread a specific message; omit it for normal responses.',
   "",
   "If the tag has an image_path attribute, Read that file — it is an attachment the sender sent.",
   "If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path.",
@@ -405,9 +405,9 @@ const TOOL_DEFS = [
   },
 ];
 
-// Tools that send/mutate on the channel require channel:write. download_attachment
+// Tools that send/mutate on the channel require agent:write. download_attachment
 // is deliberately NOT here: fetching an attachment that was sent *to* this session is
-// read-access — a channel:read session can receive and read its own messages,
+// read-access — an agent:read session can receive and read its own messages,
 // attachments included. (The legacy stdio-bridge /api/download gates it as write; the
 // MCP path is the principled read. If they ever need to match, relax the bridge, not this.)
 const WRITE_TOOLS = new Set(["reply", "react", "edit_message"]);
@@ -428,15 +428,15 @@ function mergeMeta(args: Record<string, unknown>): Record<string, string> {
  */
 function buildServer(channel: string, transport: Transport, session: McpSession): Server {
   const server = new Server(
-    // Per-channel name (`channel-<name>`) so it reads clearly in `/mcp` and lines
-    // up with the `--dangerously-load-development-channels=server:channel-<name>`
-    // flag + the `claude mcp add channel-<name>` name the setup UI/launcher use.
-    { name: `channel-${channel}`, version: "0.1.0" },
+    // Per-channel name (`agent-<name>`) so it reads clearly in `/mcp` and lines
+    // up with the `--dangerously-load-development-channels=server:agent-<name>`
+    // flag + the `claude mcp add agent-<name>` name the setup UI/launcher use.
+    { name: `agent-${channel}`, version: "0.1.0" },
     {
       capabilities: {
         experimental: {
-          "claude/channel": {},
-          "claude/channel/permission": {},
+          "claude/agent": {},
+          "claude/agent/permission": {},
         },
         tools: {},
       },
@@ -484,8 +484,11 @@ export async function dispatchTool(
   args: Record<string, unknown>,
 ): Promise<ToolResult> {
   // Read-only tokens connect + receive the wake, but cannot send. Enforce
-  // channel:write on the mutating tools using the connection's own scopes.
-  if (WRITE_TOOLS.has(name) && !scopes.includes(SCOPE_WRITE)) {
+  // agent:write on the mutating tools using the connection's own scopes.
+  // Dual-accept (channel→agent rename): a pre-rename token carrying the legacy
+  // `channel:write` scope also authorizes — `grantsScope` matches agent:write OR
+  // its channel:write alias — so HTTP-MCP sends keep working until tokens re-mint.
+  if (WRITE_TOOLS.has(name) && !grantsScope(scopes, SCOPE_WRITE)) {
     return {
       content: [
         {
@@ -585,7 +588,7 @@ function methodMissing(channel: string, transport: Transport, method: string): T
 
 /**
  * Handle a stateful Streamable HTTP MCP request for `channel`, dispatching tool
- * calls to `transport`. The daemon has ALREADY validated `channel:read` and
+ * calls to `transport`. The daemon has ALREADY validated `agent:read` and
  * passes the caller's scopes in (threaded onto the session for write-tool
  * checks). Returns the transport's Response (JSON or an SSE stream).
  *
@@ -606,7 +609,7 @@ export async function handleMcp(
     const existing = sessionsById.get(sid)!;
     // Refresh the connection's scopes from the presented token each request, so
     // a re-auth with a narrower/wider token takes effect (the daemon re-validates
-    // channel:read on every call before reaching here).
+    // agent:read on every call before reaching here).
     existing.scopes = scopes;
     const res = await existing.transport.handleRequest(req);
     // A GET opens (or reopens, after a drop) the standalone SSE push stream. The

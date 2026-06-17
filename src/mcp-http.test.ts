@@ -57,17 +57,17 @@ describe("per-channel MCP session registry + wake push", () => {
   test("pushToChannel reaches a session on A and NOT one on B", () => {
     const a = fakeSession();
     const b = fakeSession();
-    _registerSessionForTest("A", "sid-a", a.server as never, ["channel:read", "channel:write"]);
-    _registerSessionForTest("B", "sid-b", b.server as never, ["channel:read"]);
+    _registerSessionForTest("A", "sid-a", a.server as never, ["agent:read", "agent:write"]);
+    _registerSessionForTest("B", "sid-b", b.server as never, ["agent:read"]);
 
     const delivered = pushToChannel("A", "hello A", { foo: "bar" });
     expect(delivered).toBe(1);
     expect(a.captured.notes).toHaveLength(1);
-    expect(a.captured.notes[0]!.method).toBe("notifications/claude/channel");
+    expect(a.captured.notes[0]!.method).toBe("notifications/claude/agent");
     expect((a.captured.notes[0]!.params as { content: string }).content).toBe("hello A");
     // Source is stamped + caller meta merged.
     expect((a.captured.notes[0]!.params as { meta: Record<string, string> }).meta).toMatchObject({
-      source: "parachute-channel",
+      source: "parachute-agent",
       foo: "bar",
     });
     // B got nothing.
@@ -77,8 +77,8 @@ describe("per-channel MCP session registry + wake push", () => {
   test("two sessions on the same channel both get the wake", () => {
     const a1 = fakeSession();
     const a2 = fakeSession();
-    _registerSessionForTest("A", "sid-a1", a1.server as never, ["channel:read"]);
-    _registerSessionForTest("A", "sid-a2", a2.server as never, ["channel:read"]);
+    _registerSessionForTest("A", "sid-a1", a1.server as never, ["agent:read"]);
+    _registerSessionForTest("A", "sid-a2", a2.server as never, ["agent:read"]);
     expect(mcpSessionCount("A")).toBe(2);
     const delivered = pushToChannel("A", "broadcast", {});
     expect(delivered).toBe(2);
@@ -88,10 +88,10 @@ describe("per-channel MCP session registry + wake push", () => {
 
   test("pushPermissionVerdict pushes the permission method", () => {
     const a = fakeSession();
-    _registerSessionForTest("A", "sid-a", a.server as never, ["channel:read"]);
+    _registerSessionForTest("A", "sid-a", a.server as never, ["agent:read"]);
     const delivered = pushPermissionVerdict("A", { request_id: "r1", behavior: "allow" });
     expect(delivered).toBe(1);
-    expect(a.captured.notes[0]!.method).toBe("notifications/claude/channel/permission");
+    expect(a.captured.notes[0]!.method).toBe("notifications/claude/agent/permission");
     expect(a.captured.notes[0]!.params).toMatchObject({ request_id: "r1", behavior: "allow" });
   });
 
@@ -106,7 +106,7 @@ describe("per-channel MCP session registry + wake push", () => {
     // drops any notification to it. If pushToChannel counted it, the daemon would
     // advance the channel's delivery mark and the message would be lost.
     const a = fakeSession();
-    _registerSessionForTest("A", "sid-streamless", a.server as never, ["channel:read"], {
+    _registerSessionForTest("A", "sid-streamless", a.server as never, ["agent:read"], {
       streamless: true,
     });
     expect(mcpSessionCount("A")).toBe(1); // it IS registered…
@@ -119,8 +119,8 @@ describe("per-channel MCP session registry + wake push", () => {
   test("pushToChannel counts only the live-stream sessions in a mixed set", () => {
     const live = fakeSession();
     const dead = fakeSession();
-    _registerSessionForTest("A", "sid-live", live.server as never, ["channel:read"]);
-    _registerSessionForTest("A", "sid-streamless", dead.server as never, ["channel:read"], {
+    _registerSessionForTest("A", "sid-live", live.server as never, ["agent:read"]);
+    _registerSessionForTest("A", "sid-streamless", dead.server as never, ["agent:read"], {
       streamless: true,
     });
     expect(mcpSessionCount("A")).toBe(2); // both registered
@@ -138,15 +138,15 @@ describe("per-channel MCP session registry + wake push", () => {
   test("mcpSessionCount tracks registration + reset", () => {
     expect(mcpSessionCount("A")).toBe(0);
     const a = fakeSession();
-    _registerSessionForTest("A", "sid-a", a.server as never, ["channel:read"]);
+    _registerSessionForTest("A", "sid-a", a.server as never, ["agent:read"]);
     expect(mcpSessionCount("A")).toBe(1);
     _resetSessionsForTest();
     expect(mcpSessionCount("A")).toBe(0);
   });
 
   test("unregister cleans up the session and drops the empty channel set (no leak)", () => {
-    _registerSessionForTest("A", "sid-a1", fakeSession().server as never, ["channel:read"]);
-    _registerSessionForTest("A", "sid-a2", fakeSession().server as never, ["channel:read"]);
+    _registerSessionForTest("A", "sid-a1", fakeSession().server as never, ["agent:read"]);
+    _registerSessionForTest("A", "sid-a2", fakeSession().server as never, ["agent:read"]);
     expect(mcpSessionCount("A")).toBe(2);
     _unregisterSessionForTest("A", "sid-a1");
     expect(mcpSessionCount("A")).toBe(1); // the other session survives
@@ -179,7 +179,7 @@ describe("tool dispatch routes to the channel's transport + enforces write scope
   test("a write-scoped reply call reaches transport.reply with the channel + args", async () => {
     const { transport, replies } = fakeTransport();
     const { callReplyTool } = await import("./mcp-http.ts");
-    const result = await callReplyTool("A", transport, ["channel:read", "channel:write"], {
+    const result = await callReplyTool("A", transport, ["agent:read", "agent:write"], {
       text: "hi there",
       chat_id: "42",
     });
@@ -191,10 +191,23 @@ describe("tool dispatch routes to the channel's transport + enforces write scope
   test("a read-only token cannot call reply (write scope enforced)", async () => {
     const { transport, replies } = fakeTransport();
     const { callReplyTool } = await import("./mcp-http.ts");
-    const result = await callReplyTool("A", transport, ["channel:read"], { text: "blocked" });
+    const result = await callReplyTool("A", transport, ["agent:read"], { text: "blocked" });
     expect(result.isError).toBe(true);
     expect(replies).toHaveLength(0);
-    expect((result.content[0] as { text: string }).text).toContain("channel:write");
+    expect((result.content[0] as { text: string }).text).toContain("agent:write");
+  });
+
+  test("DUAL-ACCEPT: a pre-rename token with the LEGACY channel:write scope can still call reply", async () => {
+    // The write-tool gate must dual-accept (grantsScope), not raw-includes — else
+    // a pre-rename token connects + is woken but silently can't send (channel#…).
+    const { transport, replies } = fakeTransport();
+    const { callReplyTool } = await import("./mcp-http.ts");
+    const result = await callReplyTool("A", transport, ["channel:read", "channel:write"], {
+      text: "legacy-send",
+    });
+    expect(result.isError).toBeUndefined();
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ channel: "A", text: "legacy-send" });
   });
 });
 

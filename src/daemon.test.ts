@@ -38,7 +38,7 @@ beforeAll(async () => {
   // public state file would otherwise leak the exposed origin into the doc.
   envHome = process.env.PARACHUTE_HOME;
   envHubOrigin = process.env.PARACHUTE_HUB_ORIGIN;
-  homeDir = mkdtempSync(join(tmpdir(), "channel-daemon-home-"));
+  homeDir = mkdtempSync(join(tmpdir(), "agent-daemon-home-"));
   process.env.PARACHUTE_HOME = homeDir;
   delete process.env.PARACHUTE_HUB_ORIGIN;
 
@@ -136,7 +136,7 @@ describe("bridge-facing endpoints require a bearer token (401 with none)", () =>
     expect(res.status).toBe(401);
   });
 
-  test("GET /api/channels/<ch>/turn-events with no Authorization → 401 (channel:read gated)", async () => {
+  test("GET /api/channels/<ch>/turn-events with no Authorization → 401 (agent:read gated)", async () => {
     const res = await fetch(`${base}/api/channels/ui1/turn-events`);
     expect(res.status).toBe(401);
     expect(((await res.json()) as { error: string }).error).toBe("unauthorized");
@@ -210,7 +210,7 @@ describe("UI-facing + discovery endpoints stay open (no token, 200)", () => {
 
 // ---------------------------------------------------------------------------
 // OAuth discovery for the HTTP MCP surface (RFC 9728 + RFC 8414). These are the
-// endpoints a Claude Code HTTP-MCP client probes when adding the channel by URL.
+// endpoints a Claude Code HTTP-MCP client probes when adding the agent by URL.
 // Path-insertion form (`.well-known` ABOVE the resource path), mirroring vault.
 // PUBLIC — no token needed (they must be reachable before the client has one).
 // ---------------------------------------------------------------------------
@@ -219,7 +219,7 @@ describe("OAuth discovery (RFC 9728 / RFC 8414) — public, points at the hub", 
   // module's getHubOrigin via PARACHUTE_HUB_ORIGIN; default loopback otherwise.
   const HUB = process.env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "") || "http://127.0.0.1:1939";
 
-  test("GET /.well-known/oauth-protected-resource/mcp/ui1 → 200, names hub + channel scopes", async () => {
+  test("GET /.well-known/oauth-protected-resource/mcp/ui1 → 200, names hub + agent scopes", async () => {
     const res = await fetch(`${base}/.well-known/oauth-protected-resource/mcp/ui1`);
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -229,19 +229,19 @@ describe("OAuth discovery (RFC 9728 / RFC 8414) — public, points at the hub", 
       bearer_methods_supported: string[];
     };
     expect(body.authorization_servers).toEqual([HUB]);
-    expect(body.scopes_supported).toEqual(["channel:read", "channel:write"]);
+    expect(body.scopes_supported).toEqual(["agent:read", "agent:write"]);
     expect(body.bearer_methods_supported).toEqual(["header"]);
-    // No forwarded host → loopback resource URL at /mcp/<channel> (no /channel prefix).
+    // No forwarded host → loopback resource URL at /mcp/<channel> (no /agent prefix).
     expect(body.resource).toBe(`${base}/mcp/ui1`);
   });
 
-  test("X-Forwarded-Host builds the PUBLIC resource URL (with /channel mount prefix)", async () => {
+  test("X-Forwarded-Host builds the PUBLIC resource URL (with /agent mount prefix)", async () => {
     const res = await fetch(`${base}/.well-known/oauth-protected-resource/mcp/ui1`, {
       headers: { "x-forwarded-host": "parachute.taildf9ce2.ts.net", "x-forwarded-proto": "https" },
     });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { resource: string };
-    expect(body.resource).toBe("https://parachute.taildf9ce2.ts.net/channel/mcp/ui1");
+    expect(body.resource).toBe("https://parachute.taildf9ce2.ts.net/agent/mcp/ui1");
   });
 
   test("GET /.well-known/oauth-authorization-server/mcp/ui1 → 200, forwards every endpoint to the hub", async () => {
@@ -260,7 +260,7 @@ describe("OAuth discovery (RFC 9728 / RFC 8414) — public, points at the hub", 
     expect(body.token_endpoint).toBe(`${HUB}/oauth/token`);
     expect(body.registration_endpoint).toBe(`${HUB}/oauth/register`);
     expect(body.jwks_uri).toBe(`${HUB}/.well-known/jwks.json`);
-    expect(body.scopes_supported).toEqual(["channel:read", "channel:write"]);
+    expect(body.scopes_supported).toEqual(["agent:read", "agent:write"]);
   });
 });
 
@@ -301,7 +301,7 @@ describe("MCP 401 carries the WWW-Authenticate challenge (RFC 9728)", () => {
     });
     expect(res.status).toBe(401);
     expect(res.headers.get("WWW-Authenticate")).toBe(
-      'Bearer resource_metadata="https://parachute.taildf9ce2.ts.net/channel/.well-known/oauth-protected-resource/mcp/ui1"',
+      'Bearer resource_metadata="https://parachute.taildf9ce2.ts.net/agent/.well-known/oauth-protected-resource/mcp/ui1"',
     );
   });
 
@@ -347,7 +347,7 @@ describe("Layer 2 — http-ui UI endpoints require a token (401 with none)", () 
 
 // ---------------------------------------------------------------------------
 // Vault inbound webhook: POST /api/vault/inbound. A vault trigger POSTs here on
-// a new inbound #channel-message note; the daemon validates the per-channel
+// a new inbound #agent-message note; the daemon validates the per-channel
 // shared secret, resolves the channel from note.metadata.channel, and hands the
 // note to the channel's VaultTransport.ingestInbound (which emits → wakes the
 // session). Secret auth, unknown-channel 404, idempotency by note id.
@@ -388,7 +388,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
   function body(
     noteId: string,
     extraMeta: Record<string, unknown> = {},
-    tags: string[] = ["#channel-message", "#channel-message/inbound"],
+    tags: string[] = ["#agent-message", "#agent-message/inbound"],
   ) {
     return JSON.stringify({
       trigger: "channel-inbound",
@@ -543,13 +543,13 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
     }
   });
 
-  test("#channel-message/outbound-tagged note is ack'd 200 but NOT emitted (belt-and-suspenders)", async () => {
+  test("#agent-message/outbound-tagged note is ack'd 200 but NOT emitted (belt-and-suspenders)", async () => {
     const { srv, base, emitted } = buildVaultServer();
     try {
       const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: body("ob-1", { direction: "outbound" }, ["#channel-message", "#channel-message/outbound"]),
+        body: body("ob-1", { direction: "outbound" }, ["#agent-message", "#agent-message/outbound"]),
       });
       expect(res.status).toBe(200);
       expect(emitted).toHaveLength(0);
@@ -565,7 +565,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
 
 describe("resolveStartCmd (hub-supervisor start command)", () => {
   function tmpInstallDir(): string {
-    return mkdtempSync(join(tmpdir(), "channel-startcmd-"));
+    return mkdtempSync(join(tmpdir(), "agent-startcmd-"));
   }
 
   test("reads startCmd from <installDir>/.parachute/module.json", () => {
@@ -574,9 +574,9 @@ describe("resolveStartCmd (hub-supervisor start command)", () => {
       mkdirSync(join(dir, ".parachute"), { recursive: true });
       writeFileSync(
         join(dir, ".parachute", "module.json"),
-        JSON.stringify({ startCmd: ["parachute-channel"] }),
+        JSON.stringify({ startCmd: ["parachute-agent"] }),
       );
-      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
+      expect(resolveStartCmd(dir)).toEqual(["parachute-agent"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -588,9 +588,9 @@ describe("resolveStartCmd (hub-supervisor start command)", () => {
       mkdirSync(join(dir, ".parachute"), { recursive: true });
       writeFileSync(
         join(dir, ".parachute", "module.json"),
-        JSON.stringify({ startCmd: ["parachute-channel", "daemon"] }),
+        JSON.stringify({ startCmd: ["parachute-agent", "daemon"] }),
       );
-      expect(resolveStartCmd(dir)).toEqual(["parachute-channel", "daemon"]);
+      expect(resolveStartCmd(dir)).toEqual(["parachute-agent", "daemon"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -599,7 +599,7 @@ describe("resolveStartCmd (hub-supervisor start command)", () => {
   test("falls back to the bin name when module.json is absent", () => {
     const dir = tmpInstallDir();
     try {
-      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
+      expect(resolveStartCmd(dir)).toEqual(["parachute-agent"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -610,11 +610,11 @@ describe("resolveStartCmd (hub-supervisor start command)", () => {
     try {
       mkdirSync(join(dir, ".parachute"), { recursive: true });
       writeFileSync(join(dir, ".parachute", "module.json"), JSON.stringify({ startCmd: [] }));
-      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
-      writeFileSync(join(dir, ".parachute", "module.json"), JSON.stringify({ name: "channel" }));
-      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
+      expect(resolveStartCmd(dir)).toEqual(["parachute-agent"]);
+      writeFileSync(join(dir, ".parachute", "module.json"), JSON.stringify({ name: "agent" }));
+      expect(resolveStartCmd(dir)).toEqual(["parachute-agent"]);
       writeFileSync(join(dir, ".parachute", "module.json"), JSON.stringify({ startCmd: [123] }));
-      expect(resolveStartCmd(dir)).toEqual(["parachute-channel"]);
+      expect(resolveStartCmd(dir)).toEqual(["parachute-agent"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -623,7 +623,7 @@ describe("resolveStartCmd (hub-supervisor start command)", () => {
   test("the repo's own .parachute/module.json carries a usable startCmd", () => {
     // INSTALL_DIR at runtime is the repo root; src/.. is that root in this checkout.
     const repoRoot = join(import.meta.dir, "..");
-    expect(resolveStartCmd(repoRoot)).toEqual(["parachute-channel"]);
+    expect(resolveStartCmd(repoRoot)).toEqual(["parachute-agent"]);
   });
 });
 

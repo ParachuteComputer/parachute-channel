@@ -20,17 +20,27 @@ import { describe, test, expect, mock } from "bun:test";
 import type { ServerWebSocket } from "bun";
 
 // Sentinel tokens → fixed scope sets. Mirrors daemon-config-api.test.ts so this
-// process-wide mock stays compatible. ADMIN_TOKEN carries channel:admin (==
-// SCOPE_TERMINAL); READ_TOKEN is under-scoped; anything else throws (bad token).
-const ADMIN_TOKEN = "test-admin-token"; // channel:admin (== SCOPE_TERMINAL)
-const READ_TOKEN = "test-read-token"; // channel:read only (insufficient)
+// process-wide mock stays compatible. ADMIN_TOKEN carries agent:admin (==
+// SCOPE_TERMINAL); READ_TOKEN is under-scoped; LEGACY_ADMIN_TOKEN carries the
+// pre-rename channel:admin scope (dual-accept back-compat); anything else throws.
+const ADMIN_TOKEN = "test-admin-token"; // agent:admin (== SCOPE_TERMINAL)
+const READ_TOKEN = "test-read-token"; // agent:read only (insufficient)
+const LEGACY_ADMIN_TOKEN = "test-legacy-admin-token"; // legacy channel:admin (still accepted)
 import { HubJwtError, looksLikeJwt } from "@openparachute/scope-guard";
 mock.module("./hub-jwt.ts", () => ({
-  CHANNEL_AUDIENCE: "channel",
+  AGENT_AUDIENCE: "agent",
+  CHANNEL_AUDIENCE: "channel", // deprecated alias kept for back-compat
   async validateHubJwt(token: string) {
-    const base = { sub: "test", aud: "channel", jti: undefined, clientId: undefined, vaultScope: undefined };
-    if (token === ADMIN_TOKEN) return { ...base, scopes: ["channel:read", "channel:send", "channel:admin"] };
-    if (token === READ_TOKEN) return { ...base, scopes: ["channel:read"] };
+    // New tokens carry aud:"agent" + agent:* scopes (the daemon mints/validates
+    // agent now). A legacy token carries aud:"channel" + channel:* scopes — the
+    // resource server dual-accepts both during the rename window.
+    const base = { sub: "test", aud: "agent", jti: undefined, clientId: undefined, vaultScope: undefined };
+    if (token === ADMIN_TOKEN) return { ...base, scopes: ["agent:read", "agent:send", "agent:admin"] };
+    if (token === READ_TOKEN) return { ...base, scopes: ["agent:read"] };
+    // Pre-rename token: legacy audience + legacy channel:* scopes. requireScope's
+    // dual-accept (hasScope) must still authorize agent:admin from channel:admin.
+    if (token === LEGACY_ADMIN_TOKEN)
+      return { ...base, aud: "channel", scopes: ["channel:read", "channel:send", "channel:admin"] };
     throw new HubJwtError("issuer", "invalid token");
   },
   HubJwtError,
@@ -422,7 +432,7 @@ describe("tmuxAttachEnv — forces a real TERM so `tmux attach` finds terminfo",
 // ===========================================================================
 // Daemon-side terminal auth — authorizeTerminalUpgrade (pure fn)
 // ===========================================================================
-describe("authorizeTerminalUpgrade — operator-gated channel:admin", () => {
+describe("authorizeTerminalUpgrade — operator-gated agent:admin", () => {
   function channels(names: string[] = ["eng"]): Map<string, Channel> {
     const m = new Map<string, Channel>();
     for (const name of names) {
@@ -449,14 +459,14 @@ describe("authorizeTerminalUpgrade — operator-gated channel:admin", () => {
     if (!d.ok) expect(d.response.status).toBe(401);
   });
 
-  test("under-scoped token (channel:read, not channel:admin) → reject (403)", async () => {
+  test("under-scoped token (agent:read, not agent:admin) → reject (403)", async () => {
     const { req: r, url } = req(`?token=${READ_TOKEN}`);
     const d = await authorizeTerminalUpgrade(r, url, channels(), "eng");
     expect(d.ok).toBe(false);
     if (!d.ok) expect(d.response.status).toBe(403);
   });
 
-  test("valid channel:admin token → ok, with the right tmux session + geometry", async () => {
+  test("valid agent:admin token → ok, with the right tmux session + geometry", async () => {
     const { req: r, url } = req(`?token=${ADMIN_TOKEN}&cols=120&rows=40`);
     const d = await authorizeTerminalUpgrade(r, url, channels(), "eng");
     expect(d.ok).toBe(true);
@@ -465,6 +475,20 @@ describe("authorizeTerminalUpgrade — operator-gated channel:admin", () => {
       expect(d.session).toBe("eng-agent"); // <name>-agent (launch-session.sh:38)
       expect(d.cols).toBe(120);
       expect(d.rows).toBe(40);
+    }
+  });
+
+  test("legacy channel:admin token still authorizes (dual-accept back-compat)", async () => {
+    // A token minted before the channel→agent rename carries channel:admin (and
+    // aud:"channel"). requireScope's dual-accept (hasScope) must still authorize
+    // the agent:admin-gated terminal until live tokens are re-minted.
+    const { req: r, url } = req(`?token=${LEGACY_ADMIN_TOKEN}&cols=100&rows=30`);
+    const d = await authorizeTerminalUpgrade(r, url, channels(), "eng");
+    expect(d.ok).toBe(true);
+    if (d.ok) {
+      expect(d.session).toBe("eng-agent");
+      expect(d.cols).toBe(100);
+      expect(d.rows).toBe(30);
     }
   });
 

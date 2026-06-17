@@ -8,7 +8,7 @@
  * session_id) and a per-channel serial worker. An inbound message for a registered
  * channel is ENQUEUED here; the worker drains the queue ONE turn at a time, FIFO,
  * running a single `claude -p --resume <sid>` turn per message and posting the
- * reply back as an outbound `#channel-message/outbound` note.
+ * reply back as an outbound `#agent-message/outbound` note.
  *
  * ── The serial-queue contract (HARD requirement — reviewer contract) ─────────────
  * Each agent processes turns ONE AT A TIME, FIFO. There is NEVER two concurrent
@@ -27,8 +27,8 @@
  * On `ok: false` the error is logged and the turn is DROPPED (no infinite loop, no
  * retry — a failed turn's session id is already persisted by the backend, so the
  * next message resumes the conversation). The outbound write goes through `reply()`,
- * which tags the note `#channel-message/outbound` — the vault inbound trigger keys on
- * `#channel-message/inbound` only, so writing the reply CANNOT re-trigger the inbound
+ * which tags the note `#agent-message/outbound` — the vault inbound trigger keys on
+ * `#agent-message/inbound` only, so writing the reply CANNOT re-trigger the inbound
  * webhook (no loop).
  */
 
@@ -63,7 +63,7 @@ export type TurnLifecycleEvent =
 /**
  * Write an outbound reply for a channel — the seam the registry posts a turn's
  * reply through. The daemon wires this to the channel transport's `reply()` (a
- * VaultTransport writes a `#channel-message/outbound` note). `inReplyTo` threads the
+ * VaultTransport writes a `#agent-message/outbound` note). `inReplyTo` threads the
  * reply to the inbound note id when one is known. Returns nothing; a write failure
  * is the implementation's to surface (the registry logs whatever it throws).
  */
@@ -249,7 +249,7 @@ export class ProgrammaticAgentRegistry {
         await this.backend.stop(handle.backendHandle);
       } catch (err) {
         console.error(
-          `parachute-channel: programmatic backend.stop for "${name}" failed (continuing): ${(err as Error).message}`,
+          `parachute-agent: programmatic backend.stop for "${name}" failed (continuing): ${(err as Error).message}`,
         );
       }
     }
@@ -270,7 +270,7 @@ export class ProgrammaticAgentRegistry {
       await this.backend.stop(handle.backendHandle);
     } catch (err) {
       console.error(
-        `parachute-channel: programmatic session reset for "${name}" failed: ${(err as Error).message}`,
+        `parachute-agent: programmatic session reset for "${name}" failed: ${(err as Error).message}`,
       );
     }
     return true;
@@ -340,7 +340,7 @@ export class ProgrammaticAgentRegistry {
         // view to an error state (no stuck "working" spinner).
         const reason = (err as Error).message;
         console.error(
-          `parachute-channel: programmatic turn for channel "${channel}" threw ` +
+          `parachute-agent: programmatic turn for channel "${channel}" threw ` +
             `(should be a value): ${reason}`,
         );
         this.emitTurnEvent(channel, { kind: "error", error: reason });
@@ -352,7 +352,7 @@ export class ProgrammaticAgentRegistry {
         // session id (a turn can fail after establishing a session), so the next
         // message resumes the conversation. Resolve the live view to an error state.
         console.warn(
-          `parachute-channel: programmatic turn for channel "${channel}" failed: ${result.error}`,
+          `parachute-agent: programmatic turn for channel "${channel}" failed: ${result.error}`,
         );
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
         continue;
@@ -366,7 +366,7 @@ export class ProgrammaticAgentRegistry {
         } catch (err) {
           const reason = (err as Error).message;
           console.error(
-            `parachute-channel: programmatic outbound write for channel "${channel}" failed: ${reason}`,
+            `parachute-agent: programmatic outbound write for channel "${channel}" failed: ${reason}`,
           );
           // The reply was produced but NOT persisted. Resolve the live view to ERROR,
           // not `done` — a `done` would drop the in-progress bubble and trigger a poll

@@ -1,5 +1,5 @@
 /**
- * Transport abstraction for parachute-channel.
+ * Transport abstraction for parachute-agent.
  *
  * A Transport is one messaging backend (Telegram today, http-ui / vault later).
  * The daemon core — channel registry, routing, SSE fan-out, permission relay —

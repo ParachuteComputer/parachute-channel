@@ -1,12 +1,12 @@
 /**
- * OAuth discovery endpoints for parachute-channel's HTTP MCP surface — the
+ * OAuth discovery endpoints for parachute-agent's HTTP MCP surface — the
  * *resource server* side of the authorization story.
  *
- * Mirrors `parachute-vault/src/oauth-discovery.ts` exactly. The channel is a
+ * Mirrors `parachute-vault/src/oauth-discovery.ts` exactly. The agent is a
  * resource server, not an authorization server: the hub is the OAuth issuer
  * (see the hub-as-portal-oauth design doc). These endpoints advertise that
  * contract to clients per RFC 9728 + RFC 8414 so a Claude Code HTTP-MCP client
- * adding the channel by URL can auto-discover the hub and run the OAuth flow —
+ * adding the agent by URL can auto-discover the hub and run the OAuth flow —
  * the same way it discovers a vault.
  *
  *   - `handleProtectedResource` — RFC 9728: "this is the protected resource at
@@ -15,8 +15,8 @@
  *     authorization endpoints" (forwarded shape — issuer + every endpoint name
  *     the hub).
  *
- * The channel resource lives at `/mcp/<channel>` on the daemon, externally
- * `<hub>/channel/mcp/<channel>` (hub's stripPrefix removes `/channel`). The
+ * The agent resource lives at `/mcp/<channel>` on the daemon, externally
+ * `<hub>/agent/mcp/<channel>` (hub's stripPrefix removes `/agent`). The
  * metadata `resource` value is built from the request's forwarded host so the
  * advertised URL is the public one, not loopback.
  *
@@ -29,9 +29,9 @@ import { getHubOrigin } from "./hub-jwt.ts";
 import { SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
 
 /**
- * OAuth scopes the channel publishes through discovery. These are the channel
- * session scopes: a session needs `channel:read` to connect + receive the wake,
- * and `channel:write` to send (reply/react/edit). A spec-following MCP client
+ * OAuth scopes the agent publishes through discovery. These are the agent
+ * session scopes: a session needs `agent:read` to connect + receive the wake,
+ * and `agent:write` to send (reply/react/edit). A spec-following MCP client
  * reads `scopes_supported` from this PRM and requests exactly these scopes.
  */
 function scopesSupported(): string[] {
@@ -58,24 +58,24 @@ export function getBaseUrl(req: Request): string {
 }
 
 /**
- * The mount prefix the channel sits under when served through the hub expose.
- * Hub reverse-proxies `<expose>/channel/*` → the loopback daemon with
- * `stripPrefix:true`, so the daemon itself never sees `/channel`. But the
- * PUBLIC resource URL a client must address is `<hub>/channel/mcp/<channel>`.
+ * The mount prefix the module sits under when served through the hub expose.
+ * Hub reverse-proxies `<expose>/agent/*` → the loopback daemon with
+ * `stripPrefix:true`, so the daemon itself never sees `/agent`. But the
+ * PUBLIC resource URL a client must address is `<hub>/agent/mcp/<channel>`.
  *
  * When the request carries `x-forwarded-host` (i.e. it came through the hub),
- * the public URL needs the `/channel` prefix re-added; a direct loopback
+ * the public URL needs the `/agent` prefix re-added; a direct loopback
  * request (no forwarded host) addresses `/mcp/<channel>` with no prefix. We key
  * off the forwarded-host presence to decide.
  */
 function mountPrefix(req: Request): string {
-  return req.headers.get("x-forwarded-host") ? "/channel" : "";
+  return req.headers.get("x-forwarded-host") ? "/agent" : "";
 }
 
 /**
  * OAuth 2.0 Protected Resource Metadata (RFC 9728).
  *
- * Advertises the channel's `/mcp/<channel>` endpoint as the protected resource
+ * Advertises the agent's `/mcp/<channel>` endpoint as the protected resource
  * and names the hub as the authorization server. Clients following the spec
  * fetch this, then fetch the AS metadata at
  * `<hub>/.well-known/oauth-authorization-server` to drive the full flow.
@@ -94,11 +94,11 @@ export function handleProtectedResource(req: Request, channel: string): Response
 /**
  * OAuth 2.0 Authorization Server Metadata (RFC 8414).
  *
- * The channel is a resource server, not an authorization server — but we serve
+ * The agent is a resource server, not an authorization server — but we serve
  * this document as a *forwarding* metadata document: issuer + every endpoint
  * name the hub. Clients that follow the PRM pointer land here and discover the
  * hub's actual endpoints; conformant clients that probe AS metadata directly at
- * the channel path get the same answer. Mirrors vault.
+ * the agent path get the same answer. Mirrors vault.
  */
 export function handleAuthorizationServer(_req: Request, _channel: string): Response {
   const hub = getHubOrigin();

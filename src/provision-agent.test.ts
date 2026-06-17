@@ -1,5 +1,5 @@
 /**
- * Tests for the shared channel-provisioning client (src/provision-channel.ts) —
+ * Tests for the shared channel-provisioning client (src/provision-agent.ts) —
  * the module the Config page and the unified create-agent flow BOTH use so they
  * can't drift on how they provision channels.
  *
@@ -14,22 +14,22 @@
  *      pages run in the browser).
  */
 import { describe, test, expect } from "bun:test";
-import { vaultConnectionBody, PROVISION_JS } from "./provision-channel.ts";
+import { vaultConnectionBody, PROVISION_JS } from "./provision-agent.ts";
 
 describe("vaultConnectionBody (the canonical vault-backed-channel connection)", () => {
   test("builds vault.note.created (inbound tag) → channel.message.deliver", () => {
     const body = vaultConnectionBody("eng", "default");
-    expect(body.requestedBy).toBe("channel");
+    expect(body.requestedBy).toBe("agent");
     expect(body.source.module).toBe("vault");
     expect(body.source.vault).toBe("default");
     expect(body.source.event).toBe("note.created");
     // The inbound-tag filter is the loop-avoidance contract (CLAUDE.md "Vault
     // integration"): fire on the inbound CHILD tag only; require channel metadata;
     // skip already-rendered notes.
-    expect(body.source.filter.tags).toEqual(["#channel-message/inbound"]);
+    expect(body.source.filter.tags).toEqual(["#agent-message/inbound"]);
     expect(body.source.filter.has_metadata).toEqual(["channel"]);
     expect(body.source.filter.missing_metadata).toEqual(["channel_inbound_rendered_at"]);
-    expect(body.sink.module).toBe("channel");
+    expect(body.sink.module).toBe("agent");
     expect(body.sink.action).toBe("message.deliver");
     expect(body.sink.params.channel).toBe("eng");
   });

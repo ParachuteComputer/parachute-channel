@@ -2,7 +2,7 @@
  * Per-channel delivery high-water-mark — the spine of the no-silent-loss fix.
  *
  * THE PROBLEM. The vault-backed inbound pipeline wakes a session by `ctx.emit`
- * fanning a new `#channel-message/inbound` note to whatever SSE bridges + HTTP
+ * fanning a new `#agent-message/inbound` note to whatever SSE bridges + HTTP
  * MCP sessions are live on the channel. But:
  *  - the daemon acks the vault trigger `{ok:true}` regardless of how many
  *    subscribers actually received it, and the vault stamps `..._rendered_at` on
@@ -36,8 +36,8 @@
  * bounce and replays exactly the restart gap.
  *
  * PERSISTENCE. The marks live in a single small JSON file under the channel state
- * dir (`<PARACHUTE_CHANNEL_STATE_DIR>/delivery-state.json`, default
- * `~/.parachute/channel/delivery-state.json`). Writes are write-through but
+ * dir (`<PARACHUTE_AGENT_STATE_DIR>/delivery-state.json`, default
+ * `~/.parachute/agent/delivery-state.json`). Writes are write-through but
  * resilient: a failed write is logged and swallowed — losing a mark only costs a
  * bounded re-replay, never a crash. Load-on-construct reads the file once.
  */
@@ -99,7 +99,7 @@ export class DeliveryState {
       // Corrupt file — log and start empty rather than crash. The marks rebuild
       // from boot-time defaults; the cost is a bounded re-replay, not a loss.
       console.warn(
-        `parachute-channel: delivery-state file ${this.file} is unreadable (${(err as Error).message}); ` +
+        `parachute-agent: delivery-state file ${this.file} is unreadable (${(err as Error).message}); ` +
           `starting with empty marks.`,
       );
     }
@@ -114,7 +114,7 @@ export class DeliveryState {
       writeFileSync(this.file, JSON.stringify(obj, null, 2));
     } catch (err) {
       console.warn(
-        `parachute-channel: failed to persist delivery-state to ${this.file} ` +
+        `parachute-agent: failed to persist delivery-state to ${this.file} ` +
           `(${(err as Error).message}); the mark is held in memory only.`,
       );
     }

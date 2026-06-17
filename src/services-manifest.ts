@@ -5,7 +5,7 @@
  * shape is the contract between every Parachute module and the hub
  * (`parachute-hub/src/services-manifest.ts` is the canonical reader). Hub reads
  * this to know the module's port, the paths it should reverse-proxy
- * (`/channel/*` over the expose → this daemon on loopback), and the version.
+ * (`/agent/*` over the expose → this daemon on loopback), and the version.
  *
  * Best-effort: any write error is logged + swallowed by the caller. The daemon
  * still serves locally even if registration fails. Honors `PARACHUTE_HOME` so

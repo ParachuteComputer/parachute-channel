@@ -75,8 +75,8 @@ describe("SHELL_JS", () => {
     for (const sym of ["var MOUNT", "function wireShell", "function escapeHtml", "function setStatus", "function fetchToken", "function authedFetch", "function setTerminalNavVisible"]) {
       expect(SHELL_JS).toContain(sym);
     }
-    // It hits the hub channel-token endpoint with the operator cookie.
-    expect(SHELL_JS).toContain("/admin/channel-token");
+    // It hits the hub agent-token endpoint with the operator cookie.
+    expect(SHELL_JS).toContain("/admin/agent-token");
     expect(SHELL_JS).toContain('credentials: "include"');
   });
 

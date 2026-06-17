@@ -1,5 +1,5 @@
 /**
- * Static HTML for `/channel/agents` — the PRIMARY "Agents" surface: the unified
+ * Static HTML for `/agent/agents` — the PRIMARY "Agents" surface: the unified
  * **create-an-agent** flow (Phase-1 consolidation,
  * `design/2026-06-17-parachute-agent-blueprint.md` §Sequencing step 1).
  *
@@ -16,7 +16,7 @@
  *
  * CLIENT-SIDE ORCHESTRATION (the load-bearing decision): the channel half reuses
  * the EXISTING provisioning paths via the shared `PROVISION_JS`
- * (`src/provision-channel.ts`) — the SAME hub-mediated `/admin/connections` vault
+ * (`src/provision-agent.ts`) — the SAME hub-mediated `/admin/connections` vault
  * flow + `/api/channels` telegram/http-ui flow the Config page runs. The channel
  * daemon does NOT mint vault tokens (it lacks hub authority); the hub does, exactly
  * as on the Config page. No new `/api/agents` fields — the form posts the same body
@@ -29,7 +29,7 @@
  *
  * Self-contained document (HTML + inline CSS + inline JS, no build step — the same
  * shape as `terminal-ui.ts` / `home-ui.ts` / `daemon.ts`'s chat UI). It drives the
- * daemon's `channel:admin`-gated JSON API + the hub Connections engine:
+ * daemon's `agent:admin`-gated JSON API + the hub Connections engine:
  *
  *   - GET    /api/credentials/claude   → credential status (default set? overrides?)
  *   - POST   /api/credentials/claude[/:channel]  → set default / per-channel token
@@ -49,7 +49,7 @@
  *   - GET    /health                   → live per-channel connection status (mcp_sessions)
  *
  * Auth: loads OPEN (like /ui, /admin, /terminal), then fetches a hub-minted
- * `channel:admin` Bearer from `<origin>/admin/channel-token` and attaches it to the
+ * `agent:admin` Bearer from `<origin>/admin/agent-token` and attaches it to the
  * daemon `/api` calls; the vault provisioning path uses the operator's hub SESSION
  * COOKIE (credentials:"include"), not this token. Token hygiene: the pasted Claude
  * token is POSTed once and never read back; the spawn result shows scopes but never
@@ -61,7 +61,7 @@
  */
 
 import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
-import { PROVISION_JS } from "./provision-channel.ts";
+import { PROVISION_JS } from "./provision-agent.ts";
 
 export const AGENTS_UI_HTML = `<!doctype html>
 <html lang="en">
@@ -69,7 +69,7 @@ export const AGENTS_UI_HTML = `<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="referrer" content="no-referrer" />
-<title>parachute-channel · agents</title>
+<title>parachute-agent · agents</title>
 <style>
 ${THEME_CSS}
   /* ---- Agents page layout (page-specific, layered after the shared kit) ---- */
@@ -277,7 +277,7 @@ ${THEME_CSS}
               </div>
               <div>
                 <label for="vault-tags">Tag scope (optional)</label>
-                <input type="text" id="vault-tags" placeholder="#channel-message, …" autocomplete="off" />
+                <input type="text" id="vault-tags" placeholder="#agent-message/inbound, …" autocomplete="off" />
               </div>
             </div>
             <div class="muted" style="font-size:12px;">
@@ -449,7 +449,7 @@ ${PROVISION_JS}
   function clearMsg(el) { el.textContent = ""; el.className = "msg"; }
 
   // --- token + API --------------------------------------------------------
-  // fetchToken (SHELL_JS) mints + caches the channel:admin Bearer on
+  // fetchToken (SHELL_JS) mints + caches the agent:admin Bearer on
   // window.__token. api() is the agents-page JSON wrapper: it prefixes MOUNT,
   // attaches the Bearer + a JSON content-type, and retries once on 401.
   function api(path, opts, _retried) {
@@ -782,7 +782,7 @@ ${PROVISION_JS}
         if (chk.ok && chk.exists) {
           return { ok: true, reused: true, transport: chk.transport };
         }
-        // If the existence check itself failed with auth (the channel:admin list
+        // If the existence check itself failed with auth (the agent:admin list
         // 401/403'd), we can't know whether the channel already exists — so for the
         // DAEMON transports we must NOT blindly re-POST (that could 409 a duplicate
         // or overwrite an existing channel's config). Surface the auth error and let
@@ -791,7 +791,7 @@ ${PROVISION_JS}
         // token), so a list 401 doesn't predict a hub-cookie failure — fall through
         // and let provisionVaultChannel report its own auth state.
         if (chk.auth && transport !== "vault") {
-          return { ok: false, message: "not signed in — the page needs a channel:admin token to check/create the channel (open it through the hub portal, signed in)." };
+          return { ok: false, message: "not signed in — the page needs an agent:admin token to check/create the channel (open it through the hub portal, signed in)." };
         }
         // Provision per transport:
         if (transport === "vault") {
@@ -818,7 +818,7 @@ ${PROVISION_JS}
   }
   function daemonProvisionResult(res) {
     if (res.ok) return { ok: true, restart_needed: res.restart_needed, restart_error: res.error };
-    if (res.auth) return { ok: false, message: "not signed in — the page needs a channel:admin token (open it through the hub portal, signed in)." };
+    if (res.auth) return { ok: false, message: "not signed in — the page needs an agent:admin token (open it through the hub portal, signed in)." };
     return { ok: false, message: "channel provisioning failed: " + (res.error || "unknown error") };
   }
 
@@ -1099,7 +1099,7 @@ ${PROVISION_JS}
     });
   }
   // The Advanced vault-BINDING picker (the agent's own vault scope) reads the
-  // daemon's installed-vaults endpoint (channel:admin). Distinct from the channel's
+  // daemon's installed-vaults endpoint (agent:admin). Distinct from the channel's
   // backing vault — this is the vault the agent itself reads/writes.
   function loadBindingVaults() {
     return apiJson("/api/vaults").then(function (j) {
@@ -1126,7 +1126,7 @@ ${PROVISION_JS}
     loadDefaultVaults();
     showMsg(document.getElementById("create-msg"),
       "Open this page through the hub portal, signed in as the operator. " +
-      "Creating an agent needs a channel:admin token (" + err.message + ").", true);
+      "Creating an agent needs an agent:admin token (" + err.message + ").", true);
   });
 })();
 </script>

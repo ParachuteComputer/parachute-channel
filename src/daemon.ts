@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * parachute-channel daemon — the transport-agnostic orchestrator.
+ * parachute-agent daemon — the transport-agnostic orchestrator.
  *
  * Runs as a long-lived HTTP server (launchd, systemd, or manual). It loads a
  * channel registry (name → transport), starts each transport, and routes
@@ -12,10 +12,10 @@
  * platform API directly.
  *
  * Port resolution (see `resolvePort`): the hub supervisor's injected `PORT`
- * wins, then the back-compat `PARACHUTE_CHANNEL_PORT` override, then the
- * compiled-in canonical default 1941. The daemon binds AND self-registers the
- * resolved port, so the supervisor's probe/proxy and the bound port never
- * disagree (channel#41).
+ * wins, then the `PARACHUTE_AGENT_PORT` override (legacy `PARACHUTE_CHANNEL_PORT`
+ * still honored), then the compiled-in canonical default 1941. The daemon binds
+ * AND self-registers the resolved port, so the supervisor's probe/proxy and the
+ * bound port never disagree (agent#41).
  */
 
 import { mkdirSync, readFileSync, existsSync, readdirSync } from "fs";
@@ -51,7 +51,7 @@ import {
   type Channel,
   type ChannelEntry,
 } from "./registry.ts";
-import { VaultTransport, CHANNEL_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
+import { VaultTransport, AGENT_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
 import { Runner, realTickDriver } from "./runner.ts";
 import { nextRunAfter } from "./cron.ts";
@@ -146,11 +146,12 @@ const INBOX_DIR = join(STATE_DIR, "inbox");
  *
  *   1. `PORT` — the hub supervisor injects this from the module's services.json
  *      `entry.port` (the canonical pattern vault/scribe follow). It is the port
- *      the supervisor ALSO probes for readiness and proxies `/channel/*` to, so
+ *      the supervisor ALSO probes for readiness and proxies `/agent/*` to, so
  *      the daemon MUST bind it or the supervisor reports `started_but_unbound`
- *      and the proxy routes to a dead port (channel#41).
- *   2. `PARACHUTE_CHANNEL_PORT` — back-compat manual override for a daemon run
- *      outside the supervisor (the pre-#41 env var; still honored).
+ *      and the proxy routes to a dead port (agent#41).
+ *   2. `PARACHUTE_AGENT_PORT` — manual override for a daemon run outside the
+ *      supervisor. Falls back to the legacy `PARACHUTE_CHANNEL_PORT` (the
+ *      pre-rename env var; still honored during the channel→agent transition).
  *   3. `1941` — the compiled-in canonical default.
  *
  * Pre-#41 the daemon read only `PARACHUTE_CHANNEL_PORT`, so it ignored the
@@ -164,12 +165,13 @@ const INBOX_DIR = join(STATE_DIR, "inbox");
  * through rather than being treated as "set": `PORT=""` with `??` would yield
  * `parseInt("")` = NaN and bind port 0 / garbage. `||` skips the empty string
  * to the next tier — matches vault's defensive `parseInt(...) || ... || DEFAULT`.
- * The final `"1941"` literal also guards a non-numeric value (`PORT="abc"` →
+ * The final `1941` literal also guards a non-numeric value (`PORT="abc"` →
  * `parseInt` NaN → falsy → falls through to the default).
  */
 export function resolvePort(env: NodeJS.ProcessEnv = process.env): number {
   return (
     parseInt(env.PORT ?? "", 10) ||
+    parseInt(env.PARACHUTE_AGENT_PORT ?? "", 10) ||
     parseInt(env.PARACHUTE_CHANNEL_PORT ?? "", 10) ||
     1941
   );
@@ -192,15 +194,15 @@ const INSTALL_DIR = join(import.meta.dir, "..");
 
 /**
  * The argv the hub supervisor should spawn to (re)start this module — written
- * into our services.json row so `parachute restart channel` / reboot-survival /
+ * into our services.json row so `parachute restart agent` / reboot-survival /
  * adopt all have a command to run. Without it the supervisor knows the port but
  * not how to start the process, so a manually-run `bun src/daemon.ts` daemon
- * can't be supervised (channel#34).
+ * can't be supervised (agent#34).
  *
  * Sourced from our own `.parachute/module.json` `startCmd` (the canonical
  * declaration the hub already prefers when it can read the install dir),
  * falling back to the package.json `bin` name when the manifest is unreadable.
- * The bin (`parachute-channel` → `src/daemon.ts`) runs the daemon directly and
+ * The bin (`parachute-agent` → `src/daemon.ts`) runs the daemon directly and
  * ignores extra argv, so the literal command is stable regardless of any
  * subcommand the hub's first-party fallback might carry.
  */
@@ -219,7 +221,7 @@ export function resolveStartCmd(installDir: string): string[] {
   } catch {
     // fall through to the bin-name default
   }
-  return ["parachute-channel"];
+  return ["parachute-agent"];
 }
 
 const START_CMD: string[] = resolveStartCmd(INSTALL_DIR);
@@ -264,7 +266,7 @@ export function contextFor(
       });
       // ALSO wake any HTTP MCP sessions on this channel — a session connected
       // over /mcp/<channel> (vs. the stdio bridge over /events) receives the
-      // same inbound as a server-pushed notifications/claude/channel. Additive:
+      // same inbound as a server-pushed notifications/claude/agent. Additive:
       // the SSE path above is untouched.
       const mcpDelivered = mcpPushToChannel(channel, msg.content, msg.meta);
 
@@ -354,7 +356,7 @@ export async function replayBacklog(
     // The vault was unreachable / errored — don't fail the connect. Nothing to
     // replay this time; the mark stays put so a later connect retries the backlog.
     console.warn(
-      `parachute-channel: replayBacklog for "${channel}" — transcript load failed (${(err as Error).message}); ` +
+      `parachute-agent: replayBacklog for "${channel}" — transcript load failed (${(err as Error).message}); ` +
         `skipping replay (backlog stays durable in the vault).`,
     );
     return 0;
@@ -372,7 +374,7 @@ export async function replayBacklog(
   if (pending.length > REPLAY_CAP) {
     const dropped = pending.length - REPLAY_CAP;
     console.log(
-      `parachute-channel: replayBacklog for "${channel}" — backlog of ${pending.length} exceeds cap ${REPLAY_CAP}; ` +
+      `parachute-agent: replayBacklog for "${channel}" — backlog of ${pending.length} exceeds cap ${REPLAY_CAP}; ` +
         `replaying the newest ${REPLAY_CAP}, ${dropped} older message(s) left in the vault transcript.`,
     );
     pending = pending.slice(pending.length - REPLAY_CAP);
@@ -440,7 +442,7 @@ async function addChannelLive(
     try {
       await existing.transport.stop();
     } catch (err) {
-      console.error(`parachute-channel: stopping old transport for "${entry.name}" failed (continuing):`, err);
+      console.error(`parachute-agent: stopping old transport for "${entry.name}" failed (continuing):`, err);
     }
     channels.delete(entry.name);
   }
@@ -465,7 +467,7 @@ async function removeChannelLive(
   try {
     await channel.transport.stop();
   } catch (err) {
-    console.error(`parachute-channel: stopping transport for "${name}" failed (continuing):`, err);
+    console.error(`parachute-agent: stopping transport for "${name}" failed (continuing):`, err);
   }
   channels.delete(name);
   return true;
@@ -480,8 +482,8 @@ async function removeChannelLive(
  * through: resolve the channel's transport from the live `channels` map and call its
  * `reply()` — the SAME outbound path the interactive `reply` tool uses, so a
  * programmatic reply is durable + renders in the chat UI exactly like an
- * interactive one. For a VaultTransport this writes a `#channel-message/outbound`
- * note; the vault inbound trigger keys on `#channel-message/inbound`, so writing the
+ * interactive one. For a VaultTransport this writes a `#agent-message/outbound`
+ * note; the vault inbound trigger keys on `#agent-message/inbound`, so writing the
  * reply CANNOT re-trigger the inbound webhook (verified: no loop). `inReplyTo`
  * threads the reply to the inbound note id.
  *
@@ -567,11 +569,11 @@ export function createDefaultProgrammaticRegistry(
  * Transport choice (documented in the PR): a DEDICATED per-channel SSE stream
  * (`/api/channels/<ch>/turn-events`) over the existing {@link ClientRegistry},
  * NOT the durable-message poll. Rationale — the chat already POLLs vault channels
- * for their DURABLE transcript (the `#channel-message` notes, the record of truth);
+ * for their DURABLE transcript (the `#agent-message` notes, the record of truth);
  * turn progress is EPHEMERAL and chunk-frequent, so polling would be coarse + would
  * surface partial state as if durable. An SSE stream is the clean real-time fit and
  * reuses the registry/`sseFrame` infra already in the daemon. The durable path is
- * untouched: the final `result` still becomes the `#channel-message/outbound` note,
+ * untouched: the final `result` still becomes the `#agent-message/outbound` note,
  * and the live stream is purely additive progress that the UI finalizes against it.
  *
  * Keyed by channel; fans out to every subscriber on that channel. A 0-subscriber
@@ -637,7 +639,7 @@ export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry):
  * register failure is logged per-agent and never aborts boot. Returns the count
  * re-registered. `sessionsDirPath` is injectable for tests.
  *
- * ORPHAN GUARD (channel#75 — defense-in-depth). A spec dir is durable cruft: it can
+ * ORPHAN GUARD (agent#75 — defense-in-depth). A spec dir is durable cruft: it can
  * outlive the channel it was spawned for (a deleted agent whose workspace wasn't
  * swept, a crash mid-spawn, a leaked test fixture, a hand-copied dir). Re-registering
  * a programmatic agent whose wake channel ISN'T in the live channels config would
@@ -682,28 +684,28 @@ export async function reregisterProgrammaticAgents(
       : undefined;
     if (!wakeChannel) {
       console.log(
-        `parachute-channel: skipping re-register of "${spec.name}" — spec declares no channel.`,
+        `parachute-agent: skipping re-register of "${spec.name}" — spec declares no channel.`,
       );
       continue;
     }
     if (!channels.has(wakeChannel)) {
       console.log(
-        `parachute-channel: skipping re-register of "${spec.name}" — channel "${wakeChannel}" not configured.`,
+        `parachute-agent: skipping re-register of "${spec.name}" — channel "${wakeChannel}" not configured.`,
       );
       continue;
     }
     try {
       await programmatic.register(spec);
       count++;
-      console.log(`parachute-channel: re-registered programmatic agent "${spec.name}" (channel ${wakeChannel}).`);
+      console.log(`parachute-agent: re-registered programmatic agent "${spec.name}" (channel ${wakeChannel}).`);
     } catch (err) {
       console.error(
-        `parachute-channel: failed to re-register programmatic agent "${name}" from spec.json: ${(err as Error).message}`,
+        `parachute-agent: failed to re-register programmatic agent "${name}" from spec.json: ${(err as Error).message}`,
       );
     }
   }
   if (count > 0) {
-    console.log(`parachute-channel: re-registered ${count} programmatic agent(s) from persisted specs.`);
+    console.log(`parachute-agent: re-registered ${count} programmatic agent(s) from persisted specs.`);
   }
   return count;
 }
@@ -724,7 +726,7 @@ export const CHAT_UI_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>parachute-channel · chat</title>
+<title>parachute-agent · chat</title>
 <style>
 ${THEME_CSS}
   /* ---- Chat page layout + transcript (page-specific, after the shared kit) -- */
@@ -864,10 +866,10 @@ ${SHELL_JS}
   }
 
   // ----- Layer 2 auth -----------------------------------------------------
-  // The daemon's send + SSE endpoints require a hub-issued channel JWT
-  // (aud:channel, scopes channel:read channel:send). The shared fetchToken
+  // The daemon's send + SSE endpoints require a hub-issued agent JWT
+  // (aud:agent, scopes agent:read agent:send). The shared fetchToken
   // (SHELL_JS) mints one for the logged-in portal operator at
-  // <hub-origin>/admin/channel-token (cookie-gated, ~10min TTL) and caches it on
+  // <hub-origin>/admin/agent-token (cookie-gated, ~10min TTL) and caches it on
   // window.__token; it REJECTS on failure. ensureToken wraps it with the chat's
   // own notice (a "sys" transcript line) so a not-authenticated load explains
   // itself, then resolves to null — an unguarded dev daemon may still accept the
@@ -883,9 +885,9 @@ ${SHELL_JS}
     if (!ch) return;
     // The public origin this channel is reachable at. Served through the hub
     // expose, location.origin IS the hub origin and the channel mounts under
-    // /channel; served directly off the daemon, it's the loopback origin with
+    // /agent; served directly off the daemon, it's the loopback origin with
     // no mount prefix. MOUNT (derived from the page path) captures that prefix.
-    var name = "channel-" + ch;
+    var name = "agent-" + ch;
     var url = window.location.origin + MOUNT + "/mcp/" + ch;
     document.getElementById("snippet-add").textContent =
       "claude mcp add --transport http --scope user " + name + " " + url;
@@ -922,10 +924,10 @@ ${SHELL_JS}
       // /abs/path.png). There is NO endpoint that serves a reply attachment
       // as a downloadable blob: the daemon's POST /api/download goes the OTHER
       // way (a Telegram file_id -> a server-local path) and requires
-      // channel:write, which the chat page's token (channel:read channel:send)
+      // agent:write, which the chat page's token (agent:read agent:send)
       // does not hold. So we render the names clearly rather than fabricate a
       // download link. Making these downloadable needs new backend work (a
-      // blob-serving route scoped to channel:read) — left for a follow-up.
+      // blob-serving route scoped to agent:read) — left for a follow-up.
       var f = document.createElement("div");
       f.className = "files";
       var label = document.createElement("span");
@@ -1126,12 +1128,12 @@ ${SHELL_JS}
   // Render a permission prompt as an interactive bubble with Approve / Deny.
   //
   // SCOPE NOTE (flagged): submitting a verdict has NO daemon endpoint today, and
-  // the chat page's token is channel:read + channel:send only. The existing
+  // the chat page's token is agent:read + agent:send only. The existing
   // POST /api/permission is the OUTBOUND prompt (bridge -> channel,
-  // transport.sendPermission) gated channel:write — NOT a verdict sink; the
+  // transport.sendPermission) gated agent:write — NOT a verdict sink; the
   // verdict path (ctx.emitPermissionVerdict -> bridges/MCP sessions) has no HTTP
   // route the browser can call. So the buttons are wired to a clear, honest
-  // "needs backend + channel:write" state rather than a call that would 401 or
+  // "needs backend + agent:write" state rather than a call that would 401 or
   // hit the wrong endpoint. When the verdict route + scope land (Phase 4), swap
   // the handler body for the real POST. We deliberately do NOT weaken the gate.
   function addPermission(d) {
@@ -1148,7 +1150,7 @@ ${SHELL_JS}
     function disableWithNote(verdict) {
       approve.disabled = true; deny.disabled = true;
       note.textContent = "Recorded your choice (" + verdict + ") in the UI. Approving/denying " +
-        "from chat needs a verdict endpoint + a channel:write token — follow-up. " +
+        "from chat needs a verdict endpoint + a agent:write token — follow-up. " +
         "For now respond in the session's terminal.";
     }
     var approve = document.createElement("button");
@@ -1184,7 +1186,7 @@ ${SHELL_JS}
     var ch = currentChannel();
     if (!ch) { setStatus("no channel", ""); sendBtn.disabled = true; return; }
     updateSetup(ch);
-    // Vault channels read/write the durable #channel-message store via the daemon
+    // Vault channels read/write the durable #agent-message store via the daemon
     // (load transcript + poll); http-ui channels use the ephemeral SSE path below.
     if (isVault(ch)) { connectVault(ch); return; }
     setStatus("connecting…", "");
@@ -1365,14 +1367,14 @@ function json(data: unknown, status = 200): Response {
 // Layer 1 — bridge / session↔channel. The session↔channel connection is
 // authenticated with hub-issued JWTs, exactly like a vault MCP client. A
 // launched session has full machine access, so we do NOT rely on loopback trust
-// — any session on any machine presents a hub token (`aud: "channel"`, scopes
-// `channel:read`/`channel:write`) as a Bearer header and the daemon validates
+// — any session on any machine presents a hub token (`aud: "agent"`, scopes
+// `agent:read`/`agent:write`) as a Bearer header and the daemon validates
 // it against the hub's JWKS. Scope split: subscribing to inbound events is
-// `channel:read`; sending anything out (reply/react/edit/permission/download)
-// is `channel:write`.
+// `agent:read`; sending anything out (reply/react/edit/permission/download)
+// is `agent:write`.
 //
 // Layer 2 — human / chat UI — gates the http-ui transport's `send` (POST,
-// `channel:send`) + `/ui/events` SSE (`?token=` query, `channel:read`) inside
+// `agent:send`) + `/ui/events` SSE (`?token=` query, `agent:read`) inside
 // `http-ui.ts`'s ingestHttp using the same `requireScope`.
 //
 // Discovery + the page itself (/health, /.parachute/config[/schema], /ui) stay
@@ -1385,7 +1387,7 @@ function json(data: unknown, status = 200): Response {
  * routing layer is unit-testable without a live hub or a real socket — the same
  * shape the HTTP gate tests rely on.
  *
- * Auth: OPERATOR-GATED on `channel:admin` (`SCOPE_TERMINAL`). The token rides in
+ * Auth: OPERATOR-GATED on `agent:admin` (`SCOPE_TERMINAL`). The token rides in
  * as a `?token=` query param (browsers can't set Authorization on
  * `new WebSocket()`), so `allowQueryParam: true`. The no-token path
  * short-circuits to 401 before any JWKS fetch (testable offline).
@@ -1397,7 +1399,7 @@ function json(data: unknown, status = 200): Response {
  * name to be a known channel; we slug-guard it (it lands UNESCAPED in a tmux `-t`
  * target) and let the attach handle a non-existent session — `tmux attach` to a
  * missing session fails cleanly and the relay closes 1000 ("session ended"), no
- * reconnect loop. Operator-only behind channel:admin, so there's no enumeration
+ * reconnect loop. Operator-only behind agent:admin, so there's no enumeration
  * concern. (`channels` is no longer consulted; kept in the signature for the
  * stable call shape.)
  *
@@ -1584,10 +1586,10 @@ export function createFetchHandler(
     //
     // The in-page xterm.js terminal attaches to the channel's tmux session
     // (`<channel>-agent`) via Bun's native pty. Externally this is
-    // `<hub>/channel/terminal/<channel>`; the hub strips `/channel` (stripPrefix)
+    // `<hub>/agent/terminal/<channel>`; the hub strips `/agent` (stripPrefix)
     // and forwards the `Upgrade: websocket` over its Bun-native WS bridge (which
-    // honors channel's `websocket: true` declaration), so the daemon sees the
-    // bare `/terminal/<channel>` upgrade here. OPERATOR-GATED on channel:admin
+    // honors agent's `websocket: true` declaration), so the daemon sees the
+    // bare `/terminal/<channel>` upgrade here. OPERATOR-GATED on agent:admin
     // (the most dangerous capability), token via `?token=`. Must run BEFORE the
     // generic routing so the upgrade isn't 404'd.
     const termMatch = url.pathname.match(/^\/terminal\/([^/]+)$/);
@@ -1632,7 +1634,7 @@ export function createFetchHandler(
     // Terminal view (the xterm.js page) — `/terminal` or `/terminal/<channel>`
     // as a plain GET (no upgrade) serves the page; the page then opens the WS to
     // `/terminal/<channel>`. Loads OPEN (like /ui and /admin) so it can bootstrap
-    // its hub-minted channel:admin token fetch; the WS upgrade above is what's
+    // its hub-minted agent:admin token fetch; the WS upgrade above is what's
     // gated. Served by the daemon (spans every channel via a picker).
     if (req.method === "GET" && (url.pathname === "/terminal" || termMatch)) {
       return new Response(TERMINAL_UI_HTML, {
@@ -1642,7 +1644,7 @@ export function createFetchHandler(
 
     // Agent management page (the web spawn/list/kill surface, design §4/§5) —
     // `/agents`. Loads OPEN (like /ui, /admin, /terminal) so it can bootstrap its
-    // hub-minted channel:admin token; the `/api/agents` + `/api/credentials/*`
+    // hub-minted agent:admin token; the `/api/agents` + `/api/credentials/*`
     // calls it makes are what `requireScope` gates. Served by the daemon (spans
     // every channel via the spawn form + the running-agents list).
     if (req.method === "GET" && url.pathname === "/agents") {
@@ -1654,7 +1656,7 @@ export function createFetchHandler(
     // Schedules / runner page — `/jobs` (design 2026-06-17). The Schedules panel:
     // list the scheduled jobs (channel · cron · next-run · last-status), add a job
     // (agent picker → message → cron + presets), enable/disable, delete, "Run now."
-    // Loads OPEN (like /agents): it mints a hub-minted channel:admin token
+    // Loads OPEN (like /agents): it mints a hub-minted agent:admin token
     // client-side; the `/api/jobs*` calls it makes are what `requireScope` gates.
     if (req.method === "GET" && url.pathname === "/jobs") {
       return new Response(JOBS_UI_HTML, {
@@ -1663,9 +1665,9 @@ export function createFetchHandler(
     }
 
     // Home / overview landing (Phase 2) — `/home`, the DEFAULT page the hub
-    // portal lands on (`uiUrl: "/channel/home"`). Loads OPEN (like /ui, /admin,
+    // portal lands on (`uiUrl: "/agent/home"`). Loads OPEN (like /ui, /admin,
     // /terminal, /agents): the channels card reads the public config, the agents
-    // card mints a hub-minted channel:admin token client-side and tolerates a
+    // card mints a hub-minted agent:admin token client-side and tolerates a
     // failed mint. Served by the daemon (spans every channel + agent).
     if (req.method === "GET" && url.pathname === "/home") {
       return new Response(HOME_UI_HTML, {
@@ -1705,7 +1707,7 @@ export function createFetchHandler(
     // channel needs the hub to register on its behalf (PR 3). The hub GETs this,
     // substitutes the channel name into the `<channel>` placeholders, fills the
     // `<hub-origin>` in `action.webhook`, and injects `action.auth.bearer` (a
-    // minted channel:send JWT) — so the channel owns its own trigger shape rather
+    // minted agent:send JWT) — so the channel owns its own trigger shape rather
     // than the hub hardcoding it.
     if (req.method === "GET" && url.pathname === "/.parachute/config") {
       return json({
@@ -1713,13 +1715,13 @@ export function createFetchHandler(
           name: c.name,
           transport: c.transport.kind,
         })),
-        triggerTemplate: CHANNEL_VAULT_TRIGGER_TEMPLATE,
+        triggerTemplate: AGENT_VAULT_TRIGGER_TEMPLATE,
       });
     }
 
     if (req.method === "GET" && url.pathname === "/.parachute/config/schema") {
       return json({
-        title: "parachute-channel config",
+        title: "parachute-agent config",
         description: "Named channels, each bound to a transport.",
         type: "object",
         properties: {
@@ -1750,13 +1752,13 @@ export function createFetchHandler(
     // ---------------------------------------------------------------------
     // Channel config-management API — the hub writes channels.json + hot-adds
     // the channel to the LIVE daemon, so a frictionless setup never hand-edits a
-    // file or restarts the daemon. Gated on a hub JWT with `channel:admin`.
+    // file or restarts the daemon. Gated on a hub JWT with `agent:admin`.
     //
     //   POST   /api/channels        { name, transport, config } → write + hot-add
     //   GET    /api/channels        → list (name + transport + vault; NO secrets)
     //   DELETE /api/channels/:name  → stop + unregister + remove from channels.json
     //
-    // Externally hub strips `/channel`, so these are `<hub>/channel/api/channels`.
+    // Externally hub strips `/agent`, so these are `<hub>/agent/api/channels`.
     // ---------------------------------------------------------------------
     if (url.pathname === "/api/channels" && (req.method === "GET" || req.method === "POST")) {
       const denied = await requireScope(req, url, SCOPE_ADMIN);
@@ -1863,7 +1865,7 @@ export function createFetchHandler(
     // automated human": send message M to a vault agent A on cron S. Storage is
     // VAULT-NATIVE (`#agent-job` notes in the target channel's vault); these
     // routes read/write through the shared `jobStore`. ALL gated on
-    // `channel:admin` (operator-only, like /api/channels). The runner does the
+    // `agent:admin` (operator-only, like /api/channels). The runner does the
     // injecting; these routes just CRUD the durable job notes (+ fire-now).
     //
     //   GET    /api/jobs          → list (across the live vault channels)
@@ -1871,7 +1873,7 @@ export function createFetchHandler(
     //   DELETE /api/jobs/:id      → delete the job note
     //   POST   /api/jobs/:id/run  → fire now (inject the inbound message immediately)
     //
-    // Externally hub strips `/channel`, so these are `<hub>/channel/api/jobs`.
+    // Externally hub strips `/agent`, so these are `<hub>/agent/api/jobs`.
     // ---------------------------------------------------------------------
     if (url.pathname === "/api/jobs" && (req.method === "GET" || req.method === "POST")) {
       const denied = await requireScope(req, url, SCOPE_ADMIN);
@@ -1986,7 +1988,7 @@ export function createFetchHandler(
     // ---------------------------------------------------------------------
     // Claude OAuth credential store (design §6) — the per-channel secret a
     // launched agent session runs on (`CLAUDE_CODE_OAUTH_TOKEN`). Same
-    // `channel:admin` gate + 0600 file-store + redaction-on-read posture as the
+    // `agent:admin` gate + 0600 file-store + redaction-on-read posture as the
     // channel config API above. The token comes from `claude setup-token`.
     //
     //   GET    /api/credentials/claude          → { defaultSet, channels:[names] } (NO secret)
@@ -1994,7 +1996,7 @@ export function createFetchHandler(
     //   POST   /api/credentials/claude/:channel { token } → set a per-channel override
     //   DELETE /api/credentials/claude/:channel → remove an override (falls back to default)
     //
-    // Externally hub strips `/channel`, so these are `<hub>/channel/api/credentials/claude`.
+    // Externally hub strips `/agent`, so these are `<hub>/agent/api/credentials/claude`.
     // ---------------------------------------------------------------------
     if (url.pathname === "/api/credentials/claude" && (req.method === "GET" || req.method === "POST")) {
       const denied = await requireScope(req, url, SCOPE_ADMIN);
@@ -2062,7 +2064,7 @@ export function createFetchHandler(
     // ---------------------------------------------------------------------
     // Generic per-channel ENV-VAR store (GH_TOKEN / CLOUDFLARE_API_TOKEN / …) —
     // the secrets a launched agent's `gh`/`git`/build tooling needs. Same
-    // `channel:admin` gate + 0600 file-store + redaction-on-read posture as the
+    // `agent:admin` gate + 0600 file-store + redaction-on-read posture as the
     // Claude credential API above. A blank/omitted `channel` targets the
     // operator-level DEFAULT layer; a channel name targets that channel's override.
     // Denylisted names (the Claude-auth trio) are REJECTED with a 400 — they'd break
@@ -2072,7 +2074,7 @@ export function createFetchHandler(
     //   POST   /api/credentials/env  { channel?, name, value } → set
     //   DELETE /api/credentials/env  { channel?, name } (or ?channel=&name=) → remove
     //
-    // Externally hub strips `/channel`, so these are `<hub>/channel/api/credentials/env`.
+    // Externally hub strips `/agent`, so these are `<hub>/agent/api/credentials/env`.
     // ---------------------------------------------------------------------
     if (
       url.pathname === "/api/credentials/env" &&
@@ -2133,14 +2135,14 @@ export function createFetchHandler(
     // Agent management API (the web spawn/list/kill surface, design §4/§5) —
     // the SAME least-privilege launch path as the operator CLI
     // (`scripts/spawn-agent.ts`), driven from the browser. Operator-gated on
-    // `channel:admin` (a launched session is the most powerful thing this module
+    // `agent:admin` (a launched session is the most powerful thing this module
     // does, so the whole surface uses the same gate as the terminal).
     //
     //   GET    /api/agents          → list running agent tmux sessions (no secrets)
     //   POST   /api/agents          { name, channels, vault?, egress?, mounts? } → spawn
     //   DELETE /api/agents/:name    → kill the session
     //
-    // Externally hub strips `/channel`, so these are `<hub>/channel/api/agents`.
+    // Externally hub strips `/agent`, so these are `<hub>/agent/api/agents`.
     // The spawn response surfaces scopes/audiences but NEVER the minted token
     // values (redactSpawnResult); the launch resolves its deps lazily so a
     // credential set via the creds API takes effect without a daemon restart.
@@ -2264,7 +2266,7 @@ export function createFetchHandler(
       }
     }
 
-    // PER-SESSION restart — POST /api/agents/:name/restart (channel:admin). Kills
+    // PER-SESSION restart — POST /api/agents/:name/restart (agent:admin). Kills
     // `<name>-agent`, then re-spawns from the persisted spec, re-resolving the env
     // store + Claude credential, so a newly-set credential applies in ONE click.
     // PER-SESSION ONLY — no blanket "restart all" (the operator controls each
@@ -2328,7 +2330,7 @@ export function createFetchHandler(
 
     // Installed vault instances (for the agents page's vault picker) — derived
     // from the vault module's registered `/vault/<name>` paths in services.json.
-    // No secrets; channel:admin-gated to match the rest of the agents surface.
+    // No secrets; agent:admin-gated to match the rest of the agents surface.
     if (url.pathname === "/api/vaults" && req.method === "GET") {
       const denied = await requireScope(req, url, SCOPE_ADMIN);
       if (denied) return denied;
@@ -2345,8 +2347,8 @@ export function createFetchHandler(
     //   /.well-known/oauth-authorization-server/mcp/<channel>
     //
     // Both are PUBLIC (no auth) — they have to be reachable before the client
-    // holds a token. Externally they're `<hub>/channel/.well-known/...`; hub's
-    // stripPrefix removes `/channel`, so the daemon matches the bare path and
+    // holds a token. Externally they're `<hub>/agent/.well-known/...`; hub's
+    // stripPrefix removes `/agent`, so the daemon matches the bare path and
     // re-adds the prefix in the advertised URLs via x-forwarded-host.
     // ---------------------------------------------------------------------
     if (req.method === "GET") {
@@ -2357,7 +2359,7 @@ export function createFetchHandler(
     }
 
     // SSE event stream — bridges subscribe by channel. Bridge-facing: requires
-    // a hub JWT with `channel:read`.
+    // a hub JWT with `agent:read`.
     if (req.method === "GET" && url.pathname === "/events") {
       const denied = await requireScope(req, url, SCOPE_READ);
       if (denied) return denied;
@@ -2365,7 +2367,7 @@ export function createFetchHandler(
       if (!channel) {
         channel = DEFAULT_CHANNEL;
         console.warn(
-          `parachute-channel: /events without ?channel= — defaulting to "${DEFAULT_CHANNEL}". ` +
+          `parachute-agent: /events without ?channel= — defaulting to "${DEFAULT_CHANNEL}". ` +
             `This back-compat default is deprecated; pass ?channel=<name>.`,
         );
       }
@@ -2407,7 +2409,7 @@ export function createFetchHandler(
       });
     }
 
-    // Reply — bridge-facing: requires `channel:write`.
+    // Reply — bridge-facing: requires `agent:write`.
     if (req.method === "POST" && url.pathname === "/api/reply") {
       const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
@@ -2429,7 +2431,7 @@ export function createFetchHandler(
       }
     }
 
-    // React — bridge-facing: requires `channel:write`.
+    // React — bridge-facing: requires `agent:write`.
     if (req.method === "POST" && url.pathname === "/api/react") {
       const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
@@ -2457,7 +2459,7 @@ export function createFetchHandler(
       }
     }
 
-    // Edit message — bridge-facing: requires `channel:write`.
+    // Edit message — bridge-facing: requires `agent:write`.
     if (req.method === "POST" && url.pathname === "/api/edit") {
       const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
@@ -2486,7 +2488,7 @@ export function createFetchHandler(
     }
 
     // Permission prompt — bridge forwards permission_request here.
-    // Bridge-facing: requires `channel:write`.
+    // Bridge-facing: requires `agent:write`.
     if (req.method === "POST" && url.pathname === "/api/permission") {
       const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
@@ -2515,7 +2517,7 @@ export function createFetchHandler(
       }
     }
 
-    // Download attachment — bridge-facing: requires `channel:write`.
+    // Download attachment — bridge-facing: requires `agent:write`.
     if (req.method === "POST" && url.pathname === "/api/download") {
       const denied = await requireScope(req, url, SCOPE_WRITE);
       if (denied) return denied;
@@ -2533,16 +2535,16 @@ export function createFetchHandler(
     }
 
     // Vault inbound webhook — a vault trigger POSTs here when a new
-    // `#channel-message/inbound` note appears. Resolves the target channel from
+    // `#agent-message/inbound` note appears. Resolves the target channel from
     // `note.metadata.channel`, asserts it's a vault-transport channel, and hands
     // the note to that transport's `ingestInbound`, which `ctx.emit`s it →
     // wakes the subscribed bridge / MCP session.
     //
     // Auth — two paths, in order:
-    //   1. PREFERRED: `Authorization: Bearer <hub JWT>` (aud:channel, scope
-    //      `channel:send` — the trigger is effectively "posting an inbound
+    //   1. PREFERRED: `Authorization: Bearer <hub JWT>` (aud:agent, scope
+    //      `agent:send` — the trigger is effectively "posting an inbound
     //      message"). The hub registers the trigger with `action.auth.bearer`
-    //      set to a minted channel:send token, so a fresh setup never touches a
+    //      set to a minted agent:send token, so a fresh setup never touches a
     //      shared secret. Validated via the same scope-guard path as the bridge.
     //   2. DEPRECATED back-compat: a shared `?secret=` (or `X-Channel-Webhook-Secret`)
     //      validated against the target channel's vault-transport `webhookSecret`,
@@ -2582,7 +2584,7 @@ export function createFetchHandler(
       // fallback runs ONLY when there is no Authorization header.
       const authHeader = req.headers.get("authorization");
       if (authHeader !== null) {
-        // JWT path — validate the hub token, require channel:send. This is a
+        // JWT path — validate the hub token, require agent:send. This is a
         // tailnet-reachable webhook, so we keep it uniform-401: any auth failure
         // (missing/malformed/expired token OR insufficient scope OR unknown
         // channel) collapses to the SAME 401, so it can't be probed for valid
@@ -2608,8 +2610,8 @@ export function createFetchHandler(
           return json({ error: "unauthorized" }, 401);
         }
         console.warn(
-          `parachute-channel: /api/vault/inbound authenticated via DEPRECATED ?secret= shared secret ` +
-            `for channel "${channelName}". Migrate to a hub-JWT trigger (action.auth.bearer, scope channel:send).`,
+          `parachute-agent: /api/vault/inbound authenticated via DEPRECATED ?secret= shared secret ` +
+            `for channel "${channelName}". Migrate to a hub-JWT trigger (action.auth.bearer, scope agent:send).`,
         );
       }
       // Idempotency: a duplicate trigger delivery for the same note must not
@@ -2623,15 +2625,15 @@ export function createFetchHandler(
     }
 
     // Turn-event SSE — GET /api/channels/<ch>/turn-events (chat-facing; gated on
-    // `channel:read`, same scope as the transcript poll + /ui/events). The streaming
+    // `agent:read`, same scope as the transcript poll + /ui/events). The streaming
     // view (design 2026-06-16 build item #1): the chat subscribes here to watch a
     // PROGRAMMATIC turn work in real time — interim assistant text + tool_use, then a
     // done/error lifecycle event. EPHEMERAL by design: no backlog/replay (the durable
-    // record is the `#channel-message/outbound` note the turn still writes). A channel
+    // record is the `#agent-message/outbound` note the turn still writes). A channel
     // with no programmatic agent simply never receives a `turn` frame (the stream
     // stays open + idle). Open to any live channel — unknown channel still opens the
     // stream (it just never emits), matching the low-stakes ephemeral contract.
-    // Externally `<hub>/channel/api/channels/<ch>/turn-events`.
+    // Externally `<hub>/agent/api/channels/<ch>/turn-events`.
     {
       const turnMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/turn-events$/);
       if (req.method === "GET" && turnMatch) {
@@ -2666,16 +2668,16 @@ export function createFetchHandler(
     }
 
     // Transcript read — GET /api/channels/<ch>/messages (chat-facing; gated on
-    // `channel:read`, same as /ui/events). The built-in chat polls this to render
+    // `agent:read`, same as /ui/events). The built-in chat polls this to render
     // a channel's durable history and pick up replies + messages from other
     // clients (Telegram, other browsers). Behavior by transport:
     //   - vault → loadTranscript() against the channel's vault (the daemon does
     //     the vault I/O with the channel's stored vault token — the chat's
-    //     channel:read token never touches the vault).
+    //     agent:read token never touches the vault).
     //   - http-ui → that transport's traffic is ephemeral (SSE-only, no buffer),
     //     so there's no durable transcript to replay → { messages: [] }.
     //   - other (telegram) → no transcript surface here → { messages: [] }.
-    // 404 for an unknown channel. Externally `<hub>/channel/api/channels/<ch>/messages`.
+    // 404 for an unknown channel. Externally `<hub>/agent/api/channels/<ch>/messages`.
     {
       const msgMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/messages$/);
       if (req.method === "GET" && msgMatch) {
@@ -2708,10 +2710,10 @@ export function createFetchHandler(
     }
 
     // Send for a VAULT channel — POST /api/channels/<ch>/send (chat-facing; gated
-    // on `channel:send`, same scope http-ui's send uses). The daemon owns this for
+    // on `agent:send`, same scope http-ui's send uses). The daemon owns this for
     // vault transports because the http-ui transport's ingestHttp only matches its
     // OWN channel name; a vault channel needs the daemon to dispatch. For a vault
-    // channel the daemon writes a `#channel-message/inbound` note via the channel's
+    // channel the daemon writes a `#agent-message/inbound` note via the channel's
     // stored vault token — which WAKES the session through the existing vault
     // trigger (we do NOT also emit; that would double-wake). http-ui channels fall
     // through to their transport's ingestHttp (unchanged), so this guard handles
@@ -2763,11 +2765,11 @@ export function createFetchHandler(
 
     // Module-owned config/admin UI (modular-UI P4) — declared as `configUiUrl`
     // in module.json so the hub frames/links it. The PAGE itself loads OPEN (no
-    // JWT) — like /ui — so it can bootstrap its hub-minted `channel:admin`
+    // JWT) — like /ui — so it can bootstrap its hub-minted `agent:admin`
     // token fetch; the page's `/api/channels` calls are what `requireScope`
     // gates. Server-side mount is "" (the daemon serves the bare path); the page
-    // detects the public `/channel` prefix at runtime from window.location, so
-    // it works at `/admin` direct AND `/channel/admin` proxied.
+    // detects the public `/agent` prefix at runtime from window.location, so
+    // it works at `/admin` direct AND `/agent/admin` proxied.
     if (req.method === "GET" && url.pathname === "/admin") {
       return new Response(renderAdminPage(""), {
         headers: { "content-type": "text/html; charset=utf-8" },
@@ -2776,10 +2778,10 @@ export function createFetchHandler(
 
     // Stateful HTTP MCP — a session connects directly over HTTP (URL + OAuth,
     // no stdio bridge): POST/GET/DELETE /mcp/<channel>. Externally this is
-    // `<hub>/channel/mcp/<channel>`; hub's stripPrefix removes `/channel`, so the
-    // daemon sees `/mcp/<channel>`. A session needs `channel:read` to connect +
+    // `<hub>/agent/mcp/<channel>`; hub's stripPrefix removes `/agent`, so the
+    // daemon sees `/mcp/<channel>`. A session needs `agent:read` to connect +
     // receive the wake; the reply/react/edit tools additionally require
-    // `channel:write`, enforced inside the tool handlers from the connection's
+    // `agent:write`, enforced inside the tool handlers from the connection's
     // own scopes. This endpoint is ADDITIVE — the stdio bridge over /events is
     // unchanged.
     const mcpMatch = url.pathname.match(/^\/mcp\/([^/]+)$/);
@@ -2794,7 +2796,7 @@ export function createFetchHandler(
           404,
         );
       }
-      // Gate on channel:read — short-circuits to 401 pre-JWKS when no token is
+      // Gate on agent:read — short-circuits to 401 pre-JWKS when no token is
       // presented (testable without a live hub, same as the other endpoints).
       // On a 401 (no/invalid bearer), decorate with the RFC 9728
       // `WWW-Authenticate` challenge so a Claude Code HTTP-MCP client knows
@@ -2811,7 +2813,7 @@ export function createFetchHandler(
         return denied;
       }
       // Re-validate to surface the caller's scopes for the write-tool checks.
-      // (requireScope already proved the token valid + carrying channel:read;
+      // (requireScope already proved the token valid + carrying agent:read;
       // this second pass hits the warm JWKS cache.) A token present but missing
       // here would have been rejected above, so claims must resolve.
       let scopes: string[] = [];
@@ -2899,14 +2901,14 @@ function main(): void {
   try {
     channels = loadRegistry({ stateDir: STATE_DIR });
   } catch (err) {
-    console.error(`parachute-channel: failed to load channel registry: ${err}`);
+    console.error(`parachute-agent: failed to load channel registry: ${err}`);
     process.exit(1);
   }
 
   if (channels.size === 0) {
     console.error(
-      `parachute-channel: no channels configured.\n` +
-        `  Add ${join(STATE_DIR, "channels.json")} (or use the admin UI at /channel/admin)\n` +
+      `parachute-agent: no channels configured.\n` +
+        `  Add ${join(STATE_DIR, "channels.json")} (or use the admin UI at /agent/admin)\n` +
         `  to define a channel. Telegram channels carry a per-channel bot token in config.`,
     );
     process.exit(1);
@@ -2991,70 +2993,70 @@ function main(): void {
     websocket: terminalWs,
   });
 
-  console.log(`parachute-channel: daemon listening on http://127.0.0.1:${PORT}`);
-  console.log(`parachute-channel: state dir: ${STATE_DIR}`);
+  console.log(`parachute-agent: daemon listening on http://127.0.0.1:${PORT}`);
+  console.log(`parachute-agent: state dir: ${STATE_DIR}`);
   console.log(
-    `parachute-channel: ${channels.size} channel(s): ${[...channels.values()]
+    `parachute-agent: ${channels.size} channel(s): ${[...channels.values()]
       .map((c) => `${c.name}→${c.transport.kind}`)
       .join(", ")}`,
   );
 
   // Self-register into ~/.parachute/services.json so hub lists this module in the
-  // portal and reverse-proxies `<expose>/channel/*` → this loopback daemon.
+  // portal and reverse-proxies `<expose>/agent/*` → this loopback daemon.
   // Best-effort: a failure must not stop the daemon from serving locally. Honors
   // PARACHUTE_HOME, so sandboxed/e2e daemons never touch the real services.json.
   try {
     upsertService({
-      name: "parachute-channel",
+      name: "parachute-agent",
       port: PORT,
-      paths: ["/channel"],
+      paths: ["/agent"],
       health: "/health",
       version: PKG_VERSION,
-      displayName: "Channel",
+      displayName: "Agent",
       tagline: "Chat with your Claude Code sessions — a channel per session.",
       installDir: INSTALL_DIR,
       // The command the hub supervisor spawns to start/restart/adopt us. Without
       // this the supervisor knows our port but not how to launch the process, so
-      // `parachute restart channel` 404s and we don't survive reboot (channel#34).
+      // `parachute restart agent` 404s and we don't survive reboot (agent#34).
       startCmd: START_CMD,
       stripPrefix: true,
-      uiUrl: "/channel/home", // portal "Open UI" link → the Home overview landing (also in module.json; written here in case hub reads it from services.json)
-      configUiUrl: "/channel/admin", // module-owned config surface (modular-UI P4); hub frames/links it. Also in module.json.
+      uiUrl: "/agent/home", // portal "Open UI" link → the Home overview landing (also in module.json; written here in case hub reads it from services.json)
+      configUiUrl: "/agent/admin", // module-owned config surface (modular-UI P4); hub frames/links it. Also in module.json.
       // WebSocket support — tells the hub's Bun-native upgrade bridge to forward
-      // `Upgrade: websocket` requests on `/channel/*` to this daemon (the
+      // `Upgrade: websocket` requests on `/agent/*` to this daemon (the
       // in-page terminal, design §5.1). DENY-BY-DEFAULT in the hub: without this
       // the upgrade is refused (426) before it ever reaches us. Declared on
       // module.json too (the install-time contract); the hub honors either
       // source. No hub change needed — the hub already reads this field.
       websocket: true,
       // The terminal mount, declared as a `uis` sub-unit with audience "surface"
-      // so the hub's audience gate PASSES IT THROUGH (the channel daemon owns
-      // admission end-to-end — operator-grade channel:admin, enforced here). A
+      // so the hub's audience gate PASSES IT THROUGH (the agent daemon owns
+      // admission end-to-end — operator-grade agent:admin, enforced here). A
       // `surface` audience is the same pass-through the no-uis-match default
       // gives, but declaring it explicitly future-proofs against a later `uis`
       // declaration accidentally gating the terminal at hub-users. Design §5.3.
       uis: {
         // The web spawn/list/kill surface — the DEFAULT way to operate (spawn an
         // agent, scope it, watch it). audience "surface" so the hub passes it
-        // through; channel owns admission end-to-end (operator-grade channel:admin,
+        // through; agent owns admission end-to-end (operator-grade agent:admin,
         // enforced on every /api/agents call). Design §4/§5.
         agents: {
           displayName: "Agents",
           tagline: "Spawn, scope, and watch sandboxed Claude Code sessions.",
-          path: "/channel/agents",
+          path: "/agent/agents",
           audience: "surface",
         },
         terminal: {
           displayName: "Terminal",
           tagline: "Attach to a session's live tmux pane in the browser.",
-          path: "/channel/terminal",
+          path: "/agent/terminal",
           audience: "surface",
         },
       },
     });
-    console.log(`parachute-channel: self-registered into services.json (port ${PORT}, mount /channel)`);
+    console.log(`parachute-agent: self-registered into services.json (port ${PORT}, mount /agent)`);
   } catch (err) {
-    console.error(`parachute-channel: services.json self-registration failed (continuing): ${err}`);
+    console.error(`parachute-agent: services.json self-registration failed (continuing): ${err}`);
   }
 
   // Start each channel via the same single-channel add path the config API uses
@@ -3066,7 +3068,7 @@ function main(): void {
   // channel with a registered programmatic agent routes inbound to its serial queue.
   for (const channel of [...channels.values()]) {
     addChannelLive(channels, registry, channel.entry, deliveryState, programmatic).catch((err) => {
-      console.error(`parachute-channel: transport "${channel.name}" start failed:`, err);
+      console.error(`parachute-agent: transport "${channel.name}" start failed:`, err);
     });
   }
 
@@ -3078,7 +3080,7 @@ function main(): void {
   // makes the next turn `--resume` the prior conversation — no deaf problem). Best-
   // effort: a single bad spec is logged and skipped. The live `channels` map gates
   // it: only a spec whose wake channel is a configured channel is re-registered, so
-  // a leaked/orphaned spec dir can't resurrect a phantom agent (channel#75).
+  // a leaked/orphaned spec dir can't resurrect a phantom agent (agent#75).
   void reregisterProgrammaticAgents(programmatic, channels);
 
   // Start the runner's scheduled-job tick (design 2026-06-17). Tolerant of an
@@ -3087,7 +3089,7 @@ function main(): void {
   // channel sets lastStatus:error on fire rather than throwing the tick. The tick
   // is `unref`'d so it never keeps the process alive on its own.
   runner.start();
-  console.log(`parachute-channel: runner started (scheduled-job tick)`);
+  console.log(`parachute-agent: runner started (scheduled-job tick)`);
 
   // Graceful shutdown — stop the runner + all transports.
   async function shutdown(): Promise<void> {

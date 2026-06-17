@@ -4,7 +4,7 @@
  *
  * A scheduled job is "an automated human": send message M to agent (channel) A on
  * schedule S. The runner does NOT execute anything — it authors an inbound
- * `#channel-message/inbound` note on a schedule, and the existing vault trigger →
+ * `#agent-message/inbound` note on a schedule, and the existing vault trigger →
  * agent-turn → outbound flow does the rest.
  *
  * STORAGE IS VAULT-NATIVE (Aaron's call, 2026-06-17): a job IS a `#agent-job`

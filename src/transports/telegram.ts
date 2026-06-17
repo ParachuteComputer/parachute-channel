@@ -1,5 +1,5 @@
 /**
- * Telegram transport for parachute-channel.
+ * Telegram transport for parachute-agent.
  *
  * Owns everything Telegram: the getUpdates long-poll, message + callback-query
  * handling, attachment download, access control (access.json), the permission
@@ -23,13 +23,13 @@ import type {
   DownloadArgs,
 } from "../transport.ts";
 import { ChannelConfigError } from "../transport.ts";
+import { defaultStateDir } from "../registry.ts";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
 
 // ---------------------------------------------------------------------------
 // Access control — reuse the official plugin's access.json format, plus one
-// parachute-channel extension: `allowInChats`.
+// parachute-agent extension: `allowInChats`.
 //
 // Fields (all inherited from the official plugin except `allowInChats`):
 //   dmPolicy      — "open" short-circuits all gating; anything else requires
@@ -128,10 +128,7 @@ export class TelegramTransport implements Transport {
         `telegram channel ${config.name ?? "(unnamed)"} requires a per-channel bot token in its config`,
       );
     }
-    const stateDir =
-      config.stateDir ??
-      process.env.PARACHUTE_CHANNEL_STATE_DIR ??
-      join(homedir(), ".parachute", "channel");
+    const stateDir = config.stateDir ?? defaultStateDir();
     this.api = new TelegramApi(token);
     this.accessFile = join(stateDir, "access.json");
     this.inboxDir = join(stateDir, "inbox");
@@ -157,9 +154,9 @@ export class TelegramTransport implements Transport {
   private async pollLoop(ctx: TransportContext): Promise<void> {
     try {
       const me = await this.api.getMe();
-      console.log(`parachute-channel[${ctx.channel}]: polling as @${me.username}`);
+      console.log(`parachute-agent[${ctx.channel}]: polling as @${me.username}`);
     } catch (err) {
-      console.error(`parachute-channel[${ctx.channel}]: getMe failed:`, err);
+      console.error(`parachute-agent[${ctx.channel}]: getMe failed:`, err);
     }
 
     while (this.pollActive) {
@@ -174,7 +171,7 @@ export class TelegramTransport implements Transport {
           }
         }
       } catch (err) {
-        console.error(`parachute-channel[${ctx.channel}]: poll error:`, err);
+        console.error(`parachute-agent[${ctx.channel}]: poll error:`, err);
         await new Promise((r) => setTimeout(r, 5000));
       }
     }
@@ -223,7 +220,7 @@ export class TelegramTransport implements Transport {
       ? `@${msg.from.username}`
       : msg.from?.first_name ?? `user ${userId}`;
     console.log(
-      `parachute-channel[${ctx.channel}]: rx from ${userTag} in chat ${msg.chat.id}`,
+      `parachute-agent[${ctx.channel}]: rx from ${userTag} in chat ${msg.chat.id}`,
     );
 
     // Permission-reply intercept: if this looks like "yes xxxxx" or "no xxxxx"
@@ -280,7 +277,7 @@ export class TelegramTransport implements Transport {
         writeFileSync(localPath, data);
         imagePath = localPath;
       } catch (err) {
-        console.error(`parachute-channel[${ctx.channel}]: failed to download photo:`, err);
+        console.error(`parachute-agent[${ctx.channel}]: failed to download photo:`, err);
       }
     }
 
@@ -393,7 +390,7 @@ export class TelegramTransport implements Transport {
         const id = await this.api.sendMessage(chatId, text, { reply_markup: replyMarkup });
         sent.push(String(id));
       } catch (err) {
-        console.error(`parachute-channel: permission prompt to ${chatId} failed:`, err);
+        console.error(`parachute-agent: permission prompt to ${chatId} failed:`, err);
       }
     }
     return { sent };

@@ -7,7 +7,7 @@
 
 ## The observation
 
-After [PR #68](https://github.com/ParachuteComputer/parachute-channel/pull/68) we
+After [PR #68](https://github.com/ParachuteComputer/parachute-agent/pull/68) we
 have **two subsystems doing one shape**:
 
 - the `claude` credential slice (`resolveClaudeCredential` → inject

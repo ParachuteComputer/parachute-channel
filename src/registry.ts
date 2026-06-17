@@ -13,6 +13,7 @@
 import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { agentEnv } from "./env-compat.ts";
 import type { Transport } from "./transport.ts";
 import { TelegramTransport, type TelegramTransportConfig } from "./transports/telegram.ts";
 import { HttpUiTransport, type HttpUiTransportConfig } from "./transports/http-ui.ts";
@@ -35,10 +36,33 @@ export interface Channel {
   entry: ChannelEntry;
 }
 
-export function defaultStateDir(): string {
-  return (
-    process.env.PARACHUTE_CHANNEL_STATE_DIR ?? join(homedir(), ".parachute", "channel")
-  );
+/**
+ * The agent module's state dir. Resolution, in order:
+ *
+ *   1. `PARACHUTE_AGENT_STATE_DIR` env → its legacy alias
+ *      `PARACHUTE_CHANNEL_STATE_DIR` (via {@link agentEnv}) — the explicit override.
+ *   2. The new default `~/.parachute/agent`.
+ *   3. **Back-compat:** if `~/.parachute/agent` does NOT exist but the legacy
+ *      `~/.parachute/channel` DOES, use the legacy dir — so an operator's existing
+ *      config/credentials/sessions keep working with no manual move across the
+ *      channel→agent rename. Once `~/.parachute/agent` exists (a fresh install, or
+ *      after a manual move) it wins and the legacy dir is ignored.
+ *
+ * `home` is injectable for tests (default `homedir()`) so the home-dir-default +
+ * legacy-fallback branches can be exercised against a throwaway dir WITHOUT a
+ * process-wide `mock.module("os")` (which leaks `homedir()` into other test files
+ * — it broke the live-Seatbelt path-confinement tests when it did).
+ *
+ * (Migration `parachute-patterns/migrations/2026-06-17-channel-to-agent.md`.)
+ */
+export function defaultStateDir(home: string = homedir()): string {
+  const explicit = agentEnv("STATE_DIR");
+  if (explicit) return explicit;
+  const agentDir = join(home, ".parachute", "agent");
+  if (existsSync(agentDir)) return agentDir;
+  const legacyDir = join(home, ".parachute", "channel");
+  if (existsSync(legacyDir)) return legacyDir;
+  return agentDir;
 }
 
 /**

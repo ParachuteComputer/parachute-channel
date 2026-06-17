@@ -1,5 +1,5 @@
 /**
- * Shared UI kit for the channel module's web pages (chat, agents, terminal,
+ * Shared UI kit for the agent module's web pages (chat, agents, terminal,
  * config). ONE source of truth for the look + the app shell, so the four pages
  * read as one app instead of four hand-rolled surfaces.
  *
@@ -243,7 +243,7 @@ export function appShell(opts: { active: ShellView; controls?: string; status?: 
   const controls = opts.controls ? `<span class="app-controls">${opts.controls}</span>` : "";
   const status = opts.status ?? "connecting…";
   return `<header class="app-header">
-    <span class="app-brand"><span class="brand-mark">C</span><span class="brand-name">Channel${tag}</span></span>
+    <span class="app-brand"><span class="brand-mark">A</span><span class="brand-name">Agent${tag}</span></span>
     <nav class="app-nav">${links}</nav>
     <span class="spacer"></span>
     ${controls}
@@ -255,15 +255,15 @@ export function appShell(opts: { active: ShellView; controls?: string; status?: 
  * Shared client JS, injected into each page's <script> (interpolated as
  * `${SHELL_JS}` — its content, including any backticks, is inserted at runtime,
  * so it never collides with the host page's own template literal). Provides:
- *   - MOUNT      — the public path prefix (handles loopback + hub /channel proxy)
+ *   - MOUNT      — the public path prefix (handles loopback + hub /agent proxy)
  *   - wireShell  — set nav hrefs from MOUNT + mark the active tab
  *   - escapeHtml — text/attribute-safe escape (mirrors the server-side one)
  *   - setStatus  — update the shared #status element
- *   - fetchToken / authedFetch — hub channel-token fetch with one 401 retry
+ *   - fetchToken / authedFetch — hub agent-token fetch with one 401 retry
  * Pages keep their own stream logic (SSE/WS) but reuse fetchToken for the token.
  */
 export const SHELL_JS = `
-  // Public mount prefix: "" on loopback, "/channel" behind the hub proxy.
+  // Public mount prefix: "" on loopback, "/agent" behind the hub proxy.
   var MOUNT = window.location.pathname.replace(/\\/(home|ui|admin|agents|jobs|terminal)(\\/[^?]*)?\\/?$/, "");
   var NAV_MAP = { home: "/home", chat: "/ui", agents: "/agents", schedules: "/jobs", terminal: "/terminal", config: "/admin" };
   function wireShell(active) {
@@ -292,7 +292,7 @@ export const SHELL_JS = `
   // Reveal the Terminal nav entry IFF ≥1 interactive agent is running. Pages that
   // don't otherwise list agents (chat, config) call this on boot so they don't
   // STRAND an operator who has a live interactive session: GET /api/agents
-  // (channel:admin via authedFetch) and reveal when any agent's backend isn't
+  // (agent:admin via authedFetch) and reveal when any agent's backend isn't
   // programmatic. Best-effort + never throws — a failed/401 fetch leaves the
   // default-hidden state (the /terminal route still works regardless). The agents
   // + home pages drive the link directly from their own list and don't need this.
@@ -375,15 +375,17 @@ export const SHELL_JS = `
     el.textContent = text;
     el.className = "app-status" + (kind ? " " + kind : "");
   }
-  // Hub-minted channel token (cookie-gated to the logged-in operator). Cached on
+  // Hub-minted agent token (cookie-gated to the logged-in operator). Cached on
   // window.__token; pages attach it as a Bearer header and/or ?token= param.
+  // (Endpoint renamed /admin/channel-token → /admin/agent-token in the
+  // channel→agent rename; the hub 301-redirects the old path for old bookmarks.)
   function fetchToken() {
-    return fetch(window.location.origin + "/admin/channel-token", { credentials: "include" })
+    return fetch(window.location.origin + "/admin/agent-token", { credentials: "include" })
       .then(function (r) { if (!r.ok) throw new Error("token " + r.status); return r.json(); })
       .then(function (j) { window.__token = j && j.token ? j.token : null; return window.__token; })
       .catch(function (err) { window.__token = null; throw err; });
   }
-  // fetch() with the channel Bearer + a single token-refresh retry on 401.
+  // fetch() with the agent Bearer + a single token-refresh retry on 401.
   function authedFetch(url, opts) {
     opts = opts || {};
     var headers = Object.assign({}, opts.headers || {});

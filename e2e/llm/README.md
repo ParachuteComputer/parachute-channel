@@ -59,5 +59,5 @@ is the CI gate; this is run before merging changes that touch the wake/transport
 ## Debugging a failure
 
 Run with `E2E_KEEP=1`, then inspect:
-- `tmux attach -t parachute-channel-e2e` — watch the live session.
-- `/tmp/parachute-channel-e2e-<port>/daemon.log` — daemon output.
+- `tmux attach -t parachute-agent-e2e` — watch the live session.
+- `/tmp/parachute-agent-e2e-<port>/daemon.log` — daemon output.

@@ -1,4 +1,4 @@
-# parachute-channel
+# parachute-agent
 
 Messaging gateway for Claude Code. Telegram today, anything tomorrow.
 
@@ -18,7 +18,7 @@ Claude Code session
 
 The **daemon** is the only process that touches the Telegram API. It owns the getUpdates long-poll exclusively — no multi-consumer races by construction. Multiple bridges can connect simultaneously.
 
-The **bridge** is a stateless MCP server that Claude Code spawns as a subprocess. It declares `claude/channel` capability so Claude Code registers a notification listener. It connects to the daemon's SSE `/events` stream and forwards each event as a `notifications/claude/channel` MCP notification. Outbound tool calls (reply, react, edit, download) proxy to the daemon's HTTP API.
+The **bridge** is a stateless MCP server that Claude Code spawns as a subprocess. It declares `claude/agent` capability so Claude Code registers a notification listener. It connects to the daemon's SSE `/events` stream and forwards each event as a `notifications/claude/agent` MCP notification. Outbound tool calls (reply, react, edit, download) proxy to the daemon's HTTP API.
 
 ## Why not the official telegram plugin?
 
@@ -33,7 +33,7 @@ bun src/daemon.ts
 # or via launchd — see below
 ```
 
-Telegram channels carry a per-channel bot token in `channels.json` config — the daemon does NOT read a global `TELEGRAM_BOT_TOKEN`. Define channels via the admin UI at `/channel/admin` (or by writing `~/.parachute/channel/channels.json` directly).
+Telegram channels carry a per-channel bot token in `channels.json` config — the daemon does NOT read a global `TELEGRAM_BOT_TOKEN`. Define channels via the admin UI at `/agent/admin` (or by writing `~/.parachute/agent/channels.json` directly).
 
 ### Bridge (registered in .mcp.json, Claude Code spawns it)
 
@@ -41,10 +41,10 @@ Registered in `~/UnforcedAGI/.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "parachute-channel": {
+    "parachute-agent": {
       "command": "bun",
       "args": ["<path>/src/bridge.ts"],
-      "env": { "PARACHUTE_CHANNEL_URL": "http://127.0.0.1:1941" }
+      "env": { "PARACHUTE_AGENT_URL": "http://127.0.0.1:1941" }
     }
   }
 }
@@ -52,14 +52,14 @@ Registered in `~/UnforcedAGI/.mcp.json`:
 
 Launch Claude Code with:
 ```bash
-claude --dangerously-load-development-channels=server:parachute-channel
+claude --dangerously-load-development-channels=server:parachute-agent
 ```
 
-The `=` binding is load-bearing. Space-separating the value (`--dangerously-load-development-channels server:parachute-channel`) works in `--print` mode but in interactive mode the parser swallows `server:parachute-channel` as the initial-prompt positional, leaving the flag with an empty channels list. At runtime this surfaces as `"server:parachute-channel · no MCP server configured with that name"`, which points operators at the wrong suspect (the MCP config is fine; the flag-parser is what dropped the value). Always use the `=` form — it's unambiguous in every mode. See [#8](https://github.com/ParachuteComputer/parachute-channel/issues/8).
+The `=` binding is load-bearing. Space-separating the value (`--dangerously-load-development-channels server:parachute-agent`) works in `--print` mode but in interactive mode the parser swallows `server:parachute-agent` as the initial-prompt positional, leaving the flag with an empty channels list. At runtime this surfaces as `"server:parachute-agent · no MCP server configured with that name"`, which points operators at the wrong suspect (the MCP config is fine; the flag-parser is what dropped the value). Always use the `=` form — it's unambiguous in every mode. See [#8](https://github.com/ParachuteComputer/parachute-agent/issues/8).
 
 If you hit an adjacent issue:
-- The bridge now warns on stderr if the capability isn't registered, so this misconfig surfaces immediately instead of looking like everything is fine until a message arrives — see [#9](https://github.com/ParachuteComputer/parachute-channel/issues/9).
-- A cosmetic `/mcp` display warning may appear even with the correct flag — expected, ignore. See [#10](https://github.com/ParachuteComputer/parachute-channel/issues/10).
+- The bridge now warns on stderr if the capability isn't registered, so this misconfig surfaces immediately instead of looking like everything is fine until a message arrives — see [#9](https://github.com/ParachuteComputer/parachute-agent/issues/9).
+- A cosmetic `/mcp` display warning may appear even with the correct flag — expected, ignore. See [#10](https://github.com/ParachuteComputer/parachute-agent/issues/10).
 
 ## Sessions (launcher scripts)
 
@@ -79,7 +79,7 @@ Spin a session up wired to a channel with one command:
 `launch-session.sh` is idempotent, writes the session's `.mcp.json` + a reinforcing
 `CLAUDE.md` (so it always replies via the `reply` tool), auto-accepts the first-launch
 prompts (folder-trust + dev-channels), and waits for the bridge to attach. Override the
-daemon with `PARACHUTE_CHANNEL_URL` (default `http://127.0.0.1:1941`). `<name>`/`<channel>`
+daemon with `PARACHUTE_AGENT_URL` (default `http://127.0.0.1:1941`). `<name>`/`<channel>`
 must be slugs (alphanumeric/dash/underscore).
 
 **Note:** launched sessions run `claude --dangerously-skip-permissions` — the session has
@@ -89,22 +89,22 @@ are the planned hardening steps.
 
 ## Hub integration
 
-Channel self-registers into `~/.parachute/services.json` at boot and ships
+Agent self-registers into `~/.parachute/services.json` at boot and ships
 `.parachute/module.json`, so hub lists it in the portal and reverse-proxies
-`<expose>/channel/*` → the loopback daemon (`stripPrefix:true`; SSE survives the proxy).
-The built-in chat UI is reachable at `<hub-origin>/channel/ui` over the expose, and at
+`<expose>/agent/*` → the loopback daemon (`stripPrefix:true`; SSE survives the proxy).
+The built-in chat UI is reachable at `<hub-origin>/agent/ui` over the expose, and at
 `http://127.0.0.1:1941/ui` locally.
 
 ## Connecting a session over HTTP MCP (primary)
 
 A Claude Code session connects to a channel as a **pure HTTP MCP server** — by URL +
 OAuth, exactly like adding the vault. No local `.mcp.json` pointing at `bun src/bridge.ts`,
-no machine-local file: the session adds `<hub-origin>/channel/mcp/<channel>` and the daemon
+no machine-local file: the session adds `<hub-origin>/agent/mcp/<channel>` and the daemon
 serves a stateful Streamable-HTTP MCP endpoint (`src/mcp-http.ts`) that pushes the idle-wake
-`notifications/claude/channel` onto the session's SSE stream.
+`notifications/claude/agent` onto the session's SSE stream.
 
 ```bash
-claude mcp add --transport http channel <hub-origin>/channel/mcp/<channel>
+claude mcp add --transport http agent <hub-origin>/agent/mcp/<channel>
 ```
 
 It prompts for OAuth the first time (like the vault). Discovery is RFC 9728 + RFC 8414, in
@@ -113,7 +113,7 @@ the **path-insertion** form a Claude Code HTTP-MCP client probes (mirrors vault'
 
 - `GET /.well-known/oauth-protected-resource/mcp/<channel>` → `resource` (the public MCP
   URL, built from `X-Forwarded-Host`), `authorization_servers: [<hub-origin>]`,
-  `scopes_supported: ["channel:read","channel:write"]`, `bearer_methods_supported: ["header"]`.
+  `scopes_supported: ["agent:read","agent:write"]`, `bearer_methods_supported: ["header"]`.
 - `GET /.well-known/oauth-authorization-server/mcp/<channel>` → forwarder pointing
   `authorization_endpoint` / `token_endpoint` / `registration_endpoint` / `jwks_uri` at the hub.
 - A no/invalid-bearer `POST /mcp/<channel>` returns **401 + `WWW-Authenticate: Bearer
@@ -133,11 +133,11 @@ endpoint is **additive**, and is now the path the UI + launcher steer toward.
 ## Auth
 
 **Layer 1 — session↔channel (done).** The bridge-facing daemon endpoints (`GET /events`,
-`POST /api/{reply,react,edit,permission,download}`) require a hub-issued JWT (`aud: channel`,
-scope `channel:read`/`channel:write`), validated via `@openparachute/scope-guard` against the
+`POST /api/{reply,react,edit,permission,download}`) require a hub-issued JWT (`aud: agent`,
+scope `agent:read`/`agent:write`), validated via `@openparachute/scope-guard` against the
 hub's JWKS — exactly like a vault MCP client. The launcher mints the token
-(`parachute auth mint-token --scope "channel:read channel:write"`) and injects it as
-`PARACHUTE_CHANNEL_TOKEN`; the bridge presents it as a Bearer. Any session on any machine
+(`parachute auth mint-token --scope "agent:read agent:write"`) and injects it as
+`PARACHUTE_AGENT_TOKEN`; the bridge presents it as a Bearer. Any session on any machine
 connects this way — no loopback trust.
 
 The daemon **must** have `PARACHUTE_HUB_ORIGIN` set to the hub's *public* origin (the hub stamps
@@ -145,48 +145,48 @@ that as the token `iss`); the loopback fallback is dev-only. Hub-as-supervisor s
 starts the module; a manually-run daemon on an exposed box needs it in the environment.
 
 **Layer 2 — human↔UI (done).** The chat-UI traffic endpoints (`POST /api/channels/<name>/send`
-→ scope `channel:send`; `GET /ui/events` → scope `channel:read`) require a hub-issued JWT,
+→ scope `agent:send`; `GET /ui/events` → scope `agent:read`) require a hub-issued JWT,
 validated the same way as Layer 1 (shared `requireScope` in `src/auth.ts`). The token comes from
-a hub endpoint — `GET <hub-origin>/admin/channel-token` (cookie-gated to the logged-in portal
-operator), returning `{ token, expires_at, scopes }` with `aud:channel` + `channel:read channel:send`,
+a hub endpoint — `GET <hub-origin>/admin/agent-token` (cookie-gated to the logged-in portal
+operator), returning `{ token, expires_at, scopes }` with `aud:agent` + `agent:read agent:send`,
 ~10min TTL. The chat page fetches it on load (`credentials: "include"`) and attaches it: a Bearer
 header on the send POST, and a `?token=` query param on the `/ui/events` EventSource (which can't
 set headers). On a 401/SSE-error it re-fetches once and retries. `/ui`, `/health`, and
 `/.parachute/config[/schema]` stay OPEN — the page must load to bootstrap its token fetch, and the
 config listing is non-sensitive.
 
-## Vault integration (Stage 2) — channels backed by `#channel-message` notes
+## Vault integration (Stage 2) — channels backed by `#agent-message` notes
 
 A `vault` transport backs a channel with notes in a Parachute vault, so messages
 are durable, queryable, and a vault surface can render them. Multiple channels per
 vault: the note's `channel` metadata routes it.
 
 **Note shape** — TWO tags per note, carried literally (two orthogonal axes):
-- the parent `#channel-message` — the QUERYABLE membership tag. A UI lists a channel's
-  whole transcript (both directions) with one `tag: "#channel-message"` + `metadata.channel`
+- the parent `#agent-message` — the QUERYABLE membership tag. A UI lists a channel's
+  whole transcript (both directions) with one `tag: "#agent-message"` + `metadata.channel`
   query, because the parent is literally on every note.
-- a directional child — the trigger DISCRIMINATOR: `#channel-message/inbound` (human→session)
-  or `#channel-message/outbound` (session reply).
+- a directional child — the trigger DISCRIMINATOR: `#agent-message/inbound` (human→session)
+  or `#agent-message/outbound` (session reply).
 
 **The slash is a namespace, NOT query inheritance.** In a Parachute vault a slash in a tag
-NAME is a namespace convention only — `query-notes { tag: "#channel-message" }` matches
+NAME is a namespace convention only — `query-notes { tag: "#agent-message" }` matches
 descendants by the `tags.parent_names` graph (declared via `update-tag`), NOT by name-prefix.
-A note tagged ONLY `#channel-message/inbound` is INVISIBLE to a `tag: "#channel-message"`
+A note tagged ONLY `#agent-message/inbound` is INVISIBLE to a `tag: "#agent-message"`
 query unless that inheritance was separately declared — so we tag BOTH the parent and the
 child and don't depend on per-vault schema setup.
 
 Content = the message text; metadata: `{ channel, direction: "inbound"|"outbound", sender,
 in_reply_to (outbound), ts }`. Loop avoidance lives in the TAG, not metadata: the trigger
 fires on the inbound child tag only (exact match), which an outbound note never carries, so a
-reply never wakes its own session. **Inbound notes MUST carry BOTH `#channel-message` (parent,
-makes it queryable) AND `#channel-message/inbound` (child, fires the trigger), with the channel
-name in `metadata.channel`.** Outbound notes carry `#channel-message` + `#channel-message/outbound`.
+reply never wakes its own session. **Inbound notes MUST carry BOTH `#agent-message` (parent,
+makes it queryable) AND `#agent-message/inbound` (child, fires the trigger), with the channel
+name in `metadata.channel`.** Outbound notes carry `#agent-message` + `#agent-message/outbound`.
 
-**Flow.** INBOUND (human→session): a new `#channel-message` + `#channel-message/inbound` note →
-a vault **trigger** POSTs a webhook → the channel daemon's `POST /api/vault/inbound` → routes by
+**Flow.** INBOUND (human→session): a new `#agent-message` + `#agent-message/inbound` note →
+a vault **trigger** POSTs a webhook → the agent daemon's `POST /api/vault/inbound` → routes by
 `note.metadata.channel` → `ctx.emit` wakes the session (fans to SSE bridges + HTTP-MCP sessions
-alike). OUTBOUND (session→human): the session's `reply` writes a `#channel-message` +
-`#channel-message/outbound` note via the vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`,
+alike). OUTBOUND (session→human): the session's `reply` writes a `#agent-message` +
+`#agent-message/outbound` note via the vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`,
 Bearer `vault:<name>:write`).
 
 **channels.json** (the channel side):
@@ -197,20 +197,20 @@ Bearer `vault:<name>:write`).
 ```
 
 **Vault side** (operator config — activates the inbound trigger):
-1. (Optional, for indexed queries) declare the `#channel-message` tag schema with
+1. (Optional, for indexed queries) declare the `#agent-message` tag schema with
    indexed `channel`/`direction`/`sender` fields (`update-tag`).
 2. Add a trigger to the vault's `config.yaml` that fires on new inbound notes and
-   webhooks the channel daemon. Loop avoidance is by tag: the vault predicate does
-   EXACT tag membership, so firing on the inbound CHILD tag (`#channel-message/inbound`)
-   never matches an outbound (reply) note — which carries `#channel-message/outbound`,
+   webhooks the agent daemon. Loop avoidance is by tag: the vault predicate does
+   EXACT tag membership, so firing on the inbound CHILD tag (`#agent-message/inbound`)
+   never matches an outbound (reply) note — which carries `#agent-message/outbound`,
    not the inbound child — so no `missing_metadata` clause is needed. (Both directions
-   also carry the parent `#channel-message`, but the trigger keys on the child only.)
+   also carry the parent `#agent-message`, but the trigger keys on the child only.)
    ```yaml
    triggers:
      - name: channel_inbound
        events: ["created"]
        when:
-         tags: ["#channel-message/inbound"]
+         tags: ["#agent-message/inbound"]
          has_metadata: ["channel"]
          missing_metadata: ["channel_inbound_rendered_at"]
        action:
@@ -219,23 +219,23 @@ Bearer `vault:<name>:write`).
    ```
    The shared secret rides in the URL — vault doesn't sign webhooks yet; a hub-JWT
    auth block on the trigger is a follow-up. The daemon defends in depth too:
-   `ingestInbound` drops any note tagged `#channel-message/outbound`, so a reply can
+   `ingestInbound` drops any note tagged `#agent-message/outbound`, so a reply can
    never wake its own session.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | (unset) | **Highest-priority port input** — the hub supervisor injects this from the module's services.json `entry.port` (the canonical pattern vault/scribe follow). The daemon binds AND self-registers this port, so the supervisor's readiness probe + `/channel/*` proxy target agree (channel#41). Empty/non-numeric falls through. |
-| `PARACHUTE_CHANNEL_PORT` | `1941` | Daemon HTTP port — back-compat override for a daemon run *outside* the supervisor. Used only when `PORT` is unset. |
-| `PARACHUTE_CHANNEL_URL` | `http://127.0.0.1:1941` | Bridge → daemon URL |
-| `PARACHUTE_CHANNEL_STATE_DIR` | `~/.parachute/channel` | Token, access config, inbox |
+| `PORT` | (unset) | **Highest-priority port input** — the hub supervisor injects this from the module's services.json `entry.port` (the canonical pattern vault/scribe follow). The daemon binds AND self-registers this port, so the supervisor's readiness probe + `/agent/*` proxy target agree (agent#41). Empty/non-numeric falls through. |
+| `PARACHUTE_AGENT_PORT` | `1941` | Daemon HTTP port — back-compat override for a daemon run *outside* the supervisor. Used only when `PORT` is unset. |
+| `PARACHUTE_AGENT_URL` | `http://127.0.0.1:1941` | Bridge → daemon URL |
+| `PARACHUTE_AGENT_STATE_DIR` | `~/.parachute/agent` | Token, access config, inbox |
 | `PARACHUTE_HUB_ORIGIN` | `http://127.0.0.1:1939` | **Daemon:** hub's public origin for JWT `iss` validation. Required on an exposed deployment (the loopback default is dev-only); hub-as-supervisor sets it. |
-| `PARACHUTE_CHANNEL_TOKEN` | (none) | **Bridge:** hub-issued channel JWT presented as Bearer. The launcher mints + injects it; unset = no auth header (dev only). Default mint TTL is the hub's non-ephemeral default (~90d); re-launch re-mints. |
+| `PARACHUTE_AGENT_TOKEN` | (none) | **Bridge:** hub-issued agent JWT presented as Bearer. The launcher mints + injects it; unset = no auth header (dev only). Default mint TTL is the hub's non-ephemeral default (~90d); re-launch re-mints. |
 
 ## State directory
 
-`~/.parachute/channel/`:
+`~/.parachute/agent/`:
 - `channels.json` — the channel registry. Each telegram channel carries its own bot token in `config.token` (created via the admin UI or written directly).
 - `.env` — optional generic env vars (e.g. `PARACHUTE_HUB_ORIGIN`). The daemon no longer consumes `TELEGRAM_BOT_TOKEN` here.
 - `access.json` — allowlist (compatible with the official plugin's format)
@@ -254,7 +254,7 @@ The fix (`src/delivery-state.ts`):
 
 ## Access control (`access.json`)
 
-Schema is compatible with the official Telegram plugin, plus one parachute-channel extension: `allowInChats`.
+Schema is compatible with the official Telegram plugin, plus one parachute-agent extension: `allowInChats`.
 
 | Field | Type | Description |
 |---|---|---|
@@ -301,7 +301,7 @@ curl http://127.0.0.1:1941/health
 # Send a test message
 curl -X POST http://127.0.0.1:1941/api/reply \
   -H "content-type: application/json" \
-  -d '{"chat_id":"<CHAT_ID>","text":"hello from parachute-channel"}'
+  -d '{"chat_id":"<CHAT_ID>","text":"hello from parachute-agent"}'
 ```
 
 ## Future
@@ -311,7 +311,7 @@ The daemon + bridge split makes adding new backends straightforward:
 - SMS/iMessage: same pattern
 - Custom web frontend: same pattern — the bridge doesn't change
 
-The bridge's MCP contract (`notifications/claude/channel` + tool surface) stays the same regardless of backend.
+The bridge's MCP contract (`notifications/claude/agent` + tool surface) stays the same regardless of backend.
 
 ## Post-merge hygiene
 
@@ -321,4 +321,4 @@ When a PR is merged, locally:
 git checkout main && git pull
 ```
 
-Channel's steward does this already — captured here so it's durable and matches the convention now documented across every Parachute repo. Caught 2026-04-21 across vault/lens/scribe/cli where it wasn't being done.
+Agent's steward does this already — captured here so it's durable and matches the convention now documented across every Parachute repo. Caught 2026-04-21 across vault/lens/scribe/cli where it wasn't being done.

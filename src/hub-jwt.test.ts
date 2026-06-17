@@ -1,10 +1,17 @@
 /**
- * Tests for the channel-side hub-JWT adapter. These exercise the parts that
+ * Tests for the agent-side hub-JWT adapter. These exercise the parts that
  * DON'T need a live hub / JWKS endpoint: hub-origin resolution (env precedence →
- * expose-state self-heal → loopback fallback), the audience constant, and the
+ * expose-state self-heal → loopback fallback), the audience constants, and the
  * re-exported pure helpers (`looksLikeJwt`). Real signature/issuer/audience
  * validation is scope-guard's own tested surface — we don't re-test it here and
  * we never need a real JWKS.
+ *
+ * Audience constants (channel→agent rename, rule 1): the daemon now mints/
+ * validates `aud: "agent"` (`AGENT_AUDIENCE`); the pre-rename `aud: "channel"`
+ * (`CHANNEL_AUDIENCE`, deprecated) still validates during the dual-accept window
+ * via `ACCEPTED_AUDIENCES`. We assert both constants here. The dual-ACCEPT itself
+ * (a `channel`-aud token still validating) lives in `validateHubJwt`, which needs
+ * a live JWKS to exercise — that's scope-guard's tested surface, not re-tested here.
  *
  * The self-heal reads `<PARACHUTE_HOME>/expose-state.json`. Every case here
  * points `PARACHUTE_HOME` at a fresh temp dir so the operator's real
@@ -16,7 +23,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   getHubOrigin,
+  AGENT_AUDIENCE,
   CHANNEL_AUDIENCE,
+  ACCEPTED_AUDIENCES,
   looksLikeJwt,
   HubJwtError,
 } from "./hub-jwt.ts";
@@ -28,7 +37,7 @@ let home: string;
 
 beforeEach(() => {
   // Isolated, empty ecosystem root — no expose-state.json unless a case writes one.
-  home = mkdtempSync(join(tmpdir(), "channel-hubjwt-"));
+  home = mkdtempSync(join(tmpdir(), "agent-hubjwt-"));
   process.env.PARACHUTE_HOME = home;
 });
 
@@ -64,7 +73,7 @@ describe("getHubOrigin — env precedence", () => {
   });
 });
 
-describe("getHubOrigin — expose-state self-heal (channel#34)", () => {
+describe("getHubOrigin — expose-state self-heal (agent#34)", () => {
   test("reads expose-state.hubOrigin when env is unset", () => {
     delete process.env.PARACHUTE_HUB_ORIGIN;
     writeExposeState({ hubOrigin: "https://exposed.example.com" });
@@ -120,9 +129,21 @@ describe("getHubOrigin — loopback fallback", () => {
   });
 });
 
-describe("CHANNEL_AUDIENCE", () => {
-  test("is the literal 'channel' (what the hub mints aud as)", () => {
+describe("audience constants (channel→agent dual-accept, rule 1)", () => {
+  test("AGENT_AUDIENCE is the literal 'agent' (what the hub mints aud as now)", () => {
+    expect(AGENT_AUDIENCE).toBe("agent");
+  });
+
+  test("CHANNEL_AUDIENCE is the deprecated legacy literal 'channel' (pre-rename tokens)", () => {
     expect(CHANNEL_AUDIENCE).toBe("channel");
+  });
+
+  test("ACCEPTED_AUDIENCES carries BOTH — new 'agent' + legacy 'channel' (the dual-accept set)", () => {
+    // The resource-server backstop: a token whose aud is neither (e.g. minted for
+    // a vault) is rejected; both transitional forms validate until live re-mint.
+    expect([...ACCEPTED_AUDIENCES]).toEqual(["agent", "channel"]);
+    expect(ACCEPTED_AUDIENCES).toContain(AGENT_AUDIENCE);
+    expect(ACCEPTED_AUDIENCES).toContain(CHANNEL_AUDIENCE);
   });
 });
 

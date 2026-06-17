@@ -125,7 +125,7 @@ describe("TelegramTransport", () => {
       delete process.env.TELEGRAM_BOT_TOKEN;
       const perChannel = new TelegramTransport({
         token: "per-channel-tok",
-        stateDir: "/tmp/parachute-channel-test-precedence",
+        stateDir: "/tmp/parachute-agent-test-precedence",
       });
       expect(perChannel.kind).toBe("telegram");
 
@@ -134,7 +134,7 @@ describe("TelegramTransport", () => {
       process.env.TELEGRAM_BOT_TOKEN = "env-tok";
       const withEnvNoise = new TelegramTransport({
         token: "per-channel-tok",
-        stateDir: "/tmp/parachute-channel-test-precedence",
+        stateDir: "/tmp/parachute-agent-test-precedence",
       });
       expect(withEnvNoise.kind).toBe("telegram");
     } finally {
@@ -144,7 +144,7 @@ describe("TelegramTransport", () => {
   });
 
   test("kind is 'telegram' and outbound methods exist", () => {
-    const t = new TelegramTransport({ token: "tok", stateDir: "/tmp/parachute-channel-test-telegram" });
+    const t = new TelegramTransport({ token: "tok", stateDir: "/tmp/parachute-agent-test-telegram" });
     expect(t.kind).toBe("telegram");
     expect(typeof t.reply).toBe("function");
     expect(typeof t.react).toBe("function");
@@ -154,13 +154,13 @@ describe("TelegramTransport", () => {
   });
 
   test("reply without a chat_id in meta errors clearly", async () => {
-    const t = new TelegramTransport({ token: "tok", stateDir: "/tmp/parachute-channel-test-telegram" });
+    const t = new TelegramTransport({ token: "tok", stateDir: "/tmp/parachute-agent-test-telegram" });
     await expect(t.reply({ channel: "telegram", text: "hi" })).rejects.toThrow(/chat_id is required/);
   });
 
   test("sendPermission with no allowlisted users throws ChannelConfigError (→ 400, not 500)", async () => {
     // Fresh state dir → no access.json → default access has empty allowFrom.
-    const t = new TelegramTransport({ token: "tok", stateDir: "/tmp/parachute-channel-test-noperm" });
+    const t = new TelegramTransport({ token: "tok", stateDir: "/tmp/parachute-agent-test-noperm" });
     await expect(
       t.sendPermission({
         channel: "telegram",

@@ -6,6 +6,27 @@ import {
   vaultEntryKey,
 } from "./agent-mcp-config.ts";
 
+describe("channelEntryKey — the per-channel MCP server name (channel→agent rename)", () => {
+  test("is `agent-<name>` (matches mcp-http.ts buildServer + launch-session.sh)", () => {
+    // The entry-key + per-channel HTTP-MCP server name moved channel-<name> →
+    // agent-<name> with the module identity. The channel NAME slug (the domain)
+    // is preserved; only the `agent-` prefix is the renamed wire surface.
+    expect(channelEntryKey("eng")).toBe("agent-eng");
+    expect(channelEntryKey("aaron-dev")).toBe("agent-aaron-dev");
+  });
+
+  test(".mcp.json mcpServers is keyed by `agent-<name>`", () => {
+    const parsed = JSON.parse(
+      buildAgentMcpConfigJson({
+        channelUrl: "http://127.0.0.1:1941",
+        channels: [{ channel: "eng", token: "T" }],
+      }),
+    ) as { mcpServers: Record<string, unknown> };
+    expect(Object.keys(parsed.mcpServers)).toEqual(["agent-eng"]);
+    expect(parsed.mcpServers["agent-eng"]).toBeDefined();
+  });
+});
+
 describe("buildAgentMcpServers — N-entry strict config", () => {
   test("one entry per channel with its own URL + Bearer", () => {
     const servers = buildAgentMcpServers({

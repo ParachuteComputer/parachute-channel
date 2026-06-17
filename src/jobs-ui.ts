@@ -1,5 +1,5 @@
 /**
- * The Schedules page (`/channel/jobs`) — the runner's operator surface (design
+ * The Schedules page (`/agent/jobs`) — the runner's operator surface (design
  * `2026-06-17-runner-scheduled-agent-turns.md` §Components.6).
  *
  * Why a SIBLING `/jobs` page (not a section on the agents page): the agents page is
@@ -14,11 +14,11 @@
  * Idiom (matches agents-ui / admin-ui): the whole page is an HTML string with
  * browser JS as a template-string `<script>`. It reuses `ui-kit`'s `THEME_CSS` +
  * `appShell` + `SHELL_JS` (MOUNT derivation, nav wiring, `escapeHtml`,
- * `setStatus`, `fetchToken`/`authedFetch` — the hub-minted `channel:admin` token
+ * `setStatus`, `fetchToken`/`authedFetch` — the hub-minted `agent:admin` token
  * bootstrap). All dynamic text is `esc()`'d before innerHTML. Emitted-JS newlines
  * are written `\\n` so they survive into the page script.
  *
- * The page talks to the `/api/jobs*` routes (all `channel:admin`):
+ * The page talks to the `/api/jobs*` routes (all `agent:admin`):
  *   - GET    /api/jobs          → list
  *   - POST   /api/jobs          → create
  *   - DELETE /api/jobs/:id      → delete
@@ -34,7 +34,7 @@ export const JOBS_UI_HTML = `<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="referrer" content="no-referrer" />
-<title>parachute-channel · schedules</title>
+<title>parachute-agent · schedules</title>
 <style>
 ${THEME_CSS}
   .app-header { position: sticky; top: 0; z-index: 5; }
@@ -168,7 +168,7 @@ ${SHELL_JS}
   }
   function clearMsg(el) { el.textContent = ""; el.className = "msg"; }
 
-  // --- token + API (channel:admin Bearer; one 401 retry) ------------------
+  // --- token + API (agent:admin Bearer; one 401 retry) ------------------
   function api(path, opts, _retried) {
     opts = opts || {};
     var headers = Object.assign({}, opts.headers || {});
@@ -362,7 +362,7 @@ ${SHELL_JS}
   renderPresets();
   refreshCronPreview();
 
-  // Boot: mint the channel:admin token, then load the picker + the list. A failed
+  // Boot: mint the agent:admin token, then load the picker + the list. A failed
   // token mint still lets the page render (it shows the load error in-place).
   fetchToken().then(function () {
     return Promise.all([loadChannels(), loadJobs()]);

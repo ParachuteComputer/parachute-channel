@@ -1,7 +1,7 @@
 /**
- * Static HTML for `/channel/home` — the overview landing (Phase 2 of the
+ * Static HTML for `/agent/home` — the overview landing (Phase 2 of the
  * channel-UI coherence pass). This is the new DEFAULT page the hub portal lands
- * on (`uiUrl: "/channel/home"`); it orients the operator before they dive into a
+ * on (`uiUrl: "/agent/home"`); it orients the operator before they dive into a
  * specific surface.
  *
  * Self-contained document (HTML + inline CSS + inline JS, no build step — the
@@ -12,13 +12,13 @@
  *   - Channels       — fetched from `<mount>/.parachute/config` (OPEN, no auth):
  *                      each channel's name + transport + a live dot, linking to
  *                      its Chat. Footer: "Configure channels →" (the Config page).
- *   - Running agents — fetched from `<mount>/api/agents` (channel:admin Bearer via
+ *   - Running agents — fetched from `<mount>/api/agents` (agent:admin Bearer via
  *                      authedFetch): each agent's name + state, linking to its
  *                      Terminal + Chat. Auto-refreshes every 5s. Footer: "Spawn an
  *                      agent →" (the Agents page).
  *
  * Auth: the page loads OPEN (like the other surfaces); the channels card needs no
- * token, the agents card mints a hub `channel:admin` Bearer (fetchToken) and
+ * token, the agents card mints a hub `agent:admin` Bearer (fetchToken) and
  * tolerates failure with a "sign in via the portal" note — an unauthenticated
  * load still shows channels + the quick actions.
  *
@@ -34,7 +34,7 @@ export const HOME_UI_HTML = `<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="referrer" content="no-referrer" />
-<title>parachute-channel · home</title>
+<title>parachute-agent · home</title>
 <style>
 ${THEME_CSS}
   /* ---- Home page layout (page-specific, layered after the shared kit) ------ */
@@ -196,7 +196,7 @@ ${SHELL_JS}
       });
   }
 
-  // --- running agents (channel:admin Bearer via authedFetch) --------------
+  // --- running agents (agent:admin Bearer via authedFetch) --------------
   function loadAgents() {
     return authedFetch(MOUNT + "/api/agents")
       .then(function (r) { if (!r.ok) { var e = new Error("agents " + r.status); e.status = r.status; throw e; } return r.json(); })
@@ -250,7 +250,7 @@ ${SHELL_JS}
   document.getElementById("refresh").addEventListener("click", function () { refreshAll(); });
 
   // --- boot ---------------------------------------------------------------
-  // Mint the channel:admin Bearer first so the agents card is authed; tolerate a
+  // Mint the agent:admin Bearer first so the agents card is authed; tolerate a
   // failed mint (unauthenticated load) — channels still render, agents shows the
   // sign-in note. Then auto-refresh agents every 5s (like the Agents page).
   wireLinks();

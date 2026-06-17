@@ -1,6 +1,6 @@
-# Channel architecture, post-programmatic shift — a fresh look
+# Agent architecture, post-programmatic shift — a fresh look
 
-**Status:** direction (2026-06-16). Written after the channel's center of gravity moved
+**Status:** direction (2026-06-16). Written after the agent's center of gravity moved
 from **interactive** (a live Claude Code in tmux you attach to) to **programmatic**
 (each message answered by a sandboxed `claude -p --resume` turn). Companion to
 [`2026-06-16-pluggable-agent-backend.md`](./2026-06-16-pluggable-agent-backend.md),
@@ -28,7 +28,7 @@ for the default programmatic path anymore:
 - no-loss high-water-mark + backlog replay (#67)
 - per-session restart (#68)
 - the `--dangerously-load-development-channels` consent auto-confirm (#71, fixing issue #70)
-- the MCP idle-wake / reconnect transport (the `notifications/claude/channel` push to an
+- the MCP idle-wake / reconnect transport (the `notifications/claude/agent` push to an
   idle HTTP-MCP session; serves the interactive path — the programmatic backend is
   stateless per turn and needs none of it)
 
@@ -65,7 +65,7 @@ terminal reframe is **sandbox it** (a workspace-confined shell is no more powerf
 a workspace agent). Beyond that, the bigger lever is **step-up auth** (a PIN /
 re-confirm) on the genuinely dangerous actions — terminal, set-credentials, full-fs
 spawn — tracked as **#80**. That's primarily a hub-auth concern (it should cover all
-admin surfaces), with channel a consumer.
+admin surfaces), with agent a consumer.
 
 ## Build order
 
@@ -77,5 +77,5 @@ admin surfaces), with channel a consumer.
 3. **Step-up auth** (#80) — cross-cutting with hub.
 4. **Terminal → sandboxed workspace shell** — repurpose, confined to the workspace.
 
-Items 1–2 are channel-local and unblock runner; 3 is cross-cutting; 4 is the terminal
+Items 1–2 are agent-local and unblock runner; 3 is cross-cutting; 4 is the terminal
 disposition once the workspace seam exists.

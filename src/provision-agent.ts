@@ -15,7 +15,7 @@
  *     channel daemon does NOT and CANNOT mint vault tokens — so the client
  *     orchestrates against the hub, exactly as the Config page does.
  *   - TELEGRAM / HTTP-UI — a plain `POST <mount>/api/channels` to the channel
- *     daemon (channel:admin Bearer), `{ name, transport, config? }`.
+ *     daemon (agent:admin Bearer), `{ name, transport, config? }`.
  *
  * These functions are pure browser JS exposed as a STRING (`PROVISION_JS`) so the
  * pages interpolate it into their inline `<script>` exactly like `SHELL_JS`. The
@@ -30,7 +30,7 @@
  *   - provisionDaemonChannel({ apiUrl, token, name, transport, config }) → Promise<{ ok, restart_needed, auth, status, error }>
  *   - listVaults({ origin })                        → Promise<{ ok, vaults, error }>
  *
- * The connection-body shape (vault.note.created → channel.message.deliver) is the
+ * The connection-body shape (vault.note.created → agent.message.deliver) is the
  * single canonical definition — both pages get it from `vaultConnectionBody(name,
  * vault)` here, so the trigger filter can never diverge between the two surfaces.
  */
@@ -52,18 +52,18 @@ export function vaultConnectionBody(name: string, vault: string): {
   sink: { module: string; action: string; params: { channel: string } };
 } {
   return {
-    requestedBy: "channel",
+    requestedBy: "agent",
     source: {
       module: "vault",
       vault,
       event: "note.created",
       filter: {
-        tags: ["#channel-message/inbound"],
+        tags: ["#agent-message/inbound"],
         has_metadata: ["channel"],
         missing_metadata: ["channel_inbound_rendered_at"],
       },
     },
-    sink: { module: "channel", action: "message.deliver", params: { channel: name } },
+    sink: { module: "agent", action: "message.deliver", params: { channel: name } },
   };
 }
 
@@ -73,14 +73,14 @@ export function vaultConnectionBody(name: string, vault: string): {
  * which contain no backtick — never collide with the host page's template
  * literal). Defines `window.ChannelProvision`.
  *
- * NOTE: keep this backtick-free (the `provision-channel.test.ts` asserts it). Use
+ * NOTE: keep this backtick-free (the `provision-agent.test.ts` asserts it). Use
  * string concatenation, never template literals.
  */
 export const PROVISION_JS = `
   (function () {
     "use strict";
 
-    // GET <mount>/api/channels (channel:admin Bearer) and report whether a channel
+    // GET <mount>/api/channels (agent:admin Bearer) and report whether a channel
     // with this name already exists — the idempotency check both the Config page
     // and the create-agent flow use to REUSE an existing channel instead of
     // double-provisioning. Resolves { ok:true, exists, transport, channel } on a
@@ -116,18 +116,18 @@ export const PROVISION_JS = `
     // vaultConnectionBody() above (the test asserts the shapes agree).
     function vaultConnectionBody(name, vault) {
       return {
-        requestedBy: "channel",
+        requestedBy: "agent",
         source: {
           module: "vault",
           vault: vault,
           event: "note.created",
           filter: {
-            tags: ["#channel-message/inbound"],
+            tags: ["#agent-message/inbound"],
             has_metadata: ["channel"],
             missing_metadata: ["channel_inbound_rendered_at"]
           }
         },
-        sink: { module: "channel", action: "message.deliver", params: { channel: name } }
+        sink: { module: "agent", action: "message.deliver", params: { channel: name } }
       };
     }
 
@@ -136,7 +136,7 @@ export const PROVISION_JS = `
     // the approval. The hub mints the cross-module tokens + registers the vault
     // trigger and returns { connection, connect }. The channel daemon is NOT
     // involved (it can't mint vault tokens). Resolves a structured result; never
-    // rejects. requestedBy:"channel" labels provenance in the hub Connections view.
+    // rejects. requestedBy:"agent" labels provenance in the hub Connections view.
     function provisionVaultChannel(opts) {
       opts = opts || {};
       var body = vaultConnectionBody(opts.name, opts.vault);
@@ -162,7 +162,7 @@ export const PROVISION_JS = `
     }
 
     // TELEGRAM / HTTP-UI provisioning — the plain daemon path. POST
-    // <mount>/api/channels (channel:admin Bearer), { name, transport, config? }.
+    // <mount>/api/channels (agent:admin Bearer), { name, transport, config? }.
     // A 200 may still carry restart_needed:true (persisted, hot-add failed).
     // Resolves a structured result; never rejects.
     function provisionDaemonChannel(opts) {

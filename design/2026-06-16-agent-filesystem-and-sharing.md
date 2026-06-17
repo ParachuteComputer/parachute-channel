@@ -12,8 +12,8 @@ reuse these primitives.
 
 ## The problem
 
-Today an agent's session dir (`~/.parachute/channel/sessions/<name>/` by default;
-overridable via `PARACHUTE_CHANNEL_STATE_DIR` / the injected `sessionsDir` dep) fuses
+Today an agent's session dir (`~/.parachute/agent/sessions/<name>/` by default;
+overridable via `PARACHUTE_AGENT_STATE_DIR` / the injected `sessionsDir` dep) fuses
 four different things into one private blob:
 - the **working directory** (cwd),
 - a seeded **per-agent `CLAUDE_CONFIG_DIR`** (`<workspace>/home/.claude`, written by
@@ -21,7 +21,7 @@ four different things into one private blob:
   Note: the operator's real `~/.claude` is never written — only `~/.claude.json` is
   *read* as a seed source, and the agent always runs with `CLAUDE_CONFIG_DIR` pointed
   at its own dir, so CC's "user-level" config layer is fully controlled per-agent,
-- the **`.mcp.json`** (with the agent's scoped vault/channel tokens), and
+- the **`.mcp.json`** (with the agent's scoped vault/agent tokens), and
 - **mutable runtime state** (sessions, history, locks, cache, tmp).
 
 Two emerging needs break that monolith:
@@ -52,7 +52,7 @@ An agent's filesystem context is really **three** things, not one:
 > **Anything that carries a credential or a scoped capability is per-agent and never
 > shared. Anything that is inert, curated content can be shared.**
 
-- `.mcp.json` (scoped vault/channel tokens), the injected `CLAUDE_CODE_OAUTH_TOKEN`,
+- `.mcp.json` (scoped vault/agent tokens), the injected `CLAUDE_CODE_OAUTH_TOKEN`,
   any per-agent secret → **private**. Sharing them collapses the per-agent isolation
   that the whole sandbox model exists to provide.
 - Skills, slash commands, sub-agent definitions, output styles → **shareable** (they're

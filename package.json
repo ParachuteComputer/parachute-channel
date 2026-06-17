@@ -1,12 +1,12 @@
 {
-  "name": "@openparachute/channel",
+  "name": "@openparachute/agent",
   "version": "0.1.0",
   "description": "Messaging gateway for Claude Code — Telegram today, anything tomorrow",
   "license": "AGPL-3.0",
   "type": "module",
   "bin": {
-    "parachute-channel": "src/daemon.ts",
-    "parachute-channel-bridge": "src/bridge.ts"
+    "parachute-agent": "src/daemon.ts",
+    "parachute-agent-bridge": "src/bridge.ts"
   },
   "scripts": {
     "daemon": "bun src/daemon.ts",

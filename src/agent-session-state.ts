@@ -81,7 +81,7 @@ export class AgentSessionState {
       // Corrupt file — log and start empty rather than crash. The cost is that
       // every channel starts a fresh conversation on the next turn, not a loss.
       console.warn(
-        `parachute-channel: agent-session-state file ${this.file} is unreadable ` +
+        `parachute-agent: agent-session-state file ${this.file} is unreadable ` +
           `(${(err as Error).message}); starting with no resume ids.`,
       );
     }
@@ -98,7 +98,7 @@ export class AgentSessionState {
       writeFileSync(this.file, JSON.stringify(obj, null, 2), { mode: 0o600 });
     } catch (err) {
       console.warn(
-        `parachute-channel: failed to persist agent-session-state to ${this.file} ` +
+        `parachute-agent: failed to persist agent-session-state to ${this.file} ` +
           `(${(err as Error).message}); the session id is held in memory only.`,
       );
     }

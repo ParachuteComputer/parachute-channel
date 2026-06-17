@@ -51,7 +51,7 @@ export interface AgentVaultSpec {
   access: "read" | "write" | "admin";
   /**
    * Optional tag scope — narrows the minted vault token to these tags via the
-   * `permissions.scoped_tags` claim (e.g. `["#channel-message"]`). Omitted = the
+   * `permissions.scoped_tags` claim (e.g. `["#agent-message"]`). Omitted = the
    * verb's full scope across the vault.
    */
   tags?: string[];
@@ -81,15 +81,15 @@ export interface OtherMcpSpec {
  * A channel binding for an arm. A bare string is shorthand for `{ name, access:
  * "write" }` (back-compat — the common read+write resident session); the object
  * form scopes a channel read-only so an arm that only *watches* a channel mints
- * `channel:read` and never `channel:write` (the "scope an arm to channel X
+ * `agent:read` and never `agent:write` (the "scope an arm to channel X
  * read-only" use case).
  */
 export interface AgentChannelSpec {
   /** Channel name (the `/mcp/<channel>` segment). */
   name: string;
   /**
-   * Channel access. `"write"` (default) mints `channel:read channel:write`;
-   * `"read"` mints `channel:read` only — the arm can be woken + read the channel
+   * Channel access. `"write"` (default) mints `agent:read agent:write`;
+   * `"read"` mints `agent:read` only — the arm can be woken + read the channel
    * but cannot reply.
    */
   access?: "read" | "write";
@@ -104,7 +104,7 @@ export type AgentChannel = string | AgentChannelSpec;
  *  - `"programmatic"` (the DEFAULT for a NEW spawn request, per Aaron's gating
  *    decision 2026-06-16): NO resident process. An inbound message becomes one
  *    on-demand `claude -p --resume <sid>` turn ({@link AgentBackend}); the reply is
- *    posted back as an outbound `#channel-message/outbound` note. No idle session →
+ *    posted back as an outbound `#agent-message/outbound` note. No idle session →
  *    nothing to go deaf, no reconnect, no replay, no consent gate. The reliable
  *    primary path; best for clean per-message "do a task, report back" turns.
  *  - `"interactive"` (the original tmux path; now the opt-in/"advanced" backend): an

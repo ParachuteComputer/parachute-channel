@@ -18,23 +18,24 @@
  *    a session connects → the missed message is delivered exactly once.
  *
  * Auth: the same sentinel-token hub-jwt mock the other daemon tests use — a
- * `Bearer test-rw-token` validates with channel:read + write + send WITHOUT a live
+ * `Bearer test-rw-token` validates with agent:read + write + send WITHOUT a live
  * hub/JWKS. The vault I/O is a REAL VaultTransport whose loadTranscript is
  * monkeypatched on the instance (the daemon branches on `instanceof VaultTransport`),
  * so NO real vault is touched.
  */
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 
-const RW_TOKEN = "test-rw-token"; // channel:read + write + send
+const RW_TOKEN = "test-rw-token"; // agent:read + write + send
 import { HubJwtError, looksLikeJwt } from "@openparachute/scope-guard";
 mock.module("./hub-jwt.ts", () => ({
+  AGENT_AUDIENCE: "agent",
   CHANNEL_AUDIENCE: "channel",
   async validateHubJwt(token: string) {
-    const base = { sub: "test", aud: "channel", jti: undefined, clientId: undefined, vaultScope: undefined };
+    const base = { sub: "test", aud: "agent", jti: undefined, clientId: undefined, vaultScope: undefined };
     if (token === RW_TOKEN) {
       // All scopes — the config-API hot-add (used to start a channel through the
-      // daemon's OWN contextFor, so emit advances the mark) needs channel:admin.
-      return { ...base, scopes: ["channel:read", "channel:write", "channel:send", "channel:admin"] };
+      // daemon's OWN contextFor, so emit advances the mark) needs agent:admin.
+      return { ...base, scopes: ["agent:read", "agent:write", "agent:send", "agent:admin"] };
     }
     throw new HubJwtError("issuer", "invalid token");
   },
@@ -79,19 +80,19 @@ function vaultChannels(channel: string, transport: VaultTransport): Map<string, 
 let stateDir: string;
 let prevStateDirEnv: string | undefined;
 beforeEach(() => {
-  stateDir = mkdtempSync(join(tmpdir(), "channel-backlog-"));
+  stateDir = mkdtempSync(join(tmpdir(), "agent-backlog-"));
   // Point the config-API hot-add's channels.json write (defaultStateDir reads the
   // env at request time) at the temp dir, so tests NEVER touch the real
-  // ~/.parachute/channel/. The DeliveryState instances are also constructed with
+  // ~/.parachute/agent/. The DeliveryState instances are also constructed with
   // this stateDir explicitly.
-  prevStateDirEnv = process.env.PARACHUTE_CHANNEL_STATE_DIR;
-  process.env.PARACHUTE_CHANNEL_STATE_DIR = stateDir;
+  prevStateDirEnv = process.env.PARACHUTE_AGENT_STATE_DIR;
+  process.env.PARACHUTE_AGENT_STATE_DIR = stateDir;
   _resetSessionsForTest();
 });
 afterEach(() => {
   _resetSessionsForTest();
-  if (prevStateDirEnv === undefined) delete process.env.PARACHUTE_CHANNEL_STATE_DIR;
-  else process.env.PARACHUTE_CHANNEL_STATE_DIR = prevStateDirEnv;
+  if (prevStateDirEnv === undefined) delete process.env.PARACHUTE_AGENT_STATE_DIR;
+  else process.env.PARACHUTE_AGENT_STATE_DIR = prevStateDirEnv;
   rmSync(stateDir, { recursive: true, force: true });
 });
 
@@ -273,7 +274,7 @@ describe("emit advances the mark only on real delivery (via /api/vault/inbound)"
         method: "POST",
         headers: { ...auth, "content-type": "application/json" },
         body: JSON.stringify({
-          note: { id: "note-0", content: "deaf", tags: ["#channel-message/inbound"], metadata: { channel: "eng", ts: ts0, direction: "inbound" } },
+          note: { id: "note-0", content: "deaf", tags: ["#agent-message/inbound"], metadata: { channel: "eng", ts: ts0, direction: "inbound" } },
         }),
       });
       expect(r0.status).toBe(200);
@@ -292,7 +293,7 @@ describe("emit advances the mark only on real delivery (via /api/vault/inbound)"
         method: "POST",
         headers: { ...auth, "content-type": "application/json" },
         body: JSON.stringify({
-          note: { id: "note-1", content: "heard", tags: ["#channel-message/inbound"], metadata: { channel: "eng", ts: ts1, direction: "inbound" } },
+          note: { id: "note-1", content: "heard", tags: ["#agent-message/inbound"], metadata: { channel: "eng", ts: ts1, direction: "inbound" } },
         }),
       });
       expect(r1.status).toBe(200);
@@ -314,7 +315,7 @@ describe("MCP connect replays the backlog to the new session only", () => {
   function capture() {
     const notes: Array<{ method: string; params: unknown }> = [];
     const server = { notification: (n: unknown) => notes.push(n as { method: string; params: unknown }) };
-    const wakes = () => notes.filter((n) => n.method === "notifications/claude/channel");
+    const wakes = () => notes.filter((n) => n.method === "notifications/claude/agent");
     return { server, notes, wakes };
   }
 
@@ -330,7 +331,7 @@ describe("MCP connect replays the backlog to the new session only", () => {
     // Phase 1: an existing session connects with NO pending backlog (transcript
     // empty) — its connect-replay delivers nothing and leaves the mark at 10:00.
     const existing = capture();
-    _registerSessionForTest("eng", "sid-existing", existing.server as never, ["channel:read"]);
+    _registerSessionForTest("eng", "sid-existing", existing.server as never, ["agent:read"]);
     await new Promise((r) => setTimeout(r, 20));
     expect(existing.wakes()).toHaveLength(0); // nothing pending at its connect
 
@@ -341,7 +342,7 @@ describe("MCP connect replays the backlog to the new session only", () => {
 
     // A FRESH session connects → its connect-replay pushes the pending message to IT.
     const fresh = capture();
-    _registerSessionForTest("eng", "sid-fresh", fresh.server as never, ["channel:read"]);
+    _registerSessionForTest("eng", "sid-fresh", fresh.server as never, ["agent:read"]);
     await new Promise((r) => setTimeout(r, 20));
 
     expect(mcpSessionCount("eng")).toBe(2);
@@ -369,7 +370,7 @@ describe("MCP connect replays the backlog to the new session only", () => {
     createFetchHandler(channels, registry, { deliveryState: ds });
 
     const streamless = capture();
-    _registerSessionForTest("eng", "sid-streamless", streamless.server as never, ["channel:read"], {
+    _registerSessionForTest("eng", "sid-streamless", streamless.server as never, ["agent:read"], {
       streamless: true,
     });
     await new Promise((r) => setTimeout(r, 20));
@@ -461,7 +462,7 @@ describe("end-to-end deaf window", () => {
         method: "POST",
         headers: { ...auth, "content-type": "application/json" },
         body: JSON.stringify({
-          note: { id: "note-deaf", content: "are you there?", tags: ["#channel-message/inbound"], metadata: { channel: "eng", ts: missedTs, sender: "aaron", direction: "inbound" } },
+          note: { id: "note-deaf", content: "are you there?", tags: ["#agent-message/inbound"], metadata: { channel: "eng", ts: missedTs, sender: "aaron", direction: "inbound" } },
         }),
       });
       expect(wh.status).toBe(200);

@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /**
- * parachute-channel bridge — a stdio MCP server that Claude Code spawns.
+ * parachute-agent bridge — a stdio MCP server that Claude Code spawns.
  *
- * Connects to the parachute-channel daemon via SSE for inbound messages
+ * Connects to the parachute-agent daemon via SSE for inbound messages
  * and proxies outbound tool calls (reply, react, edit, download) to the
  * daemon's HTTP API. This is the only file Claude Code interacts with.
  *
@@ -18,15 +18,17 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { agentEnv } from "./env-compat.ts";
 
-const DAEMON_URL = process.env.PARACHUTE_CHANNEL_URL ?? "http://127.0.0.1:1941";
+const DAEMON_URL = agentEnv("URL") ?? "http://127.0.0.1:1941";
 
-// Hub-issued JWT (aud: "channel", scopes channel:read + channel:write) the
+// Hub-issued JWT (aud: "agent", scopes agent:read + agent:write) the
 // session presents to the daemon on every request. Minted by launch-session.sh
-// via `parachute auth mint-token` and passed through .mcp.json. When unset, the
-// bridge sends no Authorization header — back-compat for an unguarded/dev daemon
-// (a daemon with auth on will then 401, surfaced below).
-const TOKEN = process.env.PARACHUTE_CHANNEL_TOKEN;
+// via `parachute auth mint-token` and passed through .mcp.json. Read via the
+// PARACHUTE_AGENT_TOKEN → legacy PARACHUTE_CHANNEL_TOKEN fallback (rename
+// back-compat). When unset, the bridge sends no Authorization header — back-compat
+// for an unguarded/dev daemon (a daemon with auth on will then 401, surfaced below).
+const TOKEN = agentEnv("TOKEN");
 
 /** Headers for an outbound daemon request, adding the bearer when a token is set. */
 function daemonHeaders(extra: Record<string, string> = {}): Record<string, string> {
@@ -44,12 +46,12 @@ const CHANNEL = process.env.PARACHUTE_CHANNEL_NAME ?? "telegram";
 // ---------------------------------------------------------------------------
 
 const mcp = new Server(
-  { name: "parachute-channel", version: "0.1.0" },
+  { name: "parachute-agent", version: "0.1.0" },
   {
     capabilities: {
       experimental: {
-        "claude/channel": {},
-        "claude/channel/permission": {},
+        "claude/agent": {},
+        "claude/agent/permission": {},
       },
       tools: {},
     },
@@ -58,7 +60,7 @@ const mcp = new Server(
       "",
       "CRITICAL — HOW THE HUMAN SEES YOU: they read ONLY what you send via the `reply` tool. Your normal assistant/transcript text is INVISIBLE to them. So for EVERY message that arrives on this channel you MUST call the `reply` tool to answer — even a one-word reply. Never answer only in your transcript: if you don't call `reply`, the human sees nothing at all.",
       "",
-      'Inbound messages arrive as <channel source="parachute-channel" ...> with metadata attributes describing the sender. Treat each as a chat message from the human and respond by calling the reply tool — the daemon routes it back out the same channel. Pass back any addressing fields the inbound tag carried (e.g. chat_id) if present; omit them otherwise. Use reply_to (message_id) to thread a specific message; omit it for normal responses.',
+      'Inbound messages arrive as <channel source="parachute-agent" ...> with metadata attributes describing the sender. Treat each as a chat message from the human and respond by calling the reply tool — the daemon routes it back out the same channel. Pass back any addressing fields the inbound tag carried (e.g. chat_id) if present; omit them otherwise. Use reply_to (message_id) to thread a specific message; omit it for normal responses.',
       "",
       "If the tag has an image_path attribute, Read that file — it is an attachment the sender sent.",
       "If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path.",
@@ -76,7 +78,7 @@ const mcp = new Server(
 
 mcp.setNotificationHandler(
   z.object({
-    method: z.literal("notifications/claude/channel/permission_request"),
+    method: z.literal("notifications/claude/agent/permission_request"),
     params: z.object({
       request_id: z.string(),
       tool_name: z.string(),
@@ -92,7 +94,7 @@ mcp.setNotificationHandler(
         body: JSON.stringify({ channel: CHANNEL, ...params }),
       });
     } catch (err) {
-      process.stderr.write(`parachute-channel bridge: failed to relay permission request: ${err}\n`);
+      process.stderr.write(`parachute-agent bridge: failed to relay permission request: ${err}\n`);
     }
   },
 );
@@ -248,11 +250,11 @@ async function connectToEvents(): Promise<void> {
         // Surface the operator-facing cause clearly before the reconnect loop
         // retries — otherwise this looks like a generic connectivity failure.
         process.stderr.write(
-          `parachute-channel bridge: daemon rejected the channel connection (HTTP ${res.status}). ` +
+          `parachute-agent bridge: daemon rejected the channel connection (HTTP ${res.status}). ` +
             (TOKEN
-              ? "The PARACHUTE_CHANNEL_TOKEN is invalid/expired or lacks channel:read — re-mint it " +
-                "(parachute auth mint-token --scope \"channel:read channel:write\") and relaunch the session.\n"
-              : "No PARACHUTE_CHANNEL_TOKEN was provided but the daemon requires one — relaunch the " +
+              ? "The PARACHUTE_AGENT_TOKEN is invalid/expired or lacks agent:read — re-mint it " +
+                "(parachute auth mint-token --scope \"agent:read agent:write\") and relaunch the session.\n"
+              : "No PARACHUTE_AGENT_TOKEN was provided but the daemon requires one — relaunch the " +
                 "session via launch-session.sh so it mints + passes a hub token.\n"),
         );
         throw new Error(`SSE connect rejected: ${res.status}`);
@@ -291,14 +293,14 @@ async function connectToEvents(): Promise<void> {
                   source: string;
                 };
                 await mcp.notification({
-                  method: "notifications/claude/channel",
+                  method: "notifications/claude/agent",
                   params: {
                     content: parsed.content,
-                    meta: { source: "parachute-channel", ...parsed.meta },
+                    meta: { source: "parachute-agent", ...parsed.meta },
                   },
                 });
               } catch (err) {
-                process.stderr.write(`parachute-channel bridge: failed to parse/forward event: ${err}\n`);
+                process.stderr.write(`parachute-agent bridge: failed to parse/forward event: ${err}\n`);
               }
             } else if (currentEvent === "permission_verdict" && currentData) {
               try {
@@ -307,14 +309,14 @@ async function connectToEvents(): Promise<void> {
                   behavior: string;
                 };
                 await mcp.notification({
-                  method: "notifications/claude/channel/permission",
+                  method: "notifications/claude/agent/permission",
                   params: {
                     request_id: parsed.request_id,
                     behavior: parsed.behavior,
                   },
                 });
               } catch (err) {
-                process.stderr.write(`parachute-channel bridge: failed to forward permission verdict: ${err}\n`);
+                process.stderr.write(`parachute-agent bridge: failed to forward permission verdict: ${err}\n`);
               }
             }
             currentEvent = "";
@@ -323,7 +325,7 @@ async function connectToEvents(): Promise<void> {
         }
       }
     } catch (err) {
-      process.stderr.write(`parachute-channel bridge: SSE error, reconnecting in 3s: ${err}\n`);
+      process.stderr.write(`parachute-agent bridge: SSE error, reconnecting in 3s: ${err}\n`);
     }
     await new Promise((r) => setTimeout(r, 3000));
   }
@@ -333,7 +335,7 @@ async function connectToEvents(): Promise<void> {
 // Missing-subscription warning
 //
 // If Claude Code attaches to this bridge but didn't opt into the
-// experimental `claude/channel` capability (e.g. forgot
+// experimental `claude/agent` capability (e.g. forgot
 // `--dangerously-load-development-channels=server:<name>`), the MCP tools
 // register fine but every inbound notification the bridge emits is silently
 // dropped. That looks identical to a working setup until a message arrives
@@ -341,7 +343,7 @@ async function connectToEvents(): Promise<void> {
 //
 // Signals, in priority order:
 //   1. On `oninitialized`, read `getClientCapabilities().experimental` — the
-//      canonical MCP hook. If `claude/channel` is missing, warn.
+//      canonical MCP hook. If `claude/agent` is missing, warn.
 //   2. If no initialize ever arrives (bridge is running but no client
 //      connected), warn after a grace period so `bun src/bridge.ts` invoked
 //      standalone tells you so.
@@ -357,7 +359,7 @@ let initReceived = false;
 const warnIfNoInit = setTimeout(() => {
   if (initReceived || IS_TEST) return;
   process.stderr.write(
-    "parachute-channel bridge: no MCP initialize received after 15s — " +
+    "parachute-agent bridge: no MCP initialize received after 15s — " +
     "the bridge is running but no client has connected.\n",
   );
 }, SUBSCRIPTION_WARN_MS);
@@ -374,15 +376,15 @@ mcp.oninitialized = () => {
   // is populated by the time we inspect it.
   setTimeout(() => {
     const caps = mcp.getClientCapabilities();
-    const hasChannel = caps?.experimental?.["claude/channel"] !== undefined;
-    if (!hasChannel) {
+    const hasAgent = caps?.experimental?.["claude/agent"] !== undefined;
+    if (!hasAgent) {
       process.stderr.write(
         [
-          "parachute-channel bridge: WARNING — client did not advertise claude/channel support.",
+          "parachute-agent bridge: WARNING — client did not advertise claude/agent support.",
           "  Inbound Telegram messages will not reach this session.",
           "  Did you launch Claude Code with:",
-          "      --dangerously-load-development-channels=server:parachute-channel",
-          "  (See https://github.com/ParachuteComputer/parachute-channel/issues/8)",
+          "      --dangerously-load-development-channels=server:parachute-agent",
+          "  (See https://github.com/ParachuteComputer/parachute-agent/issues/8)",
           "",
         ].join("\n"),
       );
@@ -395,7 +397,7 @@ mcp.oninitialized = () => {
 // ---------------------------------------------------------------------------
 
 await mcp.connect(new StdioServerTransport());
-process.stderr.write(`parachute-channel bridge: connected to Claude Code (channel="${CHANNEL}"), connecting to daemon...\n`);
+process.stderr.write(`parachute-agent bridge: connected to Claude Code (channel="${CHANNEL}"), connecting to daemon...\n`);
 
 // Start SSE listener (runs forever, reconnects on failure)
 connectToEvents();

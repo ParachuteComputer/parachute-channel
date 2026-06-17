@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import {
   mintScopedToken,
-  channelScope,
+  agentScope,
   vaultScope,
   MintError,
   type MintTokenDeps,
@@ -30,9 +30,9 @@ function depsWith(fetchFn: typeof fetch): MintTokenDeps {
 }
 
 describe("scope string helpers", () => {
-  test("channelScope", () => {
-    expect(channelScope({ write: false })).toBe("channel:read");
-    expect(channelScope({ write: true })).toBe("channel:read channel:write");
+  test("agentScope", () => {
+    expect(agentScope({ write: false })).toBe("agent:read");
+    expect(agentScope({ write: true })).toBe("agent:read agent:write");
   });
   test("vaultScope", () => {
     expect(vaultScope("default", "read")).toBe("vault:default:read");
@@ -51,12 +51,12 @@ describe("mintScopedToken — happy path", () => {
         scope: body.scope,
       },
     }));
-    const res = await mintScopedToken({ scope: "channel:read channel:write" }, depsWith(hub.fetchFn));
+    const res = await mintScopedToken({ scope: "agent:read agent:write" }, depsWith(hub.fetchFn));
     expect(res.token).toBe("MINTED-TOKEN");
     expect(res.jti).toBe("j1");
     // Presented the MANAGER's bearer (the attenuation principal).
     expect(hub.calls[0]!.auth).toBe("Bearer MANAGER-BEARER");
-    expect(hub.calls[0]!.body.scope).toBe("channel:read channel:write");
+    expect(hub.calls[0]!.body.scope).toBe("agent:read agent:write");
   });
 
   test("passes audience + permissions (scoped_tags) through to the hub", async () => {
@@ -68,12 +68,12 @@ describe("mintScopedToken — happy path", () => {
       {
         scope: "vault:default:read",
         audience: "vault.default",
-        permissions: { scoped_tags: ["#channel-message"] },
+        permissions: { scoped_tags: ["#agent-message"] },
       },
       depsWith(hub.fetchFn),
     );
     expect(hub.calls[0]!.body.audience).toBe("vault.default");
-    expect(hub.calls[0]!.body.permissions).toEqual({ scoped_tags: ["#channel-message"] });
+    expect(hub.calls[0]!.body.permissions).toEqual({ scoped_tags: ["#agent-message"] });
   });
 });
 
@@ -122,7 +122,7 @@ describe("mintScopedToken — attenuation + error surfacing", () => {
     }));
     let err: unknown;
     try {
-      await mintScopedToken({ scope: "channel:read" }, depsWith(hub.fetchFn));
+      await mintScopedToken({ scope: "agent:read" }, depsWith(hub.fetchFn));
     } catch (e) {
       err = e;
     }
@@ -133,7 +133,7 @@ describe("mintScopedToken — attenuation + error surfacing", () => {
 
   test("a 200 with no token becomes a MintError (never returns a credential-less success)", async () => {
     const hub = fakeHub(() => ({ status: 200, json: { jti: "j", expires_at: "" } }));
-    await expect(mintScopedToken({ scope: "channel:read" }, depsWith(hub.fetchFn))).rejects.toBeInstanceOf(MintError);
+    await expect(mintScopedToken({ scope: "agent:read" }, depsWith(hub.fetchFn))).rejects.toBeInstanceOf(MintError);
   });
 
   test("a network failure to reach the hub becomes a MintError (status 0)", async () => {
@@ -142,7 +142,7 @@ describe("mintScopedToken — attenuation + error surfacing", () => {
     }) as unknown as typeof fetch;
     let err: unknown;
     try {
-      await mintScopedToken({ scope: "channel:read" }, depsWith(fetchFn));
+      await mintScopedToken({ scope: "agent:read" }, depsWith(fetchFn));
     } catch (e) {
       err = e;
     }

@@ -3,7 +3,7 @@
 # Parachute — FULL-tier cloud-init (Phase 1, sandboxed agent sessions)
 # ---------------------------------------------------------------------------
 # Provider-agnostic VPS user-data. Boots a fresh Ubuntu/Debian Linux box into a
-# working full-tier Parachute install: the hub + the channel module + everything
+# working full-tier Parachute install: the hub + the agent module + everything
 # the sandboxed-agent-session path needs (bun, the `claude` CLI, the Anthropic
 # sandbox-runtime, tmux, bubblewrap, ripgrep, socat). On first boot it starts the
 # hub and prints the one-time admin bootstrap token + the /admin/setup URL to the
@@ -132,21 +132,21 @@ write_files:
       log "parachute: $(parachute --version 2>/dev/null || echo '(installed)')"
 
       # ----------------------------------------------------------------------
-      # 3. The channel module (the agent-session gateway) — installed globally so
-      #    the `parachute-channel` binary is on PATH for the hub supervisor to
-      #    resolve via Bun.which. (module.json startCmd = ["parachute-channel"].)
+      # 3. The agent module (the agent-session gateway) — installed globally so
+      #    the `parachute-agent` binary is on PATH for the hub supervisor to
+      #    resolve via Bun.which. (module.json startCmd = ["parachute-agent"].)
       # ----------------------------------------------------------------------
-      if ! command -v parachute-channel >/dev/null 2>&1; then
-        log "installing @openparachute/channel"
-        bun add -g @openparachute/channel
+      if ! command -v parachute-agent >/dev/null 2>&1; then
+        log "installing @openparachute/agent"
+        bun add -g @openparachute/agent
       fi
 
       # ----------------------------------------------------------------------
       # 4. The Anthropic sandbox-runtime (the isolation engine) + the `claude`
       #    CLI (what each resident session runs). Both global so they're on PATH.
-      #    sandbox-runtime is pinned EXACT in the channel module's package.json;
+      #    sandbox-runtime is pinned EXACT in the agent module's package.json;
       #    here we install the same family globally so `srt` is present for any
-      #    out-of-process sandbox smoke. The channel module library-links its own
+      #    out-of-process sandbox smoke. The agent module library-links its own
       #    pinned copy at runtime (it never PATH-resolves the engine).
       # ----------------------------------------------------------------------
       if ! command -v claude >/dev/null 2>&1; then
@@ -251,8 +251,8 @@ write_files:
       echo "        ssh -L 1939:127.0.0.1:1939 parachute@<this-box-ip>" | tee /dev/console
       echo "     then open http://127.0.0.1:1939/admin/setup and paste the token." | tee /dev/console
       echo "" | tee /dev/console
-      echo " After setup: install the Channel module + create agent sessions" | tee /dev/console
-      echo " from the admin UI (or `parachute install channel`)." | tee /dev/console
+      echo " After setup: install the Agent module + create agent sessions" | tee /dev/console
+      echo " from the admin UI (or `parachute install agent`)." | tee /dev/console
       echo "==================================================================" | tee /dev/console
 
       log "bootstrap script finished"

@@ -8,13 +8,13 @@ function tmp(): string {
   return join(mkdtempSync(join(tmpdir(), "pc-manifest-")), "services.json");
 }
 
-const CHANNEL: ServiceEntry = {
-  name: "parachute-channel",
+const AGENT: ServiceEntry = {
+  name: "parachute-agent",
   port: 1941,
-  paths: ["/channel"],
+  paths: ["/agent"],
   health: "/health",
   version: "0.1.0",
-  displayName: "Channel",
+  displayName: "Agent",
   stripPrefix: true,
 };
 
@@ -30,25 +30,25 @@ describe("resolveManifestPath", () => {
 describe("upsertService", () => {
   test("creates the manifest with the entry on first write", () => {
     const path = tmp();
-    upsertService(CHANNEL, path);
+    upsertService(AGENT, path);
     const m = JSON.parse(readFileSync(path, "utf8"));
     expect(m.services).toHaveLength(1);
-    expect(m.services[0].name).toBe("parachute-channel");
-    expect(m.services[0].paths).toEqual(["/channel"]);
+    expect(m.services[0].name).toBe("parachute-agent");
+    expect(m.services[0].paths).toEqual(["/agent"]);
     expect(m.services[0].stripPrefix).toBe(true);
   });
 
-  test("carries startCmd so the hub supervisor can start/restart/adopt the module (channel#34)", () => {
+  test("carries startCmd so the hub supervisor can start/restart/adopt the module (agent#34)", () => {
     const path = tmp();
-    upsertService({ ...CHANNEL, startCmd: ["parachute-channel"] }, path);
+    upsertService({ ...AGENT, startCmd: ["parachute-agent"] }, path);
     const m = JSON.parse(readFileSync(path, "utf8"));
-    expect(m.services[0].startCmd).toEqual(["parachute-channel"]);
+    expect(m.services[0].startCmd).toEqual(["parachute-agent"]);
   });
 
   test("is idempotent — re-registering the same name does not duplicate", () => {
     const path = tmp();
-    upsertService(CHANNEL, path);
-    upsertService({ ...CHANNEL, version: "0.1.1" }, path);
+    upsertService(AGENT, path);
+    upsertService({ ...AGENT, version: "0.1.1" }, path);
     const m = JSON.parse(readFileSync(path, "utf8"));
     expect(m.services).toHaveLength(1);
     expect(m.services[0].version).toBe("0.1.1"); // module wins for fields it owns
@@ -57,8 +57,8 @@ describe("upsertService", () => {
   test("merges — preserves hub-stamped fields the module doesn't author", () => {
     const path = tmp();
     // hub stamped installDir onto the row; module re-registers without it.
-    writeFileSync(path, JSON.stringify({ services: [{ ...CHANNEL, installDir: "/hub/stamped" }] }));
-    upsertService(CHANNEL, path);
+    writeFileSync(path, JSON.stringify({ services: [{ ...AGENT, installDir: "/hub/stamped" }] }));
+    upsertService(AGENT, path);
     const m = JSON.parse(readFileSync(path, "utf8"));
     expect(m.services[0].installDir).toBe("/hub/stamped");
   });
@@ -66,16 +66,16 @@ describe("upsertService", () => {
   test("preserves other modules' entries", () => {
     const path = tmp();
     writeFileSync(path, JSON.stringify({ services: [{ name: "parachute-vault", port: 1940, paths: ["/vault/default"], health: "/vault/default/health", version: "0.5.2" }] }));
-    upsertService(CHANNEL, path);
+    upsertService(AGENT, path);
     const m = JSON.parse(readFileSync(path, "utf8"));
     expect(m.services).toHaveLength(2);
-    expect(m.services.map((s: ServiceEntry) => s.name).sort()).toEqual(["parachute-channel", "parachute-vault"]);
+    expect(m.services.map((s: ServiceEntry) => s.name).sort()).toEqual(["parachute-agent", "parachute-vault"]);
   });
 
   test("throws on a malformed manifest rather than clobbering it", () => {
     const path = tmp();
     writeFileSync(path, JSON.stringify({ not_services: true }));
-    expect(() => upsertService(CHANNEL, path)).toThrow(/malformed/);
+    expect(() => upsertService(AGENT, path)).toThrow(/malformed/);
     expect(existsSync(path)).toBe(true); // original left intact
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ not_services: true }); // content untouched
   });
@@ -86,7 +86,7 @@ describe("listVaultNames", () => {
     const path = tmp();
     writeFileSync(path, JSON.stringify({ services: [
       { name: "parachute-vault", port: 1940, paths: ["/vault/boulder", "/vault/default", "/vault/techne"], health: "x", version: "1" },
-      { name: "parachute-channel", port: 1941, paths: ["/channel"], health: "x", version: "1" },
+      { name: "parachute-agent", port: 1941, paths: ["/agent"], health: "x", version: "1" },
     ] }));
     expect(listVaultNames(path)).toEqual(["default", "boulder", "techne"]);
   });

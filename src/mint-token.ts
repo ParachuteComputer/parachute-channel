@@ -2,7 +2,7 @@
  * Scoped-token minting for a sandboxed agent session (design §4.2 step 1, §4.3).
  *
  * A hub-issued JWT's `aud` is single-valued, so each resource an arm reaches gets
- * its OWN token: `channel:read channel:write` per channel, `vault:<name>:<verb>`
+ * its OWN token: `agent:read agent:write` per channel, `vault:<name>:<verb>`
  * (optionally tag-scoped via `permissions.scoped_tags`) for the vault. The
  * spawn-manager mints these by attenuating its own grant — it presents its OWN
  * operator bearer to the hub's `POST /api/auth/mint-token`, which enforces
@@ -19,14 +19,14 @@
  */
 
 export interface MintRequest {
-  /** Space-joined scope string, e.g. "channel:read channel:write". */
+  /** Space-joined scope string, e.g. "agent:read agent:write". */
   scope: string;
   /** Pin the audience. Omitted = hub infers it from the scope. */
   audience?: string;
   /** TTL in seconds. Omitted = hub default (~90d non-ephemeral). */
   expiresIn?: number;
   /**
-   * Extra JWT claims, e.g. `{ scoped_tags: ["#channel-message"] }` for a
+   * Extra JWT claims, e.g. `{ scoped_tags: ["#agent-message"] }` for a
    * tag-scoped vault token. Passed through as the mint API's `permissions`.
    */
   permissions?: Record<string, unknown>;
@@ -128,9 +128,9 @@ export async function mintScopedToken(
   };
 }
 
-/** Build the space-joined channel scope string for a read[+write] grant. */
-export function channelScope(opts: { write: boolean }): string {
-  return opts.write ? "channel:read channel:write" : "channel:read";
+/** Build the space-joined agent scope string for a read[+write] grant. */
+export function agentScope(opts: { write: boolean }): string {
+  return opts.write ? "agent:read agent:write" : "agent:read";
 }
 
 /** Build the vault scope string for a named verb, e.g. `vault:default:read`. */

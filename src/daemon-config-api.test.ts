@@ -4,14 +4,15 @@
  *
  * These cover the THREE new surfaces, all on the real daemon fetch handler:
  *
- *  A. Webhook JWT auth on POST /api/vault/inbound — a hub JWT (aud:channel,
- *     scope channel:send) is accepted and routes the note; the DEPRECATED
+ *  A. Webhook JWT auth on POST /api/vault/inbound — a hub JWT (aud:agent,
+ *     scope agent:send) is accepted and routes the note; the DEPRECATED
  *     ?secret= fallback still works; neither → 401; an insufficient scope → 401.
- *  B. Config-management API (channel:admin) — POST writes channels.json (600
+ *     A legacy aud:channel / channel:send token is ALSO accepted (dual-accept).
+ *  B. Config-management API (agent:admin) — POST writes channels.json (600
  *     perms) + hot-adds the channel live (a subsequent inbound routes without a
  *     restart); GET never leaks token/secret; DELETE removes from file + stops
  *     routing; other scopes → 403.
- *  C. CHANNEL_VAULT_TRIGGER_TEMPLATE is exposed via /.parachute/config.
+ *  C. AGENT_VAULT_TRIGGER_TEMPLATE is exposed via /.parachute/config.
  *
  * The hub JWT validator is stubbed (sentinel tokens → fixed scope sets) so the
  * accept paths run without a live hub/JWKS. The no-token reject still hits the
@@ -26,16 +27,26 @@ import { tmpdir } from "os";
 // hub-jwt.test.ts's assertions on the genuine HubJwtError(code, message) shape.
 import { HubJwtError, looksLikeJwt } from "@openparachute/scope-guard";
 
-const SEND_TOKEN = "test-send-token"; // channel:send (the trigger token)
-const ADMIN_TOKEN = "test-admin-token"; // channel:admin (config-mgmt)
-const READ_TOKEN = "test-read-token"; // channel:read only (insufficient)
+const SEND_TOKEN = "test-send-token"; // agent:send (the trigger token)
+const ADMIN_TOKEN = "test-admin-token"; // agent:admin (config-mgmt)
+const READ_TOKEN = "test-read-token"; // agent:read only (insufficient)
+// A pre-rename token: aud "channel" + the legacy channel:send scope. It must
+// STILL authorize the agent:send-gated webhook via requireScope's dual-accept.
+const LEGACY_SEND_TOKEN = "test-legacy-send-token";
 mock.module("./hub-jwt.ts", () => ({
+  // NEW canonical audience + the deprecated alias kept so nothing breaks.
+  AGENT_AUDIENCE: "agent",
   CHANNEL_AUDIENCE: "channel",
   async validateHubJwt(token: string) {
-    const base = { sub: "test", aud: "channel", jti: undefined, clientId: undefined, vaultScope: undefined };
-    if (token === SEND_TOKEN) return { ...base, scopes: ["channel:send"] };
-    if (token === ADMIN_TOKEN) return { ...base, scopes: ["channel:admin"] };
-    if (token === READ_TOKEN) return { ...base, scopes: ["channel:read"] };
+    // NEW-style tokens: aud "agent", agent:* scopes.
+    const base = { sub: "test", aud: "agent", jti: undefined, clientId: undefined, vaultScope: undefined };
+    if (token === SEND_TOKEN) return { ...base, scopes: ["agent:send"] };
+    if (token === ADMIN_TOKEN) return { ...base, scopes: ["agent:admin"] };
+    if (token === READ_TOKEN) return { ...base, scopes: ["agent:read"] };
+    // LEGACY token: aud "channel" + channel:send — the dual-accept path.
+    if (token === LEGACY_SEND_TOKEN) {
+      return { sub: "test", aud: "channel", jti: undefined, clientId: undefined, vaultScope: undefined, scopes: ["channel:send"] };
+    }
     throw new HubJwtError("issuer", "invalid token");
   },
   HubJwtError,
@@ -46,7 +57,7 @@ mock.module("./hub-jwt.ts", () => ({
 
 import { createFetchHandler } from "./daemon.ts";
 import { ClientRegistry } from "./routing.ts";
-import { VaultTransport, CHANNEL_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
+import { VaultTransport, AGENT_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 import { channelsFilePath } from "./registry.ts";
 import type { Channel } from "./registry.ts";
 import {
@@ -60,17 +71,18 @@ import type { TransportContext, InboundMessage } from "./transport.ts";
 const sendAuth = { authorization: "Bearer " + SEND_TOKEN } as const;
 const adminAuth = { authorization: "Bearer " + ADMIN_TOKEN } as const;
 const readAuth = { authorization: "Bearer " + READ_TOKEN } as const;
+const legacySendAuth = { authorization: "Bearer " + LEGACY_SEND_TOKEN } as const;
 
 let stateDir: string;
 
 beforeEach(() => {
   // Sandbox channels.json under a throwaway state dir — the config API resolves
-  // STATE_DIR from PARACHUTE_CHANNEL_STATE_DIR (read once at daemon module load),
+  // STATE_DIR from PARACHUTE_AGENT_STATE_DIR (read once at daemon module load),
   // so set it BEFORE importing... but the module is already imported. Instead the
   // daemon's STATE_DIR is captured at module init; we set the env to a temp dir
   // and the tests that touch the file assert under that path. Re-resolve per test.
-  stateDir = mkdtempSync(join(tmpdir(), "channel-cfg-"));
-  process.env.PARACHUTE_CHANNEL_STATE_DIR = stateDir;
+  stateDir = mkdtempSync(join(tmpdir(), "agent-cfg-"));
+  process.env.PARACHUTE_AGENT_STATE_DIR = stateDir;
 });
 
 afterEach(() => {
@@ -118,7 +130,7 @@ function inboundBody(noteId: string, channel = "eng") {
       id: noteId,
       path: `channel/${channel}/${noteId}`,
       content: "wake up session",
-      tags: ["#channel-message", "#channel-message/inbound"],
+      tags: ["#agent-message", "#agent-message/inbound"],
       metadata: { channel, direction: "inbound", sender: "aaron" },
     },
   });
@@ -127,8 +139,8 @@ function inboundBody(noteId: string, channel = "eng") {
 // ===========================================================================
 // A. Webhook JWT auth on POST /api/vault/inbound
 // ===========================================================================
-describe("A — webhook hub-JWT auth (channel:send), secret fallback retained", () => {
-  test("valid channel:send JWT → 200 + routes the note (emits)", async () => {
+describe("A — webhook hub-JWT auth (agent:send), secret fallback retained", () => {
+  test("valid agent:send JWT → 200 + routes the note (emits)", async () => {
     const { srv, base, emitted } = buildServer();
     try {
       const res = await fetch(`${base}/api/vault/inbound`, {
@@ -146,7 +158,30 @@ describe("A — webhook hub-JWT auth (channel:send), secret fallback retained", 
     }
   });
 
-  test("a channel:read-only JWT → 401 (uniform on the webhook — no scope/channel probing), no emit", async () => {
+  test("DUAL-ACCEPT: a LEGACY channel:send JWT (aud:channel) STILL authorizes the agent:send-gated webhook → 200 + emits", async () => {
+    // requireScope dual-accepts a pre-rename `channel:<verb>` scope for the
+    // matching `agent:<verb>` gate, and validateHubJwt accepts aud "channel" in
+    // addition to "agent". So a token minted before the channel→agent rename
+    // (aud "channel", scope "channel:send") must keep routing inbound notes
+    // until it's re-minted — no flag-day for live triggers.
+    const { srv, base, emitted } = buildServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...legacySendAuth },
+        body: inboundBody("legacy-1"),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.channel).toBe("eng");
+      expect(emitted[0]!.meta.note_id).toBe("legacy-1");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("an agent:read-only JWT → 401 (uniform on the webhook — no scope/channel probing), no emit", async () => {
     // The webhook collapses insufficient-scope to a uniform 401 (unlike the
     // operator-facing config API, which returns 403). This tailnet-reachable
     // endpoint stays opaque to scope/channel enumeration.
@@ -213,7 +248,7 @@ describe("A — webhook hub-JWT auth (channel:send), secret fallback retained", 
     }
   });
 
-  test("M2 — a JWT-only channel (NO webhookSecret) accepts a valid channel:send JWT → 200 + emits", async () => {
+  test("M2 — a JWT-only channel (NO webhookSecret) accepts a valid agent:send JWT → 200 + emits", async () => {
     const { srv, base, emitted } = buildServer([{ name: "eng", secret: null }]);
     try {
       const res = await fetch(`${base}/api/vault/inbound`, {
@@ -292,10 +327,10 @@ describe("A — webhook hub-JWT auth (channel:send), secret fallback retained", 
 });
 
 // ===========================================================================
-// B. Config-management API (channel:admin)
+// B. Config-management API (agent:admin)
 // ===========================================================================
-describe("B — config-management API (channel:admin)", () => {
-  test("POST without channel:admin → 403 (other scope) / 401 (none)", async () => {
+describe("B — config-management API (agent:admin)", () => {
+  test("POST without agent:admin → 403 (other scope) / 401 (none)", async () => {
     const { srv, base } = buildServer([]);
     try {
       const none = await fetch(`${base}/api/channels`, {
@@ -358,7 +393,7 @@ describe("B — config-management API (channel:admin)", () => {
       });
       expect(inbound.status).toBe(200);
 
-      // HOT-ADD proof #3 (nit): a JWT-authenticated inbound (channel:send) also
+      // HOT-ADD proof #3 (nit): a JWT-authenticated inbound (agent:send) also
       // routes on the freshly hot-added channel — the JWT path is live too, not
       // just the secret fallback.
       const jwtInbound = await fetch(`${base}/api/vault/inbound`, {
@@ -492,7 +527,7 @@ describe("B — config-management API (channel:admin)", () => {
     }
   });
 
-  test("GET without channel:admin → 401 (none) / 403 (wrong scope)", async () => {
+  test("GET without agent:admin → 401 (none) / 403 (wrong scope)", async () => {
     const { srv, base } = buildServer([]);
     try {
       expect((await fetch(`${base}/api/channels`)).status).toBe(401);
@@ -534,7 +569,7 @@ describe("B — config-management API (channel:admin)", () => {
     }
   });
 
-  test("DELETE without channel:admin → 401/403", async () => {
+  test("DELETE without agent:admin → 401/403", async () => {
     const { srv, base } = buildServer([{ name: "eng" }]);
     try {
       expect((await fetch(`${base}/api/channels/eng`, { method: "DELETE" })).status).toBe(401);
@@ -548,18 +583,21 @@ describe("B — config-management API (channel:admin)", () => {
 // ===========================================================================
 // C. Prescribed trigger template exposed via /.parachute/config
 // ===========================================================================
-describe("C — CHANNEL_VAULT_TRIGGER_TEMPLATE exposed via /.parachute/config", () => {
+describe("C — AGENT_VAULT_TRIGGER_TEMPLATE exposed via /.parachute/config", () => {
   test("GET /.parachute/config carries triggerTemplate (the module-owned trigger shape)", async () => {
     const { srv, base } = buildServer([{ name: "eng" }]);
     try {
       const res = await fetch(`${base}/.parachute/config`);
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { channels: unknown[]; triggerTemplate: typeof CHANNEL_VAULT_TRIGGER_TEMPLATE };
-      expect(body.triggerTemplate).toEqual(CHANNEL_VAULT_TRIGGER_TEMPLATE);
+      const body = (await res.json()) as { channels: unknown[]; triggerTemplate: typeof AGENT_VAULT_TRIGGER_TEMPLATE };
+      expect(body.triggerTemplate).toEqual(AGENT_VAULT_TRIGGER_TEMPLATE);
       // Sanity on the shape the hub depends on (placeholders + webhook path).
+      // The trigger NAME stays `channel_inbound_<channel>` — `channel` is the
+      // domain routing key, not the module identity. The TAG moved to
+      // #agent-message and the webhook moved to the /agent mount.
       expect(body.triggerTemplate.name).toBe("channel_inbound_<channel>");
-      expect(body.triggerTemplate.when.tags).toEqual(["#channel-message/inbound"]);
-      expect(body.triggerTemplate.action.webhook).toBe("<hub-origin>/channel/api/vault/inbound");
+      expect(body.triggerTemplate.when.tags).toEqual(["#agent-message/inbound"]);
+      expect(body.triggerTemplate.action.webhook).toBe("<hub-origin>/agent/api/vault/inbound");
     } finally {
       srv.stop(true);
     }
@@ -567,9 +605,9 @@ describe("C — CHANNEL_VAULT_TRIGGER_TEMPLATE exposed via /.parachute/config", 
 });
 
 // ===========================================================================
-// D. Claude OAuth credential store API (channel:admin) — design §6
+// D. Claude OAuth credential store API (agent:admin) — design §6
 // ===========================================================================
-describe("D — Claude credential store API (channel:admin)", () => {
+describe("D — Claude credential store API (agent:admin)", () => {
   test("POST /api/credentials/claude sets the default; persisted 0600; resolve returns it", async () => {
     const { srv, base } = buildServer([]);
     try {
@@ -688,7 +726,7 @@ describe("D — Claude credential store API (channel:admin)", () => {
     }
   });
 
-  test("credential API without channel:admin → 401 (none) / 403 (wrong scope), on every verb", async () => {
+  test("credential API without agent:admin → 401 (none) / 403 (wrong scope), on every verb", async () => {
     const { srv, base } = buildServer([]);
     try {
       // GET default
@@ -738,9 +776,9 @@ describe("D — Claude credential store API (channel:admin)", () => {
 });
 
 // ===========================================================================
-// E. Generic per-channel ENV-VAR store API (channel:admin)
+// E. Generic per-channel ENV-VAR store API (agent:admin)
 // ===========================================================================
-describe("E — per-channel env-var store API (channel:admin)", () => {
+describe("E — per-channel env-var store API (agent:admin)", () => {
   test("POST /api/credentials/env sets a default var; 0600; resolves for any channel", async () => {
     const { srv, base } = buildServer([]);
     try {
@@ -886,7 +924,7 @@ describe("E — per-channel env-var store API (channel:admin)", () => {
     }
   });
 
-  test("env API without channel:admin → 401 (none) / 403 (wrong scope), on every verb", async () => {
+  test("env API without agent:admin → 401 (none) / 403 (wrong scope), on every verb", async () => {
     const { srv, base } = buildServer([]);
     try {
       expect((await fetch(`${base}/api/credentials/env`)).status).toBe(401);

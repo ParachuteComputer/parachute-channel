@@ -2,15 +2,15 @@
  * Vault-backed chat — daemon route tests for the read/send the built-in chat uses
  * against a VAULT-transport channel (Phase 4).
  *
- *   - GET  /api/channels/<ch>/messages  (gate channel:read) →
+ *   - GET  /api/channels/<ch>/messages  (gate agent:read) →
  *       vault   → loadTranscript() → { messages }
  *       http-ui → { messages: [] }  (ephemeral transport, no durable store)
  *       unknown → 404
- *   - POST /api/channels/<ch>/send      (gate channel:send) →
+ *   - POST /api/channels/<ch>/send      (gate agent:send) →
  *       vault   → writeInbound(text, "operator") → { ok, id }   (the WAKE path)
  *
  * Auth: the same sentinel-token `mock.module("./hub-jwt.ts")` harness the other
- * daemon tests use — a `Bearer test-rw-token` validates with channel:read + send
+ * daemon tests use — a `Bearer test-rw-token` validates with agent:read + send
  * WITHOUT a live hub/JWKS; the no-token path still hits the real 401 short-circuit.
  *
  * The vault I/O is exercised through a REAL `VaultTransport` instance (the daemon
@@ -20,13 +20,14 @@
  */
 import { describe, test, expect, mock } from "bun:test";
 
-const RW_TOKEN = "test-rw-token"; // channel:read + channel:send
+const RW_TOKEN = "test-rw-token"; // agent:read + agent:send
 import { HubJwtError, looksLikeJwt } from "@openparachute/scope-guard";
 mock.module("./hub-jwt.ts", () => ({
+  AGENT_AUDIENCE: "agent",
   CHANNEL_AUDIENCE: "channel",
   async validateHubJwt(token: string) {
-    const base = { sub: "test", aud: "channel", jti: undefined, clientId: undefined, vaultScope: undefined };
-    if (token === RW_TOKEN) return { ...base, scopes: ["channel:read", "channel:send"] };
+    const base = { sub: "test", aud: "agent", jti: undefined, clientId: undefined, vaultScope: undefined };
+    if (token === RW_TOKEN) return { ...base, scopes: ["agent:read", "agent:send"] };
     throw new HubJwtError("issuer", "invalid token");
   },
   HubJwtError,

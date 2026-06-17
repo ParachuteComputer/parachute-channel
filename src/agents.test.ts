@@ -8,7 +8,7 @@
  *      `redactSpawnResult` (proves token values never leak).
  *   2. `createRealAgentOps` list/kill with an injected `TmuxAdmin` recorder.
  *   3. The daemon routes through the REAL fetch handler, with `validateHubJwt`
- *      mocked (so a known token carries `channel:admin`) and a STUB `AgentOps`
+ *      mocked (so a known token carries `agent:admin`) and a STUB `AgentOps`
  *      injected — verifying the gate, the body→spec→spawn wiring, the redaction,
  *      and every error→status mapping, without a hub, a sandbox, or tmux.
  */
@@ -19,14 +19,15 @@ import { describe, test, expect, mock, afterEach } from "bun:test";
 // (same discipline daemon-config-api.test.ts keeps).
 import { HubJwtError, looksLikeJwt } from "@openparachute/scope-guard";
 
-const ADMIN_TOKEN = "test-admin-token"; // channel:admin (the operator gate)
-const READ_TOKEN = "test-read-token"; // channel:read only (insufficient)
+const ADMIN_TOKEN = "test-admin-token"; // agent:admin (the operator gate)
+const READ_TOKEN = "test-read-token"; // agent:read only (insufficient)
 mock.module("./hub-jwt.ts", () => ({
+  AGENT_AUDIENCE: "agent",
   CHANNEL_AUDIENCE: "channel",
   async validateHubJwt(token: string) {
-    const base = { sub: "test", aud: "channel", jti: undefined, clientId: undefined, vaultScope: undefined };
-    if (token === ADMIN_TOKEN) return { ...base, scopes: ["channel:read", "channel:send", "channel:admin"] };
-    if (token === READ_TOKEN) return { ...base, scopes: ["channel:read"] };
+    const base = { sub: "test", aud: "agent", jti: undefined, clientId: undefined, vaultScope: undefined };
+    if (token === ADMIN_TOKEN) return { ...base, scopes: ["agent:read", "agent:send", "agent:admin"] };
+    if (token === READ_TOKEN) return { ...base, scopes: ["agent:read"] };
     throw new HubJwtError("issuer", "invalid token");
   },
   HubJwtError,
@@ -179,12 +180,12 @@ describe("buildSpecFromBody", () => {
     const spec = buildSpecFromBody({
       name: "weaver",
       channels: [{ name: "weave", access: "read" }, { name: "out" }],
-      vault: { name: "default", access: "read", tags: ["#channel-message", " "] },
+      vault: { name: "default", access: "read", tags: ["#agent-message", " "] },
       egress: ["registry.npmjs.org", "  "],
       mounts: [{ hostPath: "/data", mountPath: "/data", mode: "ro", shared: "corpus" }],
     });
     expect(spec.channels).toEqual([{ name: "weave", access: "read" }, { name: "out" }]);
-    expect(spec.vault).toEqual({ name: "default", access: "read", tags: ["#channel-message"] });
+    expect(spec.vault).toEqual({ name: "default", access: "read", tags: ["#agent-message"] });
     expect(spec.egress).toEqual(["registry.npmjs.org"]); // blank trimmed out
     expect(spec.mounts).toEqual([{ hostPath: "/data", mountPath: "/data", mode: "ro", shared: "corpus" }]);
   });
@@ -356,10 +357,10 @@ describe("redactSpawnResult", () => {
     workspace: "/s/aaron",
     alreadyRunning: false,
     tokens: {
-      aaron: { jti: "j1", token: "SECRET-CHANNEL-TOKEN", expiresAt: "2026-07-01T00:00:00Z", scope: "channel:read channel:write" },
+      aaron: { jti: "j1", token: "SECRET-AGENT-TOKEN", expiresAt: "2026-07-01T00:00:00Z", scope: "agent:read agent:write" },
       "vault:default": { jti: "j2", token: "SECRET-VAULT-TOKEN", expiresAt: "2026-07-01T00:00:00Z", scope: "vault:default:read" },
     },
-    mcpConfigJson: JSON.stringify({ mcpServers: { "channel-aaron": {}, "vault-default": {} } }),
+    mcpConfigJson: JSON.stringify({ mcpServers: { "agent-aaron": {}, "vault-default": {} } }),
     wrapped: {
       argv: ["/bin/bash", "-c", "..."],
       env: {},
@@ -371,16 +372,16 @@ describe("redactSpawnResult", () => {
     const red = redactSpawnResult(result);
     expect(red.session).toBe("aaron-agent");
     expect(red.tokens).toEqual([
-      { resource: "aaron", scope: "channel:read channel:write", expiresAt: "2026-07-01T00:00:00Z" },
+      { resource: "aaron", scope: "agent:read agent:write", expiresAt: "2026-07-01T00:00:00Z" },
       { resource: "vault:default", scope: "vault:default:read", expiresAt: "2026-07-01T00:00:00Z" },
     ]);
-    expect(red.mcpServers).toEqual(["channel-aaron", "vault-default"]);
+    expect(red.mcpServers).toEqual(["agent-aaron", "vault-default"]);
     expect(red.egress).toEqual(["api.anthropic.com:443"]);
     expect(red.network).toBe("restricted"); // allowedDomains present → restricted
     expect(red.filesystem).toBe("workspace"); // home-tree denyRead present → scoped
     // The smoking gun: no token VALUE appears anywhere in the serialized result.
     const wire = JSON.stringify(red);
-    expect(wire).not.toContain("SECRET-CHANNEL-TOKEN");
+    expect(wire).not.toContain("SECRET-AGENT-TOKEN");
     expect(wire).not.toContain("SECRET-VAULT-TOKEN");
   });
   test("an open result (no allowedDomains, no denyRead) → network 'open' + filesystem 'full', egress []", () => {
@@ -612,7 +613,7 @@ describe("GET /agents — the unified create-agent page (loads open)", () => {
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/html");
       const html = await res.text();
-      expect(html).toContain("parachute-channel");
+      expect(html).toContain("parachute-agent");
       // Phase-1 consolidation: the page leads with the unified "Create an agent"
       // flow (fuses create-channel + spawn-agent).
       expect(html).toContain("Create an agent");
@@ -702,7 +703,7 @@ describe("GET /agents — the unified create-agent page (loads open)", () => {
   });
 });
 
-describe("/api/agents — operator-gated on channel:admin", () => {
+describe("/api/agents — operator-gated on agent:admin", () => {
   test("GET with no token → 401", async () => {
     const { srv, base } = buildServer();
     try {
@@ -713,7 +714,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
     }
   });
 
-  test("GET with channel:read (insufficient) → 403", async () => {
+  test("GET with agent:read (insufficient) → 403", async () => {
     const { srv, base } = buildServer();
     try {
       const res = await fetch(`${base}/api/agents`, { headers: readAuth });
@@ -723,7 +724,7 @@ describe("/api/agents — operator-gated on channel:admin", () => {
     }
   });
 
-  test("GET with channel:admin → 200 + the agent list", async () => {
+  test("GET with agent:admin → 200 + the agent list", async () => {
     const { srv, base } = buildServer({
       async list() {
         return [
@@ -804,8 +805,8 @@ describe("/api/agents — operator-gated on channel:admin", () => {
           session: spec.name + "-agent",
           workspace: "/s/" + spec.name,
           alreadyRunning: false,
-          tokens: { [spec.name]: { jti: "j", token: "LEAKME", expiresAt: "2026-07-01T00:00:00Z", scope: "channel:read channel:write" } },
-          mcpConfigJson: JSON.stringify({ mcpServers: { ["channel-" + spec.name]: {} } }),
+          tokens: { [spec.name]: { jti: "j", token: "LEAKME", expiresAt: "2026-07-01T00:00:00Z", scope: "agent:read agent:write" } },
+          mcpConfigJson: JSON.stringify({ mcpServers: { ["agent-" + spec.name]: {} } }),
           wrapped: {
             argv: [],
             env: {},
@@ -827,8 +828,8 @@ describe("/api/agents — operator-gated on channel:admin", () => {
       expect(text).not.toContain("LEAKME");
       const body = JSON.parse(text) as { session: string; tokens: { scope: string }[]; mcpServers: string[] };
       expect(body.session).toBe("aaron-agent");
-      expect(body.tokens[0]!.scope).toBe("channel:read channel:write");
-      expect(body.mcpServers).toEqual(["channel-aaron"]);
+      expect(body.tokens[0]!.scope).toBe("agent:read agent:write");
+      expect(body.mcpServers).toEqual(["agent-aaron"]);
     } finally {
       srv.stop(true);
     }
@@ -953,7 +954,7 @@ describe("DELETE /api/agents/:name", () => {
     }
   });
 
-  test("channel:read (insufficient) → 403 (kill never called)", async () => {
+  test("agent:read (insufficient) → 403 (kill never called)", async () => {
     let killed = false;
     const { srv, base } = buildServer({
       async kill() {
@@ -1002,15 +1003,15 @@ describe("DELETE /api/agents/:name", () => {
   });
 });
 
-describe("POST /api/agents/:name/restart — per-session restart (channel:admin)", () => {
+describe("POST /api/agents/:name/restart — per-session restart (agent:admin)", () => {
   function restartResult(name: string, killed: boolean) {
     return {
       session: name + "-agent",
       workspace: "/s/" + name,
       alreadyRunning: false,
       killed,
-      tokens: [{ resource: name, scope: "channel:read channel:write", expiresAt: "2026-07-01T00:00:00Z" }],
-      mcpServers: ["channel-" + name],
+      tokens: [{ resource: name, scope: "agent:read agent:write", expiresAt: "2026-07-01T00:00:00Z" }],
+      mcpServers: ["agent-" + name],
       filesystem: "workspace" as const,
       network: "open" as const,
       egress: [],
@@ -1034,7 +1035,7 @@ describe("POST /api/agents/:name/restart — per-session restart (channel:admin)
     }
   });
 
-  test("channel:read (insufficient) → 403 (restart never called)", async () => {
+  test("agent:read (insufficient) → 403 (restart never called)", async () => {
     let restarted = false;
     const { srv, base } = buildServer({
       async restart() {
@@ -1064,7 +1065,7 @@ describe("POST /api/agents/:name/restart — per-session restart (channel:admin)
       const body = (await res.json()) as { session: string; killed: boolean; mcpServers: string[] };
       expect(body.session).toBe("aaron-agent");
       expect(body.killed).toBe(true);
-      expect(body.mcpServers).toEqual(["channel-aaron"]);
+      expect(body.mcpServers).toEqual(["agent-aaron"]);
     } finally {
       srv.stop(true);
     }

@@ -5,7 +5,7 @@ sessions** (sandboxed Claude Code sessions you chat with through a channel).
 
 | | **Lite** | **Full** |
 |---|---|---|
-| What runs | hub + vault + static surfaces | hub + vault + **channel + sandboxed agent sessions** |
+| What runs | hub + vault + static surfaces | hub + vault + **agent + sandboxed agent sessions** |
 | Where | Render / Fly (a single container) | your **desktop** today, or a **Linux VPS** via `cloud-init-full.yaml` |
 | Isolation engine | n/a (no sessions) | `@anthropic-ai/sandbox-runtime` — **Seatbelt** on macOS, **bubblewrap** on Linux |
 | Resources | 512MB is fine | ~8GB RAM (sessions are real `claude` processes) |
@@ -19,9 +19,9 @@ spawning `claude` under bubblewrap).
 
 **Full** is this directory. The primary artifact is a **provider-agnostic
 cloud-init** script that boots a fresh Ubuntu/Debian VPS into a working full-tier
-box: hub + channel + the sandbox toolchain (`bun`, the `claude` CLI,
+box: hub + agent + the sandbox toolchain (`bun`, the `claude` CLI,
 `@anthropic-ai/sandbox-runtime`, `tmux`, `bubblewrap`, `ripgrep`, `socat`). The
-desktop path is just "install the hub + channel locally" — `cloud-init-full.yaml`
+desktop path is just "install the hub + agent locally" — `cloud-init-full.yaml`
 is the same install, scripted for a headless box.
 
 > Design context: `design/2026-06-14-sandboxed-agent-sessions.md` §7. The
@@ -39,7 +39,7 @@ AWS EC2, or any generic cloud-init datasource. On first boot it:
 1. Patches the box, installs the apt deps (`tmux bubblewrap ripgrep socat git …`).
 2. Relaxes Ubuntu 24.04's `apparmor_restrict_unprivileged_userns` so bubblewrap
    can create capability-bearing user namespaces (no-op on older kernels).
-3. Installs `bun`, then `@openparachute/hub`, `@openparachute/channel`, the
+3. Installs `bun`, then `@openparachute/hub`, `@openparachute/agent`, the
    `claude` CLI, and `@anthropic-ai/sandbox-runtime` — all as a **non-root
    `parachute` user**.
 4. Runs `parachute init --expose none --no-expose-prompt --cli-wizard` (starts
@@ -68,7 +68,7 @@ read the console for the token → SSH in → `expose` → open `/admin/setup`.*
    (public HTTPS; needs a Cloudflare-managed domain) **or**
    `parachute expose tailnet` if you run Tailscale.
 6. Open the printed URL's `/admin/setup`, paste the token, create your admin
-   account. Then install/connect the Channel module and launch sessions.
+   account. Then install/connect the Agent module and launch sessions.
 
 #### Hetzner Cloud (cheapest in the EU)
 
@@ -158,7 +158,7 @@ path (no init/journald in a plain container). Run this once on a real VPS:
 # 3. SSH in and confirm the stack:
 ssh parachute@<box-ip>
 parachute status            # hub active; vault active
-command -v claude bwrap rg tmux parachute-channel   # all present
+command -v claude bwrap rg tmux parachute-agent   # all present
 # 4. Expose + finish setup:
 parachute expose cloudflare --domain <host>   # or: parachute expose tailnet
 #    open <url>/admin/setup, paste the token, create the admin account.

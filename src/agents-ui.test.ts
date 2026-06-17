@@ -151,8 +151,8 @@ describe("vocabulary + safety", () => {
     expect(html).not.toContain("Spawn an agent");
   });
 
-  test("the page still loads OPEN and mints a channel:admin Bearer", () => {
+  test("the page still loads OPEN and mints a agent:admin Bearer", () => {
     expect(html).toContain("fetchToken()");
-    expect(html).toContain("channel:admin token");
+    expect(html).toContain("agent:admin token");
   });
 });

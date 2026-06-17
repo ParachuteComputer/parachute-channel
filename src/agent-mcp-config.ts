@@ -21,7 +21,7 @@
 export interface ChannelMcpEntry {
   /** Channel name (the `/mcp/<channel>` segment + entry-key suffix). */
   channel: string;
-  /** Per-channel hub-issued token (aud: channel; channel:read[+write]). */
+  /** Per-channel hub-issued token (aud: agent; agent:read[+write]). */
   token: string;
 }
 
@@ -58,9 +58,10 @@ interface McpHttpServer {
   headers?: { Authorization: string };
 }
 
-/** Build the channel entry key — matches launch-session.sh's `channel-<name>`. */
+/** Build the channel entry key — matches launch-session.sh's `agent-<name>` and
+ *  the HTTP-MCP per-channel server name in `mcp-http.ts` (`agent-${channel}`). */
 export function channelEntryKey(channel: string): string {
-  return `channel-${channel}`;
+  return `agent-${channel}`;
 }
 
 /** Build the vault entry key — matches runner's `parachute-vault-<name>`. */

@@ -1,5 +1,5 @@
 /**
- * http-ui transport for parachute-channel.
+ * http-ui transport for parachute-agent.
  *
  * The freestanding "make sure message sending works" surface: a human talks to
  * a Claude Code session through a browser, with NO Telegram and NO vault.
@@ -138,8 +138,8 @@ export class HttpUiTransport implements Transport {
       req.method === "POST" &&
       url.pathname === `/api/channels/${channel}/send`
     ) {
-      // Layer 2 (human→UI): a hub-issued token with `channel:send`. The UI
-      // fetches it from the hub's /admin/channel-token (portal-cookie-gated) and
+      // Layer 2 (human→UI): a hub-issued token with `agent:send`. The UI
+      // fetches it from the hub's /admin/agent-token (portal-cookie-gated) and
       // attaches it as a Bearer header. No-token → 401 (short-circuits pre-JWKS).
       const denied = await requireScope(req, url, SCOPE_SEND);
       if (denied) return denied;
@@ -168,7 +168,7 @@ export class HttpUiTransport implements Transport {
       url.pathname === "/ui/events" &&
       url.searchParams.get("channel") === channel
     ) {
-      // Layer 2: gate on `channel:read`. EventSource can't set headers, so the
+      // Layer 2: gate on `agent:read`. EventSource can't set headers, so the
       // token rides in as a `?token=` query param — the ONLY endpoint that opts
       // into the query-param fallback (allowQueryParam: true). No-token → 401
       // before the stream opens.

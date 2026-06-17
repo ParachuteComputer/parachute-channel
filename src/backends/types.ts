@@ -17,10 +17,10 @@
  *     reconnect, no backlog to replay, no TUI gate to answer. `deliver` is a direct
  *     turn into a fresh `claude -p` invocation that resumes the channel's prior
  *     conversation (`--resume <session_id>`). The daemon turns the returned reply
- *     into an outbound `#channel-message/outbound` note (the wiring follow-up).
+ *     into an outbound `#agent-message/outbound` note (the wiring follow-up).
  *
  * Everything ABOVE this seam is backend-agnostic: the vault message transport
- * (`#channel-message/{inbound,outbound}`), the chat UI, the sandbox/isolation
+ * (`#agent-message/{inbound,outbound}`), the chat UI, the sandbox/isolation
  * envelope, and the per-channel env/credential injection. Only the
  * "drive-the-agent" layer differs.
  *
@@ -103,7 +103,7 @@ export interface DeliverUsage {
 /**
  * The result of delivering one message — a discriminated union so a failure is
  * always observable inline (never a silent drop). On success the daemon turns
- * `reply` into an outbound `#channel-message/outbound` note (the wiring follow-up).
+ * `reply` into an outbound `#agent-message/outbound` note (the wiring follow-up).
  */
 export type DeliverResult =
   | {

@@ -9,7 +9,7 @@
  *  - blank-ts advance is a no-op (we never mark to an empty ts).
  *
  * Each test points the store at a throwaway temp dir, so there's no shared global
- * state and no touch of the real `~/.parachute/channel/`.
+ * state and no touch of the real `~/.parachute/agent/`.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "fs";

@@ -3,7 +3,7 @@
  * (design §4). Given an agent spec:
  *
  *   1. Mint one scoped token PER resource via the hub mint API (attenuated to the
- *      manager's own bearer): `channel:read[+write]` per channel, `vault:<name>:<verb>`
+ *      manager's own bearer): `agent:read[+write]` per channel, `vault:<name>:<verb>`
  *      (optionally tag-scoped) for the vault — one token per `aud` (§4.2 step 1, §4.3).
  *   2. Build the multi-entry strict MCP config from those tokens (§4.2 step 2).
  *   3. Launch `claude` WRAPPED BY THE SANDBOX in a tmux session, with a scrubbed
@@ -34,13 +34,14 @@ import { Sandbox, type SandboxEngine, type WrappedCommand } from "./sandbox/inde
 import type { EgressBaseInput } from "./sandbox/egress.ts";
 import {
   buildAgentMcpConfigJson,
+  channelEntryKey,
   type ChannelMcpEntry,
   type VaultMcpEntry,
   type OtherMcpEntry,
 } from "./agent-mcp-config.ts";
 import {
   mintScopedToken,
-  channelScope,
+  agentScope,
   vaultScope,
   type MintTokenDeps,
   type MintResult,
@@ -165,7 +166,7 @@ export interface TmuxLauncher {
   hasSession(name: string): Promise<boolean>;
   /**
    * Auto-answer claude's `--dangerously-load-development-channels` consent gate
-   * once it appears in the session's pane (channel#70). A headless tmux spawn has
+   * once it appears in the session's pane (agent#70). A headless tmux spawn has
    * nobody at the keyboard, so the interactive "I am using this for local
    * development" prompt would hang the session forever and the MCP never connects.
    * We answer it by sending Enter to the pane. Returns the outcome; NEVER throws
@@ -182,7 +183,7 @@ export interface SpawnAgentDeps {
   channelUrl: string;
   /** Vault base URL (if the spec binds a vault). Defaults to hubOrigin. */
   vaultUrl?: string;
-  /** Base for session workspaces (e.g. `~/.parachute/channel/sessions`). */
+  /** Base for session workspaces (e.g. `~/.parachute/agent/sessions`). */
   sessionsDir: string;
   /**
    * Read-only runtime/config binds the sandbox always grants (the claude config
@@ -240,7 +241,7 @@ export interface SpawnAgentResult {
   /** Already-running? (idempotent no-op). */
   alreadyRunning: boolean;
   /**
-   * Outcome of auto-answering the dev-channels consent gate (channel#70):
+   * Outcome of auto-answering the dev-channels consent gate (agent#70):
    * `"confirmed"` (we sent Enter), `"already-running"` (claude was past the prompt),
    * or `"timeout"` (the prompt never appeared in the window — non-fatal). Absent on
    * the already-running idempotent no-op path (no launch happened).
@@ -386,7 +387,7 @@ export function buildAgentChildEnv(
     if (typeof v !== "string" || v.length === 0) continue;
     if (DENYLISTED_ENV.has(k)) {
       console.warn(
-        `parachute-channel: refusing to inject denylisted env var "${k}" from the channel env store ` +
+        `parachute-agent: refusing to inject denylisted env var "${k}" from the channel env store ` +
           `(it controls Claude auth/billing) — skipping. Remove it from credentials.json.`,
       );
       continue;
@@ -566,7 +567,7 @@ export function seedAgentHome(
  * SEPARATE `--dangerously-load-development-channels` consent gate ("I am using this
  * for local development"), which has no skip flag and which `--channels` (the
  * allowlist path) doesn't satisfy for custom `server:` channels. That gate is
- * auto-answered post-launch by `confirmDevChannelsPrompt` (channel#70), not here.
+ * auto-answered post-launch by `confirmDevChannelsPrompt` (agent#70), not here.
  *
  * SYSTEM PROMPT (design 2026-06-16-channel-system-prompt.md): for backend-parity
  * with the programmatic path, when the spec carries a `systemPrompt` the per-session
@@ -671,10 +672,10 @@ export async function spawnAgent(
   const channelEntries: ChannelMcpEntry[] = [];
   for (const rawChannel of spec.channels) {
     const { name: channel, access } = normalizeChannel(rawChannel);
-    // A read-only channel mints `channel:read` only — the arm is woken + reads
-    // but cannot reply; a write channel mints `channel:read channel:write`.
+    // A read-only channel mints `agent:read` only — the arm is woken + reads
+    // but cannot reply; a write channel mints `agent:read agent:write`.
     const minted = await mintScopedToken(
-      { scope: channelScope({ write: access === "write" }), audience: "channel" },
+      { scope: agentScope({ write: access === "write" }), audience: "agent" },
       mintDeps,
     );
     tokens[channel] = minted;
@@ -747,7 +748,7 @@ export async function spawnAgent(
   // server name + the key the credential was resolved under.
   const claudeArgs = buildAgentClaudeArgs({
     mcpConfigPath,
-    firstChannelEntryKey: `channel-${wakeChannel}`,
+    firstChannelEntryKey: channelEntryKey(wakeChannel),
     ...(deps.claudeBin ? { claudeBin: deps.claudeBin } : {}),
     ...(systemPromptFile
       ? { systemPromptFile, systemPromptMode: spec.systemPromptMode ?? "append" }
@@ -811,7 +812,7 @@ export async function spawnAgent(
   });
 
   // Auto-answer claude's `--dangerously-load-development-channels` consent gate
-  // (channel#70). Without this, the headless tmux session hangs at the interactive
+  // (agent#70). Without this, the headless tmux session hangs at the interactive
   // "I am using this for local development" prompt forever and the MCP never
   // connects. A non-"confirmed" result (already-running / timeout) is NON-FATAL —
   // confirmDevChannelsPrompt never throws — so the spawn always returns.
@@ -884,7 +885,7 @@ function launchScriptPath(cwd: string): string {
   return join(cwd, ".launch.sh");
 }
 
-/** The prompt marker for the dev-channels consent gate (channel#70). */
+/** The prompt marker for the dev-channels consent gate (agent#70). */
 export const DEV_CHANNELS_PROMPT_MARKER = "I am using this for local development";
 /**
  * The ready marker shown once claude is running interactively. Our sessions always
@@ -901,7 +902,7 @@ export const DEV_CHANNELS_READY_MARKER = "bypass permissions on";
 
 /**
  * Auto-confirm claude's `--dangerously-load-development-channels` consent gate in a
- * detached tmux session (channel#70). The gate is INTERACTIVE — claude shows
+ * detached tmux session (agent#70). The gate is INTERACTIVE — claude shows
  *
  *   WARNING: Loading development channels
  *   ❯ 1. I am using this for local development
@@ -983,8 +984,8 @@ export async function confirmDevChannelsPrompt(
   } while (Date.now() < deadline);
 
   console.warn(
-    `parachute-channel: dev-channels consent prompt for tmux session "${session}" did not ` +
-      `appear within ${timeoutMs}ms (channel#70). If \`mcp_sessions\` stays 0, attach to the ` +
+    `parachute-agent: dev-channels consent prompt for tmux session "${session}" did not ` +
+      `appear within ${timeoutMs}ms (agent#70). If \`mcp_sessions\` stays 0, attach to the ` +
       `session and press Enter in its terminal to clear the gate.`,
   );
   return "timeout";

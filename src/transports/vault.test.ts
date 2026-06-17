@@ -520,3 +520,144 @@ describe("registry — vault", () => {
     ).toThrow(/token/);
   });
 });
+
+describe("VaultTransport — injectInbound (runner seam)", () => {
+  test("injectInbound writes an INBOUND note (both tags) with runner provenance", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ id: "inbound-1" }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const r = await t.injectInbound({ content: "Run the morning weave", sender: "runner:morning" });
+    expect(r.id).toBe("inbound-1");
+
+    const noteCalls = calls.filter((c) => c.url.endsWith("/api/notes"));
+    expect(noteCalls).toHaveLength(1);
+    const body = JSON.parse(String(noteCalls[0]!.init.body));
+    // Inbound: BOTH the parent + the inbound child (the trigger discriminator).
+    expect(body.tags).toEqual(["#channel-message", "#channel-message/inbound"]);
+    expect(body.content).toBe("Run the morning weave");
+    expect(body.metadata.direction).toBe("inbound");
+    expect(body.metadata.sender).toBe("runner:morning");
+    // NEVER stamps channel_inbound_rendered_at (so the trigger fires).
+    expect(body.metadata.channel_inbound_rendered_at).toBeUndefined();
+  });
+
+  test("injectInbound defaults sender to 'runner'", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ id: "x" }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    // No throw + returns the id; the default-sender path is exercised.
+    expect((await t.injectInbound({ content: "hi" })).id).toBe("x");
+  });
+});
+
+describe("VaultTransport — scheduled-job notes (vault-native store)", () => {
+  test("listJobNotes queries by #agent-job + maps metadata; skips malformed", async () => {
+    const urls: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      urls.push(String(url));
+      return new Response(
+        JSON.stringify([
+          {
+            id: "note-uuid-1",
+            content: "the message",
+            metadata: { jobId: "morning", channel: "eng", cron: "0 9 * * *", tz: "UTC", enabled: "true", createdAt: "t0" },
+          },
+          // a note WITHOUT jobId metadata → slug falls back to the note id
+          {
+            id: "Channels/eng/jobs/legacy",
+            content: "legacy",
+            metadata: { channel: "eng", cron: "0 0 * * *", enabled: "false" },
+          },
+          // malformed (no cron) → skipped
+          { id: "job-bad", content: "x", metadata: { channel: "eng" } },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    const jobs = await t.listJobNotes();
+    expect(urls[0]).toContain("tag=%23agent-job");
+    expect(urls[0]).toContain("include_content=true");
+    expect(jobs).toHaveLength(2);
+    // id = the slug from metadata.jobId; noteId = the vault note id.
+    expect(jobs[0]).toMatchObject({ id: "morning", noteId: "note-uuid-1", channel: "eng", cron: "0 9 * * *", tz: "UTC", enabled: true });
+    // legacy note (no jobId) → id falls back to the note id.
+    expect(jobs[1]).toMatchObject({ id: "Channels/eng/jobs/legacy", noteId: "Channels/eng/jobs/legacy", enabled: false });
+  });
+
+  test("listJobNotes throws on a non-ok vault response", async () => {
+    globalThis.fetch = (async () => new Response("nope", { status: 502 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await expect(t.listJobNotes()).rejects.toThrow(/list jobs failed \(502\)/);
+  });
+
+  test("upsertJobNote POSTs a #agent-job note at the deterministic path", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ id: "Channels/eng/jobs/m" }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    const r = await t.upsertJobNote({
+      id: "m",
+      message: "go",
+      channel: "eng",
+      cron: "0 9 * * *",
+      enabled: true,
+      createdAt: "t0",
+    });
+    expect(r.id).toBe("Channels/eng/jobs/m");
+    const body = JSON.parse(String(calls[0]!.init.body));
+    expect(body.path).toBe("Channels/eng/jobs/m");
+    expect(body.tags).toEqual(["#agent-job"]);
+    expect(body.metadata.enabled).toBe("true");
+    expect(body.metadata.jobId).toBe("m"); // slug persisted for stable display
+  });
+
+  test("patchJobNote sends a PATCH with only the changed metadata", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.patchJobNote("job-1", { lastStatus: "ok", lastRunAt: "t1" });
+    expect(calls[0]!.init.method).toBe("PATCH");
+    expect(calls[0]!.url).toContain("/api/notes/job-1");
+    expect(JSON.parse(String(calls[0]!.init.body)).metadata).toEqual({ lastRunAt: "t1", lastStatus: "ok" });
+  });
+
+  test("deleteJobNote DELETEs by id", async () => {
+    const calls: { url: string; method?: string }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), method: init?.method });
+      return new Response(null, { status: 204 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.deleteJobNote("job-1");
+    expect(calls[0]!.method).toBe("DELETE");
+    expect(calls[0]!.url).toContain("/api/notes/job-1");
+  });
+
+  test("deleteJobNote throws on a non-ok vault response", async () => {
+    globalThis.fetch = (async () => new Response("no", { status: 404 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await expect(t.deleteJobNote("job-1")).rejects.toThrow(/delete job failed \(404\)/);
+  });
+});

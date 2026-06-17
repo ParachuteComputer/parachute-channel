@@ -78,6 +78,57 @@ export interface InboundNote {
 }
 
 /**
+ * A scheduled-job note as read back from the vault (design
+ * `2026-06-17-runner-scheduled-agent-turns.md`). The runner's vault-native job
+ * store maps these to/from the `Job` type in `jobs.ts`. `content` is the message
+ * to inject; the schedule + bookkeeping live in `metadata` (all string-typed in
+ * the vault — `enabled` is "true"/"false"; `nextRunAt` is NEVER persisted, it's
+ * recomputed in memory by the runner). The note `id` (or path) addresses it for
+ * PATCH/DELETE.
+ */
+export interface JobNote {
+  /**
+   * The operator-facing job id — the SLUG the operator typed (carried in
+   * `metadata.jobId`). This is what the UI displays, what addresses the job in the
+   * `/api/jobs/:id` routes, and what stamps `runner:<jobId>` provenance. Falls back
+   * to `noteId` for a legacy note written without the metadata field.
+   */
+  id: string;
+  /** The vault note id/path — addresses the note for PATCH / DELETE I/O. */
+  noteId: string;
+  /** The message text to inject as the inbound note when this job fires. */
+  message: string;
+  /** Target channel (routes the job to its vault transport). */
+  channel: string;
+  /** 5-field cron expression. */
+  cron: string;
+  /** IANA timezone, if set. */
+  tz?: string;
+  /** Whether the runner considers this job. */
+  enabled: boolean;
+  /** ISO timestamp the job was created. */
+  createdAt?: string;
+  /** ISO timestamp of the most recent fire. */
+  lastRunAt?: string;
+  /** "ok" / "error: …" from the most recent fire. */
+  lastStatus?: string;
+}
+
+/** The metadata payload written for a job note (all string-typed, per the vault). */
+export interface JobNoteMetadata {
+  /** The operator-facing slug (so the displayed id survives the vault's note-id assignment). */
+  jobId: string;
+  channel: string;
+  cron: string;
+  tz?: string;
+  /** "true" | "false" — the vault stores metadata as strings. */
+  enabled: string;
+  createdAt: string;
+  lastRunAt?: string;
+  lastStatus?: string;
+}
+
+/**
  * One message in a channel transcript, as the built-in chat renders it. This is
  * the transport-neutral shape `loadTranscript` produces from the vault notes; the
  * daemon's `GET /api/channels/<ch>/messages` returns `{ messages: ChannelMessage[] }`.
@@ -110,6 +161,20 @@ const CHANNEL_MESSAGE_TAG = "#channel-message";
 const CHANNEL_MESSAGE_INBOUND_TAG = "#channel-message/inbound";
 /** Outbound child — replies carry this; the trigger's exact-match predicate excludes it. */
 const CHANNEL_MESSAGE_OUTBOUND_TAG = "#channel-message/outbound";
+/**
+ * Scheduled-job tag — the runner's vault-native job store (design
+ * `2026-06-17-runner-scheduled-agent-turns.md`). A job IS a vault note carrying
+ * this parent tag; queryable + durable + surface-renderable, exactly like
+ * `#channel-message`. This is a BRAND-NEW tag, so it's named for the module's new
+ * identity ("Parachute Agent") from the start — `#agent-job` — rather than the
+ * legacy `#channel-` prefix. (The separate `#channel-message → #agent-message`
+ * rename is a Phase-3 data migration; the INJECTED message notes still use the
+ * existing `#channel-message` tags. Only this never-before-written job tag adopts
+ * the new name now.)
+ */
+const AGENT_JOB_TAG = "#agent-job";
+/** Default path prefix under which job notes are written: `Channels/<ch>/jobs/<id>`. */
+const JOB_PATH_PREFIX = "Channels";
 
 /**
  * The tag schema this module manages in any vault it's connected to.
@@ -531,6 +596,187 @@ export class VaultTransport implements Transport {
       // Non-JSON / empty body — keep the proposed id.
     }
     return { id: noteId };
+  }
+
+  /**
+   * Inject an inbound message AUTHORED BY THE RUNNER (a scheduled job firing) —
+   * design `2026-06-17-runner-scheduled-agent-turns.md`. This is the runner's
+   * ONLY seam into the transport: a scheduled job is "an automated human," so
+   * firing it = writing an inbound note exactly like a human typing in chat. The
+   * existing vault trigger → agent-turn → outbound flow does the rest; the runner
+   * never touches the turn.
+   *
+   * Mechanically this is `writeInbound` with runner provenance: BOTH the parent
+   * `#channel-message` (queryable) and the inbound child `#channel-message/inbound`
+   * (the trigger discriminator that wakes the session), `direction: "inbound"`,
+   * and `sender` defaulting to a `runner:<jobId>` marker so the transcript shows
+   * who authored it. We deliberately do NOT stamp `channel_inbound_rendered_at`
+   * (so the trigger fires), and we do NOT `ctx.emit` (the trigger is the single
+   * wake path — emitting too would double-wake). Reuses the channel's existing
+   * `vault:<name>:write` token — the runner mints nothing and adds no authority.
+   *
+   * Returns the created note id (for logging / the "run now" response). Kept a
+   * thin wrapper over `writeInbound` so the inbound write path has ONE
+   * implementation; only the default sender differs.
+   */
+  async injectInbound(opts: { content: string; sender?: string }): Promise<{ id: string }> {
+    return this.writeInbound(opts.content, opts.sender ?? "runner");
+  }
+
+  // -------------------------------------------------------------------------
+  // Scheduled-job notes — the runner's VAULT-NATIVE job store (design
+  // 2026-06-17). A job IS a `#agent-job` note in THIS channel's vault. These
+  // methods own the vault I/O (URL + token + encoding) so jobs.ts stays a thin,
+  // storage-agnostic facade — token handling lives in ONE place (the transport),
+  // mirroring loadTranscript / writeInbound. The channel's existing
+  // `vault:<name>:write` token covers all of GET/POST/PATCH/DELETE — no new mint.
+  // -------------------------------------------------------------------------
+
+  /**
+   * List the scheduled-job notes in THIS channel's vault. Queries by the parent
+   * `#agent-job` tag (URLSearchParams encodes `#`→`%23`) and returns ALL job
+   * notes in the vault — the CALLER filters by `metadata.channel` (same index-free
+   * pattern as loadTranscript; we don't assume a `channel` index exists). Throws
+   * on a non-ok vault response so the API surfaces a clear error rather than a
+   * silently-empty list.
+   */
+  async listJobNotes(opts?: { limit?: number }): Promise<JobNote[]> {
+    const limit = opts?.limit ?? 500;
+    const params = new URLSearchParams();
+    params.set("tag", AGENT_JOB_TAG); // → %23agent-job
+    params.set("include_content", "true");
+    params.set("limit", String(limit));
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes?${params.toString()}`;
+    const res = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`vault transport: list jobs failed (${res.status}) ${detail}`.trim());
+    }
+    let notes: Array<{ id?: string; content?: string; metadata?: Record<string, unknown> }>;
+    try {
+      const parsed = (await res.json()) as unknown;
+      notes = Array.isArray(parsed)
+        ? (parsed as typeof notes)
+        : ((parsed as { notes?: typeof notes })?.notes ?? []);
+    } catch (err) {
+      throw new Error(`vault transport: list jobs — bad JSON from vault: ${(err as Error).message}`);
+    }
+    const jobs: JobNote[] = [];
+    for (const note of notes) {
+      if (typeof note.id !== "string" || !note.id) continue;
+      const m = note.metadata ?? {};
+      const channel = typeof m.channel === "string" ? m.channel : "";
+      const cron = typeof m.cron === "string" ? m.cron : "";
+      if (!channel || !cron) continue; // not a well-formed job note; skip.
+      // The operator-facing id is the slug in `metadata.jobId`; fall back to the
+      // note id for a note written before that field existed.
+      const slug = typeof m.jobId === "string" && m.jobId ? m.jobId : note.id;
+      const job: JobNote = {
+        id: slug,
+        noteId: note.id,
+        message: typeof note.content === "string" ? note.content : "",
+        channel,
+        cron,
+        // The vault stores metadata as strings; "false" (and only "false") disables.
+        enabled: String(m.enabled) !== "false",
+      };
+      if (typeof m.tz === "string" && m.tz) job.tz = m.tz;
+      if (typeof m.createdAt === "string") job.createdAt = m.createdAt;
+      if (typeof m.lastRunAt === "string") job.lastRunAt = m.lastRunAt;
+      if (typeof m.lastStatus === "string") job.lastStatus = m.lastStatus;
+      jobs.push(job);
+    }
+    return jobs;
+  }
+
+  /**
+   * Create OR replace a job note at a deterministic path (`Channels/<ch>/jobs/<id>`)
+   * so an upsert by the same job id overwrites in place. The vault upserts by path
+   * on POST. Returns the created/updated note id. `nextRunAt` is NEVER written
+   * (recomputed in memory by the runner).
+   */
+  async upsertJobNote(job: {
+    id: string;
+    message: string;
+    channel: string;
+    cron: string;
+    tz?: string;
+    enabled: boolean;
+    createdAt: string;
+    lastRunAt?: string;
+    lastStatus?: string;
+  }): Promise<{ id: string }> {
+    const safeId = job.id.replace(/[^a-zA-Z0-9_-]/g, "-");
+    const safeChannel = job.channel.replace(/[^a-zA-Z0-9_-]/g, "-");
+    const path = `${JOB_PATH_PREFIX}/${safeChannel}/jobs/${safeId}`;
+    const metadata: JobNoteMetadata = {
+      jobId: job.id, // the operator-facing slug, so it survives the vault's note-id assignment.
+      channel: job.channel,
+      cron: job.cron,
+      enabled: job.enabled ? "true" : "false",
+      createdAt: job.createdAt,
+    };
+    if (job.tz) metadata.tz = job.tz;
+    if (job.lastRunAt) metadata.lastRunAt = job.lastRunAt;
+    if (job.lastStatus) metadata.lastStatus = job.lastStatus;
+
+    const res = await fetch(`${this.vaultUrl}/vault/${this.vault}/api/notes`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
+      body: JSON.stringify({ content: job.message, path, tags: [AGENT_JOB_TAG], metadata }),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`vault transport: write job failed (${res.status}) ${detail}`.trim());
+    }
+    let noteId = path;
+    try {
+      const created = (await res.json()) as { id?: string; note?: { id?: string } };
+      noteId = created?.id ?? created?.note?.id ?? path;
+    } catch {
+      // Non-JSON / empty body — keep the path as the addressable id.
+    }
+    return { id: noteId };
+  }
+
+  /**
+   * PATCH a job note's bookkeeping metadata (lastRunAt / lastStatus) after a fire,
+   * by note id. We send ONLY the changed metadata fields; the vault merges them.
+   * Best-effort on the runner's side (a failed status-write is logged, not fatal),
+   * so this throws and the caller decides — the runner swallows it.
+   */
+  async patchJobNote(
+    id: string,
+    fields: { lastRunAt?: string; lastStatus?: string; enabled?: boolean },
+  ): Promise<void> {
+    const metadata: Record<string, string> = {};
+    if (fields.lastRunAt !== undefined) metadata.lastRunAt = fields.lastRunAt;
+    if (fields.lastStatus !== undefined) metadata.lastStatus = fields.lastStatus;
+    if (fields.enabled !== undefined) metadata.enabled = fields.enabled ? "true" : "false";
+    const res = await fetch(
+      `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
+        body: JSON.stringify({ metadata }),
+      },
+    );
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`vault transport: patch job failed (${res.status}) ${detail}`.trim());
+    }
+  }
+
+  /** Delete a job note by id. Throws on a non-ok vault response. */
+  async deleteJobNote(id: string): Promise<void> {
+    const res = await fetch(
+      `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(id)}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${this.token}` } },
+    );
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`vault transport: delete job failed (${res.status}) ${detail}`.trim());
+    }
   }
 
   // -------------------------------------------------------------------------

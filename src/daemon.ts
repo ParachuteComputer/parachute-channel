@@ -52,6 +52,9 @@ import {
   type ChannelEntry,
 } from "./registry.ts";
 import { VaultTransport, CHANNEL_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
+import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
+import { Runner, realTickDriver } from "./runner.ts";
+import { JOBS_UI_HTML } from "./jobs-ui.ts";
 import {
   setDefaultClaudeCredential,
   setChannelClaudeCredential,
@@ -1472,6 +1475,20 @@ export function createFetchHandler(
      * registry pushes to); tests inject one to assert the live-progress fan-out.
      */
     turnEvents?: ClientRegistry;
+    /**
+     * The vault-native scheduled-job store (runner, design 2026-06-17). The
+     * `/api/jobs*` routes read/write through it. `main` passes the boot instance
+     * (shared with the runner); tests inject one (or let it default lazily) to
+     * exercise the routes against a fake-vault transport.
+     */
+    jobStore?: VaultJobStore;
+    /**
+     * The runner — used by `POST /api/jobs/:id/run` (fire now). `main` passes the
+     * boot instance; tests inject a fake. Optional: if absent, the run-now route
+     * fires inline via the job store + the channel's `injectInbound` (so the route
+     * still works in a plain createFetchHandler).
+     */
+    runner?: Runner;
   },
 ): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
   // Spawn/list/kill operations behind the web agents surface. Lazily defaulted to
@@ -1500,6 +1517,12 @@ export function createFetchHandler(
   // surprise-replays its whole transcript on connect. The MCP connect hook +
   // the SSE `/events` replay below both run `replayBacklog` against it.
   const deliveryState: DeliveryState = opts?.deliveryState ?? new DeliveryState();
+
+  // The vault-native scheduled-job store (runner, design 2026-06-17). Defaulted to
+  // a fresh store over the live channels so a plain createFetchHandler serves the
+  // /api/jobs routes; `main` shares its boot instance with the runner so the routes
+  // and the scheduler operate on the same vault.
+  const jobStore: VaultJobStore = opts?.jobStore ?? new VaultJobStore(channels);
 
   // Install the MCP connect hook: when an MCP session's GET push stream goes live
   // (mcp-http's handleMcp GET branch → fireConnectReplay — NOT at registration,
@@ -1623,6 +1646,17 @@ export function createFetchHandler(
     // every channel via the spawn form + the running-agents list).
     if (req.method === "GET" && url.pathname === "/agents") {
       return new Response(AGENTS_UI_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // Schedules / runner page — `/jobs` (design 2026-06-17). The Schedules panel:
+    // list the scheduled jobs (channel · cron · next-run · last-status), add a job
+    // (agent picker → message → cron + presets), enable/disable, delete, "Run now."
+    // Loads OPEN (like /agents): it mints a hub-minted channel:admin token
+    // client-side; the `/api/jobs*` calls it makes are what `requireScope` gates.
+    if (req.method === "GET" && url.pathname === "/jobs") {
+      return new Response(JOBS_UI_HTML, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
@@ -1821,6 +1855,116 @@ export function createFetchHandler(
         return json({ ok: true, name, removed: false }, 200);
       }
       return json({ ok: true, name, removed: true });
+    }
+
+    // ---------------------------------------------------------------------
+    // Scheduled-jobs API — the runner (design 2026-06-17). A job is "an
+    // automated human": send message M to a vault agent A on cron S. Storage is
+    // VAULT-NATIVE (`#agent-job` notes in the target channel's vault); these
+    // routes read/write through the shared `jobStore`. ALL gated on
+    // `channel:admin` (operator-only, like /api/channels). The runner does the
+    // injecting; these routes just CRUD the durable job notes (+ fire-now).
+    //
+    //   GET    /api/jobs          → list (across the live vault channels)
+    //   POST   /api/jobs          { id, channel, message, schedule, enabled? } → create
+    //   DELETE /api/jobs/:id      → delete the job note
+    //   POST   /api/jobs/:id/run  → fire now (inject the inbound message immediately)
+    //
+    // Externally hub strips `/channel`, so these are `<hub>/channel/api/jobs`.
+    // ---------------------------------------------------------------------
+    if (url.pathname === "/api/jobs" && (req.method === "GET" || req.method === "POST")) {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+
+      if (req.method === "GET") {
+        // List across every live vault channel. A vault read failure surfaces as a
+        // 502 (not a silently-empty list that looks like "no jobs").
+        try {
+          const jobs = await jobStore.listAll();
+          return json({ jobs });
+        } catch (err) {
+          return json({ error: `failed to list jobs: ${(err as Error).message}` }, 502);
+        }
+      }
+
+      // POST — create/replace a job.
+      let body: { id?: unknown; channel?: unknown; message?: unknown; schedule?: unknown; enabled?: unknown };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      // Validate against the LIVE channels: known + vault-backed + parseable cron.
+      const validation = validateJob(body, (name) => {
+        if (!channels.has(name)) return null;
+        return channels.get(name)!.transport instanceof VaultTransport;
+      });
+      if (!validation.ok) return json({ error: validation.error }, 400);
+
+      const job: Job = {
+        id: body.id as string,
+        channel: body.channel as string,
+        message: (body.message as string).trim(),
+        schedule: body.schedule as Job["schedule"],
+        enabled: body.enabled === undefined ? true : Boolean(body.enabled),
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        const saved = await jobStore.upsert(job);
+        return json({ ok: true, job: saved });
+      } catch (err) {
+        return json({ error: `failed to write job: ${(err as Error).message}` }, 502);
+      }
+    }
+
+    // POST /api/jobs/:id/run — fire now (inject the message immediately).
+    {
+      const runMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/run$/);
+      if (runMatch && req.method === "POST") {
+        const denied = await requireScope(req, url, SCOPE_ADMIN);
+        if (denied) return denied;
+        const id = decodeURIComponent(runMatch[1]!);
+        try {
+          // Prefer the shared runner (records bookkeeping consistently with a
+          // scheduled fire). Fall back to an inline fire via the job store + the
+          // channel's injectInbound when no runner is wired (plain handler/tests).
+          if (opts?.runner) {
+            const status = await opts.runner.runNow(id);
+            return json({ ok: true, id, status });
+          }
+          const jobs = await jobStore.listAll();
+          const job = jobs.find((j) => j.id === id);
+          if (!job) return json({ error: `unknown job "${id}"` }, 404);
+          const transport = vaultTransportFor(channels, job.channel);
+          if (!transport) {
+            return json({ error: `job "${id}" targets a non-vault channel "${job.channel}"` }, 400);
+          }
+          await transport.injectInbound({ content: job.message, sender: `runner:${job.id}` });
+          return json({ ok: true, id, status: "ok" });
+        } catch (err) {
+          return json({ error: `failed to run job: ${(err as Error).message}` }, 502);
+        }
+      }
+    }
+
+    // DELETE /api/jobs/:id — remove the job note. We must resolve which channel's
+    // vault holds it; list once to find the job's channel, then delete there.
+    {
+      const jobDelMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)$/);
+      if (jobDelMatch && req.method === "DELETE") {
+        const denied = await requireScope(req, url, SCOPE_ADMIN);
+        if (denied) return denied;
+        const id = decodeURIComponent(jobDelMatch[1]!);
+        try {
+          const jobs = await jobStore.listAll();
+          const job = jobs.find((j) => j.id === id);
+          if (!job || !job.noteId) return json({ ok: true, id, removed: false }, 200);
+          await jobStore.remove(job.noteId, job.channel);
+          return json({ ok: true, id, removed: true });
+        } catch (err) {
+          return json({ error: `failed to delete job: ${(err as Error).message}` }, 502);
+        }
+      }
     }
 
     // ---------------------------------------------------------------------
@@ -2787,7 +2931,40 @@ function main(): void {
   // upgrades into these via `server.upgrade(req, { data })`.
   const terminalWs = createTerminalWsHandlers();
 
-  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, turnEvents });
+  // The vault-native scheduled-job store + the runner (design 2026-06-17). The
+  // store reads/writes `#agent-job` notes in each vault channel's vault; the
+  // runner ticks every 30s, loading jobs from the store, firing due ones by
+  // injecting an inbound note onto the job's vault channel (the existing trigger →
+  // agent-turn → outbound flow does the rest). Shared with the fetch handler so
+  // the /api/jobs routes + the scheduler operate on the SAME store, and "Run now"
+  // goes through the runner's bookkeeping path.
+  const jobStore = new VaultJobStore(channels);
+  const runner = new Runner({
+    loadJobs: () => jobStore.listAll(),
+    // Fire = inject an inbound note onto the job's vault channel, exactly like a
+    // human typing in chat. Resolve the channel's vault transport at fire time so
+    // a job whose channel was deleted logs + records an error rather than throwing
+    // the tick. No new authority — uses the channel's existing vault write token.
+    fire: async (job) => {
+      const transport = vaultTransportFor(channels, job.channel);
+      if (!transport) {
+        throw new Error(`channel "${job.channel}" is not a live vault channel`);
+      }
+      await transport.injectInbound({ content: job.message, sender: `runner:${job.id}` });
+    },
+    // Persist bookkeeping (lastRunAt/lastStatus) back onto the job note (addressed
+    // by its vault note id). A job loaded from the store always carries `noteId`.
+    persistFire: async (job) => {
+      if (!job.noteId) return; // nothing to address (shouldn't happen for a loaded job).
+      await jobStore.patch(job.noteId, job.channel, {
+        lastRunAt: job.lastRunAt,
+        lastStatus: job.lastStatus,
+      });
+    },
+    driver: realTickDriver(),
+  });
+
+  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, turnEvents, jobStore, runner });
   const server = Bun.serve<TerminalWsData, never>({
     port: PORT,
     hostname: "127.0.0.1",
@@ -2888,8 +3065,17 @@ function main(): void {
   // a leaked/orphaned spec dir can't resurrect a phantom agent (channel#75).
   void reregisterProgrammaticAgents(programmatic, channels);
 
-  // Graceful shutdown — stop all transports.
+  // Start the runner's scheduled-job tick (design 2026-06-17). Tolerant of an
+  // empty/missing job set (no `#agent-job` notes → idle) and of a daemon with no
+  // vault channels (listAll queries nothing → idle). A job targeting a now-deleted
+  // channel sets lastStatus:error on fire rather than throwing the tick. The tick
+  // is `unref`'d so it never keeps the process alive on its own.
+  runner.start();
+  console.log(`parachute-channel: runner started (scheduled-job tick)`);
+
+  // Graceful shutdown — stop the runner + all transports.
   async function shutdown(): Promise<void> {
+    runner.stop();
     await Promise.allSettled([...channels.values()].map((c) => c.transport.stop()));
     server.stop();
     process.exit(0);

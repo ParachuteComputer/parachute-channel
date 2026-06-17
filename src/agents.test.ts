@@ -132,27 +132,39 @@ describe("agentInfoFromSessions", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
-  test("surfaces workingDir from the persisted spec when a workspace is set; absent otherwise", () => {
+  test("surfaces workingDir from the persisted spec when the workspace is set AND exists; absent otherwise", () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-info-workdir-"));
+    // A REAL working dir on disk — the badge is gated on existence (a deleted dir
+    // post-spawn shouldn't surface a dead-path badge).
+    const workdir = mkdtempSync(join(tmpdir(), "agent-info-real-workdir-"));
     try {
       persistSpec(sessionWorkspace(dir, "withdir"), {
         name: "withdir",
         channels: ["withdir"],
-        workspace: "/Users/op/Code/repo",
+        workspace: workdir,
       } as AgentSpec);
       persistSpec(sessionWorkspace(dir, "nodir"), { name: "nodir", channels: ["nodir"] } as AgentSpec);
+      // A spec whose working dir no longer exists on disk → NOT surfaced.
+      persistSpec(sessionWorkspace(dir, "gonedir"), {
+        name: "gonedir",
+        channels: ["gonedir"],
+        workspace: "/Users/op/Code/deleted-repo",
+      } as AgentSpec);
       const infos = agentInfoFromSessions(
         [
           { name: "withdir-agent", attached: false },
           { name: "nodir-agent", attached: false },
+          { name: "gonedir-agent", attached: false },
         ],
         dir,
       );
       const byName = Object.fromEntries(infos.map((i) => [i.name, i]));
-      expect(byName.withdir!.workingDir).toBe("/Users/op/Code/repo");
+      expect(byName.withdir!.workingDir).toBe(workdir);
       expect(byName.nodir!.workingDir).toBeUndefined();
+      expect(byName.gonedir!.workingDir).toBeUndefined(); // path gone → no dead-path badge
     } finally {
       rmSync(dir, { recursive: true, force: true });
+      rmSync(workdir, { recursive: true, force: true });
     }
   });
 });

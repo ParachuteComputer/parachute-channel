@@ -568,7 +568,10 @@ export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry):
       const status = s.state === "queued" ? `queued:${s.queued}` : s.state;
       const workspace = sessionWorkspace(dir, h.name);
       const hasPrompt = typeof h.spec.systemPrompt === "string" && h.spec.systemPrompt.length > 0;
-      const hasWorkingDir = typeof h.spec.workspace === "string" && h.spec.workspace.length > 0;
+      // Surface the working dir only when set AND still present on disk (a deleted
+      // dir post-spawn shouldn't show a dead-path badge — mirrors `hasWorkspace`).
+      const hasWorkingDir =
+        typeof h.spec.workspace === "string" && h.spec.workspace.length > 0 && existsSync(h.spec.workspace);
       return {
         name: h.name,
         session: `${h.name}-agent`,

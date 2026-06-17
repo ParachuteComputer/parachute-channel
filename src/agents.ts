@@ -197,7 +197,13 @@ export function agentInfoFromSessions(
     // spec when one is set — so the list shows the agent carries a role.
     const persisted = readPersistedSpec(workspace);
     const hasPrompt = typeof persisted?.systemPrompt === "string" && persisted.systemPrompt.length > 0;
-    const hasWorkingDir = typeof persisted?.workspace === "string" && persisted.workspace.length > 0;
+    // Surface the working dir only when it's set AND still present on disk — an
+    // operator who deleted the dir post-spawn shouldn't see a dead-path badge
+    // (mirrors how `hasWorkspace` gates on existence rather than the bare path).
+    const hasWorkingDir =
+      typeof persisted?.workspace === "string" &&
+      persisted.workspace.length > 0 &&
+      existsSync(persisted.workspace);
     agents.push({
       name,
       session: s.name,

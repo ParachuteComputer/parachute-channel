@@ -426,7 +426,12 @@ export class DefVaultClient {
     const res = await this.fetchFn(url, {
       method: "PATCH",
       headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
-      body: JSON.stringify({ metadata }),
+      // `force: true` satisfies the vault's mutation precondition (it 428s without
+      // `if_updated_at` or `force`). Safe: `status`/`pending` are the module's OWN
+      // authoritative derived fields, the body carries no content, and the vault
+      // MERGES metadata ({...existing, ...body.metadata}) so name/backend are kept.
+      // (Without this the status stamp silently 428'd — caught via live testing.)
+      body: JSON.stringify({ metadata, force: true }),
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");

@@ -927,7 +927,12 @@ export class VaultTransport implements Transport {
       {
         method: "PATCH",
         headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
-        body: JSON.stringify({ metadata }),
+        // `force: true` satisfies the vault's mutation precondition (428 without
+        // `if_updated_at`/`force`). Safe: lastRunAt/lastStatus/enabled are the
+        // runner's OWN bookkeeping fields, no content in the body, and the vault
+        // MERGES metadata so the job's cron/message/etc. are preserved. (Without
+        // this the runner's status-write silently 428'd.)
+        body: JSON.stringify({ metadata, force: true }),
       },
     );
     if (!res.ok) {

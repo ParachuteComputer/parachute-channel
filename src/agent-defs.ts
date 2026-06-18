@@ -835,11 +835,11 @@ export class AgentDefRegistry {
       console.warn(`agent-defs: status stamp for "${def.name}" failed (continuing): ${(err as Error).message}`);
     }
     // Grant-GC (#96): a CLEAN successful load is a confident live set, so prune any grant
-    // the agent no longer declares — e.g. a `wants:` entry removed from the def. liveKeys
-    // = the connectionKey() of each CURRENTLY-declared connection (matching exactly how
-    // the hub keyed them at register). SAFETY: only reached AFTER a successful parse +
-    // instantiate; a parse/instantiate failure returns above WITHOUT reconciling, so a
-    // transient error never presents a stale/empty liveKeys that nukes approved grants.
+    // the agent no longer declares — e.g. a `wants:` entry removed from the def. We send
+    // the CURRENTLY-declared connection SPECS; the hub re-derives the keys with its own
+    // connectionKey. SAFETY: only reached AFTER a successful parse + instantiate; a
+    // parse/instantiate failure returns above WITHOUT reconciling, so a transient error
+    // never presents a stale/empty live set that nukes approved grants.
     await this.reconcileLiveKeys(def);
     console.log(`agent-defs: instantiated "${def.name}" from ${note.id} in "${vault}" (status=${status}).`);
     return true;
@@ -857,18 +857,20 @@ export class AgentDefRegistry {
 
   /**
    * Prune the agent's grants down to its CURRENTLY-declared connections (#96 grant-GC,
-   * the clean-load case). Computes `liveKeys` = {@link connectionKey} of each `wants:`
-   * connection (the SAME derivation the hub keyed grants on) and POSTs reconcile — the
-   * hub tears down + removes every grant NOT in that set (e.g. a removed want). A def
-   * with no `wants:` sends an empty liveKeys, which prunes any leftover grant from a
-   * prior `wants:` it no longer declares. Best-effort: no grants client → no-op; a
-   * reconcile failure logs a warning and never throws out of the load path.
+   * the clean-load case). POSTs reconcile with the live connection SPECS (`def.wants`);
+   * the hub re-derives each key with its own connectionKey and tears down + removes every
+   * grant NOT in that set (e.g. a removed want). A def with no `wants:` sends an empty
+   * set, which prunes any leftover grant from a prior `wants:` it no longer declares.
+   * Best-effort: no grants client → no-op; a reconcile failure logs a warning and never
+   * throws out of the load path.
    */
   private async reconcileLiveKeys(def: ParsedAgentDef): Promise<void> {
     if (!this.grants) return;
-    const liveKeys = def.wants.map((c) => connectionKey(c));
+    // Pass the live connection SPECS (def.wants) — the hub derives the keys with
+    // its own connectionKey. (Sending keys we computed via grants.ts connectionKey
+    // would diverge from the hub's for service/tagged/mcp grants → wrong prunes.)
     try {
-      const { pruned } = await this.grants.reconcileGrants(def.name, liveKeys);
+      const { pruned } = await this.grants.reconcileGrants(def.name, def.wants);
       if (pruned > 0) {
         console.log(`agent-defs: pruned ${pruned} stale grant(s) for "${def.name}".`);
       }

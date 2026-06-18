@@ -535,8 +535,8 @@ function fakeGrantsClient(opts: {
   statusByKey?: Record<string, string>;
   /** Record each registered (agent, connection). */
   registered?: Array<{ agent: string; connection: ConnectionSpec }>;
-  /** Record each reconcile (agent, liveKeys) — the #96 grant-GC call. */
-  reconciled?: Array<{ agent: string; liveKeys: string[] }>;
+  /** Record each reconcile (agent, liveConnections) — the #96 grant-GC call. */
+  reconciled?: Array<{ agent: string; liveConnections: ConnectionSpec[] }>;
   /** How many grants the hub reports pruned per reconcile (default 0). */
   prunedPerReconcile?: number;
   /** Make reconcile POSTs 500 (to assert the failure is swallowed). */
@@ -545,8 +545,8 @@ function fakeGrantsClient(opts: {
   const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
     const u = String(url);
     if (u.endsWith("/admin/grants/reconcile") && (init?.method ?? "GET") === "POST") {
-      const body = JSON.parse(String(init?.body)) as { agent: string; liveKeys: string[] };
-      opts.reconciled?.push({ agent: body.agent, liveKeys: body.liveKeys });
+      const body = JSON.parse(String(init?.body)) as { agent: string; liveConnections: ConnectionSpec[] };
+      opts.reconciled?.push({ agent: body.agent, liveConnections: body.liveConnections });
       if (opts.reconcileFails) return new Response("boom", { status: 500 });
       return new Response(JSON.stringify({ pruned: opts.prunedPerReconcile ?? 0, prunedIds: [] }), {
         status: 200,
@@ -728,9 +728,9 @@ describe("AgentDefRegistry — grant registration + status (4b)", () => {
 // ---------------------------------------------------------------------------
 
 describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
-  test("a successful load reconciles with the def's CURRENT connectionKey()s", async () => {
+  test("a successful load reconciles with the def's CURRENT live connection specs", async () => {
     const { deps } = recorderDeps();
-    const reconciled: Array<{ agent: string; liveKeys: string[] }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     const fetchFn = vaultFetch({
       defs: [
@@ -746,31 +746,30 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
 
     expect(reconciled).toHaveLength(1);
     expect(reconciled[0]!.agent).toBe("researcher");
-    // The keys sent MUST equal connectionKey() of the parsed wants (env:github + mcp:github
-    // MERGE to one service connection → key env+mcp:github), matching grants.ts exactly.
+    // The SPECS sent MUST equal the parsed wants (env:github + mcp:github MERGE to one
+    // service connection with inject ["env","mcp"]). The hub re-derives the keys.
     const wants: ConnectionSpec[] = [
       { kind: "vault", target: "research", access: "read" },
       { kind: "service", target: "github", inject: ["env", "mcp"] },
     ];
-    expect(reconciled[0]!.liveKeys).toEqual(wants.map((c) => connectionKey(c)));
-    expect(reconciled[0]!.liveKeys).toEqual(["vault:research:read", "env+mcp:github"]);
+    expect(reconciled[0]!.liveConnections).toEqual(wants);
   });
 
-  test("a def with NO wants still reconciles with an empty liveKeys (prunes any leftover)", async () => {
+  test("a def with NO wants still reconciles with empty liveConnections (prunes any leftover)", async () => {
     const { deps } = recorderDeps();
-    const reconciled: Array<{ agent: string; liveKeys: string[] }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     const fetchFn = vaultFetch({
       defs: [{ id: "Agents/uni", content: "role", metadata: { name: "uni" } }],
     });
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
     await reg.loadAll();
-    expect(reconciled).toEqual([{ agent: "uni", liveKeys: [] }]);
+    expect(reconciled).toEqual([{ agent: "uni", liveConnections: [] }]);
   });
 
   test("a REMOVED def (present in a prior load, gone now) → reconcile(agent, [])", async () => {
     const { deps } = recorderDeps();
-    const reconciled: Array<{ agent: string; liveKeys: string[] }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     // Two notes present at first; the second load drops "researcher".
     const present: Array<{ id: string; content?: string; metadata?: Record<string, unknown> }> = [
@@ -785,8 +784,8 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
         // delegate to the fake grants client's fetch by re-issuing through it isn't
         // possible here; instead record reconcile directly.
         if (u.endsWith("/admin/grants/reconcile") && method === "POST") {
-          const body = JSON.parse(String(init?.body)) as { agent: string; liveKeys: string[] };
-          reconciled.push({ agent: body.agent, liveKeys: body.liveKeys });
+          const body = JSON.parse(String(init?.body)) as { agent: string; liveConnections: ConnectionSpec[] };
+          reconciled.push({ agent: body.agent, liveConnections: body.liveConnections });
           return new Response(JSON.stringify({ pruned: 0, prunedIds: [] }), { status: 200 });
         }
         if (method === "PUT") {
@@ -811,15 +810,15 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
 
     // The removed agent gets a prune-ALL reconcile.
     const removal = reconciled.find((r) => r.agent === "researcher");
-    expect(removal).toEqual({ agent: "researcher", liveKeys: [] });
+    expect(removal).toEqual({ agent: "researcher", liveConnections: [] });
     // uni (still present, no wants) reconciles with [] too — that's its clean-load prune,
     // NOT a removal; distinguished by the agent name.
-    expect(reconciled.find((r) => r.agent === "uni")).toEqual({ agent: "uni", liveKeys: [] });
+    expect(reconciled.find((r) => r.agent === "uni")).toEqual({ agent: "uni", liveConnections: [] });
   });
 
   test("a delete reload → reconcile(agent, []) (confirmed removal)", async () => {
     const { deps } = recorderDeps();
-    const reconciled: Array<{ agent: string; liveKeys: string[] }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     const fetchFn = vaultFetch({
       defs: [{ id: "Agents/uni", content: "role", metadata: { name: "uni" } }],
@@ -829,12 +828,12 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
     reconciled.length = 0; // drop the clean-load reconcile; focus on the delete
     const result = await reg.reload("default", "Agents/uni", "deleted");
     expect(result).toBe("deregistered");
-    expect(reconciled).toEqual([{ agent: "uni", liveKeys: [] }]);
+    expect(reconciled).toEqual([{ agent: "uni", liveConnections: [] }]);
   });
 
   test("a reload that re-reads as GONE (404) → reconcile(agent, []) (confirmed removal)", async () => {
     const { deps } = recorderDeps();
-    const reconciled: Array<{ agent: string; liveKeys: string[] }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     const fetchFn = vaultFetch({
       defs: [{ id: "Agents/uni", content: "role", metadata: { name: "uni" } }],
@@ -845,12 +844,12 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
     reconciled.length = 0;
     const result = await reg.reload("default", "Agents/uni"); // no event → GET → 404
     expect(result).toBe("deregistered");
-    expect(reconciled).toEqual([{ agent: "uni", liveKeys: [] }]);
+    expect(reconciled).toEqual([{ agent: "uni", liveConnections: [] }]);
   });
 
   test("SAFETY: a PARSE-FAILING def NEVER reconciles (no prune from an error)", async () => {
     const { deps } = recorderDeps();
-    const reconciled: Array<{ agent: string; liveKeys: string[] }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     const fetchFn = vaultFetch({
       defs: [
@@ -867,7 +866,7 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
 
   test("SAFETY: a parse-failing def is NOT later flagged removed (its grants survive)", async () => {
     const { deps } = recorderDeps();
-    const reconciled: Array<{ agent: string; liveKeys: string[] }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     // First load: a CLEAN def. Second load: the SAME note now parse-fails (a transient
     // bad edit). It must NOT be treated as a removal (it's still present in the vault).
@@ -882,8 +881,8 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
       const method = init?.method ?? "GET";
       if (method === "PATCH") return new Response(null, { status: 200 });
       if (u.endsWith("/admin/grants/reconcile") && method === "POST") {
-        const body = JSON.parse(String(init?.body)) as { agent: string; liveKeys: string[] };
-        reconciled.push({ agent: body.agent, liveKeys: body.liveKeys });
+        const body = JSON.parse(String(init?.body)) as { agent: string; liveConnections: ConnectionSpec[] };
+        reconciled.push({ agent: body.agent, liveConnections: body.liveConnections });
         return new Response(JSON.stringify({ pruned: 0 }), { status: 200 });
       }
       if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
@@ -903,7 +902,7 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
 
   test("SAFETY: a vault LIST failure does NOT prune (no confident read)", async () => {
     const { deps } = recorderDeps();
-    const reconciled: Array<{ agent: string; liveKeys: string[] }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     let listShouldFail = false;
     const present = [{ id: "Agents/uni", content: "role", metadata: { name: "uni" } }];
@@ -912,8 +911,8 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
       const method = init?.method ?? "GET";
       if (method === "PATCH") return new Response(null, { status: 200 });
       if (u.endsWith("/admin/grants/reconcile") && method === "POST") {
-        const body = JSON.parse(String(init?.body)) as { agent: string; liveKeys: string[] };
-        reconciled.push({ agent: body.agent, liveKeys: body.liveKeys });
+        const body = JSON.parse(String(init?.body)) as { agent: string; liveConnections: ConnectionSpec[] };
+        reconciled.push({ agent: body.agent, liveConnections: body.liveConnections });
         return new Response(JSON.stringify({ pruned: 0 }), { status: 200 });
       }
       if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
@@ -932,7 +931,7 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
 
   test("a reconcile HTTP failure is swallowed — the load does NOT throw / still instantiates", async () => {
     const { deps, calls } = recorderDeps();
-    const reconciled: Array<{ agent: string; liveKeys: string[] }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled, reconcileFails: true }); // reconcile POST 500s
     const patches: Array<{ id: string; status?: string }> = [];
     const fetchFn = vaultFetch({
@@ -944,7 +943,7 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
     const n = await reg.loadAll();
     expect(n).toBe(1);
     expect(calls.registered.map((s) => s.name)).toEqual(["uni"]); // still instantiated
-    expect(reconciled).toEqual([{ agent: "uni", liveKeys: [] }]); // it was attempted
+    expect(reconciled).toEqual([{ agent: "uni", liveConnections: [] }]); // it was attempted
   });
 
   test("no grants client → reconcile is a no-op (the vault-native path still runs)", async () => {

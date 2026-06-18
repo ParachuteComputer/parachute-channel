@@ -281,7 +281,7 @@ describe("GrantsClient.getMaterial (GET /admin/grants/<id>/material)", () => {
 });
 
 describe("GrantsClient.reconcileGrants (POST /admin/grants/reconcile) — #96 grant-GC", () => {
-  test("POSTs { agent, liveKeys } with the manager bearer; returns { pruned, prunedIds }", async () => {
+  test("POSTs { agent, liveConnections } (specs, not keys) with the manager bearer; returns { pruned, prunedIds }", async () => {
     let captured: { url: string; method?: string; auth?: string; body?: unknown } = { url: "" };
     const client = clientWith((async (url: string | URL | Request, init?: RequestInit) => {
       captured = {
@@ -296,23 +296,29 @@ describe("GrantsClient.reconcileGrants (POST /admin/grants/reconcile) — #96 gr
       });
     }) as typeof fetch);
 
-    const out = await client.reconcileGrants("researcher", ["vault:research:read", "env+mcp:github"]);
+    // We send the live connection SPECS, not pre-computed keys (the hub re-derives
+    // keys with its own connectionKey — no cross-repo key-format dependency).
+    const live: ConnectionSpec[] = [
+      { kind: "vault", target: "research", access: "read" },
+      { kind: "service", target: "github", inject: ["env", "mcp"] },
+    ];
+    const out = await client.reconcileGrants("researcher", live);
     expect(captured.url).toBe(`${HUB}/admin/grants/reconcile`);
     expect(captured.method).toBe("POST");
     expect(captured.auth).toBe(`Bearer ${BEARER}`);
     // The field name MUST stay "agent" (deferred rename B1 is NOT in scope).
-    expect(captured.body).toEqual({ agent: "researcher", liveKeys: ["vault:research:read", "env+mcp:github"] });
+    expect(captured.body).toEqual({ agent: "researcher", liveConnections: live });
     expect(out).toEqual({ pruned: 2, prunedIds: ["g1", "g2"] });
   });
 
-  test("an empty liveKeys array (the def is gone → prune ALL) is sent verbatim", async () => {
+  test("an empty liveConnections array (the def is gone → prune ALL) is sent verbatim", async () => {
     let body: unknown;
     const client = clientWith((async (_url: string | URL | Request, init?: RequestInit) => {
       body = JSON.parse(String(init?.body));
       return new Response(JSON.stringify({ pruned: 3, prunedIds: ["a", "b", "c"] }), { status: 200 });
     }) as typeof fetch);
     const out = await client.reconcileGrants("gone", []);
-    expect(body).toEqual({ agent: "gone", liveKeys: [] });
+    expect(body).toEqual({ agent: "gone", liveConnections: [] });
     expect(out.pruned).toBe(3);
   });
 

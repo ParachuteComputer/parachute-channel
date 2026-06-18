@@ -24,9 +24,10 @@
  *         vault   → { kind:"vault",   token, mcpUrl }
  *         service → { kind:"service", token, inject }
  *         (404 unknown id / 409 not-approved)
- *   - POST <hub>/admin/grants/reconcile { agent, liveKeys } → { pruned, prunedIds } (#96
- *         grant-GC): tear down + REMOVE every grant for `agent` whose connectionKey is
- *         NOT in liveKeys (empty liveKeys = the def is gone → prune ALL). Stops a removed
+ *   - POST <hub>/admin/grants/reconcile { agent, liveConnections } → { pruned, prunedIds } (#96
+ *         grant-GC): the hub re-derives each key with ITS connectionKey and tears down +
+ *         REMOVEs every grant for `agent` whose key is NOT among the live specs (empty
+ *         liveConnections = the def is gone → prune ALL). Stops a removed
  *         want / a deleted def from orphaning a live approved grant. Pruning only ever
  *         REMOVES access, so it shares the host-admin Bearer (never an operator cookie).
  *   - Auth: all of these need a `parachute:host:admin` Bearer — we REUSE the module's
@@ -424,30 +425,38 @@ export class GrantsClient {
 
   /**
    * GARBAGE-COLLECT an agent's now-stale grants (parachute-hub #96). `POST
-   * /admin/grants/reconcile { agent, liveKeys }` → `{ pruned, prunedIds }`. The hub
-   * tears down + REMOVES every grant for `agent` whose {@link connectionKey} is NOT in
-   * `liveKeys` (an empty array prunes ALL of the agent's grants — the def is gone). This
-   * is how a removed connection (or a deleted `#agent/definition` note) stops orphaning
-   * a live `approved` grant row.
+   * /admin/grants/reconcile { agent, liveConnections }` → `{ pruned, prunedIds }`. The
+   * hub re-derives each key with ITS OWN connectionKey and tears down + REMOVES every
+   * grant for `agent` whose key is NOT among the live specs (an empty array prunes ALL
+   * of the agent's grants — the def is gone). This is how a removed connection (or a
+   * deleted `#agent/definition` note) stops orphaning a live `approved` grant row.
    *
-   * `liveKeys` MUST be the {@link connectionKey} values for the agent's CURRENTLY-declared
-   * connections — derived from the SAME `parseWants` → `connectionKey` pipeline the hub
-   * keyed each grant on, so a grant the agent still wants is never pruned.
+   * `liveConnections` is the agent's CURRENTLY-declared connection SPECS (`def.wants`).
+   * We send SPECS, not keys, so there's no dependency on this module's connectionKey
+   * matching the hub's — the hub keys them the same way it stored them.
    *
    * SAFETY: only ever call this from a CONFIDENT live set — a clean successful def load
-   * (real `liveKeys`) or a confirmed removal (empty `liveKeys`). NEVER from a parse/load
-   * failure: a transient error must not present an empty/partial `liveKeys` that nukes
+   * (real `liveConnections`) or a confirmed removal (empty array). NEVER from a parse/load
+   * failure: a transient error must not present an empty/partial set that nukes
    * approved grants. Pruning only ever REMOVES access (never escalates), so the host-admin
    * Bearer is the right auth (mirrors PUT/GET /admin/grants) — the same one the module
    * uses for register/list/material. Throws {@link GrantsApiError} on a non-ok response;
    * the caller logs + continues (best-effort — a GC fault must never crash a load).
    */
-  async reconcileGrants(agent: string, liveKeys: string[]): Promise<{ pruned: number; prunedIds?: string[] }> {
+  async reconcileGrants(
+    agent: string,
+    liveConnections: ConnectionSpec[],
+  ): Promise<{ pruned: number; prunedIds?: string[] }> {
+    // Send the live connection SPECS, not pre-computed keys: the hub re-derives
+    // each key with its OWN connectionKey (the one it stored them under). Sending
+    // keys we computed here would couple to the hub's separate connectionKey impl,
+    // which diverges for service / tagged-vault / mixed-case-mcp grants and would
+    // wrongly prune still-wanted grants (caught by live verification 2026-06-18).
     const url = `${this.base}/admin/grants/reconcile`;
     const res = await this.fetchFn(url, {
       method: "POST",
       headers: this.authHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ agent, liveKeys }),
+      body: JSON.stringify({ agent, liveConnections }),
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");

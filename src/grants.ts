@@ -299,10 +299,19 @@ export interface GrantRecord {
   approvedAt?: string;
 }
 
-/** Approved-grant material — APPROVED only. A discriminated union by `kind`. */
+/**
+ * Approved-grant material — APPROVED only. A discriminated union by `kind`.
+ *   - `vault`   → a Bearer + the granted vault's MCP URL (inject as an MCP server).
+ *   - `service` → a Bearer + the inject shape(s) (env var and/or service MCP server).
+ *   - `mcp`     → a remote-MCP grant (4b-2): a Bearer + the remote MCP URL. The wire
+ *       shape is byte-identical to `vault` (`{ token, mcpUrl }`) — the hub auto-refreshes
+ *       OAuth tokens behind `/material` and projects only `{ kind, token, mcpUrl }`, so
+ *       the consumer injects it the SAME way as a granted vault.
+ */
 export type GrantMaterial =
   | { kind: "vault"; token: string; mcpUrl: string }
-  | { kind: "service"; token: string; inject: ("env" | "mcp")[] };
+  | { kind: "service"; token: string; inject: ("env" | "mcp")[] }
+  | { kind: "mcp"; token: string; mcpUrl: string };
 
 /** A failed grants-API call — carries the HTTP status for the caller to branch on. */
 export class GrantsApiError extends Error {
@@ -498,11 +507,13 @@ export interface InjectedGrants {
  *   - service material, inject includes `"mcp"`     → the service's MCP server entry
  *       (known-service→URL map; a service with no known MCP logs + SKIPS the mcp
  *       inject, keeping the env one).
- *   - mcp-kind grants (remote MCP / OAuth) are NOT injected in 4b-1 (no OAuth) — they
- *       only ever sit `pending` server-side, so `getMaterial` returns null for them.
+ *   - mcp material (`{token, mcpUrl}`, 4b-2)         → an MCP server entry (the agent
+ *       reaches the remote MCP / OAuth resource). An UNAPPROVED mcp grant has no
+ *       material — `getMaterial` returns null (404/409), so it's simply absent.
  *
- * The MCP-entry KEYS are namespaced (`grant-vault-<name>`, `grant-service-<svc>`) so
- * they never collide with the agent's own def-vault entry (`parachute-vault-<name>`).
+ * The MCP-entry KEYS are namespaced (`grant-vault-<name>`, `grant-service-<svc>`,
+ * `grant-mcp-<grant-id>`) so they never collide with the agent's own def-vault entry
+ * (`parachute-vault-<name>`).
  *
  * Best-effort + isolated: the grant LIST failing throws (the caller logs + spawns
  * WITHOUT injected grants — own-vault still works); a SINGLE material fetch failing
@@ -542,28 +553,52 @@ export async function resolveInjectedGrants(
       continue;
     }
 
-    // service material — inject env and/or mcp per the material's `inject` list.
-    const service = g.connection.target;
-    const inject = material.inject ?? [];
-    if (inject.includes("env")) {
-      env[serviceEnvVar(service)] = material.token;
+    if (material.kind === "mcp") {
+      // Remote-MCP grant (4b-2): the /material wire shape is byte-identical to vault's
+      // (`{token, mcpUrl}`); inject it the SAME way. Key on the grant ID (not the URL)
+      // so two distinct remote MCPs never collide on the entry name.
+      mcpEntries.push({
+        name: grantMcpEntryKey(g.id),
+        url: material.mcpUrl,
+        token: material.token,
+      });
+      continue;
     }
-    if (inject.includes("mcp")) {
-      const url = serviceMcpUrl(service);
-      if (url) {
-        mcpEntries.push({
-          name: grantServiceEntryKey(service),
-          url,
-          token: material.token,
-        });
-      } else {
-        // No known MCP URL for this service — keep the env inject, skip the mcp one.
-        console.warn(
-          `parachute-agent: service "${service}" granted with inject:"mcp" but no known MCP URL — ` +
-            `skipping the MCP injection (the env injection, if any, still applies).`,
-        );
+
+    if (material.kind === "service") {
+      // service material — inject env and/or mcp per the material's `inject` list.
+      const service = g.connection.target;
+      const inject = material.inject ?? [];
+      if (inject.includes("env")) {
+        env[serviceEnvVar(service)] = material.token;
       }
+      if (inject.includes("mcp")) {
+        const url = serviceMcpUrl(service);
+        if (url) {
+          mcpEntries.push({
+            name: grantServiceEntryKey(service),
+            url,
+            token: material.token,
+          });
+        } else {
+          // No known MCP URL for this service — keep the env inject, skip the mcp one.
+          console.warn(
+            `parachute-agent: service "${service}" granted with inject:"mcp" but no known MCP URL — ` +
+              `skipping the MCP injection (the env injection, if any, still applies).`,
+          );
+        }
+      }
+      continue;
     }
+
+    // Exhaustiveness guard (future-safety): every known material kind `continue`s
+    // above, so `material` is `never` here today. If a future kind is added to the
+    // union without a branch, it lands here + is skipped LOUDLY rather than silently
+    // falling into the service path. Never log the token (the struct, not the value).
+    console.warn(
+      `parachute-agent: grant material for "${agent}" has an unhandled kind ` +
+        `"${(material as { kind?: string }).kind}" — skipping (no injection).`,
+    );
   }
 
   return { mcpEntries, env };
@@ -578,4 +613,11 @@ export function grantVaultEntryKey(vault: string): string {
 /** MCP entry key for a GRANTED service MCP server. */
 export function grantServiceEntryKey(service: string): string {
   return `grant-service-${service}`;
+}
+
+/** MCP entry key for a GRANTED remote MCP (4b-2) — keyed by the grant id (stable +
+ *  collision-free) and namespaced so it never collides with `grant-vault-*` /
+ *  `grant-service-*` / the agent's OWN def-vault entry (`parachute-vault-<name>`). */
+export function grantMcpEntryKey(slug: string): string {
+  return `grant-mcp-${slug}`;
 }

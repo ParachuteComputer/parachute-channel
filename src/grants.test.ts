@@ -10,8 +10,9 @@
  *   - GrantsClient: register (PUT) / list (GET) / material (GET, 404+409→null) — the
  *     wire contract + the manager-bearer auth header;
  *   - resolveConnectionStatus: enabled iff all approved, else pending listing keys;
- *   - resolveInjectedGrants: vault→mcp-entry, service env, service mcp, mcp-kind not
- *     injected, fresh-fetch-each-call (not cached), per-material-fault isolation.
+ *   - resolveInjectedGrants: vault→mcp-entry, service env, service mcp, mcp-material
+ *     injection (4b-2: approved→mcp-entry keyed by grant id; unapproved→absent),
+ *     fresh-fetch-each-call (not cached), per-material-fault isolation.
  */
 
 import { describe, test, expect } from "bun:test";
@@ -24,6 +25,7 @@ import {
   serviceMcpUrl,
   grantVaultEntryKey,
   grantServiceEntryKey,
+  grantMcpEntryKey,
   GrantsClient,
   GrantsApiError,
   WantsParseError,
@@ -363,6 +365,22 @@ function injectionClient(opts: {
   return new GrantsClient({ hubOrigin: HUB, managerBearer: BEARER, fetchFn });
 }
 
+describe("grant entry keys — namespaced + mutually distinct", () => {
+  test("grantMcpEntryKey returns grant-mcp-<slug>", () => {
+    expect(grantMcpEntryKey("g1")).toBe("grant-mcp-g1");
+  });
+  test("the three grant entry keys + the def-vault key never collide for the same slug", () => {
+    const slug = "x";
+    const keys = [
+      grantVaultEntryKey(slug),
+      grantServiceEntryKey(slug),
+      grantMcpEntryKey(slug),
+      `parachute-vault-${slug}`, // the agent's OWN def-vault entry prefix
+    ];
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
 describe("resolveInjectedGrants", () => {
   test("approved vault grant → an MCP entry (namespaced key)", async () => {
     const conn: ConnectionSpec = { kind: "vault", target: "research", access: "read" };
@@ -444,14 +462,82 @@ describe("resolveInjectedGrants", () => {
     ]);
   });
 
-  test("mcp-kind grant: even if (erroneously) approved, getMaterial 409/404 → not injected", async () => {
-    // In 4b-1 an mcp-kind grant stays pending server-side; model it as 409 here.
+  test("approved mcp grant (4b-2) → an MCP entry keyed by grant id, no env", async () => {
+    const conn: ConnectionSpec = { kind: "mcp", target: "https://remote.example.com/vault/eng/mcp" };
     const client = injectionClient({
-      grants: [{ id: "g1", connection: { kind: "mcp", target: "https://remote/mcp" }, status: "approved" }],
-      material: { g1: "409" },
+      grants: [{ id: "gmcp", connection: conn, status: "approved" }],
+      material: { gmcp: { kind: "mcp", token: "MTOK", mcpUrl: "https://remote.example.com/vault/eng/mcp" } },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.mcpEntries).toEqual([
+      { name: grantMcpEntryKey("gmcp"), url: "https://remote.example.com/vault/eng/mcp", token: "MTOK" },
+    ]);
+    expect(out.env).toEqual({});
+  });
+
+  test("an unapproved/pending mcp grant injects NOTHING (getMaterial 409 → absent)", async () => {
+    // A pending mcp grant has no material yet — the hub 409s /material → null → absent.
+    const client = injectionClient({
+      grants: [{ id: "gmcp", connection: { kind: "mcp", target: "https://remote/mcp" }, status: "pending" }],
+      material: { gmcp: "409" },
     });
     const out = await resolveInjectedGrants(client, "a");
     expect(out.mcpEntries).toEqual([]);
+    expect(out.env).toEqual({});
+  });
+
+  test("an approved mcp grant whose material 404s (race) → absent, not an error", async () => {
+    const client = injectionClient({
+      grants: [{ id: "gmcp", connection: { kind: "mcp", target: "https://remote/mcp" }, status: "approved" }],
+      material: { gmcp: "404" },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.mcpEntries).toEqual([]);
+    expect(out.env).toEqual({});
+  });
+
+  test("mixed: approved vault + mcp + service(env) grants all inject with distinct keys", async () => {
+    const client = injectionClient({
+      grants: [
+        { id: "gv", connection: { kind: "vault", target: "research", access: "read" }, status: "approved" },
+        { id: "gm", connection: { kind: "mcp", target: "https://remote/eng/mcp" }, status: "approved" },
+        { id: "gs", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" },
+      ],
+      material: {
+        gv: { kind: "vault", token: "VTOK", mcpUrl: "https://hub/vault/research/mcp" },
+        gm: { kind: "mcp", token: "MTOK", mcpUrl: "https://remote/eng/mcp" },
+        gs: { kind: "service", token: "GHTOK", inject: ["env"] },
+      },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.mcpEntries).toEqual([
+      { name: grantVaultEntryKey("research"), url: "https://hub/vault/research/mcp", token: "VTOK" },
+      { name: grantMcpEntryKey("gm"), url: "https://remote/eng/mcp", token: "MTOK" },
+    ]);
+    expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
+    // The vault + mcp MCP-entry keys are distinct.
+    expect(out.mcpEntries[0]!.name).not.toBe(out.mcpEntries[1]!.name);
+  });
+
+  test("two approved mcp grants for distinct remotes → two entries, keyed by id (no collision)", async () => {
+    // The rationale for keying grantMcpEntryKey on the grant id (not the URL): two
+    // distinct remote MCPs must get distinct entry names. This is that guarantee.
+    const client = injectionClient({
+      grants: [
+        { id: "gm1", connection: { kind: "mcp", target: "https://eng.example/vault/eng/mcp" }, status: "approved" },
+        { id: "gm2", connection: { kind: "mcp", target: "https://ops.example/vault/ops/mcp" }, status: "approved" },
+      ],
+      material: {
+        gm1: { kind: "mcp", token: "T1", mcpUrl: "https://eng.example/vault/eng/mcp" },
+        gm2: { kind: "mcp", token: "T2", mcpUrl: "https://ops.example/vault/ops/mcp" },
+      },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.mcpEntries).toEqual([
+      { name: grantMcpEntryKey("gm1"), url: "https://eng.example/vault/eng/mcp", token: "T1" },
+      { name: grantMcpEntryKey("gm2"), url: "https://ops.example/vault/ops/mcp", token: "T2" },
+    ]);
+    expect(out.mcpEntries[0]!.name).not.toBe(out.mcpEntries[1]!.name);
     expect(out.env).toEqual({});
   });
 

@@ -162,11 +162,15 @@ agent module.
   for future modules (`#surface/*`, …). *(Implication: the just-landed flat
   `#agent-message` / `#agent-job` tags move to `#agent/message` / `#agent/job` as part
   of this build — cheap, since the current data is disposable test state.)*
-- **Secrets stay OUT of the vault** in a local secret file, as today — until a
-  dedicated secrets-integration story emerges. (Aaron, 2026-06-17.)
+- **Secrets stay OUT of the vault** — they live **on the local filesystem** (the agent
+  module's `~/.parachute/agent/credentials.json` + per-agent `sessions/<name>/`, 0600, and
+  hub-minted/operator tokens under `~/.parachute/`), NEVER in a vault note. The note holds
+  references + status; the token *values* are local. (Confirmed Aaron, 2026-06-17 — "in the
+  hub config, lives on the file system." A dedicated secrets-integration story is later.)
 - **Multi-vault: any vault can define agents** (Aaron, 2026-06-17). Link a vault to the
   agent module → its `#agent/definition` notes become live agents here, properly scoped.
-  **Default to a single vault — `unforced`, Aaron's personal/playtest vault — but the
+  **Default to a single vault — the local `default` vault (which is what Aaron calls his
+  "unforced" vault — `default` is its actual name; his playtest vault) — but the
   architecture must NOT hard-code single-vault.** Model the binding as a **list** of
   linked def-vaults (default: one), so opening up multi-vault later is just appending,
   not a refactor. **Per-vault scoping (load-bearing):** an agent defined in vault X is
@@ -176,11 +180,50 @@ agent module.
   that makes "link any vault" safe. *(Same shape will serve `#surface/*` when a vault
   defines surfaces — a later parallel, not now.)*
 
+## Connections, approval & status (the connector model — Aaron, 2026-06-17)
+
+An agent's **own def-vault is auto-granted** (writing the def there IS the authorization;
+the module already holds/mints that vault's token). Anything **beyond** that — **another
+vault, an MCP server, an external API/service** — is a **connection the operator must
+approve**, not something a vault note can grant itself. This is the right trust boundary:
+a `#agent/definition` note *declares what it wants to reach*; granting it is operator-gated.
+
+This rides the hub's existing **Connections engine** (the same `/admin/connections` +
+operator-approval + token-minting that already wires vault↔module today), generalized from
+"event→action triggers" to also **resource grants**: the agent module asks the hub for, say,
+`vault:other:read` (or an MCP/service credential); the operator **approves in the UI**; the
+hub mints the scoped token and the module stores it **locally** (filesystem — never the note).
+*(This is the "improving connectors" Aaron flagged — the engine gains an approval-gated
+grant kind alongside triggers.)*
+
+**Status field — so MCP/any surface can see if an agent is live or pending.** The module
+resolves each declared connection and **stamps a status back onto the `#agent/definition`
+note** (the module has write to its def-vault), e.g.:
+```
+status: enabled                      # all declared connections granted + wired
+# or
+status: pending
+pending: ["vault:research:read", "service:github"]   # awaiting operator approval
+```
+So "is this agent fully enabled?" is one note query — readable from MCP, the chat UI, or any
+vault surface — exactly the "lives in the field so we know from an MCP side" Aaron wanted.
+Approve the pending connection in the hub UI → the module re-resolves → status flips to
+`enabled`. An agent runs with whatever is granted; declared-but-unapproved connections are
+simply absent until approved (it doesn't fail — it's partial/pending).
+
+**Coherence with the hub-module boundary:** hub owns identity/approval/issuance (Connections
+UI + token minting); the agent module owns lifecycle + injects the locally-stored tokens; the
+vault holds the declarative request + the status. Clean three-way split.
+
+**Phasing (so we ship value fast):**
+- **4a — first cut:** vault-native agents reading `#agent/definition` from `default`, each
+  auto-scoped to its def-vault (`default`), running. The `status` field exists and is
+  `enabled` (own-vault only). No cross-vault/external connectors yet.
+- **4b — connector layer:** declared cross-vault / MCP / service access → hub Connections
+  approval UI → locally-stored scoped tokens → `status` reflects pending/enabled. This is
+  where "improving connectors" lands.
+
 ## Open questions
-- **Cross-vault operation:** the default is an agent operates on its *defining* vault.
-  Do we ever need an agent defined in vault A to act on vault B? Deferred — start with
-  agent-bound-to-its-def-vault; revisit if a real case appears (a def could later name a
-  different target vault, gated by the operator provisioning that vault's token).
 - **Cred references:** the `uses: [name]` vocabulary + how the module maps a name to
   a provisioned credential (a local `credentials.json` keyed by name). Needs a small
   registry of named creds.

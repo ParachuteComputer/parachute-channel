@@ -1,0 +1,489 @@
+/**
+ * Unit tests for agent connectors — approval-gated grants (design
+ * 2026-06-17-agent-connectors-4b.md, slice 4b-1).
+ *
+ * Deterministic — `fetch` is INJECTED into GrantsClient (no global mock, nothing to
+ * restore); the parse + status + injection helpers are pure. Covered:
+ *   - parseWants: every spec form (vault verb + tag-scope, env/mcp service merge,
+ *     mcp:url), malformed → WantsParseError, array vs comma-string input;
+ *   - connectionKey: stable across re-parse + tag ordering;
+ *   - GrantsClient: register (PUT) / list (GET) / material (GET, 404+409→null) — the
+ *     wire contract + the manager-bearer auth header;
+ *   - resolveConnectionStatus: enabled iff all approved, else pending listing keys;
+ *   - resolveInjectedGrants: vault→mcp-entry, service env, service mcp, mcp-kind not
+ *     injected, fresh-fetch-each-call (not cached), per-material-fault isolation.
+ */
+
+import { describe, test, expect } from "bun:test";
+import {
+  parseWants,
+  connectionKey,
+  resolveConnectionStatus,
+  resolveInjectedGrants,
+  serviceEnvVar,
+  serviceMcpUrl,
+  grantVaultEntryKey,
+  grantServiceEntryKey,
+  GrantsClient,
+  GrantsApiError,
+  WantsParseError,
+  type ConnectionSpec,
+  type GrantMaterial,
+} from "./grants.ts";
+
+// ---------------------------------------------------------------------------
+// parseWants
+// ---------------------------------------------------------------------------
+
+describe("parseWants — spec forms", () => {
+  test("vault:<name>:<verb>", () => {
+    expect(parseWants("vault:research:read")).toEqual([
+      { kind: "vault", target: "research", access: "read" },
+    ]);
+    expect(parseWants("vault:ops:write")).toEqual([
+      { kind: "vault", target: "ops", access: "write" },
+    ]);
+  });
+
+  test("vault with one or more #tag suffixes", () => {
+    expect(parseWants("vault:research:read#published")).toEqual([
+      { kind: "vault", target: "research", access: "read", tags: ["#published"] },
+    ]);
+    expect(parseWants("vault:research:read#published#wip")).toEqual([
+      { kind: "vault", target: "research", access: "read", tags: ["#published", "#wip"] },
+    ]);
+  });
+
+  test("env:<service> → service inject:[env]", () => {
+    expect(parseWants("env:github")).toEqual([
+      { kind: "service", target: "github", inject: ["env"] },
+    ]);
+  });
+
+  test("mcp:<service> (non-url) → service inject:[mcp]", () => {
+    expect(parseWants("mcp:github")).toEqual([
+      { kind: "service", target: "github", inject: ["mcp"] },
+    ]);
+  });
+
+  test("env:<svc> + mcp:<svc> for the same service MERGE → inject:[env,mcp]", () => {
+    expect(parseWants("env:github, mcp:github")).toEqual([
+      { kind: "service", target: "github", inject: ["env", "mcp"] },
+    ]);
+    // Order-independent: mcp first then env still merges to [env,mcp] (canonical order).
+    expect(parseWants("mcp:github, env:github")).toEqual([
+      { kind: "service", target: "github", inject: ["env", "mcp"] },
+    ]);
+  });
+
+  test("mcp:<https-url> → kind mcp (parsed; deferred to 4b-2)", () => {
+    expect(parseWants("mcp:https://remote.example.com/mcp")).toEqual([
+      { kind: "mcp", target: "https://remote.example.com/mcp" },
+    ]);
+    expect(parseWants("mcp:http://localhost:9000/mcp")).toEqual([
+      { kind: "mcp", target: "http://localhost:9000/mcp" },
+    ]);
+  });
+
+  test("a mixed list keeps first-seen order; services merge in place", () => {
+    const got = parseWants(
+      "vault:research:read#pub, env:github, vault:ops:write, mcp:github, env:cloudflare",
+    );
+    expect(got).toEqual([
+      { kind: "vault", target: "research", access: "read", tags: ["#pub"] },
+      { kind: "service", target: "github", inject: ["env", "mcp"] }, // merged at first pos
+      { kind: "vault", target: "ops", access: "write" },
+      { kind: "service", target: "cloudflare", inject: ["env"] },
+    ]);
+  });
+
+  test("accepts a real array (a vault that didn't stringify)", () => {
+    expect(parseWants(["vault:a:read", "env:github"])).toEqual([
+      { kind: "vault", target: "a", access: "read" },
+      { kind: "service", target: "github", inject: ["env"] },
+    ]);
+  });
+
+  test("empty / undefined / null → []", () => {
+    expect(parseWants(undefined)).toEqual([]);
+    expect(parseWants(null)).toEqual([]);
+    expect(parseWants("")).toEqual([]);
+    expect(parseWants("  ,  ")).toEqual([]);
+    expect(parseWants([])).toEqual([]);
+  });
+});
+
+describe("parseWants — malformed → WantsParseError", () => {
+  test("no kind prefix (no colon)", () => {
+    expect(() => parseWants("github")).toThrow(WantsParseError);
+  });
+  test("unknown kind", () => {
+    expect(() => parseWants("smtp:server")).toThrow(/unknown kind/);
+  });
+  test("vault without a verb", () => {
+    expect(() => parseWants("vault:research")).toThrow(/needs a verb/);
+  });
+  test("vault with a bad verb", () => {
+    expect(() => parseWants("vault:research:admin")).toThrow(/read.*write/);
+    expect(() => parseWants("vault:research:delete")).toThrow(WantsParseError);
+  });
+  test("vault with a non-slug name", () => {
+    // The list is comma/space-separated, so a slug-breaking char is `.`/`@`/… not a space.
+    expect(() => parseWants("vault:bad.name:read")).toThrow(/slug/);
+  });
+  test("service with a non-slug name", () => {
+    expect(() => parseWants("env:bad.name")).toThrow(/slug/);
+  });
+  test("mcp with a non-http(s) url-looking target is treated as a service slug → bad slug", () => {
+    // "ftp://x" doesn't match http(s) → treated as a service name → not a slug.
+    expect(() => parseWants("mcp:ftp://x")).toThrow(/slug/);
+  });
+  test("one malformed entry in a list throws (no half-parse)", () => {
+    expect(() => parseWants("vault:a:read, garbage")).toThrow(WantsParseError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// connectionKey — stable identity
+// ---------------------------------------------------------------------------
+
+describe("connectionKey", () => {
+  test("stable across a re-parse of the same wants entry", () => {
+    const a = parseWants("vault:research:read#a#b")[0]!;
+    const b = parseWants("vault:research:read#a#b")[0]!;
+    expect(connectionKey(a)).toBe(connectionKey(b));
+  });
+  test("tag order does not change the key", () => {
+    const ab = parseWants("vault:r:read#a#b")[0]!;
+    const ba = parseWants("vault:r:read#b#a")[0]!;
+    expect(connectionKey(ab)).toBe(connectionKey(ba));
+  });
+  test("service key reflects merged inject; vault key reflects verb", () => {
+    expect(connectionKey({ kind: "service", target: "github", inject: ["env", "mcp"] })).toBe(
+      "env+mcp:github",
+    );
+    expect(connectionKey({ kind: "vault", target: "ops", access: "write" })).toBe("vault:ops:write");
+    expect(connectionKey({ kind: "mcp", target: "https://x/mcp" })).toBe("mcp:https://x/mcp");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GrantsClient — the wire contract
+// ---------------------------------------------------------------------------
+
+const HUB = "https://hub.example.com";
+const BEARER = "MANAGER-OPERATOR-TOKEN";
+
+function clientWith(fetchFn: typeof fetch): GrantsClient {
+  return new GrantsClient({ hubOrigin: HUB, managerBearer: BEARER, fetchFn });
+}
+
+describe("GrantsClient.registerGrant (PUT /admin/grants)", () => {
+  test("PUTs { agent, connection } with the manager bearer; returns the record", async () => {
+    let captured: { url: string; method?: string; auth?: string; body?: unknown } = { url: "" };
+    const conn: ConnectionSpec = { kind: "vault", target: "research", access: "read" };
+    const client = clientWith((async (url: string | URL | Request, init?: RequestInit) => {
+      captured = {
+        url: String(url),
+        method: init?.method,
+        auth: (init?.headers as Record<string, string>)?.authorization,
+        body: JSON.parse(String(init?.body)),
+      };
+      return new Response(
+        JSON.stringify({ id: "g1", agent: "researcher", connection: conn, status: "pending" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch);
+
+    const rec = await client.registerGrant("researcher", conn);
+    expect(captured.url).toBe(`${HUB}/admin/grants`);
+    expect(captured.method).toBe("PUT");
+    expect(captured.auth).toBe(`Bearer ${BEARER}`);
+    expect(captured.body).toEqual({ agent: "researcher", connection: conn });
+    expect(rec).toEqual({ id: "g1", agent: "researcher", connection: conn, status: "pending" });
+  });
+
+  test("throws GrantsApiError carrying the status on a non-ok response", async () => {
+    const client = clientWith((async () => new Response("nope", { status: 403 })) as unknown as typeof fetch);
+    await expect(
+      client.registerGrant("a", { kind: "vault", target: "v", access: "read" }),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+});
+
+describe("GrantsClient.listGrants (GET /admin/grants?agent=)", () => {
+  test("GETs with the agent query + bearer; returns the grants array", async () => {
+    let url = "";
+    let auth = "";
+    const client = clientWith((async (u: string | URL | Request, init?: RequestInit) => {
+      url = String(u);
+      auth = (init?.headers as Record<string, string>)?.authorization ?? "";
+      return new Response(
+        JSON.stringify({
+          grants: [
+            { id: "g1", agent: "a", connection: { kind: "vault", target: "v", access: "read" }, status: "approved" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch);
+
+    const grants = await client.listGrants("a");
+    expect(url).toBe(`${HUB}/admin/grants?agent=a`);
+    expect(auth).toBe(`Bearer ${BEARER}`);
+    expect(grants).toHaveLength(1);
+    expect(grants[0]!.status).toBe("approved");
+  });
+
+  test("missing grants array → [] (defensive)", async () => {
+    const client = clientWith((async () => new Response("{}", { status: 200 })) as unknown as typeof fetch);
+    expect(await client.listGrants("a")).toEqual([]);
+  });
+
+  test("throws on a non-ok response", async () => {
+    const client = clientWith((async () => new Response("err", { status: 500 })) as unknown as typeof fetch);
+    await expect(client.listGrants("a")).rejects.toThrow(GrantsApiError);
+  });
+});
+
+describe("GrantsClient.getMaterial (GET /admin/grants/<id>/material)", () => {
+  test("returns the vault material on 200", async () => {
+    const mat: GrantMaterial = { kind: "vault", token: "VTOK", mcpUrl: "https://v/mcp" };
+    let url = "";
+    const client = clientWith((async (u: string | URL | Request) => {
+      url = String(u);
+      return new Response(JSON.stringify(mat), { status: 200 });
+    }) as typeof fetch);
+    expect(await client.getMaterial("g1")).toEqual(mat);
+    expect(url).toBe(`${HUB}/admin/grants/g1/material`);
+  });
+
+  test("404 (unknown id) → null", async () => {
+    const client = clientWith((async () => new Response("no", { status: 404 })) as unknown as typeof fetch);
+    expect(await client.getMaterial("ghost")).toBeNull();
+  });
+
+  test("409 (not approved) → null", async () => {
+    const client = clientWith((async () => new Response("pending", { status: 409 })) as unknown as typeof fetch);
+    expect(await client.getMaterial("g-pending")).toBeNull();
+  });
+
+  test("any other non-ok throws", async () => {
+    const client = clientWith((async () => new Response("boom", { status: 500 })) as unknown as typeof fetch);
+    await expect(client.getMaterial("g1")).rejects.toThrow(GrantsApiError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveConnectionStatus
+// ---------------------------------------------------------------------------
+
+describe("resolveConnectionStatus", () => {
+  const vault: ConnectionSpec = { kind: "vault", target: "research", access: "read" };
+  const svc: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
+
+  test("no connections → enabled", () => {
+    expect(resolveConnectionStatus([], new Map())).toEqual({ status: "enabled" });
+  });
+  test("all approved → enabled", () => {
+    const m = new Map([
+      [connectionKey(vault), "approved"],
+      [connectionKey(svc), "approved"],
+    ]);
+    expect(resolveConnectionStatus([vault, svc], m)).toEqual({ status: "enabled" });
+  });
+  test("any unapproved (pending / missing) → pending listing the keys", () => {
+    const m = new Map([[connectionKey(vault), "approved"]]); // svc missing
+    expect(resolveConnectionStatus([vault, svc], m)).toEqual({
+      status: "pending",
+      pending: [connectionKey(svc)],
+    });
+  });
+  test("a pending grant status counts as not approved", () => {
+    const m = new Map([[connectionKey(vault), "pending"]]);
+    expect(resolveConnectionStatus([vault], m)).toEqual({
+      status: "pending",
+      pending: [connectionKey(vault)],
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// service env / mcp maps
+// ---------------------------------------------------------------------------
+
+describe("service env var + mcp url maps", () => {
+  test("known services map to canonical env var names", () => {
+    expect(serviceEnvVar("github")).toBe("GITHUB_TOKEN");
+    expect(serviceEnvVar("cloudflare")).toBe("CLOUDFLARE_API_TOKEN");
+  });
+  test("unknown service defaults to <TARGET>_TOKEN upper-snake", () => {
+    expect(serviceEnvVar("my-svc")).toBe("MY_SVC_TOKEN");
+    expect(serviceEnvVar("openai")).toBe("OPENAI_TOKEN");
+  });
+  test("github has a known MCP url; an unknown service has none", () => {
+    expect(serviceMcpUrl("github")).toMatch(/^https:\/\//);
+    expect(serviceMcpUrl("cloudflare")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveInjectedGrants — approved grants → mcp entries + env
+// ---------------------------------------------------------------------------
+
+/** A grants client whose list returns `grants` + whose material is keyed by grant id. */
+function injectionClient(opts: {
+  grants: Array<{ id: string; connection: ConnectionSpec; status: string }>;
+  material?: Record<string, GrantMaterial | "404" | "409" | "throw">;
+  onMaterialCall?: (id: string) => void;
+}): GrantsClient {
+  const fetchFn = (async (url: string | URL | Request) => {
+    const u = String(url);
+    if (u.includes("/admin/grants/")) {
+      const id = u.split("/admin/grants/")[1]!.replace("/material", "");
+      opts.onMaterialCall?.(id);
+      const m = opts.material?.[id];
+      if (!m || m === "404") return new Response("no", { status: 404 });
+      if (m === "409") return new Response("pending", { status: 409 });
+      if (m === "throw") return new Response("boom", { status: 500 });
+      return new Response(JSON.stringify(m), { status: 200 });
+    }
+    // list
+    return new Response(
+      JSON.stringify({
+        grants: opts.grants.map((g) => ({ id: g.id, agent: "a", connection: g.connection, status: g.status })),
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+  return new GrantsClient({ hubOrigin: HUB, managerBearer: BEARER, fetchFn });
+}
+
+describe("resolveInjectedGrants", () => {
+  test("approved vault grant → an MCP entry (namespaced key)", async () => {
+    const conn: ConnectionSpec = { kind: "vault", target: "research", access: "read" };
+    const client = injectionClient({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: { g1: { kind: "vault", token: "VTOK", mcpUrl: "https://hub/vault/research/mcp" } },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.mcpEntries).toEqual([
+      { name: grantVaultEntryKey("research"), url: "https://hub/vault/research/mcp", token: "VTOK" },
+    ]);
+    expect(out.env).toEqual({});
+  });
+
+  test("approved service grant (env) → an env var, no MCP entry", async () => {
+    const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
+    const client = injectionClient({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: { g1: { kind: "service", token: "GHTOK", inject: ["env"] } },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
+    expect(out.mcpEntries).toEqual([]);
+  });
+
+  test("approved service grant (mcp) → an MCP entry for the known service URL", async () => {
+    const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["mcp"] };
+    const client = injectionClient({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: { g1: { kind: "service", token: "GHTOK", inject: ["mcp"] } },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.mcpEntries).toEqual([
+      { name: grantServiceEntryKey("github"), url: serviceMcpUrl("github")!, token: "GHTOK" },
+    ]);
+    expect(out.env).toEqual({});
+  });
+
+  test("service granted env+mcp → both an env var AND an MCP entry", async () => {
+    const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env", "mcp"] };
+    const client = injectionClient({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: { g1: { kind: "service", token: "GHTOK", inject: ["env", "mcp"] } },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
+    expect(out.mcpEntries).toEqual([
+      { name: grantServiceEntryKey("github"), url: serviceMcpUrl("github")!, token: "GHTOK" },
+    ]);
+  });
+
+  test("service with inject:[mcp] but no known MCP url → env kept, mcp skipped (no throw)", async () => {
+    const conn: ConnectionSpec = { kind: "service", target: "cloudflare", inject: ["env", "mcp"] };
+    const client = injectionClient({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: { g1: { kind: "service", token: "CFTOK", inject: ["env", "mcp"] } },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.env).toEqual({ CLOUDFLARE_API_TOKEN: "CFTOK" });
+    expect(out.mcpEntries).toEqual([]); // no known cloudflare MCP url → skipped
+  });
+
+  test("only APPROVED grants are fetched (pending/revoked skipped, no material call)", async () => {
+    const called: string[] = [];
+    const client = injectionClient({
+      grants: [
+        { id: "g1", connection: { kind: "vault", target: "a", access: "read" }, status: "pending" },
+        { id: "g2", connection: { kind: "service", target: "github", inject: ["env"] }, status: "revoked" },
+        { id: "g3", connection: { kind: "vault", target: "b", access: "read" }, status: "approved" },
+      ],
+      material: { g3: { kind: "vault", token: "BTOK", mcpUrl: "https://hub/vault/b/mcp" } },
+      onMaterialCall: (id) => called.push(id),
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    // Only the approved grant's material was fetched.
+    expect(called).toEqual(["g3"]);
+    expect(out.mcpEntries).toEqual([
+      { name: grantVaultEntryKey("b"), url: "https://hub/vault/b/mcp", token: "BTOK" },
+    ]);
+  });
+
+  test("mcp-kind grant: even if (erroneously) approved, getMaterial 409/404 → not injected", async () => {
+    // In 4b-1 an mcp-kind grant stays pending server-side; model it as 409 here.
+    const client = injectionClient({
+      grants: [{ id: "g1", connection: { kind: "mcp", target: "https://remote/mcp" }, status: "approved" }],
+      material: { g1: "409" },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.mcpEntries).toEqual([]);
+    expect(out.env).toEqual({});
+  });
+
+  test("a single material fetch fault is isolated — the other grants still inject", async () => {
+    const client = injectionClient({
+      grants: [
+        { id: "g1", connection: { kind: "vault", target: "a", access: "read" }, status: "approved" },
+        { id: "g2", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" },
+      ],
+      material: {
+        g1: "throw", // 500 → fetch throws GrantsApiError → skipped
+        g2: { kind: "service", token: "GHTOK", inject: ["env"] },
+      },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.mcpEntries).toEqual([]); // g1's vault entry skipped
+    expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" }); // g2 still injected
+  });
+
+  test("a list failure propagates (caller spawns without grants)", async () => {
+    const fetchFn = (async () => new Response("boom", { status: 500 })) as unknown as typeof fetch;
+    const client = new GrantsClient({ hubOrigin: HUB, managerBearer: BEARER, fetchFn });
+    await expect(resolveInjectedGrants(client, "a")).rejects.toThrow(GrantsApiError);
+  });
+
+  test("material is fetched FRESH each call (not cached across spawns)", async () => {
+    const called: string[] = [];
+    const client = injectionClient({
+      grants: [{ id: "g1", connection: { kind: "vault", target: "a", access: "read" }, status: "approved" }],
+      material: { g1: { kind: "vault", token: "VTOK", mcpUrl: "https://hub/vault/a/mcp" } },
+      onMaterialCall: (id) => called.push(id),
+    });
+    await resolveInjectedGrants(client, "a");
+    await resolveInjectedGrants(client, "a");
+    // Two spawns → two material fetches (no cache between them — revocation takes
+    // effect next spawn precisely because we re-fetch).
+    expect(called).toEqual(["g1", "g1"]);
+  });
+});

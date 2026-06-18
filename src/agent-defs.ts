@@ -46,6 +46,14 @@ import {
   type AgentMount,
 } from "./sandbox/types.ts";
 import { AGENT_DEFINITION_TAG } from "./transports/vault.ts";
+import {
+  parseWants,
+  connectionKey,
+  resolveConnectionStatus,
+  WantsParseError,
+  GrantsClient,
+  type ConnectionSpec,
+} from "./grants.ts";
 
 const DEFAULT_DEF_VAULT_URL = "http://127.0.0.1:1940";
 
@@ -85,10 +93,20 @@ export interface ParsedAgentDef {
   spec: AgentSpec;
   /**
    * Declared cross-vault / MCP / external-service connections beyond the def-vault
-   * (the `uses:` field). PARSED + surfaced in 4a; granting is 4b. Empty = own-vault
-   * only → `enabled`.
+   * (the legacy `uses:` field — raw name strings). PARSED + surfaced in 4a; superseded
+   * by the structured `wants:` field in 4b. Kept for back-compat (a 4a-era note that
+   * declared `uses:` still surfaces its names) — but a note SHOULD use `wants:` (see
+   * {@link wants}). Empty = no legacy declarations.
    */
   declaredConnections: string[];
+  /**
+   * Declared connections in the STRUCTURED 4b form (the `wants:` field) — vault /
+   * service / mcp connection specs the agent wants to reach beyond its def-vault
+   * (design 2026-06-17-agent-connectors-4b.md). REGISTERED as pending grants on
+   * instantiate + injected (when approved) at spawn — granting is operator-approved
+   * in the hub. Empty = own-vault only.
+   */
+  wants: ConnectionSpec[];
 }
 
 /** A failed parse — the note isn't a well-formed agent def. */
@@ -266,11 +284,26 @@ export function parseAgentDef(note: {
   const mounts = parseMounts(meta.mounts);
   if (mounts.length > 0) spec.mounts = mounts;
 
-  // Declared connections beyond the def-vault (the `uses:` field). PARSED + surfaced;
-  // granting is 4b. Never a secret — these are NAMES (`github`, `vault:research:read`).
+  // Declared connections beyond the def-vault (the legacy `uses:` field). PARSED +
+  // surfaced; never a secret — these are NAMES (`github`, `vault:research:read`).
   const declaredConnections = metaList(meta.uses);
 
-  return { noteId, name, spec, declaredConnections };
+  // STRUCTURED connection declarations (the 4b `wants:` field — design
+  // 2026-06-17-agent-connectors-4b.md). Comma-separated connection specs parsed into
+  // {@link ConnectionSpec}s. A MALFORMED `wants:` → the def is an ERROR (we re-throw
+  // as AgentDefParseError so the registry stamps status:error + doesn't half-
+  // instantiate, design §1). The def-vault is implicit — never appears in `wants:`.
+  let wants: ConnectionSpec[];
+  try {
+    wants = parseWants(meta.wants);
+  } catch (err) {
+    if (err instanceof WantsParseError) {
+      throw new AgentDefParseError(`#agent/definition note ${noteId}: ${err.message}`);
+    }
+    throw err;
+  }
+
+  return { noteId, name, spec, declaredConnections, wants };
 }
 
 /** Parse a metadata `mounts` value (JSON array string or real array) → AgentMount[]. */
@@ -303,16 +336,27 @@ function parseMounts(v: unknown): AgentMount[] {
 }
 
 /**
- * Resolve the status a parsed def gets in 4a. Own-vault only → `enabled`; a def that
- * declares external connections → `pending` (listing them) since 4b hasn't granted
- * them. The agent still runs own-vault either way; this is the queryable signal.
+ * Resolve the status a parsed def gets WITHOUT grant information — the fallback path
+ * (no grants client wired, e.g. hub not provisioned). Own-vault only → `enabled`; a
+ * def that declares ANY connection (legacy `uses:` names OR structured `wants:`) →
+ * `pending` (listing them) since nothing has been granted yet. The agent still runs
+ * own-vault either way; this is the queryable signal.
+ *
+ * When a grants client IS wired, the registry instead registers each `wants:`
+ * connection + resolves status from the hub's grant statuses
+ * (`resolveConnectionStatus` in grants.ts) — `enabled` only once every connection is
+ * approved. This pure function is the no-hub fallback + the legacy-`uses:` path.
  */
 export function resolveDefStatus(def: ParsedAgentDef): {
   status: AgentDefStatus;
   pending?: string[];
 } {
-  if (def.declaredConnections.length > 0) {
-    return { status: "pending", pending: def.declaredConnections };
+  const pending = [
+    ...def.declaredConnections,
+    ...def.wants.map((c) => connectionKey(c)),
+  ];
+  if (pending.length > 0) {
+    return { status: "pending", pending };
   }
   return { status: "enabled" };
 }
@@ -504,12 +548,30 @@ export class AgentDefRegistry {
   /** `${vault}\u0000${noteId}` → the live record. */
   private readonly live = new Map<string, LiveDef>();
   private readonly deps: InstantiateDeps;
+  /**
+   * The hub grants client (4b) — used to REGISTER each def's `wants:` connections as
+   * pending grants on instantiate + resolve status from the hub's grant statuses.
+   * Optional: null when the hub isn't provisioned yet (no manager bearer) — then the
+   * registry falls back to {@link resolveDefStatus} (pending if any connection is
+   * declared) and never registers, so the vault-native path still runs own-vault.
+   */
+  private grants: GrantsClient | null;
 
-  constructor(deps: InstantiateDeps, opts?: { bindings?: DefVaultBinding[]; fetchFn?: typeof fetch }) {
+  constructor(
+    deps: InstantiateDeps,
+    opts?: { bindings?: DefVaultBinding[]; fetchFn?: typeof fetch; grants?: GrantsClient | null },
+  ) {
     this.deps = deps;
+    this.grants = opts?.grants ?? null;
     for (const b of opts?.bindings ?? []) {
       this.addVault(b, opts?.fetchFn);
     }
+  }
+
+  /** Wire (or replace) the hub grants client — set once the manager bearer resolves
+   *  at boot (the constructor runs before the operator token is read). */
+  setGrantsClient(grants: GrantsClient | null): void {
+    this.grants = grants;
   }
 
   /** Register a def-vault binding (additive — multi-vault is appending). */
@@ -636,7 +698,13 @@ export class AgentDefRegistry {
       return false;
     }
 
-    const { status, pending } = resolveDefStatus(def);
+    // Resolve status. 4b: when a grants client is wired AND the def declares `wants:`
+    // connections, REGISTER each as a pending grant with the hub + derive status from
+    // the hub's grant statuses (`enabled` only once every connection is approved).
+    // Otherwise fall back to the pure {@link resolveDefStatus} (pending if anything is
+    // declared, enabled if nothing is). Either way the agent ALREADY ran its own-vault
+    // setup above — an unapproved connection is absent at spawn, never a failure here.
+    const { status, pending } = await this.resolveStatusWithGrants(def);
     this.live.set(this.keyOf(vault, note.id), { vault, noteId: note.id, name: def.name, status });
     // Stamp status — best-effort: a failed stamp doesn't unmake the running agent.
     try {
@@ -646,6 +714,51 @@ export class AgentDefRegistry {
     }
     console.log(`agent-defs: instantiated "${def.name}" from ${note.id} in "${vault}" (status=${status}).`);
     return true;
+  }
+
+  /**
+   * Resolve a def's status, registering its `wants:` connections as PENDING grants
+   * when a grants client is wired (4b). For each declared connection: `PUT
+   * /admin/grants {agent, connection}` (idempotent upsert), collect the returned
+   * status, then derive `enabled` (every connection approved) vs `pending` (listing
+   * the unapproved connection keys). Legacy `uses:` names are appended to `pending`
+   * (they have no grants flow — informational only).
+   *
+   * Best-effort + non-fatal: NO grants client, NO `wants:`, or a registration failure
+   * all fall back to {@link resolveDefStatus} (a connection that couldn't register
+   * counts as unapproved → the def is `pending`, not `error` — the agent still runs
+   * own-vault, the operator can retry the hub). A single connection's PUT failing is
+   * logged + that connection counts as unapproved; the others still register.
+   */
+  private async resolveStatusWithGrants(
+    def: ParsedAgentDef,
+  ): Promise<{ status: AgentDefStatus; pending?: string[] }> {
+    if (!this.grants || def.wants.length === 0) {
+      // No hub wiring / no structured connections → the pure fallback.
+      return resolveDefStatus(def);
+    }
+    const grants = this.grants;
+    const statusByKey = new Map<string, string>();
+    for (const conn of def.wants) {
+      try {
+        const rec = await grants.registerGrant(def.name, conn);
+        statusByKey.set(connectionKey(conn), rec.status);
+      } catch (err) {
+        // A failed registration → the connection counts as unapproved (absent from
+        // statusByKey). Never fatal — the agent runs own-vault; the operator retries.
+        console.warn(
+          `agent-defs: registering grant for "${def.name}" (${connectionKey(conn)}) failed ` +
+            `(treating as pending): ${(err as Error).message}`,
+        );
+      }
+    }
+    const resolved = resolveConnectionStatus(def.wants, statusByKey);
+    // Surface legacy `uses:` names alongside the structured pending keys (no grant flow).
+    const pending = [...(resolved.pending ?? []), ...def.declaredConnections];
+    if (resolved.status === "enabled" && pending.length === 0) {
+      return { status: "enabled" };
+    }
+    return { status: "pending", pending };
   }
 
   /** Tear down the agent for a given (vault, noteId): deregister + drop its channel. */

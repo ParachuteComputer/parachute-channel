@@ -21,6 +21,7 @@ import {
   type DefVaultBinding,
   type InstantiateDeps,
 } from "./agent-defs.ts";
+import { GrantsClient, connectionKey, type ConnectionSpec } from "./grants.ts";
 import type { AgentSpec } from "./sandbox/types.ts";
 
 const realFetch = globalThis.fetch;
@@ -116,6 +117,54 @@ describe("parseAgentDef", () => {
       { vault: "default" },
     );
     expect(def.declaredConnections).toEqual(["github", "cloudflare"]);
+  });
+
+  test("parses the structured `wants:` field into connection specs (4b)", () => {
+    const def = parseAgentDef(
+      {
+        id: "n1",
+        content: "role",
+        metadata: {
+          name: "researcher",
+          wants: "vault:research:read#published, env:github, mcp:github, mcp:https://remote/mcp",
+        },
+      },
+      { vault: "default" },
+    );
+    expect(def.wants).toEqual([
+      { kind: "vault", target: "research", access: "read", tags: ["#published"] },
+      { kind: "service", target: "github", inject: ["env", "mcp"] }, // merged
+      { kind: "mcp", target: "https://remote/mcp" },
+    ]);
+    // No grants client wired (pure resolveDefStatus) → pending listing the conn keys.
+    expect(resolveDefStatus(def)).toEqual({
+      status: "pending",
+      pending: def.wants.map((c) => connectionKey(c)),
+    });
+  });
+
+  test("a def with no `wants:` → wants is [] (own-vault only → enabled)", () => {
+    const def = parseAgentDef(
+      { id: "n1", content: "role", metadata: { name: "x" } },
+      { vault: "default" },
+    );
+    expect(def.wants).toEqual([]);
+    expect(resolveDefStatus(def)).toEqual({ status: "enabled" });
+  });
+
+  test("a MALFORMED `wants:` makes the WHOLE def a parse error (no half-instantiate)", () => {
+    expect(() =>
+      parseAgentDef(
+        { id: "n1", content: "role", metadata: { name: "x", wants: "vault:research" } },
+        { vault: "default" },
+      ),
+    ).toThrow(AgentDefParseError);
+    expect(() =>
+      parseAgentDef(
+        { id: "n1", content: "role", metadata: { name: "x", wants: "smtp:server" } },
+        { vault: "default" },
+      ),
+    ).toThrow(/unknown kind/);
   });
 
   test("parses JSON-array mounts; ignores malformed entries", () => {
@@ -471,5 +520,189 @@ describe("AgentDefRegistry — lifecycle", () => {
     reg.addVault({ vault: "research", token: "t" });
     expect(reg.soleVaultName()).toBeUndefined();
     expect(reg.vaultCount).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AgentDefRegistry — 4b grant registration + status (design 2026-06-17-agent-connectors-4b)
+// ---------------------------------------------------------------------------
+
+/** A fake GrantsClient that records PUTs and returns a configurable per-connection
+ *  status. The hub isn't deployed in the test env — this mocks its grants API. */
+function fakeGrantsClient(opts: {
+  /** connectionKey → the status the hub returns on register. Default "pending". */
+  statusByKey?: Record<string, string>;
+  /** Record each registered (agent, connection). */
+  registered?: Array<{ agent: string; connection: ConnectionSpec }>;
+}): GrantsClient {
+  const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
+    const u = String(url);
+    if (u.endsWith("/admin/grants") && (init?.method ?? "GET") === "PUT") {
+      const body = JSON.parse(String(init?.body)) as { agent: string; connection: ConnectionSpec };
+      opts.registered?.push({ agent: body.agent, connection: body.connection });
+      const key = connectionKey(body.connection);
+      const status = opts.statusByKey?.[key] ?? "pending";
+      return new Response(
+        JSON.stringify({ id: `g-${key}`, agent: body.agent, connection: body.connection, status }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+  return new GrantsClient({ hubOrigin: "https://hub.example.com", managerBearer: "MGR", fetchFn });
+}
+
+describe("AgentDefRegistry — grant registration + status (4b)", () => {
+  test("registers each `wants:` connection as a pending grant on instantiate", async () => {
+    const { deps } = recorderDeps();
+    const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
+    const grants = fakeGrantsClient({ registered }); // all default "pending"
+    const patches: Array<{ id: string; status?: string; pending?: string }> = [];
+    const fetchFn = vaultFetch({
+      defs: [
+        {
+          id: "Agents/researcher",
+          content: "role",
+          metadata: { name: "researcher", wants: "vault:research:read, env:github" },
+        },
+      ],
+      patches,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+    await reg.loadAll();
+
+    // Both connections were registered for the agent.
+    expect(registered.map((r) => r.connection.target).sort()).toEqual(["github", "research"]);
+    expect(registered.every((r) => r.agent === "researcher")).toBe(true);
+    // None approved → status pending listing the connection keys.
+    const p = patches.find((x) => x.id === "Agents/researcher")!;
+    expect(p.status).toBe("pending");
+    expect(p.pending).toContain("vault:research:read");
+    expect(p.pending).toContain("env:github");
+  });
+
+  test("status = enabled only once EVERY connection is approved", async () => {
+    const { deps } = recorderDeps();
+    const vaultConn: ConnectionSpec = { kind: "vault", target: "research", access: "read" };
+    const svcConn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
+    const grants = fakeGrantsClient({
+      statusByKey: {
+        [connectionKey(vaultConn)]: "approved",
+        [connectionKey(svcConn)]: "approved",
+      },
+    });
+    const patches: Array<{ id: string; status?: string; pending?: string }> = [];
+    const fetchFn = vaultFetch({
+      defs: [
+        { id: "Agents/r", content: "role", metadata: { name: "r", wants: "vault:research:read, env:github" } },
+      ],
+      patches,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+    await reg.loadAll();
+    const p = patches.find((x) => x.id === "Agents/r")!;
+    expect(p.status).toBe("enabled");
+    expect(p.pending).toBe("");
+    expect(reg.list().find((d) => d.name === "r")!.status).toBe("enabled");
+  });
+
+  test("partial approval → pending listing only the UNAPPROVED connection keys", async () => {
+    const { deps } = recorderDeps();
+    const vaultConn: ConnectionSpec = { kind: "vault", target: "research", access: "read" };
+    const grants = fakeGrantsClient({
+      statusByKey: { [connectionKey(vaultConn)]: "approved" }, // github stays pending
+    });
+    const patches: Array<{ id: string; status?: string; pending?: string }> = [];
+    const fetchFn = vaultFetch({
+      defs: [
+        { id: "Agents/r", content: "role", metadata: { name: "r", wants: "vault:research:read, env:github" } },
+      ],
+      patches,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+    await reg.loadAll();
+    const p = patches.find((x) => x.id === "Agents/r")!;
+    expect(p.status).toBe("pending");
+    expect(p.pending).toBe("env:github"); // only the unapproved one
+    // The agent STILL instantiated (own-vault runs regardless of grant approval).
+    expect(reg.list().find((d) => d.name === "r")).toBeDefined();
+  });
+
+  test("an mcp-kind want registers + stays pending (parsed, not granted in 4b-1)", async () => {
+    const { deps } = recorderDeps();
+    const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
+    const grants = fakeGrantsClient({ registered }); // mcp stays "pending"
+    const patches: Array<{ id: string; status?: string; pending?: string }> = [];
+    const fetchFn = vaultFetch({
+      defs: [
+        { id: "Agents/r", content: "role", metadata: { name: "r", wants: "mcp:https://remote/mcp" } },
+      ],
+      patches,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+    await reg.loadAll();
+    expect(registered).toHaveLength(1);
+    expect(registered[0]!.connection).toEqual({ kind: "mcp", target: "https://remote/mcp" });
+    const p = patches.find((x) => x.id === "Agents/r")!;
+    expect(p.status).toBe("pending");
+    expect(p.pending).toBe("mcp:https://remote/mcp");
+  });
+
+  test("a malformed `wants:` stamps status error (does not register or instantiate)", async () => {
+    const { deps, calls } = recorderDeps();
+    const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
+    const grants = fakeGrantsClient({ registered });
+    const patches: Array<{ id: string; status?: string }> = [];
+    const fetchFn = vaultFetch({
+      defs: [{ id: "Agents/bad", content: "role", metadata: { name: "bad", wants: "vault:research" } }],
+      patches,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+    const n = await reg.loadAll();
+    expect(n).toBe(0);
+    expect(calls.registered).toHaveLength(0); // never instantiated
+    expect(registered).toHaveLength(0); // never registered a grant
+    expect(patches.find((p) => p.id === "Agents/bad")!.status).toBe("error");
+  });
+
+  test("a grant-registration FAILURE is non-fatal → connection counts as pending", async () => {
+    const { deps, calls } = recorderDeps();
+    // A grants client whose PUT 500s.
+    const fetchFn500 = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith("/admin/grants") && init?.method === "PUT") {
+        return new Response("boom", { status: 500 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const grants = new GrantsClient({ hubOrigin: "https://hub.example.com", managerBearer: "MGR", fetchFn: fetchFn500 });
+    const patches: Array<{ id: string; status?: string; pending?: string }> = [];
+    const fetchFn = vaultFetch({
+      defs: [{ id: "Agents/r", content: "role", metadata: { name: "r", wants: "vault:research:read" } }],
+      patches,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+    const count = await reg.loadAll();
+    // The agent STILL instantiated (own-vault) — a hub blip never blocks it.
+    expect(count).toBe(1);
+    expect(calls.registered.map((s) => s.name)).toEqual(["r"]);
+    const p = patches.find((x) => x.id === "Agents/r")!;
+    expect(p.status).toBe("pending");
+    expect(p.pending).toBe("vault:research:read");
+  });
+
+  test("setGrantsClient(null) → falls back to the pure status (no registration)", async () => {
+    const { deps } = recorderDeps();
+    const patches: Array<{ id: string; status?: string; pending?: string }> = [];
+    const fetchFn = vaultFetch({
+      defs: [{ id: "Agents/r", content: "role", metadata: { name: "r", wants: "vault:research:read" } }],
+      patches,
+    });
+    // No grants client at all → resolveDefStatus fallback (pending listing conn keys).
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+    reg.setGrantsClient(null);
+    await reg.loadAll();
+    const p = patches.find((x) => x.id === "Agents/r")!;
+    expect(p.status).toBe("pending");
+    expect(p.pending).toBe("vault:research:read");
   });
 });

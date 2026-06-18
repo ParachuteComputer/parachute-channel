@@ -71,6 +71,7 @@ import {
 } from "../mint-token.ts";
 import { buildAgentMcpConfigJson, vaultEntryKey } from "../agent-mcp-config.ts";
 import { resolveClaudeCredential, resolveChannelEnv } from "../credentials.ts";
+import { resolveInjectedGrants, type GrantsClient } from "../grants.ts";
 import { AgentSessionState } from "../agent-session-state.ts";
 import { parseStreamJsonStream } from "./stream-json.ts";
 import type {
@@ -126,6 +127,25 @@ export interface ProgrammaticBackendDeps {
   sandboxEngine?: SandboxEngine;
   /** fetch override for the mint client (tests). */
   fetchFn?: typeof fetch;
+  /**
+   * The hub grants client (4b — design 2026-06-17-agent-connectors-4b.md). When
+   * wired, each turn fetches the agent's APPROVED cross-resource grants FRESH and
+   * injects their material: granted-vault material → an extra MCP server in the
+   * agent's `--mcp-config`; granted-service material → an env var (e.g. GITHUB_TOKEN)
+   * and/or the service's MCP server. Fetched per-turn (never cached) so a revocation
+   * takes effect on the NEXT spawn. Optional: null/absent → no cross-resource grants
+   * (own-vault only, today's behavior). A grants-list failure is logged + the turn
+   * runs WITHOUT the extra grants (own-vault still works).
+   */
+  grants?: GrantsClient | null;
+  /**
+   * The agent NAME used to key the agent's grants on the hub (`GET
+   * /admin/grants?agent=<name>`). Defaults to `spec.name` when absent. The grants are
+   * keyed by the agent name (= the def's name), which equals `spec.name` for a
+   * vault-native agent. Threaded explicitly so a future channel/agent-name split
+   * doesn't silently fetch the wrong agent's grants.
+   */
+  grantsAgentName?: string;
   /**
    * The subprocess spawner — runs the sandbox-wrapped `claude -p`. Tests inject a
    * fake that emits canned stream-json; the daemon uses the real Bun.spawn adapter.
@@ -312,15 +332,44 @@ export class ProgrammaticBackend implements AgentBackend {
       }
     }
 
-    // Write the (vault-only) strict MCP config 0600 — it inlines the vault token.
-    // No channels[] entry: messaging is the daemon's job, not the agent's. With an
-    // empty `channels`, `channelUrl` is never read (it only builds `/mcp/<channel>`
-    // entry URLs), so we pass "" rather than thread an unrelated origin into a slot
-    // that goes nowhere.
+    // 4b: resolve the agent's APPROVED cross-resource grants FRESH this turn (design
+    // 2026-06-17-agent-connectors-4b.md §3). Granted-vault material → extra MCP
+    // servers (the agent reaches OTHER vaults alongside its own); granted-service
+    // material → env vars (GITHUB_TOKEN, …) and/or the service's MCP server. Fetched
+    // per-turn (never cached) so a revocation takes effect next spawn. Best-effort: a
+    // grants-list failure logs + the turn runs WITHOUT the extra grants — own-vault is
+    // unaffected. The secret material lands ONLY in the ephemeral 0600 .mcp.json + the
+    // child env below; NEVER in a vault note. mcp-kind grants stay pending server-side
+    // in 4b-1 (no OAuth) → getMaterial returns null for them → never injected.
+    let grantMcpEntries: { name: string; url: string; token: string }[] = [];
+    let grantEnv: Record<string, string> = {};
+    if (this.deps.grants) {
+      const agentName = this.deps.grantsAgentName ?? spec.name;
+      try {
+        const injected = await resolveInjectedGrants(this.deps.grants, agentName);
+        grantMcpEntries = injected.mcpEntries;
+        grantEnv = injected.env;
+      } catch (err) {
+        // A failed grant LIST aborts only the cross-resource injection — the turn
+        // still runs with own-vault. (A revoked-mid-list / hub blip class.)
+        console.warn(
+          `parachute-agent: resolving grants for "${agentName}" failed (running this turn ` +
+            `WITHOUT cross-resource grants — own-vault unaffected): ${(err as Error).message}`,
+        );
+      }
+    }
+
+    // Write the strict MCP config 0600 — it inlines the vault token + any granted-
+    // resource tokens. No channels[] entry: messaging is the daemon's job, not the
+    // agent's. With an empty `channels`, `channelUrl` is never read (it only builds
+    // `/mcp/<channel>` entry URLs), so we pass "" rather than thread an unrelated
+    // origin into a slot that goes nowhere. The granted MCP servers are added as
+    // `otherMcps` (each with its own Bearer) — additive to the own-vault entry.
     const mcpConfigJson = buildAgentMcpConfigJson({
       channelUrl: "",
       channels: [],
       ...(vaultArg ? { vault: vaultArg } : {}),
+      ...(grantMcpEntries.length > 0 ? { otherMcps: grantMcpEntries } : {}),
     });
     mkdirSync(workspace, { recursive: true });
     const mcpConfigPath = join(workspace, ".mcp.json");
@@ -381,13 +430,22 @@ export class ProgrammaticBackend implements AgentBackend {
     );
     const homeEnv = seedAgentHome(workspace, { mcpServers: mcpServerNames, projectRoot: cwd });
 
+    // Merge the granted-service env (GITHUB_TOKEN, …) with the operator-scoped
+    // per-channel env. The per-channel store wins on a key collision (it's the
+    // explicit operator override); both go in at the SAME (lowest) precedence layer of
+    // buildAgentChildEnv — which then applies its denylist (ANTHROPIC_API_KEY /
+    // CLAUDE_API_KEY / CLAUDE_CODE_OAUTH_TOKEN can NEVER be set from either source) and
+    // sets CLAUDE_CODE_OAUTH_TOKEN LAST, so a granted var can never clobber the
+    // session's managed auth or the subscription-billing guarantee.
+    const mergedChannelEnv: Record<string, string> = { ...grantEnv, ...channelEnv };
+
     // Layer the scrubbed agent env UNDER the sandbox wrapper's env; the HOME/config/
     // temp vars layer LAST so they win. CLAUDE_CODE_OAUTH_TOKEN injected;
     // ANTHROPIC_API_KEY/CLAUDE_API_KEY absent (the subscription-billing guarantee).
     const childEnv = buildAgentChildEnv(
       this.deps.parentEnv ?? process.env,
       claudeOauthToken,
-      channelEnv,
+      mergedChannelEnv,
     );
     const launchEnv: Record<string, string | undefined> = {
       ...childEnv,

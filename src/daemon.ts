@@ -58,6 +58,7 @@ import {
   type InstantiateDeps,
 } from "./agent-defs.ts";
 import { resolveDefVaults } from "./def-vaults.ts";
+import { GrantsClient } from "./grants.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
 import { Runner, realTickDriver } from "./runner.ts";
 import { nextRunAfter } from "./cron.ts";
@@ -603,6 +604,11 @@ export function createDefaultProgrammaticRegistry(
       sessionState,
       spawnFn: realProgrammaticSpawn(),
       ...(deps.claudeBin ? { claudeBin: deps.claudeBin } : {}),
+      // 4b: the hub grants client — reuses the manager bearer (same operator token
+      // the vault-token mint uses). Lets each `claude -p` turn inject the agent's
+      // APPROVED cross-resource grants (other-vault MCP, service env/MCP). design
+      // 2026-06-17-agent-connectors-4b.md.
+      grants: new GrantsClient({ hubOrigin: deps.hubOrigin, managerBearer: deps.managerBearer }),
     };
   } catch {
     // No operator token yet — construct with placeholders; a per-turn mint will
@@ -3264,6 +3270,15 @@ function main(): void {
     } catch {
       // No operator token yet — resolveDefVaults handles the null (idle vault-native
       // path; channels.json unaffected).
+    }
+    // 4b: wire the hub grants client now the manager bearer is resolved (the registry
+    // was constructed before the operator token was read). With it, each def's `wants:`
+    // connections register as pending grants on instantiate + status derives from the
+    // hub's grant statuses. No bearer → null → the registry falls back to the pure
+    // status (pending if anything is declared) and the vault-native path still runs
+    // own-vault. design 2026-06-17-agent-connectors-4b.md.
+    if (managerBearer) {
+      agentDefs.setGrantsClient(new GrantsClient({ hubOrigin: getHubOrigin(), managerBearer }));
     }
     const bindings = await resolveDefVaults({ hubOrigin: getHubOrigin(), managerBearer });
     for (const b of bindings) agentDefs.addVault(b);

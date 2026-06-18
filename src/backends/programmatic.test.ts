@@ -35,6 +35,14 @@ import type { SandboxEngine } from "../sandbox/index.ts";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { AgentSpec } from "../sandbox/types.ts";
 import { vaultEntryKey, channelEntryKey } from "../agent-mcp-config.ts";
+import {
+  GrantsClient,
+  grantVaultEntryKey,
+  grantServiceEntryKey,
+  serviceMcpUrl,
+  type ConnectionSpec,
+  type GrantMaterial,
+} from "../grants.ts";
 
 let sessionsDir: string;
 let stateDir: string;
@@ -814,5 +822,170 @@ describe("ProgrammaticBackend — start / stop / status", () => {
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault());
     expect(await backend.status(handle)).toEqual({ live: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4b — cross-resource grant injection (design 2026-06-17-agent-connectors-4b)
+// ---------------------------------------------------------------------------
+
+/**
+ * A fake hub grants API for the spawn-injection path. `listGrants` returns the given
+ * approved grants; `getMaterial` returns the keyed material (or 404). Records each
+ * material fetch so a test can prove FRESH-each-spawn (no caching).
+ */
+function grantsClientFor(opts: {
+  grants: Array<{ id: string; connection: ConnectionSpec; status: string }>;
+  material?: Record<string, GrantMaterial>;
+  onMaterialCall?: (id: string) => void;
+}): GrantsClient {
+  const fetchFn = (async (url: string | URL | Request) => {
+    const u = String(url);
+    if (u.includes("/admin/grants/")) {
+      const id = u.split("/admin/grants/")[1]!.replace("/material", "");
+      opts.onMaterialCall?.(id);
+      const m = opts.material?.[id];
+      if (!m) return new Response("no", { status: 404 });
+      return new Response(JSON.stringify(m), { status: 200 });
+    }
+    return new Response(
+      JSON.stringify({
+        grants: opts.grants.map((g) => ({ id: g.id, agent: "eng", connection: g.connection, status: g.status })),
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+  return new GrantsClient({ hubOrigin: "https://hub.example.com", managerBearer: "MGR", fetchFn });
+}
+
+/** Read the written per-spawn .mcp.json's mcpServers for a session. */
+function readMcpServers(name: string): Record<string, { type: string; url: string; headers?: { Authorization: string } }> {
+  const parsed = JSON.parse(readFileSync(join(sessionsDir, name, ".mcp.json"), "utf8")) as {
+    mcpServers: Record<string, { type: string; url: string; headers?: { Authorization: string } }>;
+  };
+  return parsed.mcpServers;
+}
+
+describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
+  test("approved VAULT grant → an extra MCP server in --mcp-config (alongside own-vault)", async () => {
+    mkDirs("grant-vault");
+    const conn: ConnectionSpec = { kind: "vault", target: "research", access: "read" };
+    const grants = grantsClientFor({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: { g1: { kind: "vault", token: "RTOK", mcpUrl: "https://hub/vault/research/mcp" } },
+    });
+    const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "hi");
+
+    const servers = readMcpServers("eng");
+    // Own def-vault entry still present…
+    expect(servers[vaultEntryKey("default")]).toBeDefined();
+    // …PLUS the granted research vault, namespaced + with its Bearer.
+    const granted = servers[grantVaultEntryKey("research")]!;
+    expect(granted.type).toBe("http");
+    expect(granted.url).toBe("https://hub/vault/research/mcp");
+    expect(granted.headers!.Authorization).toBe("Bearer RTOK");
+  });
+
+  test("approved SERVICE grant (env) → an env var for the agent's shell tools", async () => {
+    mkDirs("grant-env");
+    const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
+    const grants = grantsClientFor({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: { g1: { kind: "service", token: "ghp_GRANTED", inject: ["env"] } },
+    });
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "hi");
+
+    expect(calls[0]!.env.GITHUB_TOKEN).toBe("ghp_GRANTED");
+    // The granted env var never clobbers the managed Claude auth.
+    expect(calls[0]!.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("OAUTH-CRED-PLACEHOLDER");
+    // No service MCP entry for an env-only grant.
+    expect(readMcpServers("eng")[grantServiceEntryKey("github")]).toBeUndefined();
+  });
+
+  test("approved SERVICE grant (mcp) → the service's MCP server in --mcp-config", async () => {
+    mkDirs("grant-svc-mcp");
+    const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["mcp"] };
+    const grants = grantsClientFor({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: { g1: { kind: "service", token: "ghp_MCP", inject: ["mcp"] } },
+    });
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "hi");
+
+    const svc = readMcpServers("eng")[grantServiceEntryKey("github")]!;
+    expect(svc.type).toBe("http");
+    expect(svc.url).toBe(serviceMcpUrl("github")!);
+    expect(svc.headers!.Authorization).toBe("Bearer ghp_MCP");
+    // mcp-only inject → no GITHUB_TOKEN env var.
+    expect(calls[0]!.env.GITHUB_TOKEN).toBeUndefined();
+  });
+
+  test("MCP-KIND grant is NEVER injected in 4b-1 (no material → 404 → absent)", async () => {
+    mkDirs("grant-mcp-kind");
+    const conn: ConnectionSpec = { kind: "mcp", target: "https://remote/mcp" };
+    // Even modeled as "approved", the hub returns no material in 4b-1 (no OAuth).
+    const grants = grantsClientFor({ grants: [{ id: "g1", connection: conn, status: "approved" }] });
+    const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "hi");
+
+    const servers = readMcpServers("eng");
+    // Only the own def-vault entry — the mcp-kind grant added nothing.
+    expect(Object.keys(servers)).toEqual([vaultEntryKey("default")]);
+  });
+
+  test("material is fetched FRESH each spawn (revocation takes effect next turn — no cache)", async () => {
+    mkDirs("grant-fresh");
+    const called: string[] = [];
+    const conn: ConnectionSpec = { kind: "vault", target: "research", access: "read" };
+    const grants = grantsClientFor({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: { g1: { kind: "vault", token: "RTOK", mcpUrl: "https://hub/vault/research/mcp" } },
+      onMaterialCall: (id) => called.push(id),
+    });
+    const { fn } = sequencedSpawn([successTurn("s", "one"), successTurn("s", "two")]);
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "turn one");
+    await backend.deliver(handle, "turn two");
+    // Two turns → two material fetches (no caching).
+    expect(called).toEqual(["g1", "g1"]);
+  });
+
+  test("a grants-LIST failure is non-fatal — the turn runs with own-vault only", async () => {
+    mkDirs("grant-list-fail");
+    const fetchFn = (async (url: string | URL | Request) => {
+      // mint succeeds (vault token), grants list 500s.
+      if (String(url).includes("/admin/grants")) return new Response("boom", { status: 500 });
+      return fakeMintFetch()(url);
+    }) as typeof fetch;
+    const grants = new GrantsClient({ hubOrigin: "https://hub.example.com", managerBearer: "MGR", fetchFn });
+    const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    // Use the same fetch for the mint path so the vault token still mints.
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants, fetchFn }));
+    const handle = await backend.start(specWithVault("eng"));
+    const result = await backend.deliver(handle, "hi");
+    expect(result.ok).toBe(true); // own-vault turn unaffected by the grant blip
+    const servers = readMcpServers("eng");
+    expect(servers[vaultEntryKey("default")]).toBeDefined();
+    expect(Object.keys(servers)).toEqual([vaultEntryKey("default")]); // no grants injected
+  });
+
+  test("NO grants client → today's behavior exactly (own-vault only)", async () => {
+    mkDirs("grant-none");
+    const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn)); // no grants in deps
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "hi");
+    expect(Object.keys(readMcpServers("eng"))).toEqual([vaultEntryKey("default")]);
   });
 });

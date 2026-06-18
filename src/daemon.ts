@@ -52,6 +52,11 @@ import {
   type ChannelEntry,
 } from "./registry.ts";
 import { VaultTransport, AGENT_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
+import {
+  AgentDefRegistry,
+  type DefVaultBinding,
+  type InstantiateDeps,
+} from "./agent-defs.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
 import { Runner, realTickDriver } from "./runner.ts";
 import { nextRunAfter } from "./cron.ts";
@@ -471,6 +476,65 @@ async function removeChannelLive(
   }
   channels.delete(name);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Vault-native agent definitions (design 2026-06-17-vault-native-agents, Phase 4a)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the vault `ChannelEntry` for a vault-native agent's wake channel, from its
+ * def-vault binding. The agent's conversation lives in its def-vault, so the channel
+ * is a `vault` transport pointed at the SAME vault + token the def registry reads
+ * from (own-vault scoping — 4a). This is the exact `ChannelEntry` shape the existing
+ * create-agent flow + boot persist; we just synthesize it from the binding instead
+ * of from channels.json (the note IS the definition).
+ */
+export function defVaultChannelEntry(name: string, binding: DefVaultBinding): ChannelEntry {
+  return {
+    name,
+    transport: "vault",
+    config: {
+      vault: binding.vault,
+      ...(binding.vaultUrl ? { vaultUrl: binding.vaultUrl } : {}),
+      token: binding.token,
+    },
+  };
+}
+
+/**
+ * Build the {@link InstantiateDeps} the {@link AgentDefRegistry} drives, wired to the
+ * SAME machinery the create-agent flow + boot use — so a vault-defined agent comes up
+ * byte-for-byte like a UI-created one, only its SOURCE differs (a note, not a form):
+ *   - ensureChannel    → `addChannelLive` with a vault `ChannelEntry` from the binding;
+ *   - setupAndRegister → `setupProgrammaticSpawn` (persist spec.json) + `programmatic.register`;
+ *   - deregister       → `programmatic.deregister`;
+ *   - removeChannel    → `removeChannelLive`.
+ *
+ * `setupProgrammaticSpawn` resolves the Claude credential early — a missing one
+ * throws `CredentialNotConfiguredError`, which the registry catches + stamps the
+ * note `status: error` (the agent can't run turns without auth; the note surfaces
+ * the gap rather than registering a dead agent). Secrets stay local throughout.
+ */
+export function buildInstantiateDeps(
+  channels: Map<string, Channel>,
+  registry: ClientRegistry,
+  deliveryState: DeliveryState,
+  programmatic: ProgrammaticAgentRegistry,
+): InstantiateDeps {
+  return {
+    ensureChannel: async (name, binding) => {
+      await addChannelLive(channels, registry, defVaultChannelEntry(name, binding), deliveryState, programmatic);
+    },
+    setupAndRegister: async (spec) => {
+      // Persist spec.json (so boot re-register + per-turn deliver find the workspace)
+      // then register — the same two steps the web programmatic spawn runs.
+      setupProgrammaticSpawn(spec);
+      await programmatic.register({ ...spec, backend: "programmatic" });
+    },
+    deregister: async (name) => programmatic.deregister(name),
+    removeChannel: async (name) => removeChannelLive(channels, name),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1492,6 +1556,13 @@ export function createFetchHandler(
      * still works in a plain createFetchHandler).
      */
     runner?: Runner;
+    /**
+     * The vault-native agent-def registry (design 2026-06-17-vault-native-agents,
+     * Phase 4a). The `POST /api/vault/agent-def` reload webhook drives it. `main`
+     * passes the boot instance; tests inject one. Optional — when absent, the reload
+     * route is a clean no-op ack (a daemon with no def-vaults configured).
+     */
+    agentDefs?: AgentDefRegistry;
   },
 ): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
   // Spawn/list/kill operations behind the web agents surface. Lazily defaulted to
@@ -1526,6 +1597,11 @@ export function createFetchHandler(
   // /api/jobs routes; `main` shares its boot instance with the runner so the routes
   // and the scheduler operate on the same vault.
   const jobStore: VaultJobStore = opts?.jobStore ?? new VaultJobStore(channels);
+
+  // The vault-native agent-def registry (Phase 4a). Optional — when absent the
+  // reload webhook is a no-op ack (a daemon with no def-vaults). `main` passes the
+  // boot instance so the route reloads the same set the boot instantiated.
+  const agentDefs: AgentDefRegistry | undefined = opts?.agentDefs;
 
   // Install the MCP connect hook: when an MCP session's GET push stream goes live
   // (mcp-http's handleMcp GET branch → fireConnectReplay — NOT at registration,
@@ -2624,6 +2700,63 @@ export function createFetchHandler(
       return json({ ok: true });
     }
 
+    // ---------------------------------------------------------------------
+    // Vault-native agent-def RELOAD webhook — POST /api/vault/agent-def
+    // (design 2026-06-17-vault-native-agents, Phase 4a). A vault trigger on
+    // `#agent/definition` created/updated/deleted POSTs here; we reload that one
+    // agent (per-note granularity). Mirrors /api/vault/inbound's auth (hub JWT,
+    // scope agent:send — the trigger is a vault→module action) and its uniform-401.
+    // Body: { event?, vault?, note: { id, ... } }. `vault` names the source
+    // def-vault (the hub fills it / it defaults to the single configured one when
+    // exactly one is bound). Externally `<hub>/agent/api/vault/agent-def`.
+    // ---------------------------------------------------------------------
+    if (req.method === "POST" && url.pathname === "/api/vault/agent-def") {
+      const denied = await requireScope(req, url, SCOPE_SEND);
+      if (denied) return json({ error: "unauthorized" }, 401);
+      if (!agentDefs) {
+        // No def-vaults configured — nothing to reload. Clean ack (the trigger
+        // shouldn't have fired, but don't error a benign delivery).
+        return json({ ok: true, reloaded: "skipped" });
+      }
+      let body: {
+        event?: "created" | "updated" | "deleted";
+        vault?: string;
+        note?: { id?: string; path?: string; metadata?: Record<string, unknown> };
+      };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      const noteId =
+        typeof body.note?.id === "string" && body.note.id
+          ? body.note.id
+          : typeof body.note?.path === "string"
+            ? body.note.path
+            : undefined;
+      if (!noteId) {
+        return json({ error: "body must include note.id" }, 400);
+      }
+      // Resolve the source vault: the explicit `vault` field, else the sole
+      // configured def-vault (the single-vault default — unambiguous), else 400.
+      let vault = typeof body.vault === "string" && body.vault ? body.vault : undefined;
+      if (!vault) {
+        const names = agentDefs.list();
+        const distinct = new Set([...names.map((d) => d.vault)]);
+        // Fall back to the lone bound vault even with zero live defs yet.
+        if (agentDefs.vaultCount === 1) {
+          vault = agentDefs.soleVaultName();
+        } else if (distinct.size === 1) {
+          vault = [...distinct][0];
+        }
+      }
+      if (!vault) {
+        return json({ error: "body.vault is required (multiple def-vaults configured)" }, 400);
+      }
+      const result = await agentDefs.reload(vault, noteId, body.event);
+      return json({ ok: true, reloaded: result });
+    }
+
     // Turn-event SSE — GET /api/channels/<ch>/turn-events (chat-facing; gated on
     // `agent:read`, same scope as the transcript poll + /ui/events). The streaming
     // view (design 2026-06-16 build item #1): the chat subscribes here to watch a
@@ -2987,7 +3120,18 @@ function main(): void {
     driver: realTickDriver(),
   });
 
-  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, turnEvents, jobStore, runner });
+  // The vault-native agent-def registry (design 2026-06-17-vault-native-agents,
+  // Phase 4a). Reads `#agent/definition` notes from the configured def-vaults and
+  // instantiates each as a live agent (a vault channel + a programmatic agent) via
+  // the SAME machinery the create-agent flow uses (buildInstantiateDeps). Constructed
+  // here (empty) so it's shared with the fetch handler's reload webhook; the boot
+  // resolve below (resolveDefVaults → addVault → loadAll) fills it. ADDITIVE to
+  // channels.json — both paths coexist.
+  const agentDefs = new AgentDefRegistry(
+    buildInstantiateDeps(channels, registry, deliveryState, programmatic),
+  );
+
+  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, turnEvents, jobStore, runner, agentDefs });
   const server = Bun.serve<TerminalWsData, never>({
     port: PORT,
     hostname: "127.0.0.1",
@@ -3095,6 +3239,13 @@ function main(): void {
   // is `unref`'d so it never keeps the process alive on its own.
   runner.start();
   console.log(`parachute-agent: runner started (scheduled-job tick)`);
+
+  // VAULT-NATIVE AGENT DEFINITIONS (design 2026-06-17-vault-native-agents, Phase 4a).
+  // The registry + reload webhook are wired (above); the def-vault BINDINGS that fill
+  // it are resolved by the config layer (next commit). With no bindings the registry
+  // is empty — the reactive route is a no-op ack and the vault-native path is idle.
+  // ADDITIVE to channels.json (both paths coexist).
+  void agentDefs;
 
   // Graceful shutdown — stop the runner + all transports.
   async function shutdown(): Promise<void> {

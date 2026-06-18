@@ -377,6 +377,28 @@ export const AGENT_VAULT_TRIGGER_TEMPLATE = {
   },
 } as const;
 
+/**
+ * The vault trigger that keeps vault-native agent DEFINITIONS in sync (design
+ * `2026-06-17-vault-native-agents.md`, Phase 4a). On a `#agent/definition` note
+ * created/updated/deleted, the hub POSTs the def-reload webhook; the daemon reloads
+ * that ONE agent (created/updated → re-instantiate; deleted → deregister). MODULE-
+ * OWNED DATA — the module declares the trigger it needs; the hub fills the origin +
+ * the `action.auth.bearer` (a minted `agent:send` token, the same auth as the inbound
+ * trigger). One trigger per def-vault (no per-note placeholder — the predicate is the
+ * whole `#agent/definition` tag). A poll fallback covers vaults without trigger support.
+ */
+export const AGENT_DEF_VAULT_TRIGGER_TEMPLATE = {
+  name: "agent_def_reload",
+  events: ["created", "updated", "deleted"],
+  when: {
+    tags: ["#agent/definition"],
+  },
+  action: {
+    webhook: "<hub-origin>/agent/api/vault/agent-def", // hub fills origin + the auth.bearer
+    send: "json",
+  },
+} as const;
+
 export class VaultTransport implements Transport {
   readonly kind = "vault";
 

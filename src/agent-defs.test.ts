@@ -325,6 +325,71 @@ describe("DefVaultClient", () => {
     const client = new DefVaultClient(binding);
     expect(await client.getNote("gone")).toBeNull();
   });
+
+  test("createNote POSTs body + the def tag + metadata, returns the created note", async () => {
+    let captured: { url: string; method: string; body: Record<string, unknown> } | null = null;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      captured = { url: String(url), method: init?.method ?? "GET", body: JSON.parse(String(init?.body)) };
+      return new Response(JSON.stringify({ id: "Agents/newbot", content: "P", metadata: { name: "newbot" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const client = new DefVaultClient(binding);
+    const created = await client.createNote({
+      content: "P",
+      metadata: { name: "newbot", backend: "programmatic" },
+      path: "Agents/newbot",
+    });
+    expect(created.id).toBe("Agents/newbot");
+    expect(captured!.method).toBe("POST");
+    expect(captured!.url).toContain("/vault/default/api/notes");
+    expect(captured!.body.tags).toEqual(["#agent/definition"]);
+    expect(captured!.body.content).toBe("P");
+    expect((captured!.body.metadata as Record<string, string>).name).toBe("newbot");
+    expect(captured!.body.path).toBe("Agents/newbot");
+  });
+
+  test("createNote throws on a non-ok vault response", async () => {
+    globalThis.fetch = (async () => new Response("nope", { status: 500 })) as unknown as typeof fetch;
+    const client = new DefVaultClient(binding);
+    await expect(
+      client.createNote({ content: "x", metadata: { name: "x" } }),
+    ).rejects.toThrow(/create def failed \(500\)/);
+  });
+
+  test("patchNote sends content/metadata with force:true (the 428 guard)", async () => {
+    let body: Record<string, unknown> = {};
+    let method = "";
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      method = init?.method ?? "GET";
+      body = JSON.parse(String(init?.body));
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    const client = new DefVaultClient(binding);
+    await client.patchNote("Agents/newbot", { content: "new", metadata: { wants: "vault:r:read" } });
+    expect(method).toBe("PATCH");
+    expect(body.content).toBe("new");
+    expect((body.metadata as Record<string, string>).wants).toBe("vault:r:read");
+    expect(body.force).toBe(true); // satisfies the vault's mutation precondition.
+  });
+
+  test("deleteNote DELETEs the note; a 404 is OK (gone is gone)", async () => {
+    let method = "";
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      method = init?.method ?? "GET";
+      return new Response("no", { status: 404 });
+    }) as typeof fetch;
+    const client = new DefVaultClient(binding);
+    await client.deleteNote("Agents/gone"); // must NOT throw on 404.
+    expect(method).toBe("DELETE");
+  });
+
+  test("deleteNote throws on a non-404 error", async () => {
+    globalThis.fetch = (async () => new Response("boom", { status: 500 })) as unknown as typeof fetch;
+    const client = new DefVaultClient(binding);
+    await expect(client.deleteNote("n")).rejects.toThrow(/delete def n failed \(500\)/);
+  });
 });
 
 // ---------------------------------------------------------------------------

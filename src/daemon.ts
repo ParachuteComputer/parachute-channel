@@ -54,10 +54,18 @@ import {
 import { VaultTransport, AGENT_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 import {
   AgentDefRegistry,
+  AgentDefWriteError,
   type DefVaultBinding,
   type InstantiateDeps,
 } from "./agent-defs.ts";
-import { resolveDefVaults } from "./def-vaults.ts";
+import {
+  resolveDefVaults,
+  readDefVaultsFile,
+  writeDefVaultsFile,
+  DEFAULT_DEF_VAULT_URL,
+  DEFAULT_HUB_ORIGIN,
+} from "./def-vaults.ts";
+import { mintScopedToken, vaultScope } from "./mint-token.ts";
 import { GrantsClient } from "./grants.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
 import { Runner, realTickDriver } from "./runner.ts";
@@ -593,6 +601,64 @@ export function buildInstantiateDeps(
 }
 
 /**
+ * The real "add a def-vault" implementation behind `POST /api/agent-vaults`: mint the
+ * vault's `vault:<name>:write` token (attenuated to the operator bearer, the SAME path
+ * `resolveDefVaults` mints the default with), persist it into `agent-vaults.json`
+ * (0600 — it carries a token), then `addVault` + `loadAll` for THAT vault so its defs
+ * come up LIVE immediately (no restart). Re-resolves the manager bearer + hub origin at
+ * request time (dynamic-read discipline — a credential set after boot is picked up).
+ * Returns the non-secret view; throws on a missing operator token, a mint refusal, or
+ * a duplicate vault. No-ops cleanly when no registry is wired.
+ */
+function defaultAddDefVault(
+  agentDefs: AgentDefRegistry | undefined,
+): (args: { vault: string; url?: string }) => Promise<{ vault: string; url: string; tokenPresent: boolean }> {
+  return async ({ vault, url }) => {
+    if (!agentDefs) {
+      throw new Error("no def-vault registry configured (the vault-native agent path is idle)");
+    }
+    if (agentDefs.hasVault(vault)) {
+      throw new Error(`def-vault "${vault}" is already configured`);
+    }
+    const vaultUrl = url && url.length > 0 ? url : DEFAULT_DEF_VAULT_URL;
+    // Resolve the operator bearer + hub origin at request time (a credential set after
+    // boot is picked up). A missing operator token → can't mint a child token.
+    let managerBearer: string;
+    try {
+      managerBearer = resolveSpawnDeps().managerBearer;
+    } catch {
+      throw new Error(
+        "cannot mint the def-vault token — no operator token (the hub isn't provisioned yet)",
+      );
+    }
+    if (!managerBearer) {
+      throw new Error(
+        "cannot mint the def-vault token — no operator token (the hub isn't provisioned yet)",
+      );
+    }
+    const minted = await mintScopedToken(
+      { scope: vaultScope(vault, "write") },
+      { hubOrigin: getHubOrigin() || DEFAULT_HUB_ORIGIN, managerBearer },
+    );
+    const binding: DefVaultBinding = { vault, vaultUrl, token: minted.token };
+    // Persist into agent-vaults.json (merge: keep existing entries, append this one).
+    // Source the existing set from the LIVE registry bindings (which carry the real
+    // boot-minted tokens) — NOT a tokenless reconstruction from vaultNames(), which
+    // would clobber a boot-minted default's token to empty on disk and 401 next boot.
+    // Prefer the on-disk file when present (it's the durable record); fall back to the
+    // live bindings when no file has been written yet.
+    const stateDir = defaultStateDir();
+    const existing = readDefVaultsFile(stateDir)?.vaults ?? agentDefs.liveBindings();
+    const merged = [...existing.filter((v) => v.vault !== vault), binding];
+    writeDefVaultsFile({ vaults: merged }, stateDir);
+    // Bring the vault up LIVE: register it + load its defs now (the immediate path).
+    agentDefs.addVault(binding);
+    await agentDefs.loadAll();
+    return { vault, url: vaultUrl, tokenPresent: true };
+  };
+}
+
+/**
  * Build a {@link ChannelQueueStore} for a channel name from its live VaultTransport —
  * the durable inbound-note queue a CHANNEL-backend agent's connected session pulls
  * from (design 2026-06-18). Returns null when the channel isn't a live vault transport
@@ -776,6 +842,48 @@ export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry):
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Map the registered CHANNEL-backend agents to the {@link AgentInfo} shape the
+ * `/api/agents` list returns (#102 — the v2 API layer stops rejecting `channel`).
+ * A channel agent has no tmux session + no daemon-run turn: its turns are handled by
+ * a Claude Code session the operator connects to the channel's MCP endpoint, and the
+ * inbound notes accumulate as a durable queue. So `attached` is always false, the
+ * `session` label is the conventional `<name>-agent` for display continuity, and the
+ * live `status` is `queued:N` (N = pending inbound waiting for the connected session)
+ * or `idle`. The pending counts are read from the queue in parallel (one vault read
+ * each) — best-effort: a queue read failure degrades that agent's status to `idle`,
+ * never failing the whole list. NEVER surfaces a token/secret.
+ */
+export async function listChannelAgents(channelQueue: ChannelQueueRegistry): Promise<AgentInfo[]> {
+  const dir = defaultSessionsDir();
+  const records = channelQueue.list();
+  return Promise.all(
+    records.map(async (rec) => {
+      let status = "idle";
+      try {
+        const view = await channelQueue.pending(rec.channel);
+        status = view.count > 0 ? `queued:${view.count}` : "idle";
+      } catch {
+        // A queue read failure shouldn't sink the list — show idle, not an error.
+      }
+      const workspace = sessionWorkspace(dir, rec.name);
+      const info: AgentInfo = {
+        name: rec.name,
+        session: `${rec.name}-agent`,
+        attached: false,
+        workspace,
+        hasWorkspace: existsSync(join(workspace, "spec.json")),
+        backend: "channel",
+        status,
+        channel: rec.channel,
+        ...(rec.systemPrompt ? { systemPromptMode: "append" as const } : {}),
+        ...(rec.vault ? { vault: rec.vault } : {}),
+      };
+      return info;
+    }),
+  ).then((infos) => infos.sort((a, b) => a.name.localeCompare(b.name)));
 }
 
 /**
@@ -1599,6 +1707,22 @@ export function isWebSocketUpgrade(req: Request): boolean {
   return (req.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
 }
 
+/**
+ * Coerce an untrusted JSON object into a `Record<string,string>` for a def note's
+ * extra metadata bag — every value stringified (the vault stores metadata as strings).
+ * Non-object input yields an empty map. Used by the agent-def write routes so a caller
+ * passing `{ workspace: "/x", filesystem: "workspace" }` lands as string metadata.
+ */
+function coerceStringMap(v: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!v || typeof v !== "object" || Array.isArray(v)) return out;
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (val === undefined || val === null) continue;
+    out[k] = typeof val === "string" ? val : String(val);
+  }
+  return out;
+}
+
 /** Parse + clamp a `?cols=`/`?rows=` query dim to [1, 9999], with a fallback. */
 function clampQueryDim(raw: string | null, fallback: number): number {
   const n = raw === null ? NaN : parseInt(raw, 10);
@@ -1662,6 +1786,19 @@ export function createFetchHandler(
      * route is a clean no-op ack (a daemon with no def-vaults configured).
      */
     agentDefs?: AgentDefRegistry;
+    /**
+     * Add a def-vault to the live registry — the `POST /api/agent-vaults` body of work
+     * (mint the vault's write token, persist `agent-vaults.json`, `addVault` + `loadAll`
+     * for it). Injected so tests exercise the route WITHOUT a live hub mint or a real
+     * vault; `main` leaves it unset and the route uses the real mint
+     * (`mintScopedToken`) + the persisted-file path. Returns the resulting binding's
+     * non-secret view (name + url + token-present).
+     */
+    addDefVault?: (args: { vault: string; url?: string }) => Promise<{
+      vault: string;
+      url: string;
+      tokenPresent: boolean;
+    }>;
   },
 ): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
   // Spawn/list/kill operations behind the web agents surface. Lazily defaulted to
@@ -1708,6 +1845,12 @@ export function createFetchHandler(
   // reload webhook is a no-op ack (a daemon with no def-vaults). `main` passes the
   // boot instance so the route reloads the same set the boot instantiated.
   const agentDefs: AgentDefRegistry | undefined = opts?.agentDefs;
+
+  // Add-a-def-vault (the `POST /api/agent-vaults` body of work). Defaulted to the real
+  // mint + persist path so a plain createFetchHandler serves the route; tests inject a
+  // stub so the route is exercised WITHOUT a live hub mint or a real vault. Returns the
+  // resulting binding's non-secret view (name + url + token-present).
+  const addDefVault = opts?.addDefVault ?? defaultAddDefVault(agentDefs);
 
   // Install the MCP connect hook: when an MCP session's GET push stream goes live
   // (mcp-http's handleMcp GET branch → fireConnectReplay — NOT at registration,
@@ -2336,12 +2479,15 @@ export function createFetchHandler(
       if (req.method === "GET") {
         try {
           // The list MERGES interactive tmux sessions + registered programmatic
-          // agents (design 2026-06-16 step 6). Programmatic agents have no tmux
-          // session, so they carry `backend: "programmatic"` + a live `status`
-          // (idle|working|queued:N) instead of `attached`/`mcp_sessions`.
+          // agents (design 2026-06-16 step 6) + registered CHANNEL-backend agents
+          // (#102 — the v2 API layer stops rejecting `channel`). Neither programmatic
+          // nor channel agents have a tmux session, so they carry their `backend` +
+          // a live `status` (idle|working|queued:N) instead of `attached`/`mcp_sessions`;
+          // a channel agent also surfaces its wake `channel` + backing `vault`.
           const interactive = await agentOps.list();
           const programmaticInfos = listProgrammaticAgents(programmatic);
-          return json({ agents: [...interactive, ...programmaticInfos] });
+          const channelInfos = await listChannelAgents(channelQueue);
+          return json({ agents: [...interactive, ...programmaticInfos, ...channelInfos] });
         } catch (err) {
           return json({ error: `failed to list agents: ${(err as Error).message}` }, 500);
         }
@@ -2517,6 +2663,238 @@ export function createFetchHandler(
       const denied = await requireScope(req, url, SCOPE_ADMIN);
       if (denied) return denied;
       return json({ vaults: listVaultNames() });
+    }
+
+    // ---------------------------------------------------------------------
+    // Vault-native agent DEFINITIONS — the v2 API layer (design
+    // 2026-06-18-agent-ui-v2-and-reactivity.md Part 2 Phase 1). A `#agent/definition`
+    // note IS the agent (body = system prompt, metadata = config); these routes
+    // list + create + edit + delete them in a configured def-vault, reloading the
+    // changed note into a LIVE agent IMMEDIATELY (the per-note reload, NOT the 60s
+    // poll). NO secrets surfaced (no tokens). Externally `<hub>/agent/api/agent-defs`.
+    //
+    //   GET    /api/agent-defs           → list (read-scoped) — per def: noteId, name,
+    //                                       backend, vault, status, pending,
+    //                                       systemPromptPreview, wants, channel
+    //   POST   /api/agent-defs           { vault, name, backend, systemPrompt, wants?,
+    //                                       metadata? } → write note + reload live (admin)
+    //   PATCH  /api/agent-defs/<noteId>  { systemPrompt?, wants?, metadata? } → edit +
+    //                                       reload (admin)
+    //   DELETE /api/agent-defs/<noteId>  → delete note + deregister (admin)
+    // ---------------------------------------------------------------------
+    if (url.pathname === "/api/agent-defs" && (req.method === "GET" || req.method === "POST")) {
+      // GET is READ-scoped (a listing, no secrets); POST is admin (it mints/writes).
+      const scope = req.method === "GET" ? SCOPE_READ : SCOPE_ADMIN;
+      const denied = await requireScope(req, url, scope);
+      if (denied) return denied;
+      if (!agentDefs) {
+        // No def-vaults configured — an empty list (GET) / a clear 400 (POST).
+        if (req.method === "GET") return json({ defs: [] });
+        return json({ error: "no def-vaults configured (add one via POST /api/agent-vaults)" }, 400);
+      }
+
+      if (req.method === "GET") {
+        return json({ defs: agentDefs.listDetailed() });
+      }
+
+      // POST — create a new def note + reload it live.
+      let body: { vault?: unknown; name?: unknown; backend?: unknown; systemPrompt?: unknown; wants?: unknown; metadata?: unknown };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      if (typeof body.vault !== "string" || body.vault.length === 0) {
+        return json({ error: "body.vault (string) is required" }, 400);
+      }
+      if (typeof body.name !== "string" || body.name.length === 0) {
+        return json({ error: "body.name (string) is required" }, 400);
+      }
+      const backend = body.backend === undefined ? "programmatic" : body.backend;
+      if (backend !== "programmatic" && backend !== "channel") {
+        return json({ error: 'body.backend must be "programmatic" or "channel"' }, 400);
+      }
+      if (body.systemPrompt !== undefined && typeof body.systemPrompt !== "string") {
+        return json({ error: "body.systemPrompt must be a string" }, 400);
+      }
+      if (body.wants !== undefined && typeof body.wants !== "string") {
+        return json({ error: "body.wants must be a comma-separated string" }, 400);
+      }
+      if (body.metadata !== undefined && (typeof body.metadata !== "object" || body.metadata === null || Array.isArray(body.metadata))) {
+        return json({ error: "body.metadata must be an object of strings" }, 400);
+      }
+      try {
+        const detail = await agentDefs.createDef({
+          vault: body.vault,
+          name: body.name,
+          backend,
+          systemPrompt: typeof body.systemPrompt === "string" ? body.systemPrompt : "",
+          ...(typeof body.wants === "string" ? { wants: body.wants } : {}),
+          ...(body.metadata ? { metadata: coerceStringMap(body.metadata) } : {}),
+        });
+        return json({ ok: true, def: detail }, 201);
+      } catch (err) {
+        if (err instanceof AgentDefWriteError) return json({ error: err.message }, err.status);
+        return json({ error: `failed to create agent def: ${(err as Error).message}` }, 502);
+      }
+    }
+
+    const defMatch = url.pathname.match(/^\/api\/agent-defs\/(.+)$/);
+    if (defMatch && (req.method === "PATCH" || req.method === "DELETE")) {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+      const noteId = decodeURIComponent(defMatch[1]!);
+      if (!agentDefs) {
+        return json({ error: "no def-vaults configured" }, 400);
+      }
+
+      if (req.method === "DELETE") {
+        try {
+          const removed = await agentDefs.deleteDef(noteId);
+          return json({ ok: true, ...removed, removed: true });
+        } catch (err) {
+          if (err instanceof AgentDefWriteError) return json({ error: err.message }, err.status);
+          return json({ error: `failed to delete agent def: ${(err as Error).message}` }, 502);
+        }
+      }
+
+      // PATCH — edit body and/or metadata, reload live.
+      let body: { systemPrompt?: unknown; wants?: unknown; metadata?: unknown };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      if (body.systemPrompt !== undefined && typeof body.systemPrompt !== "string") {
+        return json({ error: "body.systemPrompt must be a string" }, 400);
+      }
+      if (body.wants !== undefined && typeof body.wants !== "string") {
+        return json({ error: "body.wants must be a comma-separated string" }, 400);
+      }
+      if (body.metadata !== undefined && (typeof body.metadata !== "object" || body.metadata === null || Array.isArray(body.metadata))) {
+        return json({ error: "body.metadata must be an object of strings" }, 400);
+      }
+      try {
+        const detail = await agentDefs.editDef(noteId, {
+          ...(typeof body.systemPrompt === "string" ? { systemPrompt: body.systemPrompt } : {}),
+          ...(typeof body.wants === "string" ? { wants: body.wants } : {}),
+          ...(body.metadata ? { metadata: coerceStringMap(body.metadata) } : {}),
+        });
+        return json({ ok: true, def: detail });
+      } catch (err) {
+        if (err instanceof AgentDefWriteError) return json({ error: err.message }, err.status);
+        return json({ error: `failed to edit agent def: ${(err as Error).message}` }, 502);
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Module-level DEF-VAULT list — which vault(s) this module reads
+    // `#agent/definition` notes from (`agent-vaults.json`). Today invisible +
+    // uneditable; the v2 API surfaces + manages it. NO token VALUE surfaced (only
+    // present/absent). Externally `<hub>/agent/api/agent-vaults`. Admin-scoped.
+    //
+    //   GET    /api/agent-vaults         → list { vault, url, tokenPresent } (no value)
+    //   POST   /api/agent-vaults         { vault, url? } → mint token + persist + live
+    //   DELETE /api/agent-vaults/<name>  → drop from file + deregister its agents
+    // ---------------------------------------------------------------------
+    if (url.pathname === "/api/agent-vaults" && (req.method === "GET" || req.method === "POST")) {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+
+      if (req.method === "GET") {
+        // Source of truth: the LIVE registry's bound vaults (a boot-minted binding
+        // shows its token even before the file write lands). NEVER the token value. We
+        // fall back to the persisted file only when no registry is wired (idle path),
+        // so the listing isn't silently empty. The url defaults to the loopback vault.
+        if (agentDefs) {
+          return json({ vaults: agentDefs.vaultStatuses() });
+        }
+        let persisted: DefVaultBinding[] = [];
+        try {
+          persisted = readDefVaultsFile(defaultStateDir())?.vaults ?? [];
+        } catch {
+          persisted = [];
+        }
+        const vaults = persisted
+          .map((v) => ({
+            vault: v.vault,
+            url: v.vaultUrl ?? DEFAULT_DEF_VAULT_URL,
+            tokenPresent: typeof v.token === "string" && v.token.length > 0,
+          }))
+          .sort((a, b) => a.vault.localeCompare(b.vault));
+        return json({ vaults });
+      }
+
+      // POST — add a def-vault (mint token + persist + load its defs live).
+      let body: { vault?: unknown; url?: unknown };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      if (typeof body.vault !== "string" || body.vault.length === 0) {
+        return json({ error: "body.vault (string) is required" }, 400);
+      }
+      if (!/^[a-zA-Z0-9_-]+$/.test(body.vault)) {
+        return json({ error: `body.vault "${body.vault}" must be a slug (alphanumeric, dash, underscore)` }, 400);
+      }
+      if (body.url !== undefined && typeof body.url !== "string") {
+        return json({ error: "body.url must be a string (the vault REST origin)" }, 400);
+      }
+      try {
+        const added = await addDefVault({
+          vault: body.vault,
+          ...(typeof body.url === "string" && body.url.length > 0 ? { url: body.url } : {}),
+        });
+        return json({ ok: true, vault: added }, 201);
+      } catch (err) {
+        if (err instanceof MintError) {
+          return json({ error: `token mint failed: ${err.message}` }, err.status >= 400 && err.status < 600 ? err.status : 502);
+        }
+        // A duplicate / no-operator-token / no-registry error → 400 (operator-actionable).
+        return json({ error: `failed to add def-vault: ${(err as Error).message}` }, 400);
+      }
+    }
+
+    const vaultDelMatch = url.pathname.match(/^\/api\/agent-vaults\/([^/]+)$/);
+    if (vaultDelMatch && req.method === "DELETE") {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+      const name = decodeURIComponent(vaultDelMatch[1]!);
+      if (!agentDefs) {
+        return json({ error: "no def-vaults configured" }, 400);
+      }
+      // GUARD: don't remove the last def-vault — that would orphan the module's whole
+      // vault-native path (no vault to define agents in). Mirror the channels.json
+      // posture: removing the only one is a clear 400, not a silent orphan.
+      const names = agentDefs.vaultNames();
+      if (!names.includes(name)) {
+        return json({ ok: true, vault: name, removed: false }, 200);
+      }
+      if (names.length <= 1) {
+        return json(
+          { error: `cannot remove the only def-vault "${name}" — the vault-native agent path would have no vault to define agents in. Add another first.` },
+          400,
+        );
+      }
+      // Tear down its live agents, then drop it from the live registry + the file.
+      try {
+        await agentDefs.deregisterAllForVault(name);
+      } catch (err) {
+        return json({ error: `failed to deregister agents for "${name}": ${(err as Error).message}` }, 502);
+      }
+      // Rewrite agent-vaults.json without this vault (idempotent).
+      try {
+        const stateDir = defaultStateDir();
+        const file = readDefVaultsFile(stateDir);
+        if (file) {
+          writeDefVaultsFile({ vaults: file.vaults.filter((v) => v.vault !== name) }, stateDir);
+        }
+      } catch (err) {
+        return json({ error: `failed to update agent-vaults.json: ${(err as Error).message}` }, 500);
+      }
+      agentDefs.removeVault(name);
+      return json({ ok: true, vault: name, removed: true });
     }
 
     // ---------------------------------------------------------------------

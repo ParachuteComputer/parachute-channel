@@ -66,17 +66,33 @@ export interface AgentInfo {
   /** Whether the session's workspace (with its .mcp.json) is present on disk. */
   hasWorkspace: boolean;
   /**
-   * Which backend drives this agent. `"interactive"` (the default — a tmux session)
-   * or `"programmatic"` (no tmux; on-demand `claude -p` turns). The list merges
-   * interactive tmux sessions + registered programmatic agents (design 2026-06-16).
+   * Which backend drives this agent. `"interactive"` (a tmux session),
+   * `"programmatic"` (no tmux; on-demand `claude -p` turns), or `"channel"` (no tmux,
+   * no daemon-run turn — a Claude Code session the operator connects to the channel's
+   * MCP endpoint handles the turn; inbound notes accumulate as a durable queue). The
+   * list merges interactive tmux sessions + registered programmatic agents (design
+   * 2026-06-16) + registered channel-backend agents (#102, the v2 API layer).
    */
-  backend: "interactive" | "programmatic";
+  backend: "interactive" | "programmatic" | "channel";
   /**
-   * Programmatic-only live status — `idle` | `working` | `queued:N` (N = pending).
-   * Absent for interactive agents (their liveness is the tmux `attached` flag +
-   * /health's `mcp_sessions`). Present for programmatic agents in place of those.
+   * Live status — for a programmatic agent `idle` | `working` | `queued:N` (N =
+   * pending); for a channel agent `queued:N` (N = pending inbound waiting for the
+   * connected session) or `idle`. Absent for interactive agents (their liveness is
+   * the tmux `attached` flag + /health's `mcp_sessions`).
    */
   status?: string;
+  /**
+   * The wake channel this agent serves (the channel inbound routes to it on). Present
+   * for channel-backend agents (where agent == channel); absent for interactive +
+   * programmatic agents whose channel isn't surfaced in this list shape.
+   */
+  channel?: string;
+  /**
+   * The vault backing this agent's conversation, when known — the def-vault a
+   * vault-native agent's channel is bound to. Present for channel/programmatic agents
+   * instantiated from a `#agent/definition` note; absent otherwise.
+   */
+  vault?: string;
   /**
    * The agent's system-prompt COMPOSITION mode when a per-channel system prompt is
    * set (design 2026-06-16-channel-system-prompt.md) — `"append"` (kept CC's base +

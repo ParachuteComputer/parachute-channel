@@ -204,25 +204,26 @@ export function parseAgentDef(note: {
     );
   }
 
-  // Backend — default programmatic (the reliable primary path; interactive is the
-  // gated opt-in, selectable but not the default for a vault def). 4a: the
-  // vault-native instantiate path is programmatic-only — `interactive` is NOT yet
-  // wired for vault defs (it forces a tmux spawn the def path doesn't drive). So we
-  // REJECT it here with a clear message (→ status:error on the note) rather than
-  // silently demoting to programmatic. Supporting interactive for vault defs is a
-  // later increment.
+  // Backend — default programmatic (the reliable primary path). A vault-native def
+  // may select EITHER `programmatic` (the daemon runs `claude -p` turns) OR `channel`
+  // (the design 2026-06-18-channel-backend path — the turn is handled by a Claude Code
+  // session the operator connects to the channel's MCP endpoint; the daemon runs no
+  // turn, the inbound notes accumulate as a durable queue). `interactive` (the retired
+  // tmux path) is REJECTED with a clear message (→ status:error on the note) rather
+  // than silently demoting — `channel` is what it was reaching for, done right.
   let backend: AgentBackendKind = "programmatic";
   const rawBackend = metaStr(meta.backend);
   if (rawBackend !== undefined) {
     if (rawBackend === "interactive") {
       throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: the "interactive" backend is not yet supported for ` +
-          `vault-native defs — use "programmatic" (the default).`,
+        `#agent/definition note ${noteId}: the "interactive" backend is retired — use ` +
+          `"programmatic" (daemon-run turns, the default) or "channel" (handled by a Claude ` +
+          `Code session you connect to the channel).`,
       );
     }
-    if (rawBackend !== "programmatic") {
+    if (rawBackend !== "programmatic" && rawBackend !== "channel") {
       throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: backend must be "programmatic"`,
+        `#agent/definition note ${noteId}: backend must be "programmatic" or "channel"`,
       );
     }
     backend = rawBackend;

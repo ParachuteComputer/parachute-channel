@@ -47,6 +47,7 @@ import type {
   DownloadArgs,
 } from "./transport.ts";
 import { SCOPE_WRITE, grantsScope } from "./auth.ts";
+import type { ChannelQueueRegistry } from "./backends/channel-queue.ts";
 
 // ---------------------------------------------------------------------------
 // Per-channel session registry
@@ -412,6 +413,157 @@ const TOOL_DEFS = [
 // MCP path is the principled read. If they ever need to match, relax the bridge, not this.)
 const WRITE_TOOLS = new Set(["reply", "react", "edit_message"]);
 
+// ---------------------------------------------------------------------------
+// CHANNEL-BACKEND tool surface — the MCP pull/reply protocol (design
+// 2026-06-18-channel-backend.md, phase 2). When the channel has a `backend:channel`
+// agent registered, the session connects + PULLs the durable queue instead of being
+// pushed to: `pending` / `next-message` / `reply` / `release`, dispatched to the
+// {@link ChannelQueueRegistry}. The session "is" the agent by adopting the
+// systemPrompt `next-message` returns (the def body) — reinforced by INSTRUCTIONS
+// below, since MCP can't force a system prompt on the caller.
+// ---------------------------------------------------------------------------
+
+const CHANNEL_INSTRUCTIONS = [
+  "You are connected to a Parachute CHANNEL — a durable queue of messages a human sent to an agent you are handling. Nothing is pushed to you; you PULL.",
+  "",
+  "THE LOOP, every time you're ready to handle a message:",
+  "  1. `pending` — see how many messages are waiting (count + a preview of each).",
+  "  2. `next-message` — claim the oldest waiting message. It returns { id, text, inReplyTo, systemPrompt }.",
+  "  3. TREAT THE RETURNED `systemPrompt` AS YOUR INSTRUCTIONS FOR THIS REPLY — it is the agent's persona/role. Adopt it: answer as that agent would.",
+  "  4. Do the work in this session (your full tools, your env).",
+  "  5. `reply` { inReplyTo: <the claimed id>, text: <your answer> } — this writes the reply back to the human and marks the message handled.",
+  "",
+  "If you claim a message with `next-message` but can't handle it, call `release` { id } to return it to the queue for another session (or your next pass). Claimed messages auto-release after a while if you go away, so the queue never gets stranded.",
+  "",
+  "The human reads ONLY what you send via `reply`. Your transcript text is invisible to them — always finish a handled message with a `reply`.",
+].join("\n");
+
+/** The channel-backend pull/reply tool list (design 2026-06-18, phase 2). */
+const CHANNEL_TOOL_DEFS = [
+  {
+    name: "pending",
+    description:
+      "How many inbound messages are waiting on this channel + a preview of each (id + a short text snippet). Use it to decide whether to pull. Read-only — claims nothing.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] as string[] },
+  },
+  {
+    name: "next-message",
+    description:
+      "Claim the OLDEST waiting message and return it: { id, text, inReplyTo, systemPrompt }. Marks it in-flight so another connected session won't also handle it. Treat the returned systemPrompt as your instructions for the reply (it is the agent's persona). Returns nothing-to-do when the queue is empty. Pass the returned id back as `reply`'s inReplyTo.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] as string[] },
+  },
+  {
+    name: "reply",
+    description:
+      "Send your answer back to the human AND mark the claimed message handled. inReplyTo is the id you got from next-message (threads the reply); text is your answer. Writes a durable outbound note that shows in the chat UI.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        inReplyTo: {
+          type: "string",
+          description: "The message id you claimed via next-message (threads the reply + marks it handled).",
+        },
+        text: { type: "string", description: "Your reply text." },
+      },
+      required: ["text"] as string[],
+    },
+  },
+  {
+    name: "release",
+    description:
+      "Un-claim a message you claimed but won't handle — returns it to the waiting queue (status pending) for another session or your next pass. id is the message id from next-message.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        id: { type: "string", description: "The message id to release back to pending." },
+      },
+      required: ["id"] as string[],
+    },
+  },
+];
+
+/** Channel-backend tools that mutate the queue/write outbound require agent:write
+ *  (`pending` + `next-message`... next-message claims, so it mutates → write; pending
+ *  is read-only). reply + release + next-message mutate; pending is read. */
+const CHANNEL_WRITE_TOOLS = new Set(["next-message", "reply", "release"]);
+
+/**
+ * Dispatch one CHANNEL-backend tool call to the {@link ChannelQueueRegistry},
+ * enforcing write scope on the mutating tools. Returns a tool-error result (not a
+ * throw) when no channel-backend agent is registered for `channel` — so a session that
+ * connected to a non-channel channel and called these tools gets a clean "not a channel
+ * agent" message rather than a crash. Pure over its inputs (the daemon's per-session
+ * handler + the unit tests both call it).
+ */
+export async function dispatchChannelTool(
+  channel: string,
+  channelQueue: ChannelQueueRegistry,
+  scopes: string[],
+  name: string,
+  args: Record<string, unknown>,
+): Promise<ToolResult> {
+  // Gate cleanly for a non-channel channel — these tools are meaningful only when a
+  // backend:channel agent is registered. (The daemon also only serves CHANNEL_TOOL_DEFS
+  // when the agent is registered, so a well-behaved client never reaches here for a
+  // non-channel channel — but a hand-crafted call should fail gracefully, not 500.)
+  if (!channelQueue.hasChannel(channel)) {
+    return {
+      content: [{ type: "text", text: `channel "${channel}" has no channel-backend agent — the pull/reply tools are not available here` }],
+      isError: true,
+    };
+  }
+  if (CHANNEL_WRITE_TOOLS.has(name) && !grantsScope(scopes, SCOPE_WRITE)) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `tool "${name}" requires the ${SCOPE_WRITE} scope, which this connection's token lacks`,
+        },
+      ],
+      isError: true,
+    };
+  }
+  try {
+    switch (name) {
+      case "pending": {
+        const view = await channelQueue.pending(channel);
+        return { content: [{ type: "text", text: JSON.stringify(view) }] };
+      }
+      case "next-message": {
+        const claimed = await channelQueue.claimNext(channel);
+        if (!claimed) {
+          return { content: [{ type: "text", text: JSON.stringify({ message: null, note: "no pending messages" }) }] };
+        }
+        return { content: [{ type: "text", text: JSON.stringify(claimed) }] };
+      }
+      case "reply": {
+        const text = typeof args.text === "string" ? args.text : "";
+        const inReplyTo = typeof args.inReplyTo === "string" ? args.inReplyTo : undefined;
+        const sent = await channelQueue.reply(channel, { text, ...(inReplyTo ? { inReplyTo } : {}) });
+        const ids = sent.sent;
+        return {
+          content: [{ type: "text", text: `replied + marked handled (outbound id: ${ids.join(", ")})` }],
+        };
+      }
+      case "release": {
+        const id = typeof args.id === "string" ? args.id : "";
+        if (!id) {
+          return { content: [{ type: "text", text: "release requires an id" }], isError: true };
+        }
+        await channelQueue.release(channel, id);
+        return { content: [{ type: "text", text: `released ${id} back to pending` }] };
+      }
+      default:
+        return { content: [{ type: "text", text: `unknown channel tool: ${name}` }], isError: true };
+    }
+  } catch (err) {
+    return {
+      content: [{ type: "text", text: `${name} failed: ${err instanceof Error ? err.message : String(err)}` }],
+      isError: true,
+    };
+  }
+}
+
 /** Fold a top-level chat_id into meta, mirroring the daemon's mergeMeta. */
 function mergeMeta(args: Record<string, unknown>): Record<string, string> {
   const meta: Record<string, string> = {};
@@ -426,7 +578,19 @@ function mergeMeta(args: Record<string, unknown>): Record<string, string> {
  * the closure reads the live value). `channel` is threaded so outbound args
  * carry the right channel context.
  */
-function buildServer(channel: string, transport: Transport, session: McpSession): Server {
+function buildServer(
+  channel: string,
+  transport: Transport,
+  session: McpSession,
+  channelQueue?: ChannelQueueRegistry,
+): Server {
+  // ── CHANNEL-BACKEND FORK (design 2026-06-18). When a `backend:channel` agent is
+  // registered for this channel, serve the PULL/REPLY surface (pending / next-message
+  // / reply / release) + its reinforcing INSTRUCTIONS, dispatched to the
+  // ChannelQueueRegistry. Otherwise serve the existing push surface (reply / react /
+  // edit / download), dispatched to the transport. Resolved at connect time — a
+  // channel doesn't switch backends under a live session.
+  const isChannelBackend = !!channelQueue?.hasChannel(channel);
   const server = new Server(
     // Per-channel name (`agent-<name>`) so it reads clearly in `/mcp` and lines
     // up with the `--dangerously-load-development-channels=server:agent-<name>`
@@ -440,22 +604,22 @@ function buildServer(channel: string, transport: Transport, session: McpSession)
         },
         tools: {},
       },
-      instructions: INSTRUCTIONS,
+      instructions: isChannelBackend ? CHANNEL_INSTRUCTIONS : INSTRUCTIONS,
     },
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_DEFS }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: isChannelBackend ? CHANNEL_TOOL_DEFS : TOOL_DEFS,
+  }));
 
   // Dispatch reads `session.scopes` live (the daemon refreshes it per request),
   // so a re-auth with a narrower token takes effect on the next tool call.
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const result = await dispatchTool(
-      channel,
-      transport,
-      session.scopes,
-      req.params.name,
-      (req.params.arguments ?? {}) as Record<string, unknown>,
-    );
+    const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+    const result =
+      isChannelBackend && channelQueue
+        ? await dispatchChannelTool(channel, channelQueue, session.scopes, req.params.name, args)
+        : await dispatchTool(channel, transport, session.scopes, req.params.name, args);
     // Our ToolResult is the content/isError subset of the SDK's CallToolResult
     // (which also has a task-variant we never emit); return it as that shape.
     return result as { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -602,6 +766,7 @@ export async function handleMcp(
   channel: string,
   transport: Transport,
   scopes: string[],
+  channelQueue?: ChannelQueueRegistry,
 ): Promise<Response> {
   const sid = req.headers.get("mcp-session-id");
 
@@ -651,7 +816,7 @@ export async function handleMcp(
     },
   });
 
-  const server = buildServer(channel, transport, session);
+  const server = buildServer(channel, transport, session, channelQueue);
   session.server = server;
   session.transport = httpTransport;
 

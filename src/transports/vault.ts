@@ -172,6 +172,43 @@ export interface ChannelMessage {
   inReplyTo?: string;
 }
 
+/**
+ * The claim status carried on an `#agent/message/inbound` note for a CHANNEL-backend
+ * agent (design 2026-06-18-channel-backend.md "Claim/ack durability"). The vault is
+ * the source of truth — the status lives on the note so a claim survives a daemon
+ * restart and a handled message is never re-presented.
+ *
+ *  - `pending`   — unhandled; waiting for a connected session to claim it.
+ *  - `in-flight` — claimed by a session (`next-message`); `claimedAt` stamps when.
+ *                  Auto-released back to `pending` after a TTL (the daemon sweep) so a
+ *                  crashed session can't strand the queue.
+ *  - `handled`   — replied to; the outbound note is written. Never re-presented.
+ *
+ * NOTE: programmatic-backend inbound notes do NOT use this field — their turn runs
+ * synchronously in the serial worker; status is meaningful only on the channel path.
+ */
+export type InboundStatus = "pending" | "in-flight" | "handled";
+
+/**
+ * One inbound queue item for a CHANNEL-backend agent — an `#agent/message/inbound`
+ * note as the {@link ChannelQueueRegistry} reads it. Carries the claim `status` +
+ * `claimedAt` (for the TTL sweep) alongside the message text + threading id.
+ */
+export interface InboundQueueNote {
+  /** The vault note id — addresses the note for the status PATCH + threads the reply. */
+  id: string;
+  /** The message text the connected session works on. */
+  text: string;
+  /** Who authored it (metadata.sender). */
+  sender: string;
+  /** ISO timestamp (metadata.ts) — the queue is ordered ascending by this (oldest first). */
+  ts: string;
+  /** The claim status (`pending` when the field is absent — a fresh inbound). */
+  status: InboundStatus;
+  /** ISO timestamp the note was claimed (set with `in-flight`); used by the TTL sweep. */
+  claimedAt?: string;
+}
+
 const DEFAULT_VAULT_URL = "http://127.0.0.1:1940";
 const DEFAULT_PATH_PREFIX = "channel";
 /** Parent tag (NEW, namespaced) — carried LITERALLY on every note WE write; query
@@ -182,6 +219,23 @@ const AGENT_MESSAGE_TAG = "#agent/message";
 const AGENT_MESSAGE_INBOUND_TAG = "#agent/message/inbound";
 /** Outbound child (NEW) — replies carry this; the trigger's exact-match predicate excludes it. */
 const AGENT_MESSAGE_OUTBOUND_TAG = "#agent/message/outbound";
+
+/** Metadata key carrying the channel-queue claim status (design 2026-06-18). */
+const STATUS_META_KEY = "status";
+/** Metadata key carrying the ISO timestamp an inbound was claimed (for the TTL sweep). */
+const CLAIMED_AT_META_KEY = "claimedAt";
+
+/**
+ * Coerce a raw `status` metadata value to an {@link InboundStatus}. The vault stores
+ * metadata as strings; an absent / empty / unrecognized value reads as `pending` (the
+ * safe default — a fresh inbound the trigger just created carries no status, and an
+ * unknown value shouldn't strand the note). Only the two non-default states need an
+ * explicit value.
+ */
+function coerceInboundStatus(v: unknown): InboundStatus {
+  if (v === "in-flight" || v === "handled") return v;
+  return "pending";
+}
 
 // ---------------------------------------------------------------------------
 // PRIOR tags (pre-namespace) — DUAL-READ only. We never WRITE these going forward,
@@ -790,6 +844,108 @@ export class VaultTransport implements Transport {
    */
   async injectInbound(opts: { content: string; sender?: string }): Promise<{ id: string }> {
     return this.writeInbound(opts.content, opts.sender ?? "runner");
+  }
+
+  // -------------------------------------------------------------------------
+  // Channel-queue inbound notes — the durable queue a CHANNEL-backend agent's
+  // connected session pulls from (design 2026-06-18-channel-backend.md). The
+  // inbound `#agent/message/inbound` notes themselves ARE the queue; the claim
+  // `status` (pending | in-flight | handled) lives on each note so the vault is
+  // the source of truth (restart-safe). These methods own the vault I/O (URL +
+  // token + encoding) so the ChannelQueueRegistry stays storage-agnostic — the
+  // same separation jobs.ts has from the job-note I/O. The channel's existing
+  // `vault:<name>:write` token covers GET + the status PATCH; no new mint.
+  // -------------------------------------------------------------------------
+
+  /**
+   * List THIS channel's INBOUND queue notes (the `#agent/message/inbound` notes),
+   * ascending by `ts` (oldest first), carrying the claim `status`/`claimedAt`. The
+   * query is index-free, mirroring {@link loadTranscript}: query by the inbound
+   * CHILD tag (we want inbound only — outbound replies are not queue items) and
+   * filter to this channel CLIENT-SIDE on `metadata.channel` (we don't assume a
+   * `channel` index). A note with NO `status` field reads as `pending` (a fresh
+   * inbound the trigger just created). Throws on a non-ok vault response so the
+   * caller surfaces a clear error rather than a silently-empty queue.
+   */
+  async listInboundQueue(opts?: { limit?: number }): Promise<InboundQueueNote[]> {
+    const channel = this.channel;
+    const limit = opts?.limit ?? 200;
+    // Overfetch (the tag query spans all channels) then keep this channel's items.
+    const fetchLimit = Math.min(Math.max(limit * 4, 500), 2000);
+    const params = new URLSearchParams();
+    params.set("tag", AGENT_MESSAGE_INBOUND_TAG); // → %23agent%2Fmessage%2Finbound
+    params.set("include_content", "true");
+    params.set("limit", String(fetchLimit));
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes?${params.toString()}`;
+    const res = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`vault transport: list inbound queue failed (${res.status}) ${detail}`.trim());
+    }
+    type RawNote = { id?: string; content?: string; metadata?: Record<string, unknown> };
+    let notes: RawNote[];
+    try {
+      const parsed = (await res.json()) as unknown;
+      notes = Array.isArray(parsed)
+        ? (parsed as RawNote[])
+        : ((parsed as { notes?: RawNote[] })?.notes ?? []);
+    } catch (err) {
+      throw new Error(
+        `vault transport: list inbound queue — bad JSON from vault: ${(err as Error).message}`,
+      );
+    }
+    const out: InboundQueueNote[] = [];
+    for (const note of notes) {
+      if (typeof note.id !== "string" || !note.id) continue;
+      const meta = note.metadata ?? {};
+      if (meta.channel !== channel) continue; // client-side channel filter (index-free).
+      out.push({
+        id: note.id,
+        text: typeof note.content === "string" ? note.content : "",
+        sender: typeof meta.sender === "string" ? meta.sender : "",
+        ts: typeof meta.ts === "string" ? meta.ts : "",
+        status: coerceInboundStatus(meta[STATUS_META_KEY]),
+        ...(typeof meta[CLAIMED_AT_META_KEY] === "string"
+          ? { claimedAt: meta[CLAIMED_AT_META_KEY] as string }
+          : {}),
+      });
+    }
+    // Ascending by ts; blank-ts notes sort first (stable, deterministic).
+    out.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+    return out;
+  }
+
+  /**
+   * PATCH an inbound note's claim status (+ optionally `claimedAt`), by note id.
+   * Sends ONLY the changed metadata; the vault MERGES it, so the channel/direction/
+   * sender/ts are preserved. `force: true` satisfies the vault's 428 mutation
+   * precondition (the 4a precondition) — safe here: `status`/`claimedAt` are the
+   * module's OWN authoritative claim fields, the body carries no content. Passing
+   * `claimedAt: null` CLEARS the field (written as an empty string) — used on
+   * release/handled so a stale claim timestamp doesn't linger. Throws on a non-ok
+   * vault response (the caller decides whether to surface or swallow).
+   */
+  async setInboundStatus(
+    id: string,
+    status: InboundStatus,
+    claimedAt?: string | null,
+  ): Promise<void> {
+    const metadata: Record<string, string> = { [STATUS_META_KEY]: status };
+    if (claimedAt !== undefined) {
+      metadata[CLAIMED_AT_META_KEY] = claimedAt === null ? "" : claimedAt;
+    }
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(id)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
+      body: JSON.stringify({ metadata, force: true }),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(
+        `vault transport: set inbound status ${id} failed (${res.status}) ${detail}`.trim(),
+      );
+    }
   }
 
   // -------------------------------------------------------------------------

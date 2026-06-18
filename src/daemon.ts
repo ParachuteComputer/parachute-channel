@@ -114,6 +114,10 @@ import {
   type WriteOutbound,
   type TurnEventSink,
 } from "./backends/registry.ts";
+import {
+  ChannelQueueRegistry,
+  type ChannelQueueStore,
+} from "./backends/channel-queue.ts";
 import { AgentSessionState } from "./agent-session-state.ts";
 import { readPersistedSpec, interpretPersistedBackend, sessionWorkspace } from "./spawn-agent.ts";
 import { normalizeChannel } from "./sandbox/types.ts";
@@ -244,10 +248,27 @@ export function contextFor(
   channel: string,
   deliveryState: DeliveryState,
   programmatic?: ProgrammaticAgentRegistry,
+  channelQueue?: ChannelQueueRegistry,
 ): TransportContext {
   return {
     channel,
     emit(msg: InboundMessage): void {
+      // ── DAEMON ROUTING FORK (design 2026-06-18-channel-backend.md, the load-bearing
+      // change). Route inbound by the agent's BACKEND:
+      //
+      //   backend: channel → the ChannelQueueRegistry path. The inbound
+      //     `#agent/message/inbound` note IS the queue item (durable in the vault,
+      //     status:pending by default). There is NO `claude -p`, NO serial worker, and
+      //     NO live push — a connected Claude Code session PULLS it via the channel MCP
+      //     surface. So a channel inbound is a NO-OP here beyond its own durability:
+      //     we MUST NOT enqueue to the programmatic worker (that would run a turn the
+      //     channel model deliberately doesn't), and we don't advance the delivery
+      //     high-water-mark (there's no live subscriber to deliver to; the durable note
+      //     queue + claim status is the durability, not replay). Checked FIRST so a
+      //     channel agent NEVER falls through to the programmatic enqueue below.
+      if (channelQueue?.hasChannel(channel)) {
+        return;
+      }
       // PROGRAMMATIC ROUTING (design 2026-06-16 step 3). If a programmatic agent is
       // registered for this channel, the inbound becomes one on-demand `claude -p`
       // turn — ENQUEUE it (the per-channel serial worker drains it) and do NOT also
@@ -441,6 +462,7 @@ async function addChannelLive(
   entry: ChannelEntry,
   deliveryState: DeliveryState,
   programmatic?: ProgrammaticAgentRegistry,
+  channelQueue?: ChannelQueueRegistry,
 ): Promise<Channel> {
   const existing = channels.get(entry.name);
   if (existing) {
@@ -456,7 +478,7 @@ async function addChannelLive(
   const transport = instantiateTransport(entry);
   const channel: Channel = { name: entry.name, transport, entry };
   channels.set(entry.name, channel);
-  await transport.start(contextFor(registry, entry.name, deliveryState, programmatic));
+  await transport.start(contextFor(registry, entry.name, deliveryState, programmatic, channelQueue));
   return channel;
 }
 
@@ -523,19 +545,80 @@ export function buildInstantiateDeps(
   registry: ClientRegistry,
   deliveryState: DeliveryState,
   programmatic: ProgrammaticAgentRegistry,
+  channelQueue: ChannelQueueRegistry,
 ): InstantiateDeps {
   return {
     ensureChannel: async (name, binding) => {
-      await addChannelLive(channels, registry, defVaultChannelEntry(name, binding), deliveryState, programmatic);
+      await addChannelLive(
+        channels,
+        registry,
+        defVaultChannelEntry(name, binding),
+        deliveryState,
+        programmatic,
+        channelQueue,
+      );
     },
     setupAndRegister: async (spec) => {
+      // ── BACKEND FORK (design 2026-06-18-channel-backend.md). A `channel` agent
+      // does NOT register with the programmatic registry (no `claude -p`, no serial
+      // worker) — it registers with the ChannelQueueRegistry, whose store is the
+      // agent's live VaultTransport (the durable inbound-note queue). A `programmatic`
+      // agent takes the existing path (persist spec.json + register the serial worker).
+      if (spec.backend === "channel") {
+        const store = channelQueueStoreFor(channels, spec.channels[0]);
+        if (!store) {
+          throw new Error(
+            `cannot register channel-backend agent "${spec.name}": its wake channel is not a ` +
+              `live vault transport (the queue needs the vault as its durable store)`,
+          );
+        }
+        channelQueue.register(spec, store);
+        return;
+      }
       // Persist spec.json (so boot re-register + per-turn deliver find the workspace)
       // then register — the same two steps the web programmatic spawn runs.
       setupProgrammaticSpawn(spec);
       await programmatic.register({ ...spec, backend: "programmatic" });
     },
-    deregister: async (name) => programmatic.deregister(name),
+    // Deregister covers BOTH registries — an agent lives in exactly one, and
+    // deregister is a no-op (returns false) where it isn't registered. OR the two so
+    // a reload/delete tears the agent down regardless of its backend.
+    deregister: async (name) => {
+      const fromProgrammatic = await programmatic.deregister(name);
+      const fromChannel = channelQueue.deregister(name);
+      return fromProgrammatic || fromChannel;
+    },
     removeChannel: async (name) => removeChannelLive(channels, name),
+  };
+}
+
+/**
+ * Build a {@link ChannelQueueStore} for a channel name from its live VaultTransport —
+ * the durable inbound-note queue a CHANNEL-backend agent's connected session pulls
+ * from (design 2026-06-18). Returns null when the channel isn't a live vault transport
+ * (a channel agent's queue REQUIRES the vault as its source of truth). The store is a
+ * thin adapter over the transport's `listInboundQueue` / `setInboundStatus` / `reply`
+ * — the same `reply()` the programmatic worker uses, so the outbound is durable +
+ * loop-safe (tagged `#agent/message/outbound`, which the inbound trigger never fires on).
+ */
+export function channelQueueStoreFor(
+  channels: Map<string, Channel>,
+  channelName: string | { name: string } | undefined,
+): ChannelQueueStore | null {
+  const name = typeof channelName === "string" ? channelName : channelName?.name;
+  if (!name) return null;
+  const vt = channels.get(name)?.transport;
+  if (!(vt instanceof VaultTransport)) return null;
+  return {
+    listInboundQueue: (opts) => vt.listInboundQueue(opts),
+    setInboundStatus: (id, status, claimedAt) => vt.setInboundStatus(id, status, claimedAt),
+    reply: async (args) => {
+      return vt.reply({
+        channel: name,
+        text: args.text,
+        ...(args.inReplyTo ? { meta: { in_reply_to: args.inReplyTo } } : {}),
+      });
+    },
   };
 }
 
@@ -1542,6 +1625,15 @@ export function createFetchHandler(
     deliveryState?: DeliveryState;
     programmatic?: ProgrammaticAgentRegistry;
     /**
+     * The CHANNEL-backend queue registry (design 2026-06-18-channel-backend.md) — the
+     * durable inbound-note queue + claim tracker a connected Claude Code session pulls
+     * from via the channel MCP surface (`next-message` / `pending` / `reply` /
+     * `release`). `main` passes the boot instance (the SAME one the transports'
+     * `contextFor` routing fork checks); tests inject a fake-store-backed instance.
+     * Optional — when absent, the channel MCP tools no-op (no channel agents).
+     */
+    channelQueue?: ChannelQueueRegistry;
+    /**
      * The per-channel turn-event SSE registry (the streaming view, design build
      * item #1). The `/api/channels/<ch>/turn-events` SSE route registers subscribers
      * here; the programmatic registry's turn-event sink fans out to them. `main`
@@ -1591,6 +1683,13 @@ export function createFetchHandler(
   // and threads the turn-event sink so its turns stream to this handler's `turnEvents`.
   const programmatic: ProgrammaticAgentRegistry =
     opts?.programmatic ?? createDefaultProgrammaticRegistry(channels, buildTurnEventSink(turnEvents));
+
+  // The CHANNEL-backend queue registry (design 2026-06-18). `main` shares its boot
+  // instance (the SAME one the transports' `contextFor` routing fork checks + the
+  // channel MCP surface dispatches to). Defaulted to a fresh instance so a plain
+  // createFetchHandler still serves the channel MCP tools (it just has no channel
+  // agents registered until one is instantiated). Tests inject a fake-store-backed one.
+  const channelQueue: ChannelQueueRegistry = opts?.channelQueue ?? new ChannelQueueRegistry();
 
   // Per-channel delivery high-water-mark store (the no-silent-loss spine). The
   // daemon's `main` passes the boot-time instance; tests that don't care get a
@@ -1906,7 +2005,7 @@ export function createFetchHandler(
         return json({ error: `failed to write channels.json: ${(err as Error).message}` }, 500);
       }
       try {
-        await addChannelLive(channels, registry, entry, deliveryState, programmatic);
+        await addChannelLive(channels, registry, entry, deliveryState, programmatic, channelQueue);
       } catch (err) {
         return json(
           {
@@ -2971,7 +3070,7 @@ export function createFetchHandler(
         // Unreachable in practice (requireScope passed); fall back to read-only.
         scopes = [SCOPE_READ];
       }
-      return handleMcp(req, channel, transport, scopes);
+      return handleMcp(req, channel, transport, scopes, channelQueue);
     }
 
     // Give each transport a chance to handle a route the daemon didn't. Runs
@@ -3095,6 +3194,16 @@ function main(): void {
   // its interim progress to `turnEvents` (the chat's live view).
   const programmatic = createDefaultProgrammaticRegistry(channels, buildTurnEventSink(turnEvents));
 
+  // The CHANNEL-backend queue registry (design 2026-06-18-channel-backend.md),
+  // constructed ONCE at boot and shared by the fetch handler (the channel MCP surface),
+  // the transports' `contextFor` (the routing fork — a channel inbound is NOT enqueued
+  // to the programmatic worker), the agent-def instantiate path (a `backend:channel`
+  // def registers here, not with programmatic), and the periodic sweep below. The
+  // durable queue + claim state lives on the inbound notes in each channel's vault, so
+  // this registry holds no per-message state of its own — it's the claim/peek/reply
+  // surface over those notes.
+  const channelQueue = new ChannelQueueRegistry();
+
   // The terminal WS handler set (pty↔socket relay + backpressure flow control,
   // src/terminal.ts). One handler object serves every terminal connection;
   // per-connection state lives on `ws.data`. The fetch handler routes accepted
@@ -3142,10 +3251,10 @@ function main(): void {
   // resolve below (resolveDefVaults → addVault → loadAll) fills it. ADDITIVE to
   // channels.json — both paths coexist.
   const agentDefs = new AgentDefRegistry(
-    buildInstantiateDeps(channels, registry, deliveryState, programmatic),
+    buildInstantiateDeps(channels, registry, deliveryState, programmatic, channelQueue),
   );
 
-  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, turnEvents, jobStore, runner, agentDefs });
+  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, channelQueue, turnEvents, jobStore, runner, agentDefs });
   const server = Bun.serve<TerminalWsData, never>({
     port: PORT,
     hostname: "127.0.0.1",
@@ -3230,7 +3339,7 @@ function main(): void {
   // still serve the channels that did come up. Pass the programmatic registry so a
   // channel with a registered programmatic agent routes inbound to its serial queue.
   for (const channel of [...channels.values()]) {
-    addChannelLive(channels, registry, channel.entry, deliveryState, programmatic).catch((err) => {
+    addChannelLive(channels, registry, channel.entry, deliveryState, programmatic, channelQueue).catch((err) => {
       console.error(`parachute-agent: transport "${channel.name}" start failed:`, err);
     });
   }
@@ -3253,6 +3362,20 @@ function main(): void {
   // is `unref`'d so it never keeps the process alive on its own.
   runner.start();
   console.log(`parachute-agent: runner started (scheduled-job tick)`);
+
+  // CHANNEL-BACKEND CLAIM TTL SWEEP (design 2026-06-18-channel-backend.md). A periodic
+  // tick scans every channel-backend agent's in-flight inbound notes and resets any
+  // claimed longer than the claim TTL (15 min) back to `pending` — so a crashed /
+  // abandoned connected session can't strand the queue. Cheap + idempotent (a
+  // channel with no channel agents lists nothing). `unref` so it never holds the
+  // process open; runs at the same 30s cadence as the runner tick.
+  const sweepIntervalMs = parseInt(process.env.PARACHUTE_AGENT_SWEEP_MS ?? "", 10) || 30_000;
+  const channelSweep = setInterval(() => {
+    void channelQueue.sweepExpired().catch((err) => {
+      console.error(`parachute-agent: channel-queue sweep failed (continuing): ${(err as Error).message}`);
+    });
+  }, sweepIntervalMs);
+  channelSweep.unref?.();
 
   // VAULT-NATIVE AGENT DEFINITIONS (design 2026-06-17-vault-native-agents, Phase 4a).
   // Resolve the def-vault bindings (agent-vaults.json, or the minted single-`default`
@@ -3305,6 +3428,7 @@ function main(): void {
   // Graceful shutdown — stop the runner + all transports.
   async function shutdown(): Promise<void> {
     runner.stop();
+    clearInterval(channelSweep);
     if (agentDefPoll) clearInterval(agentDefPoll);
     await Promise.allSettled([...channels.values()].map((c) => c.transport.stop()));
     server.stop();

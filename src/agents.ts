@@ -372,7 +372,15 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
   // file on disk, so existing interactive agents are never silently migrated.
   if (b.backend !== undefined && b.backend !== null) {
     if (b.backend !== "interactive" && b.backend !== "programmatic") {
-      throw new SpawnRequestError('body.backend must be "interactive" or "programmatic"');
+      // `channel` is a valid backend kind but is VAULT-NATIVE only — define a
+      // channel agent as a #agent/definition note, not via this web spawn POST
+      // (the create-agent UX for channel is phase 5). Spell that out so a
+      // `backend:"channel"` POST gets a useful error, not a misleading one.
+      throw new SpawnRequestError(
+        b.backend === "channel"
+          ? 'channel-backend agents are vault-native — define them as an #agent/definition note, not via this endpoint'
+          : 'body.backend must be "programmatic" or "interactive"',
+      );
     }
     spec.backend = b.backend;
   } else {

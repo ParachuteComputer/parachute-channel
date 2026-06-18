@@ -242,6 +242,7 @@ Bearer `vault:<name>:write`).
 | `PARACHUTE_AGENT_PORT` | `1941` | Daemon HTTP port — back-compat override for a daemon run *outside* the supervisor. Used only when `PORT` is unset. |
 | `PARACHUTE_AGENT_URL` | `http://127.0.0.1:1941` | Bridge → daemon URL |
 | `PARACHUTE_AGENT_STATE_DIR` | `~/.parachute/agent` | Token, access config, inbox |
+| `PARACHUTE_AGENT_SWEEP_MS` | `30000` | **Daemon:** cadence of the channel-backend claim-sweep tick (auto-releases `in-flight` inbound claims older than the 15-min TTL back to `pending`, so a crashed/abandoned session can't strand a channel queue). |
 | `PARACHUTE_HUB_ORIGIN` | `http://127.0.0.1:1939` | **Daemon:** hub's public origin for JWT `iss` validation. Required on an exposed deployment (the loopback default is dev-only); hub-as-supervisor sets it. |
 | `PARACHUTE_AGENT_TOKEN` | (none) | **Bridge:** hub-issued agent JWT presented as Bearer. The launcher mints + injects it; unset = no auth header (dev only). Default mint TTL is the hub's non-ephemeral default (~90d); re-launch re-mints. |
 

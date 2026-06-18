@@ -210,10 +210,23 @@ describe("parseAgentDef", () => {
     ).toThrow(/network/);
   });
 
-  test("rejects backend:interactive for 4a (not yet wired for vault defs)", () => {
+  test("rejects backend:interactive (retired — design 2026-06-18)", () => {
     expect(() =>
       parseAgentDef({ id: "n", content: "x", metadata: { name: "a", backend: "interactive" } }, { vault: "v" }),
     ).toThrow(/interactive/);
+  });
+
+  test("accepts backend:channel (design 2026-06-18-channel-backend), threads it onto the spec", () => {
+    const def = parseAgentDef(
+      { id: "Agents/laptop", content: "You are the laptop agent.", metadata: { name: "laptop", backend: "channel" } },
+      { vault: "default" },
+    );
+    expect(def.spec.backend).toBe("channel");
+    expect(def.name).toBe("laptop");
+    // The body is still the system prompt (the session adopts it on next-message).
+    expect(def.spec.systemPrompt).toBe("You are the laptop agent.");
+    // Wake channel = the agent name (agent ≡ channel) — same collapse as programmatic.
+    expect(def.spec.channels).toEqual(["laptop"]);
   });
 
   test("rejects a relative workspace path", () => {

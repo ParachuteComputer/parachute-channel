@@ -99,7 +99,8 @@ export interface AgentChannelSpec {
 export type AgentChannel = string | AgentChannelSpec;
 
 /**
- * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md):
+ * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md +
+ * 2026-06-18-channel-backend.md):
  *
  *  - `"programmatic"` (the DEFAULT for a NEW spawn request, per Aaron's gating
  *    decision 2026-06-16): NO resident process. An inbound message becomes one
@@ -107,11 +108,22 @@ export type AgentChannel = string | AgentChannelSpec;
  *    posted back as an outbound `#agent/message/outbound` note. No idle session →
  *    nothing to go deaf, no reconnect, no replay, no consent gate. The reliable
  *    primary path; best for clean per-message "do a task, report back" turns.
- *  - `"interactive"` (the original tmux path; now the opt-in/"advanced" backend): an
- *    idle interactive `claude` in a tmux pane, fed inbound by pushing onto a
- *    subscribed MCP development channel. Carries the deaf-on-restart machinery
- *    (#67/#68/#70/#71) — currently less stable, kept for "watch / drive a live
- *    session" (operator attaches the terminal) and to hedge the billing uncertainty.
+ *  - `"channel"` (design 2026-06-18-channel-backend.md): the turn is delivered over
+ *    a channel to a Claude Code session the OPERATOR runs themselves (their machine,
+ *    their env/creds, unsandboxed) and has connected to the channel's MCP endpoint.
+ *    The daemon runs NO `claude -p`; the inbound `#agent/message/inbound` notes
+ *    accumulate as a durable queue (the vault IS the queue). The connected session
+ *    PULLs the next message (an MCP tool), works, and REPLYs (an MCP tool) — the
+ *    daemon writes the outbound note + marks the inbound handled. Routed to the
+ *    {@link ChannelQueueRegistry}, entirely bypassing the programmatic serial worker
+ *    (the daemon routing fork). Claim state lives on the inbound note's `status`
+ *    (`pending | in-flight | handled`), so it's restart-safe.
+ *  - `"interactive"` (the original tmux path; now RETIRED — design 2026-06-18
+ *    "Retiring interactive"): an idle interactive `claude` in a tmux pane, fed
+ *    inbound by pushing onto a subscribed MCP development channel. Carries the
+ *    deaf-on-restart machinery (#67/#68/#70/#71). Kept in the type for back-compat
+ *    of already-persisted specs; NOT selectable for a vault-native def (parseAgentDef
+ *    rejects it). `channel` supersedes the human-driven-CC need it hedged.
  *
  * DEFAULT-RESOLUTION NOTE — the omitted-field default differs by context, on
  * purpose: a NEW request that omits `backend` resolves to `"programmatic"`
@@ -120,7 +132,7 @@ export type AgentChannel = string | AgentChannelSpec;
  * ({@link interpretPersistedBackend} in `spawn-agent.ts`) — so the flip applies going
  * forward without silently migrating already-running interactive agents.
  */
-export type AgentBackendKind = "interactive" | "programmatic";
+export type AgentBackendKind = "interactive" | "programmatic" | "channel";
 
 /**
  * How a channel's {@link AgentSpec.systemPrompt} composes with Claude Code's own

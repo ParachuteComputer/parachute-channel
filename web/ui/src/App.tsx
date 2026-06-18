@@ -21,14 +21,12 @@ import { Agents } from "./routes/Agents.tsx";
 
 const WORDMARK = "Parachute Agent";
 
-function subtitleFor(pathname: string): string {
-  if (pathname === "/agents" || pathname.startsWith("/agents/")) return "agents";
-  return "agents";
-}
+// Single view today (the Agents list). When create/config views land (Phase 3-4),
+// derive the subtitle from the route then.
+const SUBTITLE = "agents";
 
 export function App() {
-  const { pathname } = useLocation();
-  const subtitle = subtitleFor(pathname);
+  const subtitle = SUBTITLE;
 
   return (
     <div className="page">

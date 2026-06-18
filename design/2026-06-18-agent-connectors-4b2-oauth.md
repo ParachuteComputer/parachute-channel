@@ -165,7 +165,11 @@ Add the `mcp` variant:
   }
 ```
 `/material` returns ONLY `{ kind:"mcp", token, mcpUrl }` — the refresh/issuer
-internals never leave the hub.
+internals never leave the hub. **Field-name seam (don't leak the internal name):**
+the access token is stored as `access_token` *inside* the grant material, but the
+`/material` wire response projects it as **`token`** (matching the vault/service
+material wire shape the agent already consumes). Builder: read `material.access_token`
+from the store, emit `{ kind:"mcp", token: material.access_token, mcpUrl }` on the wire.
 
 ### Pending-flow store (the consent in-flight record)
 A dedicated on-disk store `agent-oauth-flows.json` in the hub state dir (0600, same

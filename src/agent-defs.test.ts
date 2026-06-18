@@ -161,6 +161,12 @@ describe("parseAgentDef", () => {
     ).toThrow(/network/);
   });
 
+  test("rejects backend:interactive for 4a (not yet wired for vault defs)", () => {
+    expect(() =>
+      parseAgentDef({ id: "n", content: "x", metadata: { name: "a", backend: "interactive" } }, { vault: "v" }),
+    ).toThrow(/interactive/);
+  });
+
   test("rejects a relative workspace path", () => {
     expect(() =>
       parseAgentDef({ id: "n", content: "x", metadata: { name: "a", workspace: "rel/path" } }, { vault: "v" }),

@@ -2754,7 +2754,14 @@ export function createFetchHandler(
       if (!vault) {
         return json({ error: "body.vault is required (multiple def-vaults configured)" }, 400);
       }
-      const result = await agentDefs.reload(vault, noteId, body.event);
+      // Coerce `event` to the declared union (it's an untrusted webhook body) — any
+      // unrecognized value becomes `undefined` (a hint only; reload() re-reads ground
+      // truth regardless, but keep the runtime honest with the type contract).
+      const event =
+        body.event === "created" || body.event === "updated" || body.event === "deleted"
+          ? body.event
+          : undefined;
+      const result = await agentDefs.reload(vault, noteId, event);
       return json({ ok: true, reloaded: result });
     }
 

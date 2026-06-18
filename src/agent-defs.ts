@@ -175,13 +175,24 @@ export function parseAgentDef(note: {
   }
 
   // Backend — default programmatic (the reliable primary path; interactive is the
-  // gated opt-in, selectable but not the default for a vault def).
+  // gated opt-in, selectable but not the default for a vault def). 4a: the
+  // vault-native instantiate path is programmatic-only — `interactive` is NOT yet
+  // wired for vault defs (it forces a tmux spawn the def path doesn't drive). So we
+  // REJECT it here with a clear message (→ status:error on the note) rather than
+  // silently demoting to programmatic. Supporting interactive for vault defs is a
+  // later increment.
   let backend: AgentBackendKind = "programmatic";
   const rawBackend = metaStr(meta.backend);
   if (rawBackend !== undefined) {
-    if (rawBackend !== "programmatic" && rawBackend !== "interactive") {
+    if (rawBackend === "interactive") {
       throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: backend must be "programmatic" or "interactive"`,
+        `#agent/definition note ${noteId}: the "interactive" backend is not yet supported for ` +
+          `vault-native defs — use "programmatic" (the default).`,
+      );
+    }
+    if (rawBackend !== "programmatic") {
+      throw new AgentDefParseError(
+        `#agent/definition note ${noteId}: backend must be "programmatic"`,
       );
     }
     backend = rawBackend;

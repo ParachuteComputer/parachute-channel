@@ -31,6 +31,8 @@ import type { DefVaultBinding } from "./agent-defs.ts";
 export const DEFAULT_DEF_VAULT_NAME = "default";
 /** The loopback vault REST origin (the local vault daemon). */
 export const DEFAULT_DEF_VAULT_URL = "http://127.0.0.1:1940";
+/** The loopback HUB origin (the mint-token endpoint lives on the hub, NOT the vault). */
+export const DEFAULT_HUB_ORIGIN = "http://127.0.0.1:1939";
 
 /** The on-disk shape of `agent-vaults.json`. */
 export interface DefVaultsFile {
@@ -134,7 +136,7 @@ export async function resolveDefVaults(deps: ResolveDefVaultsDeps = {}): Promise
     const minted = await mintScopedToken(
       { scope: vaultScope(DEFAULT_DEF_VAULT_NAME, "write") },
       {
-        hubOrigin: deps.hubOrigin ?? DEFAULT_DEF_VAULT_URL,
+        hubOrigin: deps.hubOrigin ?? DEFAULT_HUB_ORIGIN,
         managerBearer: deps.managerBearer,
         ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
       },

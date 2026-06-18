@@ -241,6 +241,9 @@ describe("DefVaultClient", () => {
     expect(body.metadata.status).toBe("enabled");
     // Always sets pending (empty here) so a prior list doesn't go stale.
     expect(body.metadata.pending).toBe("");
+    // MUST carry the vault mutation precondition or the PATCH 428s (the real-vault
+    // bug this guards): `force: true` since status is the module's own derived field.
+    expect(body.force).toBe(true);
   });
 
   test("patchStatus writes the pending list joined when pending", async () => {

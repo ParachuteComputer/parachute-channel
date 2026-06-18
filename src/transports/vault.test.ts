@@ -857,7 +857,10 @@ describe("VaultTransport — scheduled-job notes (vault-native store)", () => {
     await t.patchJobNote("job-1", { lastStatus: "ok", lastRunAt: "t1" });
     expect(calls[0]!.init.method).toBe("PATCH");
     expect(calls[0]!.url).toContain("/api/notes/job-1");
-    expect(JSON.parse(String(calls[0]!.init.body)).metadata).toEqual({ lastRunAt: "t1", lastStatus: "ok" });
+    const patchBody = JSON.parse(String(calls[0]!.init.body));
+    expect(patchBody.metadata).toEqual({ lastRunAt: "t1", lastStatus: "ok" });
+    // MUST carry the vault mutation precondition or the PATCH 428s (real-vault bug).
+    expect(patchBody.force).toBe(true);
   });
 
   test("deleteJobNote DELETEs by id", async () => {

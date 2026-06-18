@@ -197,6 +197,16 @@ function specWithSystemPrompt(
   };
 }
 
+/** A one-shot spec — the ephemeral execution-lifecycle mode (no resume, no persist). */
+function specOneShot(name = "eng"): AgentSpec {
+  return {
+    name,
+    channels: [name],
+    mode: "one-shot",
+    vault: { name: "default", access: "read", tags: ["#agent/message"] },
+  };
+}
+
 function mkDirs(tag: string): void {
   sessionsDir = mkdtempSync(join(tmpdir(), `prog-sessions-${tag}-`));
   stateDir = mkdtempSync(join(tmpdir(), `prog-state-${tag}-`));
@@ -331,6 +341,65 @@ describe("ProgrammaticBackend.deliver — second turn (sid stored)", () => {
     expect(cmd2).toContain("--resume sess-RESUME");
     // The sid is stable (same conversation continued, not forked).
     expect(state.get("eng")).toBe("sess-RESUME");
+  });
+});
+
+describe("ProgrammaticBackend.deliver — mode: one-shot (ephemeral, no resume/persist)", () => {
+  test("one-shot turn does NOT --resume even with a stored sid, and does NOT persist the returned id", async () => {
+    mkDirs("oneshot");
+    const state = new AgentSessionState({ stateDir });
+    // Plant a prior session id for the channel — a resident turn WOULD resume it; a
+    // one-shot turn must IGNORE it (no --resume) and must NOT overwrite it.
+    state.set("eng", "sess-PRIOR");
+
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-NEW", "ephemeral reply") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const handle = await backend.start(specOneShot("eng"));
+
+    const result = await backend.deliver(handle, "fire the one-shot");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.reply).toBe("ephemeral reply");
+
+    // The argv carries NO --resume (the prior id was deliberately not read).
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain("SBX claude -p");
+    expect(cmd).not.toContain("--resume");
+
+    // The returned id is NOT persisted: the store still holds the PRIOR id, untouched
+    // (a one-shot fire leaves no continuity handle behind).
+    expect(state.get("eng")).toBe("sess-PRIOR");
+    // …and a fresh store instance ("restart") confirms it was never written.
+    expect(new AgentSessionState({ stateDir }).get("eng")).toBe("sess-PRIOR");
+  });
+
+  test("a one-shot turn with NO prior id still omits --resume and persists nothing", async () => {
+    mkDirs("oneshot-fresh");
+    const state = new AgentSessionState({ stateDir });
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-X", "reply") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const handle = await backend.start(specOneShot("eng"));
+
+    await backend.deliver(handle, "go");
+    expect(calls[0]!.argv[2]!).not.toContain("--resume");
+    // Nothing persisted — the channel has no stored id after a one-shot fire.
+    expect(state.get("eng")).toBeUndefined();
+  });
+
+  test("REGRESSION: resident (default mode) still resumes + persists exactly as before", async () => {
+    mkDirs("resident-regress");
+    const state = new AgentSessionState({ stateDir });
+    state.set("eng", "sess-PRIOR");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-PRIOR", "continued") });
+    // specWithVault has NO mode → resident (the default).
+    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "continue the thread");
+    expect(result.ok).toBe(true);
+    // A resident turn DOES resume the stored id…
+    expect(calls[0]!.argv[2]!).toContain("--resume sess-PRIOR");
+    // …and persists the (same, stable) id.
+    expect(state.get("eng")).toBe("sess-PRIOR");
   });
 });
 

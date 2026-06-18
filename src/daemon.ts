@@ -121,6 +121,7 @@ import {
 import {
   ProgrammaticAgentRegistry,
   type WriteOutbound,
+  type WriteRun,
   type TurnEventSink,
 } from "./backends/registry.ts";
 import {
@@ -724,6 +725,37 @@ export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutboun
 }
 
 /**
+ * Build the {@link WriteRun} the programmatic registry posts a one-shot turn's run
+ * record through — resolve the channel's transport from the live `channels` map and
+ * call its `writeRun()` (a VaultTransport writes an `#agent/run` note). A transport
+ * without a durable store (telegram) has no `writeRun`; we no-op there (a one-shot on a
+ * non-vault channel still runs — it just leaves no run note). A missing transport
+ * (channel deregistered between the turn + its run record) throws; the registry logs it
+ * and moves on (it never re-runs the turn).
+ */
+export function buildWriteRun(channels: Map<string, Channel>): WriteRun {
+  return async (run) => {
+    const ch = channels.get(run.channel);
+    if (!ch) {
+      throw new Error(`no live transport for channel "${run.channel}" — cannot write the run note`);
+    }
+    // Only a transport with a durable store implements writeRun (the VaultTransport).
+    if (!ch.transport.writeRun) return;
+    await ch.transport.writeRun({
+      channel: run.channel,
+      ...(run.definition ? { definition: run.definition } : {}),
+      mode: run.mode,
+      status: run.status,
+      input: run.input,
+      output: run.output,
+      started_at: run.started_at,
+      ended_at: run.ended_at,
+      ...(run.usage ? { usage: run.usage } : {}),
+    });
+  };
+}
+
+/**
  * Build the REAL programmatic-agent registry — the {@link ProgrammaticBackend}
  * wired to the env-resolved spawn deps + the per-channel session-id store, plus the
  * outbound-write callback over the live `channels`. Lazily defaulted by
@@ -779,6 +811,7 @@ export function createDefaultProgrammaticRegistry(
   return new ProgrammaticAgentRegistry({
     backend,
     writeOutbound: buildWriteOutbound(channels),
+    writeRun: buildWriteRun(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }

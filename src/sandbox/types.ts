@@ -154,6 +154,31 @@ export type AgentBackendKind = "interactive" | "programmatic" | "channel";
  */
 export type SystemPromptMode = "append" | "replace";
 
+/**
+ * The agent's EXECUTION-LIFECYCLE mode — how a turn relates to the agent's
+ * conversation thread + what run record it leaves (the architecture synthesis,
+ * Phase 3 prerequisite). Defined entirely by `claude -p` session-id semantics:
+ *
+ *  - `"resident"` (DEFAULT; = today's behavior): ONE persistent session id per
+ *    channel. Each turn `--resume`s the stored id and persists the returned id after
+ *    — the channel transcript IS the thread, so there is NO separate run record. A
+ *    scheduled runner job for a resident def is a synthetic inbound that RESUMES that
+ *    one thread (continuing the chat). This is exactly what every agent does today.
+ *
+ *  - `"one-shot"`: an EPHEMERAL turn. Do NOT read the prior session id (no
+ *    `--resume`) and do NOT persist the returned id — each fire is a clean,
+ *    independent invocation with no conversation continuity. Because there's no
+ *    resumed transcript to be the record, a completed one-shot turn writes ONE
+ *    `#agent/run` note (the run record: input + reply + status + timing). This is
+ *    what an operator reaches for when a scheduled job should be a clean task run,
+ *    NOT a silent continuation of the chat thread.
+ *
+ *  - `"per-thread"` (DEFERRED — not yet supported): one session id per inbound
+ *    THREAD. Needs inbound thread-routing that doesn't exist yet; {@link
+ *    parseAgentDef} REJECTS it with a clear error rather than silently demoting.
+ */
+export type AgentMode = "resident" | "one-shot" | "per-thread";
+
 export interface AgentSpec {
   /** Human-readable arm name; used as the tmux session + workspace slug. */
   name: string;
@@ -277,6 +302,26 @@ export interface AgentSpec {
    * {@link SystemPromptMode}.
    */
   systemPromptMode?: SystemPromptMode;
+  /**
+   * The execution-lifecycle mode (the Phase-3 prerequisite). `"resident"`
+   * (DEFAULT, = today): one persistent session per channel, `--resume`d + persisted
+   * each turn, the channel transcript is the thread (no run note). `"one-shot"`: an
+   * ephemeral turn — no `--resume`, the returned session id is NOT persisted, and a
+   * completed turn writes one `#agent/run` note. `"per-thread"` is deferred (parse
+   * rejects it). Read at the session-handling chokepoint (the programmatic backend's
+   * `deliver` resume block) + governs whether the registry writes a run note.
+   * Persisted in spec.json (set from the def's `metadata.mode`). See {@link AgentMode}.
+   */
+  mode?: AgentMode;
+  /**
+   * The `#agent/definition` note id this agent was instantiated from — the
+   * provenance carried into the `#agent/run` note a one-shot turn writes (so a run
+   * record links back to its def). A plain id STRING for now (interim — typed link
+   * fields are a future vault feature). Set by {@link parseAgentDef} from the note
+   * id; unset for a spec not sourced from a def note (then a one-shot run note
+   * carries no definition link).
+   */
+  definition?: string;
 }
 
 /**

@@ -13,6 +13,8 @@ import { describe, test, expect } from "bun:test";
 import {
   ProgrammaticAgentRegistry,
   type WriteOutbound,
+  type WriteRun,
+  type RunNote,
   type TurnEventSink,
   type TurnLifecycleEvent,
 } from "./registry.ts";
@@ -92,6 +94,23 @@ function recorder(): { calls: { channel: string; reply: string; inReplyTo?: stri
   };
   return { calls, fn };
 }
+
+/** A recorder WriteRun — captures every `#agent/run` note the registry writes. */
+function runRecorder(): { runs: RunNote[]; fn: WriteRun } {
+  const runs: RunNote[] = [];
+  const fn: WriteRun = async (run) => {
+    runs.push(run);
+  };
+  return { runs, fn };
+}
+
+/** A one-shot spec (writes an `#agent/run` note per fire). */
+const specOneShot = (name: string, channel = name, definition?: string): AgentSpec => ({
+  name,
+  channels: [channel],
+  mode: "one-shot",
+  ...(definition ? { definition } : {}),
+});
 
 /** A recorder TurnEventSink — captures every (channel, event) the registry emits. */
 function turnRecorder(): { events: { channel: string; event: TurnLifecycleEvent }[]; fn: TurnEventSink } {
@@ -219,6 +238,81 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
     // Both turns ran; the throw on the first didn't strand the second.
     expect(backend.calls.map((c) => c.message)).toEqual(["first (throws)", "second (ok)"]);
     expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:second (ok)" }]);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — #agent/run notes (one-shot lifecycle)", () => {
+  test("a completed ONE-SHOT turn writes an #agent/run note (status ok) carrying input/output/definition/mode", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const runs = runRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeRun: runs.fn });
+    await reg.register(specOneShot("digest", "digest", "Agents/digest"));
+
+    reg.enqueue("digest", { content: "run the digest" });
+    await until(() => runs.runs.length === 1);
+
+    expect(runs.runs).toHaveLength(1);
+    const run = runs.runs[0]!;
+    expect(run.channel).toBe("digest");
+    expect(run.status).toBe("ok");
+    expect(run.mode).toBe("one-shot");
+    expect(run.definition).toBe("Agents/digest");
+    expect(run.input).toBe("run the digest");
+    expect(run.output).toBe("reply:run the digest");
+    expect(typeof run.started_at).toBe("string");
+    expect(typeof run.ended_at).toBe("string");
+  });
+
+  test("a RESIDENT turn writes NO #agent/run note (the channel transcript is its record)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const runs = runRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeRun: runs.fn });
+    // specFor → no mode → resident (the default).
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => rec.calls.length === 1);
+    // Let any erroneous run-note write land, then assert none did.
+    await new Promise<void>((r) => setTimeout(r, 5));
+    expect(runs.runs).toHaveLength(0);
+    // The resident outbound reply was still written (no regression).
+    expect(rec.calls).toHaveLength(1);
+  });
+
+  test("a FAILED one-shot turn still writes an #agent/run note with status:error + the reason", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: false, error: "mint refused" });
+    const rec = recorder();
+    const runs = runRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeRun: runs.fn });
+    await reg.register(specOneShot("digest"));
+
+    reg.enqueue("digest", { content: "do it" });
+    await until(() => runs.runs.length === 1);
+
+    expect(runs.runs).toHaveLength(1);
+    expect(runs.runs[0]!.status).toBe("error");
+    expect(runs.runs[0]!.output).toBe("mint refused");
+    // No outbound note for a failed turn (unchanged behavior).
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  test("a one-shot turn with an empty reply STILL writes a run note (status ok, empty output)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: true, reply: "" });
+    const rec = recorder();
+    const runs = runRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeRun: runs.fn });
+    await reg.register(specOneShot("digest"));
+
+    reg.enqueue("digest", { content: "tool-only run" });
+    await until(() => runs.runs.length === 1);
+    expect(runs.runs[0]!.status).toBe("ok");
+    expect(runs.runs[0]!.output).toBe("");
+    // Empty reply → no outbound message note (the run note IS the record).
+    expect(rec.calls).toHaveLength(0);
   });
 });
 

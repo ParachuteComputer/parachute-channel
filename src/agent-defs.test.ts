@@ -230,6 +230,47 @@ describe("parseAgentDef", () => {
     expect(def.spec.channels).toEqual(["laptop"]);
   });
 
+  // --- execution-lifecycle mode (the Phase-3 prerequisite) ---
+
+  test("mode defaults to resident when omitted (= today's behavior)", () => {
+    const def = parseAgentDef(
+      { id: "Agents/uni-dev", content: "role", metadata: { name: "uni-dev" } },
+      { vault: "default" },
+    );
+    expect(def.spec.mode).toBe("resident");
+    // The def note id is threaded onto the spec as provenance (for a one-shot run note).
+    expect(def.spec.definition).toBe("Agents/uni-dev");
+  });
+
+  test("accepts mode:resident explicitly", () => {
+    const def = parseAgentDef(
+      { id: "n1", content: "role", metadata: { name: "a", mode: "resident" } },
+      { vault: "v" },
+    );
+    expect(def.spec.mode).toBe("resident");
+  });
+
+  test("accepts mode:one-shot, threads it onto the spec", () => {
+    const def = parseAgentDef(
+      { id: "Agents/digest", content: "Run the daily digest.", metadata: { name: "digest", mode: "one-shot" } },
+      { vault: "default" },
+    );
+    expect(def.spec.mode).toBe("one-shot");
+    expect(def.spec.definition).toBe("Agents/digest");
+  });
+
+  test("REJECTS mode:per-thread with a clear, actionable error (deferred — needs thread routing)", () => {
+    expect(() =>
+      parseAgentDef({ id: "n", content: "x", metadata: { name: "a", mode: "per-thread" } }, { vault: "v" }),
+    ).toThrow(/per-thread mode is not yet supported.*resident or one-shot/);
+  });
+
+  test("rejects an unrecognized mode value", () => {
+    expect(() =>
+      parseAgentDef({ id: "n", content: "x", metadata: { name: "a", mode: "weird" } }, { vault: "v" }),
+    ).toThrow(/mode must be "resident" or "one-shot"/);
+  });
+
   test("rejects a relative workspace path", () => {
     expect(() =>
       parseAgentDef({ id: "n", content: "x", metadata: { name: "a", workspace: "rel/path" } }, { vault: "v" }),

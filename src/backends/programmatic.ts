@@ -393,8 +393,16 @@ export class ProgrammaticBackend implements AgentBackend {
       writeFileSync(systemPromptFile, spec.systemPrompt, { mode: 0o600 });
     }
 
-    // Build the -p argv with --resume when a session id is stored for this channel.
-    const resumeSessionId = this.deps.sessionState.get(channel);
+    // Mode-aware session handling (the architecture-synthesis chokepoint). A
+    // `one-shot` agent runs an EPHEMERAL turn: do NOT read a prior session id (no
+    // `--resume`) and do NOT persist the returned id below — each fire is a clean,
+    // independent invocation with no conversation continuity. `resident` (the default,
+    // = today) reads + persists exactly as before. Branch ONCE here on `spec.mode`.
+    const oneShot = spec.mode === "one-shot";
+
+    // Build the -p argv with --resume when a session id is stored for this channel —
+    // skipped entirely for one-shot (no continuity to restore).
+    const resumeSessionId = oneShot ? undefined : this.deps.sessionState.get(channel);
     const argv = buildProgrammaticClaudeArgs({
       message,
       mcpConfigPath,
@@ -489,8 +497,10 @@ export class ProgrammaticBackend implements AgentBackend {
 
     // Persist the captured session id so the NEXT turn resumes it — even on a
     // failed turn (a turn can fail AFTER establishing a session; the id is still
-    // the continuation handle). A blank id is a no-op in the store.
-    if (parsed.sessionId) this.deps.sessionState.set(channel, parsed.sessionId);
+    // the continuation handle). A blank id is a no-op in the store. SKIPPED for
+    // one-shot: the turn is ephemeral, so its session id is never stored (the next
+    // fire must start fresh — no resume, no persist).
+    if (!oneShot && parsed.sessionId) this.deps.sessionState.set(channel, parsed.sessionId);
 
     const usage: DeliverUsage | undefined = parsed.usage
       ? {

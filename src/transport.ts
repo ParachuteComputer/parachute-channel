@@ -30,6 +30,34 @@ export interface ReplyArgs {
   meta?: Record<string, string>;
 }
 
+/**
+ * The durable record of ONE `one-shot` agent turn (the execution-lifecycle taxonomy).
+ * A one-shot turn has no resumed transcript to be its record, so the daemon writes a
+ * run note instead. (A `resident` turn writes NONE — the channel transcript is its
+ * record.) The transport that backs the channel persists this; only the VaultTransport
+ * implements it (a `#agent/run` note) — other transports omit the optional method.
+ */
+export interface RunRecord {
+  /** The channel the turn ran on. */
+  channel: string;
+  /** The `#agent/definition` note id this run came from (provenance; plain id string). */
+  definition?: string;
+  /** The mode the turn ran under (always `one-shot` for a run note today). */
+  mode: string;
+  /** Outcome — `ok` (success) or `error` (the turn failed). */
+  status: "ok" | "error";
+  /** The inbound text the turn was handed (the `-p` prompt). */
+  input: string;
+  /** The reply text on success, or the failure reason on error. */
+  output: string;
+  /** ISO timestamp the turn started. */
+  started_at: string;
+  /** ISO timestamp the turn ended. */
+  ended_at: string;
+  /** Optional token/cost usage for observability (serialized into the note metadata). */
+  usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
+}
+
 export interface ReactArgs {
   channel: string;
   message_id: string;
@@ -95,6 +123,14 @@ export interface Transport {
   sendPermission?(args: PermissionArgs): Promise<{ sent: string[] }>;
   /** Optional: fetch an attachment, returning a local path. */
   download?(args: DownloadArgs): Promise<{ path: string }>;
+  /**
+   * Optional: write the durable record of a completed `one-shot` turn (an
+   * `#agent/run` note for the VaultTransport). Only meaningful for a vault-backed
+   * channel; transports without a durable store omit it. The daemon calls it ONLY for
+   * one-shot turns (a resident turn's record is its channel transcript). Returns the
+   * written record's id(s).
+   */
+  writeRun?(run: RunRecord): Promise<{ sent: string[] }>;
   /**
    * Optional: handle an HTTP request the daemon didn't handle itself. The
    * daemon owns `Bun.serve`; a transport that needs to contribute routes (e.g.

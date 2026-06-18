@@ -73,6 +73,42 @@ export type WriteOutbound = (
   inReplyTo?: string,
 ) => Promise<void>;
 
+/**
+ * The run record one `one-shot` turn produces — the data the registry hands {@link
+ * WriteRun} to persist as an `#agent/run` note. A `resident` turn produces NONE (its
+ * record is the channel transcript). Mirrors {@link RunRecord} in transport.ts; kept
+ * local here so the registry doesn't import the transport layer.
+ */
+export interface RunNote {
+  channel: string;
+  /** The `#agent/definition` note id (provenance; plain id string). */
+  definition?: string;
+  /** The mode the turn ran under (always `one-shot` for a run note). */
+  mode: string;
+  /** Outcome — `ok` (success) or `error` (the turn failed). */
+  status: "ok" | "error";
+  /** The inbound text handed to the turn (the `-p` prompt). */
+  input: string;
+  /** The reply on success, or the failure reason on error. */
+  output: string;
+  /** ISO start/end of the turn. */
+  started_at: string;
+  ended_at: string;
+  /** Optional token/cost usage for observability. */
+  usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
+}
+
+/**
+ * Write the run record for a completed `one-shot` turn — the seam the registry posts a
+ * run note through. The daemon wires this to the channel transport's `writeRun()` (a
+ * VaultTransport writes an `#agent/run` note). Called ONLY for one-shot turns; a
+ * resident turn writes NO run note (its record is the transcript). A write failure is
+ * the implementation's to surface (the registry logs whatever it throws); it never
+ * re-runs the turn. Optional on the registry — when unwired (no vault-backed channel),
+ * a one-shot turn still runs, it just leaves no run note.
+ */
+export type WriteRun = (run: RunNote) => Promise<void>;
+
 /** A queued inbound message awaiting its serial turn. */
 interface QueuedMessage {
   /** The inbound text handed to the `claude -p` turn as the prompt. */
@@ -120,12 +156,20 @@ export class ProgrammaticAgentRegistry {
 
   private readonly backend: AgentBackend;
   private readonly writeOutbound: WriteOutbound;
+  /** Optional run-note sink — write an `#agent/run` note for a one-shot turn. */
+  private readonly writeRun?: WriteRun;
   /** Optional streaming-view sink — push interim + lifecycle turn events per channel. */
   private readonly onTurnEvent?: TurnEventSink;
 
-  constructor(deps: { backend: AgentBackend; writeOutbound: WriteOutbound; onTurnEvent?: TurnEventSink }) {
+  constructor(deps: {
+    backend: AgentBackend;
+    writeOutbound: WriteOutbound;
+    writeRun?: WriteRun;
+    onTurnEvent?: TurnEventSink;
+  }) {
     this.backend = deps.backend;
     this.writeOutbound = deps.writeOutbound;
+    if (deps.writeRun) this.writeRun = deps.writeRun;
     if (deps.onTurnEvent) this.onTurnEvent = deps.onTurnEvent;
   }
 
@@ -326,6 +370,12 @@ export class ProgrammaticAgentRegistry {
       if (!handle) return; // deregistered mid-drain — stop.
       const msg = queue.shift()!;
 
+      // Mode governs the run record: a `one-shot` turn writes an `#agent/run` note (it
+      // has no resumed transcript to be its record); a `resident` turn writes NONE
+      // (the channel transcript IS its record — don't double-write). Read off the spec.
+      const oneShot = handle.spec.mode === "one-shot";
+      const startedAt = new Date().toISOString();
+
       let result;
       try {
         // Forward each interim event to the streaming-view sink (keyed by channel)
@@ -343,6 +393,11 @@ export class ProgrammaticAgentRegistry {
           `parachute-agent: programmatic turn for channel "${channel}" threw ` +
             `(should be a value): ${reason}`,
         );
+        // A one-shot turn records its run even on a (defensive-catch) failure — the
+        // run note is the record, so a failed run is still a queryable `status:error`.
+        if (oneShot) {
+          await this.recordRun(handle, msg, "error", reason, startedAt, undefined);
+        }
         this.emitTurnEvent(channel, { kind: "error", error: reason });
         continue;
       }
@@ -354,6 +409,11 @@ export class ProgrammaticAgentRegistry {
         console.warn(
           `parachute-agent: programmatic turn for channel "${channel}" failed: ${result.error}`,
         );
+        // A one-shot turn records the failed run (status:error) — its record is the run
+        // note, not the transcript, so a failure must still leave a queryable trace.
+        if (oneShot) {
+          await this.recordRun(handle, msg, "error", result.error, startedAt, undefined);
+        }
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
         continue;
       }
@@ -377,12 +437,60 @@ export class ProgrammaticAgentRegistry {
         }
       }
 
+      // A one-shot turn's RUN RECORD: write the `#agent/run` note (status:ok) now that
+      // the turn succeeded. The run note is the one-shot's record — `resident` writes
+      // NONE (its record is the channel transcript, written via `reply()` above). The
+      // outbound reply (above) is unchanged for both modes; this is ADDITIVE for
+      // one-shot. Best-effort: a run-note failure is logged + the turn still resolves
+      // (we never re-run a `claude -p` turn — that would burn quota for a duplicate).
+      if (oneShot) {
+        await this.recordRun(handle, msg, "ok", result.reply ?? "", startedAt, result.usage);
+      }
+
       // Resolve the live view: `done` carries the final reply text (empty when the
       // turn produced none) so the UI finalizes the in-progress bubble — the durable
       // note (written above) is what actually persists; this just ends the spinner.
       // Reached only when the outbound write SUCCEEDED, or there was no reply to write
       // (empty/tool-only turn → clean resolve, no note expected).
       this.emitTurnEvent(channel, { kind: "done", reply: result.reply ?? "" });
+    }
+  }
+
+  /**
+   * Write the `#agent/run` note for a completed one-shot turn — the run record. A
+   * no-op when no {@link WriteRun} sink is wired (a channel with no durable store). The
+   * timing is captured by the caller (`startedAt` before the turn; `ended_at` is now).
+   * Best-effort: a write failure is LOGGED, never thrown out — a missing run note must
+   * not strand the queue, and the turn is never re-run (it would burn quota for a
+   * duplicate `claude -p`).
+   */
+  private async recordRun(
+    handle: ProgrammaticAgentHandle,
+    msg: QueuedMessage,
+    status: "ok" | "error",
+    output: string,
+    startedAt: string,
+    usage: RunNote["usage"],
+  ): Promise<void> {
+    if (!this.writeRun) return;
+    const run: RunNote = {
+      channel: handle.channel,
+      ...(handle.spec.definition ? { definition: handle.spec.definition } : {}),
+      mode: handle.spec.mode ?? "one-shot",
+      status,
+      input: msg.content,
+      output,
+      started_at: startedAt,
+      ended_at: new Date().toISOString(),
+      ...(usage ? { usage } : {}),
+    };
+    try {
+      await this.writeRun(run);
+    } catch (err) {
+      console.error(
+        `parachute-agent: writing #agent/run note for channel "${handle.channel}" failed ` +
+          `(continuing): ${(err as Error).message}`,
+      );
     }
   }
 }

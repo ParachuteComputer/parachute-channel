@@ -26,7 +26,7 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { VaultTransport, AGENT_VAULT_TAG_SCHEMA } from "./vault.ts";
+import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_RUN_TAG } from "./vault.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
 
@@ -147,6 +147,114 @@ describe("VaultTransport — reply (outbound note write)", () => {
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
     await expect(t.reply({ channel: "eng", text: "x" })).rejects.toThrow(/write reply failed/);
+  });
+});
+
+describe("VaultTransport — writeRun (#agent/run record for a one-shot turn)", () => {
+  test("writeRun() POSTs an #agent/run note with indexed status/definition/mode + timing + Bearer", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ id: "run-note-1" }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const result = await t.writeRun({
+      channel: "eng",
+      definition: "Agents/digest",
+      mode: "one-shot",
+      status: "ok",
+      input: "run the daily digest",
+      output: "digest complete: 3 items",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:12.000Z",
+      usage: { inputTokens: 100, outputTokens: 40, totalCostUsd: 0.002 },
+    });
+
+    expect(result.sent).toEqual(["run-note-1"]);
+    // start() also fires ensureSchema() (PUT .../api/tags/*); isolate the run-note POST.
+    const noteCalls = calls.filter((c) => c.url.endsWith("/api/notes"));
+    expect(noteCalls).toHaveLength(1);
+    const call = noteCalls[0]!;
+    expect(call.url).toBe("http://127.0.0.1:1940/vault/default/api/notes");
+    expect(call.init.method).toBe("POST");
+    expect((call.init.headers as Record<string, string>).authorization).toBe("Bearer write-token-xyz");
+
+    const sent = JSON.parse(String(call.init.body)) as {
+      content: string;
+      path: string;
+      tags: string[];
+      metadata: Record<string, string>;
+    };
+    // The run note carries the run tag ONLY — NOT a message tag + NOT the inbound
+    // child, so it can never wake a session (no loop).
+    expect(sent.tags).toEqual([AGENT_RUN_TAG]);
+    expect(sent.tags).not.toContain("#agent/message");
+    expect(sent.tags).not.toContain("#agent/message/inbound");
+    // Indexed/queryable fields.
+    expect(sent.metadata.status).toBe("ok");
+    expect(sent.metadata.definition).toBe("Agents/digest");
+    expect(sent.metadata.mode).toBe("one-shot");
+    // Timing + channel + usage (stringified for the vault).
+    expect(sent.metadata.channel).toBe("eng");
+    expect(sent.metadata.started_at).toBe("2026-06-18T07:00:00.000Z");
+    expect(sent.metadata.ended_at).toBe("2026-06-18T07:00:12.000Z");
+    expect(sent.metadata.input_tokens).toBe("100");
+    expect(sent.metadata.output_tokens).toBe("40");
+    expect(sent.metadata.total_cost_usd).toBe("0.002");
+    // The body carries the input + reply (the human-readable run record).
+    expect(sent.content).toContain("run the daily digest");
+    expect(sent.content).toContain("digest complete: 3 items");
+    expect(sent.path.startsWith("Runs/eng/")).toBe(true);
+  });
+
+  test("writeRun() on an error run records status:error + the failure reason in the body", async () => {
+    let captured: { tags: string[]; metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith("/api/notes")) {
+        captured = JSON.parse(String(init?.body));
+      }
+      return new Response(JSON.stringify({ id: "run-err-1" }), { status: 201 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.writeRun({
+      channel: "eng",
+      mode: "one-shot",
+      status: "error",
+      input: "do the thing",
+      output: "claude -p exited 1: boom",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:01.000Z",
+    });
+
+    expect(captured!.metadata.status).toBe("error");
+    // No definition → the field is absent (not an empty string).
+    expect("definition" in captured!.metadata).toBe(false);
+    expect(captured!.content).toContain("claude -p exited 1: boom");
+  });
+
+  test("writeRun() throws on a non-ok vault response", async () => {
+    globalThis.fetch = (async () =>
+      new Response("boom", { status: 500 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await expect(
+      t.writeRun({
+        channel: "eng",
+        mode: "one-shot",
+        status: "ok",
+        input: "x",
+        output: "y",
+        started_at: "2026-06-18T07:00:00.000Z",
+        ended_at: "2026-06-18T07:00:01.000Z",
+      }),
+    ).rejects.toThrow(/write run note failed/);
   });
 });
 
@@ -626,12 +734,13 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(jobBody.parent_names).toEqual(["#agent"]);
   });
 
-  test("schema declares the #agent/* namespace rollup PLUS the interim + legacy families (dual-read, 12 entries)", async () => {
+  test("schema declares the #agent/* namespace rollup PLUS the interim + legacy families (dual-read, 13 entries)", async () => {
     // The `#agent/*` namespace (design 2026-06-17-vault-native-agents) rolls up
-    // definitions, messages, and jobs to the `#agent` root. DUAL-READ: the schema
+    // definitions, messages, jobs, AND runs to the `#agent` root. DUAL-READ: the schema
     // ALSO keeps declaring the interim flat `#agent-message*` AND legacy
     // `#channel-message*` inheritance so pre-namespace history keeps its parent/child
-    // expansion until the one-time re-tag run lands. Exactly 12 entries.
+    // expansion until the one-time re-tag run lands. Exactly 13 entries (12 + the
+    // execution-lifecycle `#agent/run` record tag).
     const names = AGENT_VAULT_TAG_SCHEMA.map((e) => e.name);
     expect(names).toEqual([
       "#agent",
@@ -640,6 +749,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
       "#agent/message/inbound",
       "#agent/message/outbound",
       "#agent/job",
+      "#agent/run",
       "#agent-message",
       "#agent-message/inbound",
       "#agent-message/outbound",
@@ -652,6 +762,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(byName("#agent/definition").parent_names).toEqual(["#agent"]);
     expect(byName("#agent/message").parent_names).toEqual(["#agent"]);
     expect(byName("#agent/job").parent_names).toEqual(["#agent"]);
+    expect(byName("#agent/run").parent_names).toEqual(["#agent"]);
     expect(byName("#agent/message/inbound").parent_names).toEqual(["#agent/message"]);
     expect(byName("#agent/message/outbound").parent_names).toEqual(["#agent/message"]);
     // The interim + legacy children still declare their own parents (inheritance preserved).
@@ -659,6 +770,14 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(byName("#agent-message/outbound").parent_names).toEqual(["#agent-message"]);
     expect(byName("#channel-message/inbound").parent_names).toEqual(["#channel-message"]);
     expect(byName("#channel-message/outbound").parent_names).toEqual(["#channel-message"]);
+    // `#agent/run` declares INDEXED string fields so runs are operator-queryable —
+    // "all failed runs" (status), "all runs of agent X" (definition), "all one-shot
+    // runs" (mode).
+    expect(byName("#agent/run").fields).toEqual({
+      status: { type: "string", indexed: true },
+      definition: { type: "string", indexed: true },
+      mode: { type: "string", indexed: true },
+    });
   });
 
   test("schema is sourced from AGENT_VAULT_TAG_SCHEMA — declares exactly its entries", async () => {
@@ -672,6 +791,24 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     await t.ensureSchema();
 
     expect(declared).toEqual(AGENT_VAULT_TAG_SCHEMA.map((e) => e.name));
+  });
+
+  test("ensureSchema sends the indexed `fields` body for #agent/run", async () => {
+    let runBody: { fields?: Record<string, unknown> } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const name = decodeURIComponent(String(url).split("/api/tags/")[1]!);
+      if (name === AGENT_RUN_TAG) runBody = JSON.parse(String(init?.body));
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.ensureSchema();
+
+    expect(runBody?.fields).toEqual({
+      status: { type: "string", indexed: true },
+      definition: { type: "string", indexed: true },
+      mode: { type: "string", indexed: true },
+    });
   });
 
   test("best-effort: a rejecting fetch does NOT throw out of ensureSchema", async () => {

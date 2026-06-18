@@ -42,6 +42,7 @@
 import {
   type AgentSpec,
   type AgentBackendKind,
+  type AgentMode,
   type SystemPromptMode,
   type AgentMount,
 } from "./sandbox/types.ts";
@@ -180,6 +181,8 @@ function nameOfDefNote(note: { metadata?: Record<string, unknown> }): string | u
  *   - note BODY (`content`)  → `spec.systemPrompt` (the agent's role, in prose).
  *   - `metadata.name`        → `spec.name` (REQUIRED, slug) = the wake channel.
  *   - `metadata.backend`     → `spec.backend` (default `programmatic`).
+ *   - `metadata.mode`        → `spec.mode` (default `resident`; `one-shot` ok;
+ *     `per-thread` REJECTED — deferred). The note id → `spec.definition` (provenance).
  *   - `metadata.systemPromptMode` → `spec.systemPromptMode` (default `append`).
  *   - `metadata.workspace`   → `spec.workspace` (optional absolute host cwd).
  *   - `metadata.filesystem`  → `spec.filesystem` (`workspace` | `full`).
@@ -245,10 +248,37 @@ export function parseAgentDef(note: {
     backend = rawBackend;
   }
 
+  // Execution-lifecycle mode (the Phase-3 prerequisite). Default `resident` (= today:
+  // one persistent session per channel, resumed + persisted each turn). `one-shot` is
+  // an ephemeral turn (no resume, no persist, writes an `#agent/run` note). `per-thread`
+  // is DEFERRED — it needs inbound thread-routing that doesn't exist yet, so REJECT it
+  // with a clear, actionable error (→ status:error on the note) rather than silently
+  // demoting to resident (which would hide the operator's intent).
+  let mode: AgentMode = "resident";
+  const rawMode = metaStr(meta.mode);
+  if (rawMode !== undefined) {
+    if (rawMode === "per-thread") {
+      throw new AgentDefParseError(
+        `#agent/definition note ${noteId}: per-thread mode is not yet supported — ` +
+          `needs thread routing; use resident or one-shot.`,
+      );
+    }
+    if (rawMode !== "resident" && rawMode !== "one-shot") {
+      throw new AgentDefParseError(
+        `#agent/definition note ${noteId}: mode must be "resident" or "one-shot"`,
+      );
+    }
+    mode = rawMode;
+  }
+
   const spec: AgentSpec = {
     name,
     channels: [name], // wake channel = the agent name (agent ≡ channel)
     backend,
+    mode,
+    // The def note id — provenance carried into a one-shot run note (interim plain id
+    // string; typed link fields are a future vault feature).
+    definition: noteId,
     // Own-vault binding (4a): the def-vault, write-scoped. NOT sourced from the note
     // — it's the vault the note LIVES in (passed in by the caller).
     vault: { name: binding.vault, access: "write" },

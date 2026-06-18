@@ -64,6 +64,7 @@ import type {
   Transport,
   TransportContext,
   ReplyArgs,
+  RunRecord,
 } from "../transport.ts";
 
 /** Config for a vault transport instance (from the channel registry entry). */
@@ -294,6 +295,20 @@ const AGENT_JOB_TAG = "#agent/job";
 const JOB_PATH_PREFIX = "Channels";
 
 /**
+ * Run-record tag — a `#agent/run` note is the durable record of ONE `one-shot`
+ * agent turn (the execution-lifecycle taxonomy; the Phase-3 prerequisite). A
+ * `resident` turn leaves no run note — the channel transcript IS its record — so this
+ * is written ONLY for one-shot fires. Body = the input + reply; metadata =
+ * `{ definition, mode, status, started_at, ended_at, usage? }`. The INDEXED string
+ * fields (`status`, `definition`, `mode`) make "all failed runs" / "all runs of agent
+ * X" / "all one-shot runs" operator-queryable. `definition` is a plain note-id string
+ * for now (interim — typed link fields are a future vault feature).
+ */
+export const AGENT_RUN_TAG = "#agent/run";
+/** Default path prefix under which run notes are written: `Runs/<ch>/<id>`. */
+const RUN_PATH_PREFIX = "Runs";
+
+/**
  * The tag schema this module manages in any vault it's connected to.
  *
  * This is the declarative complement to the "tag both parent + child" fail-safe
@@ -329,6 +344,14 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
   name: string;
   description?: string;
   parent_names?: string[];
+  /**
+   * Indexed metadata field declarations (the vault's `update-tag` `fields` shape) —
+   * `{ <field>: { type, indexed } }`. Declared so the field gets a generated column +
+   * index, making it queryable via metadata operator objects. Used by `#agent/run`
+   * (status/definition/mode) so an operator can query "all failed runs" / "all runs of
+   * agent X" / "all one-shot runs".
+   */
+  fields?: Record<string, { type: "string" | "boolean" | "integer"; indexed?: boolean }>;
 }> = [
   {
     name: AGENT_ROOT_TAG,
@@ -358,6 +381,21 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     name: AGENT_JOB_TAG,
     parent_names: [AGENT_ROOT_TAG],
     description: "A scheduled job — the runner injects this note's message on its cron schedule.",
+  },
+  {
+    name: AGENT_RUN_TAG,
+    parent_names: [AGENT_ROOT_TAG],
+    description:
+      "A run record for ONE one-shot agent turn — body is the input + reply, metadata is the run outcome.",
+    // Indexed so an operator can query runs by outcome / agent / mode:
+    //  - status     → "all failed runs" (status:error)
+    //  - definition → "all runs of agent X" (the def note id)
+    //  - mode       → "all one-shot runs"
+    fields: {
+      status: { type: "string", indexed: true },
+      definition: { type: "string", indexed: true },
+      mode: { type: "string", indexed: true },
+    },
   },
   // --- Interim (dual-read) — the flat `#agent-message*` tags that preceded the
   //     `#agent/*` namespace. Declared so pre-namespace history keeps its
@@ -525,9 +563,14 @@ export class VaultTransport implements Transport {
         // Single-segment, percent-encoded name: `#agent/message/inbound` →
         // `%23agent%2Fmessage%2Finbound`. The vault decodes it back to the literal.
         const url = `${this.vaultUrl}/vault/${this.vault}/api/tags/${encodeURIComponent(entry.name)}`;
-        const body: { description?: string; parent_names?: string[] } = {};
+        const body: {
+          description?: string;
+          parent_names?: string[];
+          fields?: Record<string, { type: "string" | "boolean" | "integer"; indexed?: boolean }>;
+        } = {};
         if (entry.description !== undefined) body.description = entry.description;
         if (entry.parent_names !== undefined) body.parent_names = entry.parent_names;
+        if (entry.fields !== undefined) body.fields = entry.fields;
 
         const res = await fetch(url, {
           method: "PUT",
@@ -615,6 +658,64 @@ export class VaultTransport implements Transport {
 
     // The vault returns the created note; surface its id. Fall back to the id we
     // proposed in the path if the response shape is unexpected.
+    let noteId: string = id;
+    try {
+      const created = (await res.json()) as { id?: string; note?: { id?: string } };
+      noteId = created?.id ?? created?.note?.id ?? id;
+    } catch {
+      // Non-JSON / empty body — keep the proposed id.
+    }
+    return { sent: [noteId] };
+  }
+
+  /**
+   * Write the durable record of ONE completed `one-shot` turn — an `#agent/run` note
+   * (the execution-lifecycle taxonomy; the Phase-3 prerequisite). The body is the
+   * input + reply; the metadata is the run outcome. The INDEXED fields
+   * (`status`/`definition`/`mode`) make runs operator-queryable. This note is NOT a
+   * `#agent/message` and carries NO inbound child tag, so it can never wake a session
+   * (no loop). Best-effort caller-side: a throw is surfaced to the registry, which
+   * logs it (a missing run note never re-runs the turn — that would fork nothing here,
+   * but it's the same "don't retry" posture as outbound).
+   */
+  async writeRun(run: RunRecord): Promise<{ sent: string[] }> {
+    const id = crypto.randomUUID();
+    const safeChannel = run.channel.replace(/[^a-zA-Z0-9_-]/g, "-");
+    const path = `${RUN_PATH_PREFIX}/${safeChannel}/${id}`;
+
+    // Indexed string fields (queryable) + the timing/usage observability fields. The
+    // vault stores metadata as strings; usage numbers are stringified.
+    const metadata: Record<string, string> = {
+      channel: run.channel,
+      mode: run.mode,
+      status: run.status,
+      started_at: run.started_at,
+      ended_at: run.ended_at,
+    };
+    if (run.definition) metadata.definition = run.definition;
+    if (run.usage) {
+      if (typeof run.usage.inputTokens === "number") metadata.input_tokens = String(run.usage.inputTokens);
+      if (typeof run.usage.outputTokens === "number") metadata.output_tokens = String(run.usage.outputTokens);
+      if (typeof run.usage.totalCostUsd === "number") metadata.total_cost_usd = String(run.usage.totalCostUsd);
+    }
+
+    // Body = the input + the reply (or the error) — the human-readable run record.
+    const body = `## Input\n\n${run.input}\n\n## ${run.status === "ok" ? "Reply" : "Error"}\n\n${run.output}\n`;
+
+    const res = await fetch(`${this.vaultUrl}/vault/${this.vault}/api/notes`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ content: body, path, tags: [AGENT_RUN_TAG], metadata }),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`vault transport: write run note failed (${res.status}) ${detail}`.trim());
+    }
+
     let noteId: string = id;
     try {
       const created = (await res.json()) as { id?: string; note?: { id?: string } };

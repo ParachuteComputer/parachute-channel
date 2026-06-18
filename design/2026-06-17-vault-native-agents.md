@@ -164,11 +164,23 @@ agent module.
   of this build — cheap, since the current data is disposable test state.)*
 - **Secrets stay OUT of the vault** in a local secret file, as today — until a
   dedicated secrets-integration story emerges. (Aaron, 2026-06-17.)
+- **Multi-vault: any vault can define agents** (Aaron, 2026-06-17). Link a vault to the
+  agent module → its `#agent/definition` notes become live agents here, properly scoped.
+  **Default to a single vault — `unforced`, Aaron's personal/playtest vault — but the
+  architecture must NOT hard-code single-vault.** Model the binding as a **list** of
+  linked def-vaults (default: one), so opening up multi-vault later is just appending,
+  not a refactor. **Per-vault scoping (load-bearing):** an agent defined in vault X is
+  bound to vault X — its conversations/jobs live there and its minted vault token is
+  scoped to X. So a vault only grants its agents access to *itself* (no cross-vault
+  reach unless a def explicitly + with authorization asks for it). This is the scoping
+  that makes "link any vault" safe. *(Same shape will serve `#surface/*` when a vault
+  defines surfaces — a later parallel, not now.)*
 
 ## Open questions
-- **Which vault holds the defs:** the agent module binds one "home" vault for defs;
-  do an agent's conversation/jobs live in that same vault (simplest) or can an agent
-  be defined in vault A while operating on vault B? Start single-vault.
+- **Cross-vault operation:** the default is an agent operates on its *defining* vault.
+  Do we ever need an agent defined in vault A to act on vault B? Deferred — start with
+  agent-bound-to-its-def-vault; revisit if a real case appears (a def could later name a
+  different target vault, gated by the operator provisioning that vault's token).
 - **Cred references:** the `uses: [name]` vocabulary + how the module maps a name to
   a provisioned credential (a local `credentials.json` keyed by name). Needs a small
   registry of named creds.

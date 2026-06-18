@@ -57,6 +57,7 @@ import {
   type DefVaultBinding,
   type InstantiateDeps,
 } from "./agent-defs.ts";
+import { resolveDefVaults } from "./def-vaults.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
 import { Runner, realTickDriver } from "./runner.ts";
 import { nextRunAfter } from "./cron.ts";
@@ -117,7 +118,7 @@ import { readPersistedSpec, interpretPersistedBackend, sessionWorkspace } from "
 import { normalizeChannel } from "./sandbox/types.ts";
 import { CredentialNotConfiguredError } from "./credentials.ts";
 import { MintError } from "./mint-token.ts";
-import { validateHubJwt } from "./hub-jwt.ts";
+import { validateHubJwt, getHubOrigin } from "./hub-jwt.ts";
 import {
   handleProtectedResource,
   handleAuthorizationServer,
@@ -3241,15 +3242,48 @@ function main(): void {
   console.log(`parachute-agent: runner started (scheduled-job tick)`);
 
   // VAULT-NATIVE AGENT DEFINITIONS (design 2026-06-17-vault-native-agents, Phase 4a).
-  // The registry + reload webhook are wired (above); the def-vault BINDINGS that fill
-  // it are resolved by the config layer (next commit). With no bindings the registry
-  // is empty — the reactive route is a no-op ack and the vault-native path is idle.
-  // ADDITIVE to channels.json (both paths coexist).
-  void agentDefs;
+  // Resolve the def-vault bindings (agent-vaults.json, or the minted single-`default`
+  // default), add each to the registry, and instantiate every `#agent/definition`
+  // note in them — each becomes a live agent (a vault channel + a programmatic agent).
+  // Fire-and-forget so a slow/unreachable vault never blocks the daemon from serving;
+  // the reload webhook (POST /api/vault/agent-def) keeps them in sync reactively, and
+  // a poll fallback re-syncs vaults without trigger support. Best-effort throughout —
+  // a def-vault failure is logged and never affects channels.json-defined channels.
+  let agentDefPoll: ReturnType<typeof setInterval> | undefined;
+  void (async () => {
+    let managerBearer: string | null = null;
+    try {
+      managerBearer = resolveSpawnDeps().managerBearer;
+    } catch {
+      // No operator token yet — resolveDefVaults handles the null (idle vault-native
+      // path; channels.json unaffected).
+    }
+    const bindings = await resolveDefVaults({ hubOrigin: getHubOrigin(), managerBearer });
+    for (const b of bindings) agentDefs.addVault(b);
+    if (bindings.length === 0) return; // nothing bound — vault-native path idle.
+    const n = await agentDefs.loadAll();
+    console.log(
+      `parachute-agent: vault-native agent defs — ${n} instantiated from ${bindings.length} def-vault(s).`,
+    );
+    // Poll fallback (every 60s) for vaults without trigger support: re-load all defs
+    // so a created/updated/deleted note converges even with no webhook. The reload
+    // webhook is the fast path; this is the safety net. `unref` so it never holds the
+    // process open. Cheap + idempotent (re-instantiate replaces in place).
+    const interval = parseInt(process.env.PARACHUTE_AGENT_DEF_POLL_MS ?? "", 10) || 60_000;
+    agentDefPoll = setInterval(() => {
+      void agentDefs.loadAll().catch((err) => {
+        console.error(`parachute-agent: agent-def poll failed (continuing): ${(err as Error).message}`);
+      });
+    }, interval);
+    agentDefPoll.unref?.();
+  })().catch((err) => {
+    console.error(`parachute-agent: vault-native agent-def boot failed (continuing): ${(err as Error).message}`);
+  });
 
   // Graceful shutdown — stop the runner + all transports.
   async function shutdown(): Promise<void> {
     runner.stop();
+    if (agentDefPoll) clearInterval(agentDefPoll);
     await Promise.allSettled([...channels.values()].map((c) => c.transport.stop()));
     server.stop();
     process.exit(0);

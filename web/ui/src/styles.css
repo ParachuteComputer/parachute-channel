@@ -1,0 +1,395 @@
+/*
+ * Brand tokens kept in sync with the agent daemon's server-rendered surfaces
+ * (src/ui-kit.ts THEME_CSS) and the hub SPA (parachute-hub/web/ui/src/styles.css)
+ * so the v2 SPA is visually continuous with the hub portal the operator just
+ * came from and the daemon HTML pages it sits alongside during the migration.
+ * Don't drift these without updating the server-rendered surfaces too.
+ */
+:root {
+  --bg: #faf8f4;
+  --bg-soft: #f3f0ea;
+  --fg: #2c2a26;
+  --fg-muted: #6b6860;
+  --fg-dim: #9a9690;
+  --accent: #4a7c59;
+  --accent-soft: rgba(74, 124, 89, 0.08);
+  --accent-hover: #3d6849;
+  --border: #e4e0d8;
+  --border-light: #ece9e2;
+  --card-bg: #ffffff;
+  --error: #a3392b;
+  --error-soft: rgba(163, 57, 43, 0.08);
+  --warn: #b08023;
+  --warn-soft: rgba(176, 128, 35, 0.08);
+  --success: #3d6849;
+  --success-soft: rgba(61, 104, 73, 0.08);
+  --font-serif: Georgia, "Times New Roman", serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
+  font-family: var(--font-sans);
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+button {
+  font: inherit;
+  background: var(--accent);
+  color: white;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.45rem 0.9rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+button:hover {
+  background: var(--accent-hover);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.secondary {
+  background: white;
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+button.secondary:hover {
+  background: var(--bg-soft);
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--bg-soft);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+}
+
+.page {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1.5rem 1.5rem 6rem;
+}
+
+/* ---- Nav ---- */
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1rem;
+  align-items: center;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2rem;
+}
+.nav .brand {
+  font-weight: 600;
+  font-family: var(--font-serif);
+  font-size: 1.15rem;
+  margin-right: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--accent);
+  text-decoration: none;
+}
+.nav .brand:hover {
+  color: var(--accent-hover);
+  text-decoration: none;
+}
+.nav .brand-wordmark {
+  color: var(--fg);
+  letter-spacing: -0.005em;
+}
+.nav .brand .sub {
+  color: var(--fg-dim);
+  font-size: 0.78rem;
+  font-weight: 400;
+  margin-left: 0.4rem;
+  font-family: var(--font-sans);
+}
+.nav a {
+  color: var(--fg-muted);
+  font-size: 0.95rem;
+}
+.nav a:hover {
+  text-decoration: none;
+  color: var(--fg);
+}
+.nav a.nav-link-active {
+  color: var(--accent);
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: 0.3em;
+  text-decoration-thickness: 2px;
+}
+.nav .nav-divider {
+  display: inline-block;
+  width: 1px;
+  height: 1.1em;
+  background: var(--border);
+  align-self: center;
+}
+
+/* ---- Headings ---- */
+h1 {
+  margin: 0 0 0.5rem;
+  font-family: var(--font-serif);
+  font-size: 1.85rem;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  color: var(--fg);
+}
+h2 {
+  margin: 0 0 1rem;
+  font-size: 1.4rem;
+  font-weight: 500;
+}
+h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.muted {
+  color: var(--fg-muted);
+  font-size: 0.92rem;
+}
+.dim {
+  color: var(--fg-dim);
+  font-size: 0.85rem;
+}
+
+.lede {
+  color: var(--fg-muted);
+  font-size: 0.95rem;
+  margin: 0 0 1.5rem;
+  max-width: 60ch;
+}
+
+/* ---- Banners / states ---- */
+.error-banner {
+  background: var(--error-soft);
+  border: 1px solid var(--error);
+  color: var(--error);
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+.empty {
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 2rem 1.5rem;
+  text-align: center;
+  color: var(--fg-muted);
+  background: var(--card-bg);
+}
+.loading {
+  color: var(--fg-muted);
+  padding: 1rem 0;
+  font-size: 0.92rem;
+}
+
+/* ---- Cards / sections ---- */
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.1rem 1.25rem;
+  box-shadow: 0 1px 2px rgba(44, 42, 38, 0.04), 0 8px 24px rgba(44, 42, 38, 0.05);
+  margin-bottom: 1.5rem;
+}
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+.section-head .count {
+  color: var(--fg-dim);
+  font-size: 0.85rem;
+}
+
+/* ---- Tables ---- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+th,
+td {
+  text-align: left;
+  padding: 0.6rem 0.7rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+th {
+  color: var(--fg-muted);
+  font-weight: 500;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+tr.agent-row {
+  cursor: pointer;
+}
+tr.agent-row:hover {
+  background: var(--bg-soft);
+}
+tr.agent-row.selected {
+  background: var(--accent-soft);
+}
+.cell-name {
+  font-weight: 600;
+  color: var(--fg);
+}
+.cell-dim {
+  color: var(--fg-dim);
+}
+
+/* ---- Pills / badges ---- */
+.pill {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  background: var(--bg-soft);
+}
+.pill.backend-programmatic {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+.pill.backend-channel {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-color: transparent;
+}
+.pill.backend-interactive {
+  color: var(--fg-muted);
+  background: var(--bg-soft);
+}
+.pill.status-enabled,
+.pill.status-idle {
+  color: var(--success);
+  background: var(--success-soft);
+  border-color: transparent;
+}
+.pill.status-working {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+.pill.status-pending,
+.pill.status-queued {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-color: transparent;
+}
+.pill.status-error {
+  color: var(--error);
+  background: var(--error-soft);
+  border-color: transparent;
+}
+
+/* ---- Detail panel ---- */
+.detail {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem 1.4rem;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 1px 2px rgba(44, 42, 38, 0.04), 0 8px 24px rgba(44, 42, 38, 0.05);
+}
+.detail-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.9rem;
+}
+.detail-head h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.45rem 1.2rem;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+.detail-grid dt {
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+.detail-grid dd {
+  margin: 0;
+  color: var(--fg);
+  word-break: break-word;
+}
+.detail-prompt {
+  background: var(--bg-soft);
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  padding: 0.75rem 0.9rem;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  color: var(--fg);
+  margin: 0.3rem 0 1rem;
+}
+.detail-note {
+  font-size: 0.82rem;
+  color: var(--fg-dim);
+  margin: 0.5rem 0 0;
+}
+.detail-close {
+  margin-left: auto;
+  background: white;
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  padding: 0.3rem 0.7rem;
+  font-size: 0.82rem;
+}
+.detail-close:hover {
+  background: var(--bg-soft);
+  color: var(--fg);
+}
+
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.tag {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+  color: var(--fg-muted);
+}

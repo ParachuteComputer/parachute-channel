@@ -101,6 +101,7 @@ import { TERMINAL_UI_HTML } from "./terminal-ui.ts";
 import { serveTerminalAsset } from "./terminal-assets.ts";
 import { AGENTS_UI_HTML } from "./agents-ui.ts";
 import { HOME_UI_HTML } from "./home-ui.ts";
+import { isSpaPath, serveSpa, spaDistDir } from "./spa-serve.ts";
 import {
   createRealAgentOps,
   buildSpecFromBody,
@@ -2000,6 +2001,19 @@ export function createFetchHandler(
       return new Response(HOME_UI_HTML, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
+    }
+
+    // Agent UI v2 SPA (the agent-centric React surface) — served at the NEW
+    // `/app` mount, reachable at `<hub>/agent/app/` over the hub proxy. Coexists
+    // with the daemon-rendered HTML pages above (the design's incremental
+    // migration; the HTML retires in a later phase). Serves `index.html` for the
+    // SPA route(s) + `dist/assets/*` for assets; a missing `dist/` → 503 with a
+    // "run build" hint (dev-checkout case). Loads OPEN (like /ui, /admin, /agents)
+    // so it can bootstrap its hub-minted `agent:admin` token; the `/api/*` calls
+    // it makes are what `requireScope` gates. Bundle path is anchored to the
+    // install dir so a `bun src/daemon.ts` from any cwd finds web/ui/dist/.
+    if (req.method === "GET" && isSpaPath(url.pathname)) {
+      return serveSpa(spaDistDir(INSTALL_DIR), url.pathname);
     }
 
     // Health check — per-channel client counts. Programmatic agents (design

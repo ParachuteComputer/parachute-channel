@@ -123,7 +123,7 @@ describe("unified transport select drives fields + submit path", () => {
     expect(html).toContain('requestedBy: "agent"');
     // The canonical source/sink: vault.note.created (inbound tag) → agent.message.deliver.
     expect(html).toContain('event: "note.created"');
-    expect(html).toContain("#agent-message/inbound");
+    expect(html).toContain("#agent/message/inbound");
     expect(html).toContain('action: "message.deliver"');
     // The chosen channel name (the shared #f-name input) rides as the sink param.
     expect(html).toContain("params: { channel: name }");
@@ -494,7 +494,7 @@ describe("module.json — modular-UI (P4) declaration", () => {
     expect(tmpl?.requestedBy).toBe("agent");
     expect(tmpl?.source?.module).toBe("vault");
     expect(tmpl?.source?.event).toBe("note.created");
-    expect(tmpl?.source?.filter?.tags).toContain("#agent-message/inbound");
+    expect(tmpl?.source?.filter?.tags).toContain("#agent/message/inbound");
     expect(tmpl?.sink?.module).toBe("agent");
     expect(tmpl?.sink?.action).toBe("message.deliver");
     // It's PARAMETERIZED — the operator picks the vault + names the channel.

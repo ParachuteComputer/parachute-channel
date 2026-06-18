@@ -42,7 +42,7 @@
         "module": "vault",
         "event": "note.created",
         "filter": {
-          "tags": ["#agent-message/inbound"],
+          "tags": ["#agent/message/inbound"],
           "has_metadata": ["channel"],
           "missing_metadata": ["channel_inbound_rendered_at"]
         }

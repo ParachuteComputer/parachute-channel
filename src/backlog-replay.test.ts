@@ -274,7 +274,7 @@ describe("emit advances the mark only on real delivery (via /api/vault/inbound)"
         method: "POST",
         headers: { ...auth, "content-type": "application/json" },
         body: JSON.stringify({
-          note: { id: "note-0", content: "deaf", tags: ["#agent-message/inbound"], metadata: { channel: "eng", ts: ts0, direction: "inbound" } },
+          note: { id: "note-0", content: "deaf", tags: ["#agent/message/inbound"], metadata: { channel: "eng", ts: ts0, direction: "inbound" } },
         }),
       });
       expect(r0.status).toBe(200);
@@ -293,7 +293,7 @@ describe("emit advances the mark only on real delivery (via /api/vault/inbound)"
         method: "POST",
         headers: { ...auth, "content-type": "application/json" },
         body: JSON.stringify({
-          note: { id: "note-1", content: "heard", tags: ["#agent-message/inbound"], metadata: { channel: "eng", ts: ts1, direction: "inbound" } },
+          note: { id: "note-1", content: "heard", tags: ["#agent/message/inbound"], metadata: { channel: "eng", ts: ts1, direction: "inbound" } },
         }),
       });
       expect(r1.status).toBe(200);
@@ -462,7 +462,7 @@ describe("end-to-end deaf window", () => {
         method: "POST",
         headers: { ...auth, "content-type": "application/json" },
         body: JSON.stringify({
-          note: { id: "note-deaf", content: "are you there?", tags: ["#agent-message/inbound"], metadata: { channel: "eng", ts: missedTs, sender: "aaron", direction: "inbound" } },
+          note: { id: "note-deaf", content: "are you there?", tags: ["#agent/message/inbound"], metadata: { channel: "eng", ts: missedTs, sender: "aaron", direction: "inbound" } },
         }),
       });
       expect(wh.status).toBe(200);

@@ -3,10 +3,10 @@
  * fetch handler (runner, design 2026-06-17). They cover:
  *
  *  - auth: all routes require `agent:admin` (no token → 401; agent:read → 403);
- *  - GET    /api/jobs          → lists `#agent-job` notes across the vault channels;
+ *  - GET    /api/jobs          → lists `#agent/job` notes across the vault channels;
  *  - POST   /api/jobs          → 400 on bad cron / unknown / non-vault channel;
- *                                200 + writes a #agent-job note on success;
- *  - POST   /api/jobs/:id/run  → fires now (injects an inbound #agent-message note);
+ *                                200 + writes a #agent/job note on success;
+ *  - POST   /api/jobs/:id/run  → fires now (injects an inbound #agent/message note);
  *  - DELETE /api/jobs/:id      → deletes the job note.
  *
  * The vault REST API is stubbed via `globalThis.fetch` (no live vault); the hub
@@ -112,7 +112,7 @@ describe("/api/jobs — auth", () => {
 });
 
 describe("GET /api/jobs — list", () => {
-  test("lists #agent-job notes from the vault", async () => {
+  test("lists #agent/job notes from the vault", async () => {
     const { srv, base } = buildServer();
     stubVault(() =>
       new Response(
@@ -172,7 +172,7 @@ describe("POST /api/jobs — create + validation", () => {
     } finally { srv.stop(true); }
   });
 
-  test("valid → 200 + writes a #agent-job note", async () => {
+  test("valid → 200 + writes a #agent/job note", async () => {
     const { srv, base } = buildServer();
     const calls = stubVault((url, init) => {
       // The job POST is to /api/notes; everything else (ensureSchema PUTs) is benign.
@@ -194,7 +194,7 @@ describe("POST /api/jobs — create + validation", () => {
       expect(body.job.noteId).toBe("Channels/eng/jobs/x"); // vault note id for addressing
       const post = calls.find((c) => c.url.endsWith("/api/notes") && c.init.method === "POST")!;
       const sent = JSON.parse(String(post.init.body));
-      expect(sent.tags).toEqual(["#agent-job"]);
+      expect(sent.tags).toEqual(["#agent/job"]);
       expect(sent.content).toBe("do it"); // trimmed
       expect(sent.metadata.enabled).toBe("true");
       expect(sent.metadata.jobId).toBe("x");
@@ -203,7 +203,7 @@ describe("POST /api/jobs — create + validation", () => {
 });
 
 describe("POST /api/jobs/:id/run — fire now", () => {
-  test("injects an inbound #agent-message note + returns ok", async () => {
+  test("injects an inbound #agent/message note + returns ok", async () => {
     const { srv, base } = buildServer();
     const calls = stubVault((url, init) => {
       if (url.includes("/api/notes") && (init.method ?? "GET") === "GET") {
@@ -221,10 +221,10 @@ describe("POST /api/jobs/:id/run — fire now", () => {
       const res = await fetch(`${base}/api/jobs/${encodeURIComponent("Channels/eng/jobs/x")}/run`, { method: "POST", headers: adminAuth });
       expect(res.status).toBe(200);
       expect((await res.json()).ok).toBe(true);
-      // The injected note is INBOUND with the #agent-message tags.
+      // The injected note is INBOUND with the #agent/message tags.
       const inject = calls.find((c) => c.url.endsWith("/api/notes") && c.init.method === "POST")!;
       const sent = JSON.parse(String(inject.init.body));
-      expect(sent.tags).toEqual(["#agent-message", "#agent-message/inbound"]);
+      expect(sent.tags).toEqual(["#agent/message", "#agent/message/inbound"]);
       expect(sent.metadata.sender).toBe("runner:Channels/eng/jobs/x");
     } finally { srv.stop(true); }
   });

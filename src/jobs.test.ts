@@ -126,7 +126,7 @@ describe("VaultJobStore — vault-native CRUD", () => {
     const jobs = await store.listAll();
     // Only ONE vault transport in the map → queried exactly once (telegram is skipped).
     expect(urls.filter((u) => u.includes("/api/notes")).length).toBe(1);
-    expect(urls[0]).toContain("tag=%23agent-job");
+    expect(urls[0]).toContain("tag=%23agent%2Fjob");
     expect(jobs).toHaveLength(2);
     expect(jobs[0]).toMatchObject({
       id: "note-1",
@@ -138,7 +138,7 @@ describe("VaultJobStore — vault-native CRUD", () => {
     expect(jobs[1]!.enabled).toBe(false); // "false" string → disabled
   });
 
-  test("upsert writes a #agent-job note via the target channel's vault", async () => {
+  test("upsert writes a #agent/job note via the target channel's vault", async () => {
     const { channels } = channelsWithVault();
     const calls: { url: string; init: RequestInit }[] = [];
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -156,7 +156,7 @@ describe("VaultJobStore — vault-native CRUD", () => {
     expect(saved.noteId).toBe("Channels/uni-dev/jobs/morning");
     expect(calls).toHaveLength(1);
     const body = JSON.parse(String(calls[0]!.init.body));
-    expect(body.tags).toEqual(["#agent-job"]);
+    expect(body.tags).toEqual(["#agent/job"]);
     expect(body.path).toBe("Channels/uni-dev/jobs/morning");
     expect(body.metadata.jobId).toBe("morning"); // slug persisted for stable display
     expect(body.content).toBe("Run the morning weave");

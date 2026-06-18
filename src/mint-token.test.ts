@@ -68,12 +68,12 @@ describe("mintScopedToken — happy path", () => {
       {
         scope: "vault:default:read",
         audience: "vault.default",
-        permissions: { scoped_tags: ["#agent-message"] },
+        permissions: { scoped_tags: ["#agent/message"] },
       },
       depsWith(hub.fetchFn),
     );
     expect(hub.calls[0]!.body.audience).toBe("vault.default");
-    expect(hub.calls[0]!.body.permissions).toEqual({ scoped_tags: ["#agent-message"] });
+    expect(hub.calls[0]!.body.permissions).toEqual({ scoped_tags: ["#agent/message"] });
   });
 });
 

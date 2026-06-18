@@ -58,7 +58,7 @@ export function vaultConnectionBody(name: string, vault: string): {
       vault,
       event: "note.created",
       filter: {
-        tags: ["#agent-message/inbound"],
+        tags: ["#agent/message/inbound"],
         has_metadata: ["channel"],
         missing_metadata: ["channel_inbound_rendered_at"],
       },
@@ -122,7 +122,7 @@ export const PROVISION_JS = `
           vault: vault,
           event: "note.created",
           filter: {
-            tags: ["#agent-message/inbound"],
+            tags: ["#agent/message/inbound"],
             has_metadata: ["channel"],
             missing_metadata: ["channel_inbound_rendered_at"]
           }

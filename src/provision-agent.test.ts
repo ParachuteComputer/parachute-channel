@@ -26,7 +26,7 @@ describe("vaultConnectionBody (the canonical vault-backed-channel connection)", 
     // The inbound-tag filter is the loop-avoidance contract (CLAUDE.md "Vault
     // integration"): fire on the inbound CHILD tag only; require channel metadata;
     // skip already-rendered notes.
-    expect(body.source.filter.tags).toEqual(["#agent-message/inbound"]);
+    expect(body.source.filter.tags).toEqual(["#agent/message/inbound"]);
     expect(body.source.filter.has_metadata).toEqual(["channel"]);
     expect(body.source.filter.missing_metadata).toEqual(["channel_inbound_rendered_at"]);
     expect(body.sink.module).toBe("agent");

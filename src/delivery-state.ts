@@ -2,7 +2,7 @@
  * Per-channel delivery high-water-mark — the spine of the no-silent-loss fix.
  *
  * THE PROBLEM. The vault-backed inbound pipeline wakes a session by `ctx.emit`
- * fanning a new `#agent-message/inbound` note to whatever SSE bridges + HTTP
+ * fanning a new `#agent/message/inbound` note to whatever SSE bridges + HTTP
  * MCP sessions are live on the channel. But:
  *  - the daemon acks the vault trigger `{ok:true}` regardless of how many
  *    subscribers actually received it, and the vault stamps `..._rendered_at` on

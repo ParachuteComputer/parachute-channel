@@ -379,7 +379,7 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     const spec: AgentSpec = {
       name: "aaron-dev",
       channels: ["aaron-dev"],
-      vault: { name: "default", access: "read", tags: ["#agent-message"] },
+      vault: { name: "default", access: "read", tags: ["#agent/message"] },
       network: "restricted", // exercise the egress floor; scoped reads are the default (step 6)
     };
     const res = await spawnAgent(spec, baseDeps({ tmux, sandboxEngine: engine }));
@@ -501,13 +501,13 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     const spec: AgentSpec = {
       name: "weaver",
       channels: ["c"],
-      vault: { name: "default", access: "read", tags: ["#agent-message"] },
+      vault: { name: "default", access: "read", tags: ["#agent/message"] },
     };
     await spawnAgent(spec, baseDeps({ fetchFn }));
     const vaultCall = calls.find((c) => String(c.scope).startsWith("vault:"));
     expect(vaultCall).toBeDefined();
     expect(vaultCall!.scope).toBe("vault:default:read");
-    expect(vaultCall!.permissions).toEqual({ scoped_tags: ["#agent-message"] });
+    expect(vaultCall!.permissions).toEqual({ scoped_tags: ["#agent/message"] });
   });
 
   test("idempotent: an already-running session is a no-op", async () => {
@@ -605,7 +605,7 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     const spec: AgentSpec = {
       name: "weaver",
       channels: [{ name: "weave", access: "read" }],
-      vault: { name: "default", access: "read", tags: ["#agent-message"] },
+      vault: { name: "default", access: "read", tags: ["#agent/message"] },
       network: "restricted",
       egress: ["registry.npmjs.org"],
     };

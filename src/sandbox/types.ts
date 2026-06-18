@@ -51,7 +51,7 @@ export interface AgentVaultSpec {
   access: "read" | "write" | "admin";
   /**
    * Optional tag scope — narrows the minted vault token to these tags via the
-   * `permissions.scoped_tags` claim (e.g. `["#agent-message"]`). Omitted = the
+   * `permissions.scoped_tags` claim (e.g. `["#agent/message"]`). Omitted = the
    * verb's full scope across the vault.
    */
   tags?: string[];
@@ -104,7 +104,7 @@ export type AgentChannel = string | AgentChannelSpec;
  *  - `"programmatic"` (the DEFAULT for a NEW spawn request, per Aaron's gating
  *    decision 2026-06-16): NO resident process. An inbound message becomes one
  *    on-demand `claude -p --resume <sid>` turn ({@link AgentBackend}); the reply is
- *    posted back as an outbound `#agent-message/outbound` note. No idle session →
+ *    posted back as an outbound `#agent/message/outbound` note. No idle session →
  *    nothing to go deaf, no reconnect, no replay, no consent gate. The reliable
  *    primary path; best for clean per-message "do a task, report back" turns.
  *  - `"interactive"` (the original tmux path; now the opt-in/"advanced" backend): an

@@ -347,7 +347,7 @@ describe("Layer 2 — http-ui UI endpoints require a token (401 with none)", () 
 
 // ---------------------------------------------------------------------------
 // Vault inbound webhook: POST /api/vault/inbound. A vault trigger POSTs here on
-// a new inbound #agent-message note; the daemon validates the per-channel
+// a new inbound #agent/message note; the daemon validates the per-channel
 // shared secret, resolves the channel from note.metadata.channel, and hands the
 // note to the channel's VaultTransport.ingestInbound (which emits → wakes the
 // session). Secret auth, unknown-channel 404, idempotency by note id.
@@ -388,7 +388,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
   function body(
     noteId: string,
     extraMeta: Record<string, unknown> = {},
-    tags: string[] = ["#agent-message", "#agent-message/inbound"],
+    tags: string[] = ["#agent/message", "#agent/message/inbound"],
   ) {
     return JSON.stringify({
       trigger: "channel-inbound",
@@ -543,13 +543,13 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
     }
   });
 
-  test("#agent-message/outbound-tagged note is ack'd 200 but NOT emitted (belt-and-suspenders)", async () => {
+  test("#agent/message/outbound-tagged note is ack'd 200 but NOT emitted (belt-and-suspenders)", async () => {
     const { srv, base, emitted } = buildVaultServer();
     try {
       const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: body("ob-1", { direction: "outbound" }, ["#agent-message", "#agent-message/outbound"]),
+        body: body("ob-1", { direction: "outbound" }, ["#agent/message", "#agent/message/outbound"]),
       });
       expect(res.status).toBe(200);
       expect(emitted).toHaveLength(0);

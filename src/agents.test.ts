@@ -180,12 +180,12 @@ describe("buildSpecFromBody", () => {
     const spec = buildSpecFromBody({
       name: "weaver",
       channels: [{ name: "weave", access: "read" }, { name: "out" }],
-      vault: { name: "default", access: "read", tags: ["#agent-message", " "] },
+      vault: { name: "default", access: "read", tags: ["#agent/message", " "] },
       egress: ["registry.npmjs.org", "  "],
       mounts: [{ hostPath: "/data", mountPath: "/data", mode: "ro", shared: "corpus" }],
     });
     expect(spec.channels).toEqual([{ name: "weave", access: "read" }, { name: "out" }]);
-    expect(spec.vault).toEqual({ name: "default", access: "read", tags: ["#agent-message"] });
+    expect(spec.vault).toEqual({ name: "default", access: "read", tags: ["#agent/message"] });
     expect(spec.egress).toEqual(["registry.npmjs.org"]); // blank trimmed out
     expect(spec.mounts).toEqual([{ hostPath: "/data", mountPath: "/data", mode: "ro", shared: "corpus" }]);
   });

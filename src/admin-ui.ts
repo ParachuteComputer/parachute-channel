@@ -547,7 +547,7 @@ const PAGE_SCRIPT = String.raw`
     if (hint) {
       if (transport === "vault") {
         hint.innerHTML =
-          "Inbound messages become <code>#agent-message</code> notes; a session replies by writing notes. " +
+          "Inbound messages become <code>#agent/message</code> notes; a session replies by writing notes. " +
           "Clicking <strong>Add channel</strong> is your approval &mdash; the hub mints the cross-module tokens " +
           "and registers the vault trigger.";
       } else if (transport === "telegram") {

@@ -482,8 +482,8 @@ async function removeChannelLive(
  * through: resolve the channel's transport from the live `channels` map and call its
  * `reply()` — the SAME outbound path the interactive `reply` tool uses, so a
  * programmatic reply is durable + renders in the chat UI exactly like an
- * interactive one. For a VaultTransport this writes a `#agent-message/outbound`
- * note; the vault inbound trigger keys on `#agent-message/inbound`, so writing the
+ * interactive one. For a VaultTransport this writes a `#agent/message/outbound`
+ * note; the vault inbound trigger keys on `#agent/message/inbound`, so writing the
  * reply CANNOT re-trigger the inbound webhook (verified: no loop). `inReplyTo`
  * threads the reply to the inbound note id.
  *
@@ -569,11 +569,11 @@ export function createDefaultProgrammaticRegistry(
  * Transport choice (documented in the PR): a DEDICATED per-channel SSE stream
  * (`/api/channels/<ch>/turn-events`) over the existing {@link ClientRegistry},
  * NOT the durable-message poll. Rationale — the chat already POLLs vault channels
- * for their DURABLE transcript (the `#agent-message` notes, the record of truth);
+ * for their DURABLE transcript (the `#agent/message` notes, the record of truth);
  * turn progress is EPHEMERAL and chunk-frequent, so polling would be coarse + would
  * surface partial state as if durable. An SSE stream is the clean real-time fit and
  * reuses the registry/`sseFrame` infra already in the daemon. The durable path is
- * untouched: the final `result` still becomes the `#agent-message/outbound` note,
+ * untouched: the final `result` still becomes the `#agent/message/outbound` note,
  * and the live stream is purely additive progress that the UI finalizes against it.
  *
  * Keyed by channel; fans out to every subscriber on that channel. A 0-subscriber
@@ -1186,7 +1186,7 @@ ${SHELL_JS}
     var ch = currentChannel();
     if (!ch) { setStatus("no channel", ""); sendBtn.disabled = true; return; }
     updateSetup(ch);
-    // Vault channels read/write the durable #agent-message store via the daemon
+    // Vault channels read/write the durable #agent/message store via the daemon
     // (load transcript + poll); http-ui channels use the ephemeral SSE path below.
     if (isVault(ch)) { connectVault(ch); return; }
     setStatus("connecting…", "");
@@ -1863,7 +1863,7 @@ export function createFetchHandler(
     // ---------------------------------------------------------------------
     // Scheduled-jobs API — the runner (design 2026-06-17). A job is "an
     // automated human": send message M to a vault agent A on cron S. Storage is
-    // VAULT-NATIVE (`#agent-job` notes in the target channel's vault); these
+    // VAULT-NATIVE (`#agent/job` notes in the target channel's vault); these
     // routes read/write through the shared `jobStore`. ALL gated on
     // `agent:admin` (operator-only, like /api/channels). The runner does the
     // injecting; these routes just CRUD the durable job notes (+ fire-now).
@@ -2535,7 +2535,7 @@ export function createFetchHandler(
     }
 
     // Vault inbound webhook — a vault trigger POSTs here when a new
-    // `#agent-message/inbound` note appears. Resolves the target channel from
+    // `#agent/message/inbound` note appears. Resolves the target channel from
     // `note.metadata.channel`, asserts it's a vault-transport channel, and hands
     // the note to that transport's `ingestInbound`, which `ctx.emit`s it →
     // wakes the subscribed bridge / MCP session.
@@ -2629,7 +2629,7 @@ export function createFetchHandler(
     // view (design 2026-06-16 build item #1): the chat subscribes here to watch a
     // PROGRAMMATIC turn work in real time — interim assistant text + tool_use, then a
     // done/error lifecycle event. EPHEMERAL by design: no backlog/replay (the durable
-    // record is the `#agent-message/outbound` note the turn still writes). A channel
+    // record is the `#agent/message/outbound` note the turn still writes). A channel
     // with no programmatic agent simply never receives a `turn` frame (the stream
     // stays open + idle). Open to any live channel — unknown channel still opens the
     // stream (it just never emits), matching the low-stakes ephemeral contract.
@@ -2713,7 +2713,7 @@ export function createFetchHandler(
     // on `agent:send`, same scope http-ui's send uses). The daemon owns this for
     // vault transports because the http-ui transport's ingestHttp only matches its
     // OWN channel name; a vault channel needs the daemon to dispatch. For a vault
-    // channel the daemon writes a `#agent-message/inbound` note via the channel's
+    // channel the daemon writes a `#agent/message/inbound` note via the channel's
     // stored vault token — which WAKES the session through the existing vault
     // trigger (we do NOT also emit; that would double-wake). http-ui channels fall
     // through to their transport's ingestHttp (unchanged), so this guard handles
@@ -2955,7 +2955,7 @@ function main(): void {
   const terminalWs = createTerminalWsHandlers();
 
   // The vault-native scheduled-job store + the runner (design 2026-06-17). The
-  // store reads/writes `#agent-job` notes in each vault channel's vault; the
+  // store reads/writes `#agent/job` notes in each vault channel's vault; the
   // runner ticks every 30s, loading jobs from the store, firing due ones by
   // injecting an inbound note onto the job's vault channel (the existing trigger →
   // agent-turn → outbound flow does the rest). Shared with the fetch handler so
@@ -3089,7 +3089,7 @@ function main(): void {
   void reregisterProgrammaticAgents(programmatic, channels);
 
   // Start the runner's scheduled-job tick (design 2026-06-17). Tolerant of an
-  // empty/missing job set (no `#agent-job` notes → idle) and of a daemon with no
+  // empty/missing job set (no `#agent/job` notes → idle) and of a daemon with no
   // vault channels (listAll queries nothing → idle). A job targeting a now-deleted
   // channel sets lastStatus:error on fire rather than throwing the tick. The tick
   // is `unref`'d so it never keeps the process alive on its own.

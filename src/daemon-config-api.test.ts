@@ -130,7 +130,7 @@ function inboundBody(noteId: string, channel = "eng") {
       id: noteId,
       path: `channel/${channel}/${noteId}`,
       content: "wake up session",
-      tags: ["#agent-message", "#agent-message/inbound"],
+      tags: ["#agent/message", "#agent/message/inbound"],
       metadata: { channel, direction: "inbound", sender: "aaron" },
     },
   });
@@ -594,9 +594,9 @@ describe("C — AGENT_VAULT_TRIGGER_TEMPLATE exposed via /.parachute/config", ()
       // Sanity on the shape the hub depends on (placeholders + webhook path).
       // The trigger NAME stays `channel_inbound_<channel>` — `channel` is the
       // domain routing key, not the module identity. The TAG moved to
-      // #agent-message and the webhook moved to the /agent mount.
+      // #agent/message and the webhook moved to the /agent mount.
       expect(body.triggerTemplate.name).toBe("channel_inbound_<channel>");
-      expect(body.triggerTemplate.when.tags).toEqual(["#agent-message/inbound"]);
+      expect(body.triggerTemplate.when.tags).toEqual(["#agent/message/inbound"]);
       expect(body.triggerTemplate.action.webhook).toBe("<hub-origin>/agent/api/vault/inbound");
     } finally {
       srv.stop(true);

@@ -17,7 +17,7 @@ sessions from the browser**.
 ## What you get
 
 - **Talk to a session over any transport.** A channel is bound to one transport:
-  - `vault` — messages are durable [`#agent-message`](#vault-backed-channels)
+  - `vault` — messages are durable [`#agent/message`](#vault-backed-channels)
     notes in a Parachute vault, so the conversation is queryable and renders in any
     vault surface (this is the recommended transport).
   - `telegram` — a Telegram bot, one per channel.
@@ -123,9 +123,9 @@ Reachable at `<hub-origin>/agent/`:
 ## Vault-backed channels
 
 A `vault` channel stores every message as a note carrying **two tags**: the parent
-`#agent-message` (queryable membership — list a channel's whole transcript with
-one `tag: "#agent-message"` + `metadata.channel` query) and a directional child
-`#agent-message/inbound` (human→session) or `#agent-message/outbound`
+`#agent/message` (queryable membership — list a channel's whole transcript with
+one `tag: "#agent/message"` + `metadata.channel` query) and a directional child
+`#agent/message/inbound` (human→session) or `#agent/message/outbound`
 (session→human). Inbound notes wake the session via a vault trigger; replies are
 written as outbound notes. Because the conversation lives in the vault, it's
 durable, queryable, and renders in any vault surface — the built-in chat and a

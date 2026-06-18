@@ -155,38 +155,50 @@ set headers). On a 401/SSE-error it re-fetches once and retries. `/ui`, `/health
 `/.parachute/config[/schema]` stay OPEN — the page must load to bootstrap its token fetch, and the
 config listing is non-sensitive.
 
-## Vault integration (Stage 2) — channels backed by `#agent-message` notes
+## Vault integration (Stage 2) — channels backed by `#agent/message` notes
 
 A `vault` transport backs a channel with notes in a Parachute vault, so messages
 are durable, queryable, and a vault surface can render them. Multiple channels per
 vault: the note's `channel` metadata routes it.
 
+**The `#agent/*` namespace is module-owned** (design
+`design/2026-06-17-vault-native-agents.md`). Every vault object this module manages
+hangs off the `#agent` prefix: `#agent/definition` (a vault-native agent def — body
+is the system prompt, metadata is the config), `#agent/message{,/inbound,/outbound}`
+(a conversation turn), `#agent/job` (a scheduled trigger). The tag schema declares
+`parent_names` so a human `tag:#agent` query rolls up to everything the module owns.
+The module always queries the EXACT leaf tag (never relies on prefix magic), and
+keeps the "tag both queryable parent + directional child literally" floor so loop
+avoidance + transcript listing work with zero per-vault schema dependency. DUAL-READ
+recognizes the prior flat `#agent-message*` and legacy `#channel-message*` tags on
+READ (pre-namespace history) but only ever WRITES the namespaced tags.
+
 **Note shape** — TWO tags per note, carried literally (two orthogonal axes):
-- the parent `#agent-message` — the QUERYABLE membership tag. A UI lists a channel's
-  whole transcript (both directions) with one `tag: "#agent-message"` + `metadata.channel`
+- the parent `#agent/message` — the QUERYABLE membership tag. A UI lists a channel's
+  whole transcript (both directions) with one `tag: "#agent/message"` + `metadata.channel`
   query, because the parent is literally on every note.
-- a directional child — the trigger DISCRIMINATOR: `#agent-message/inbound` (human→session)
-  or `#agent-message/outbound` (session reply).
+- a directional child — the trigger DISCRIMINATOR: `#agent/message/inbound` (human→session)
+  or `#agent/message/outbound` (session reply).
 
 **The slash is a namespace, NOT query inheritance.** In a Parachute vault a slash in a tag
-NAME is a namespace convention only — `query-notes { tag: "#agent-message" }` matches
+NAME is a namespace convention only — `query-notes { tag: "#agent/message" }` matches
 descendants by the `tags.parent_names` graph (declared via `update-tag`), NOT by name-prefix.
-A note tagged ONLY `#agent-message/inbound` is INVISIBLE to a `tag: "#agent-message"`
+A note tagged ONLY `#agent/message/inbound` is INVISIBLE to a `tag: "#agent/message"`
 query unless that inheritance was separately declared — so we tag BOTH the parent and the
 child and don't depend on per-vault schema setup.
 
 Content = the message text; metadata: `{ channel, direction: "inbound"|"outbound", sender,
 in_reply_to (outbound), ts }`. Loop avoidance lives in the TAG, not metadata: the trigger
 fires on the inbound child tag only (exact match), which an outbound note never carries, so a
-reply never wakes its own session. **Inbound notes MUST carry BOTH `#agent-message` (parent,
-makes it queryable) AND `#agent-message/inbound` (child, fires the trigger), with the channel
-name in `metadata.channel`.** Outbound notes carry `#agent-message` + `#agent-message/outbound`.
+reply never wakes its own session. **Inbound notes MUST carry BOTH `#agent/message` (parent,
+makes it queryable) AND `#agent/message/inbound` (child, fires the trigger), with the channel
+name in `metadata.channel`.** Outbound notes carry `#agent/message` + `#agent/message/outbound`.
 
-**Flow.** INBOUND (human→session): a new `#agent-message` + `#agent-message/inbound` note →
+**Flow.** INBOUND (human→session): a new `#agent/message` + `#agent/message/inbound` note →
 a vault **trigger** POSTs a webhook → the agent daemon's `POST /api/vault/inbound` → routes by
 `note.metadata.channel` → `ctx.emit` wakes the session (fans to SSE bridges + HTTP-MCP sessions
-alike). OUTBOUND (session→human): the session's `reply` writes a `#agent-message` +
-`#agent-message/outbound` note via the vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`,
+alike). OUTBOUND (session→human): the session's `reply` writes a `#agent/message` +
+`#agent/message/outbound` note via the vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`,
 Bearer `vault:<name>:write`).
 
 **channels.json** (the channel side):
@@ -197,20 +209,20 @@ Bearer `vault:<name>:write`).
 ```
 
 **Vault side** (operator config — activates the inbound trigger):
-1. (Optional, for indexed queries) declare the `#agent-message` tag schema with
+1. (Optional, for indexed queries) declare the `#agent/message` tag schema with
    indexed `channel`/`direction`/`sender` fields (`update-tag`).
 2. Add a trigger to the vault's `config.yaml` that fires on new inbound notes and
    webhooks the agent daemon. Loop avoidance is by tag: the vault predicate does
-   EXACT tag membership, so firing on the inbound CHILD tag (`#agent-message/inbound`)
-   never matches an outbound (reply) note — which carries `#agent-message/outbound`,
+   EXACT tag membership, so firing on the inbound CHILD tag (`#agent/message/inbound`)
+   never matches an outbound (reply) note — which carries `#agent/message/outbound`,
    not the inbound child — so no `missing_metadata` clause is needed. (Both directions
-   also carry the parent `#agent-message`, but the trigger keys on the child only.)
+   also carry the parent `#agent/message`, but the trigger keys on the child only.)
    ```yaml
    triggers:
      - name: channel_inbound
        events: ["created"]
        when:
-         tags: ["#agent-message/inbound"]
+         tags: ["#agent/message/inbound"]
          has_metadata: ["channel"]
          missing_metadata: ["channel_inbound_rendered_at"]
        action:
@@ -219,7 +231,7 @@ Bearer `vault:<name>:write`).
    ```
    The shared secret rides in the URL — vault doesn't sign webhooks yet; a hub-JWT
    auth block on the trigger is a follow-up. The daemon defends in depth too:
-   `ingestInbound` drops any note tagged `#agent-message/outbound`, so a reply can
+   `ingestInbound` drops any note tagged `#agent/message/outbound`, so a reply can
    never wake its own session.
 
 ## Environment variables

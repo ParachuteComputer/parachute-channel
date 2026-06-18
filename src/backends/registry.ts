@@ -8,7 +8,7 @@
  * session_id) and a per-channel serial worker. An inbound message for a registered
  * channel is ENQUEUED here; the worker drains the queue ONE turn at a time, FIFO,
  * running a single `claude -p --resume <sid>` turn per message and posting the
- * reply back as an outbound `#agent-message/outbound` note.
+ * reply back as an outbound `#agent/message/outbound` note.
  *
  * ── The serial-queue contract (HARD requirement — reviewer contract) ─────────────
  * Each agent processes turns ONE AT A TIME, FIFO. There is NEVER two concurrent
@@ -27,8 +27,8 @@
  * On `ok: false` the error is logged and the turn is DROPPED (no infinite loop, no
  * retry — a failed turn's session id is already persisted by the backend, so the
  * next message resumes the conversation). The outbound write goes through `reply()`,
- * which tags the note `#agent-message/outbound` — the vault inbound trigger keys on
- * `#agent-message/inbound` only, so writing the reply CANNOT re-trigger the inbound
+ * which tags the note `#agent/message/outbound` — the vault inbound trigger keys on
+ * `#agent/message/inbound` only, so writing the reply CANNOT re-trigger the inbound
  * webhook (no loop).
  */
 
@@ -63,7 +63,7 @@ export type TurnLifecycleEvent =
 /**
  * Write an outbound reply for a channel — the seam the registry posts a turn's
  * reply through. The daemon wires this to the channel transport's `reply()` (a
- * VaultTransport writes a `#agent-message/outbound` note). `inReplyTo` threads the
+ * VaultTransport writes a `#agent/message/outbound` note). `inReplyTo` threads the
  * reply to the inbound note id when one is known. Returns nothing; a write failure
  * is the implementation's to surface (the registry logs whatever it throws).
  */

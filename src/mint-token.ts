@@ -26,7 +26,7 @@ export interface MintRequest {
   /** TTL in seconds. Omitted = hub default (~90d non-ephemeral). */
   expiresIn?: number;
   /**
-   * Extra JWT claims, e.g. `{ scoped_tags: ["#agent-message"] }` for a
+   * Extra JWT claims, e.g. `{ scoped_tags: ["#agent/message"] }` for a
    * tag-scoped vault token. Passed through as the mint API's `permissions`.
    */
   permissions?: Record<string, unknown>;

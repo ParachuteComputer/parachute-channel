@@ -277,7 +277,7 @@ ${THEME_CSS}
               </div>
               <div>
                 <label for="vault-tags">Tag scope (optional)</label>
-                <input type="text" id="vault-tags" placeholder="#agent-message/inbound, …" autocomplete="off" />
+                <input type="text" id="vault-tags" placeholder="#agent/message/inbound, …" autocomplete="off" />
               </div>
             </div>
             <div class="muted" style="font-size:12px;">

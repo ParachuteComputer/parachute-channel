@@ -4,10 +4,10 @@
  *
  * A scheduled job is "an automated human": send message M to agent (channel) A on
  * schedule S. The runner does NOT execute anything — it authors an inbound
- * `#agent-message/inbound` note on a schedule, and the existing vault trigger →
+ * `#agent/message/inbound` note on a schedule, and the existing vault trigger →
  * agent-turn → outbound flow does the rest.
  *
- * STORAGE IS VAULT-NATIVE (Aaron's call, 2026-06-17): a job IS a `#agent-job`
+ * STORAGE IS VAULT-NATIVE (Aaron's call, 2026-06-17): a job IS a `#agent/job`
  * note in the TARGET channel's vault — durable, queryable, and renderable by any
  * surface, converging with the blueprint's "vault as the spine" and the future
  * `tag:job` idea. There is NO jobs.json. The vault note I/O lives on
@@ -37,7 +37,7 @@ export interface JobSchedule {
 
 /**
  * One scheduled job. The in-memory shape the runner + API operate on; persisted as
- * a `#agent-job` vault note (see the store below). `id` is the slug (also the
+ * a `#agent/job` vault note (see the store below). `id` is the slug (also the
  * `runner:<id>` sender provenance + the note path segment).
  */
 export interface Job {
@@ -152,7 +152,7 @@ export function vaultTransportFor(
 
 /**
  * The vault-native job store. Same read-all / upsert / remove interface the file
- * store had, now backed by `#agent-job` vault notes via the channel's
+ * store had, now backed by `#agent/job` vault notes via the channel's
  * `VaultTransport`. Each method resolves the target channel's vault transport (the
  * channel carries the vault binding + write token) and delegates the I/O to it.
  *
@@ -205,7 +205,7 @@ export class VaultJobStore {
   }
 
   /**
-   * Create or replace a job (by slug id) as a `#agent-job` note in its target
+   * Create or replace a job (by slug id) as a `#agent/job` note in its target
    * channel's vault. Throws if the target channel isn't a live vault channel
    * (the API validates this first, so it's a guard, not the primary check).
    * Returns the persisted job with its `noteId` filled in (the `id` stays the slug).

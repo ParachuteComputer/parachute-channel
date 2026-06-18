@@ -162,6 +162,25 @@ export class ChannelQueueRegistry {
   }
 
   /**
+   * The registered channel-backend agents as plain records (name + channel + the
+   * spec's surfaceable, non-secret fields). The `GET /api/agents` list (#102) maps
+   * these into {@link AgentInfo}; tests assert the shape. Sorted by name for a stable
+   * list. NEVER carries a token/secret — the spec's vault binding is a name + access
+   * verb only. The live `pending` count is fetched separately (it's an async vault
+   * read; see {@link pending}) so this accessor stays synchronous + cheap.
+   */
+  list(): Array<{ name: string; channel: string; vault?: string; systemPrompt?: string }> {
+    return [...this.byChannel.values()]
+      .map((rec) => ({
+        name: rec.name,
+        channel: rec.channel,
+        ...(rec.spec.vault?.name ? { vault: rec.spec.vault.name } : {}),
+        ...(rec.spec.systemPrompt ? { systemPrompt: rec.spec.systemPrompt } : {}),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
    * Peek the pending queue for a channel: the count of `status:pending` inbound + a
    * bounded oldest-first preview. A no-op shape `{ count: 0, items: [] }` for an
    * unregistered (non-channel) channel — the MCP surface gates cleanly on a non-channel

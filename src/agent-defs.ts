@@ -118,6 +118,22 @@ export class AgentDefParseError extends Error {
 }
 
 /**
+ * A failed def WRITE (create/edit/delete) — carries an HTTP status the daemon route
+ * maps directly (400 validation, 404 unknown note, 409 name collision, 502 a
+ * write/instantiate failure). Distinct from {@link AgentDefParseError} (a note that's
+ * already in the vault but malformed).
+ */
+export class AgentDefWriteError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "AgentDefWriteError";
+  }
+}
+
+/**
  * Coerce a vault metadata value (the vault stores metadata as strings, but a note
  * authored in another client may carry a real array/number) to a trimmed string.
  */
@@ -495,6 +511,92 @@ export class DefVaultClient {
       throw new Error(`def-vault "${this.vault}": patch status ${noteId} failed (${res.status}) ${detail}`.trim());
     }
   }
+
+  /**
+   * Create a `#agent/definition` note: body = the system prompt, metadata = the
+   * config, tagged the exact def tag (the same tag {@link listDefNotes} queries). The
+   * vault assigns the note id; we return the created note (id + content + metadata) so
+   * the caller can reload it into a live agent immediately. Throws on a non-ok vault
+   * response. The path defaults under `Agents/<name>` (a flat, predictable slug) so a
+   * vault surface groups them; the vault is free to relocate it.
+   */
+  async createNote(args: {
+    content: string;
+    metadata: Record<string, string>;
+    path?: string;
+  }): Promise<{ id: string; content?: string; metadata?: Record<string, unknown> }> {
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes`;
+    const body: Record<string, unknown> = {
+      content: args.content,
+      tags: [AGENT_DEFINITION_TAG],
+      metadata: args.metadata,
+    };
+    if (args.path) body.path = args.path;
+    const res = await this.fetchFn(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`def-vault "${this.vault}": create def failed (${res.status}) ${detail}`.trim());
+    }
+    let parsed: unknown;
+    try {
+      parsed = await res.json();
+    } catch (err) {
+      throw new Error(`def-vault "${this.vault}": create def — bad JSON: ${(err as Error).message}`);
+    }
+    const n = (parsed ?? {}) as {
+      id?: string;
+      note?: { id?: string; content?: string; metadata?: Record<string, unknown> };
+      content?: string;
+      metadata?: Record<string, unknown>;
+    };
+    const note = n.note ?? n;
+    if (typeof note.id !== "string" || !note.id) {
+      throw new Error(`def-vault "${this.vault}": create def succeeded but response had no note id`);
+    }
+    return { id: note.id, content: note.content, metadata: note.metadata };
+  }
+
+  /**
+   * Edit an existing def note: update its body (system prompt) and/or merge metadata
+   * fields. `force: true` satisfies the vault's 428 mutation precondition (the module's
+   * own authoritative edit; the vault MERGES metadata so unspecified fields are kept).
+   * Only the provided fields are sent. Throws on a non-ok vault response.
+   */
+  async patchNote(
+    noteId: string,
+    fields: { content?: string; metadata?: Record<string, string> },
+  ): Promise<void> {
+    const body: Record<string, unknown> = { force: true };
+    if (fields.content !== undefined) body.content = fields.content;
+    if (fields.metadata !== undefined) body.metadata = fields.metadata;
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(noteId)}`;
+    const res = await this.fetchFn(url, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`def-vault "${this.vault}": patch def ${noteId} failed (${res.status}) ${detail}`.trim());
+    }
+  }
+
+  /** Delete a def note by id. Throws on a non-ok vault response (404 IS ok — gone is gone). */
+  async deleteNote(noteId: string): Promise<void> {
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(noteId)}`;
+    const res = await this.fetchFn(url, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${this.token}` },
+    });
+    if (!res.ok && res.status !== 404) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`def-vault "${this.vault}": delete def ${noteId} failed (${res.status}) ${detail}`.trim());
+    }
+  }
 }
 
 /**
@@ -534,7 +636,44 @@ interface LiveDef {
   name: string;
   /** The resolved status (for /health + observability). */
   status: AgentDefStatus;
+  /** The agent backend the def selected (`programmatic` | `channel`). */
+  backend: AgentBackendKind;
+  /** First ~200 chars of the system prompt (the note body) — a preview, NOT a secret. */
+  systemPromptPreview: string;
+  /** Declared connections still pending approval (the status `pending` list), if any. */
+  pending: string[];
+  /** Structured `wants:` connection keys (surfaced for the UI; never a secret). */
+  wants: string[];
 }
+
+/**
+ * The detailed view of one live vault-native agent the `GET /api/agent-defs` route
+ * returns — everything a UI needs to render + edit it, NO secrets (no tokens). The
+ * channel == the agent name (agent ≡ channel); the vault is the def-vault.
+ */
+export interface AgentDefDetail {
+  /** The vault note id (the create/edit/delete key). */
+  noteId: string;
+  /** The agent name (= wake channel + spec name). */
+  name: string;
+  /** The agent backend (`programmatic` | `channel`). */
+  backend: AgentBackendKind;
+  /** The def-vault this agent is defined in. */
+  vault: string;
+  /** The resolved liveness status (`enabled` | `pending` | `error`). */
+  status: AgentDefStatus;
+  /** Declared connections still pending approval (empty when none). */
+  pending: string[];
+  /** First ~200 chars of the system prompt (the note body) — a preview, NOT the full text. */
+  systemPromptPreview: string;
+  /** Structured `wants:` connection keys the agent declared (empty when own-vault only). */
+  wants: string[];
+  /** The wake channel inbound routes to this agent on (== name). */
+  channel: string;
+}
+
+/** How many chars of the system prompt the detail preview surfaces. */
+export const SYSTEM_PROMPT_PREVIEW_LEN = 200;
 
 /**
  * The vault-native agent-def registry — reads `#agent/definition` notes from the
@@ -610,6 +749,19 @@ export class AgentDefRegistry {
     this.bindings.set(binding.vault, binding);
   }
 
+  /**
+   * Remove a def-vault binding (the client + binding indexes). The caller
+   * ({@link deregisterAllForVault}) tears down the vault's live agents FIRST; this
+   * drops the registry's knowledge of the vault so a later `loadAll` no longer queries
+   * it. Idempotent. Does NOT touch the persisted `agent-vaults.json` — that's the
+   * daemon route's job (the registry has no file knowledge).
+   */
+  removeVault(vault: string): void {
+    this.clients.delete(vault);
+    this.bindings.delete(vault);
+    this.seenDefs.delete(vault);
+  }
+
   /** The number of def-vaults bound (for /health + tests). */
   get vaultCount(): number {
     return this.clients.size;
@@ -624,7 +776,118 @@ export class AgentDefRegistry {
 
   /** The live instantiated defs (for /health + the agents list + tests). */
   list(): ReadonlyArray<{ vault: string; noteId: string; name: string; status: AgentDefStatus }> {
-    return [...this.live.values()].map((d) => ({ ...d }));
+    return [...this.live.values()].map((d) => ({
+      vault: d.vault,
+      noteId: d.noteId,
+      name: d.name,
+      status: d.status,
+    }));
+  }
+
+  /**
+   * The live instantiated defs in the DETAILED `GET /api/agent-defs` shape — backend,
+   * vault, status, pending, the system-prompt PREVIEW (not the full body), wants, and
+   * the wake channel. NO secrets (no tokens). Sorted by name for a stable list.
+   */
+  listDetailed(): AgentDefDetail[] {
+    return [...this.live.values()]
+      .map((d) => ({
+        noteId: d.noteId,
+        name: d.name,
+        backend: d.backend,
+        vault: d.vault,
+        status: d.status,
+        pending: [...d.pending],
+        systemPromptPreview: d.systemPromptPreview,
+        wants: [...d.wants],
+        channel: d.name, // agent ≡ channel.
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** Whether a def-vault by this name is configured (the write-path vault guard). */
+  hasVault(vault: string): boolean {
+    return this.clients.has(vault);
+  }
+
+  /** The configured def-vault names (for /api/agent-vaults + the write-path guard). */
+  vaultNames(): string[] {
+    return [...this.clients.keys()];
+  }
+
+  /**
+   * The configured def-vault bindings VERBATIM (carrying their tokens) — for
+   * persisting the live set back to `agent-vaults.json` on an add (so a boot-minted
+   * default's real token is preserved, never clobbered to empty). INTERNAL: this
+   * carries SECRETS — never serialize it to the wire (the wire view is
+   * {@link vaultStatuses}). Returns copies so a caller can't mutate the registry's
+   * bindings in place.
+   */
+  liveBindings(): DefVaultBinding[] {
+    return [...this.bindings.values()].map((b) => ({ ...b }));
+  }
+
+  /**
+   * The configured def-vaults as a non-secret view — name + url + whether a token is
+   * present (NEVER the token VALUE). The `GET /api/agent-vaults` listing's source of
+   * truth (the live registry, not the on-disk file, so a boot-minted binding shows its
+   * token even before the file write lands). Sorted by name.
+   */
+  vaultStatuses(): Array<{ vault: string; url: string; tokenPresent: boolean }> {
+    return [...this.bindings.values()]
+      .map((b) => ({
+        vault: b.vault,
+        url: b.vaultUrl ?? DEFAULT_DEF_VAULT_URL,
+        tokenPresent: typeof b.token === "string" && b.token.length > 0,
+      }))
+      .sort((a, b) => a.vault.localeCompare(b.vault));
+  }
+
+  /**
+   * Whether a note id is a CURRENTLY-LIVE def in a given vault — the write-path guard
+   * for PATCH/DELETE so the routes only ever touch notes this module actually
+   * instantiated as `#agent/definition` agents in a configured def-vault (not an
+   * arbitrary note id an operator passes). Returns the live detail when it is, else
+   * null.
+   */
+  liveDef(vault: string, noteId: string): AgentDefDetail | null {
+    const d = this.live.get(this.keyOf(vault, noteId));
+    if (!d) return null;
+    return {
+      noteId: d.noteId,
+      name: d.name,
+      backend: d.backend,
+      vault: d.vault,
+      status: d.status,
+      pending: [...d.pending],
+      systemPromptPreview: d.systemPromptPreview,
+      wants: [...d.wants],
+      channel: d.name,
+    };
+  }
+
+  /** Find a live def by note id across ALL configured vaults (PATCH/DELETE address
+   *  a note by id; the vault is resolved here). Returns the {vault, detail} or null.
+   *  AMBIGUITY GUARD (#106 review): if two configured def-vaults each vend a note at
+   *  the SAME id, picking the first match is non-deterministic — so throw a 409-class
+   *  {@link AgentDefWriteError} ("specify vault") rather than silently mutating one of
+   *  them. The single-match happy path is unchanged. */
+  findLiveByNote(noteId: string): { vault: string; detail: AgentDefDetail } | null {
+    const matches: string[] = [];
+    for (const d of this.live.values()) {
+      if (d.noteId === noteId) matches.push(d.vault);
+    }
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      throw new AgentDefWriteError(
+        `note ${noteId} is a live agent definition in multiple def-vaults (${matches
+          .sort()
+          .join(", ")}); ambiguous note id across vaults — specify vault`,
+        409,
+      );
+    }
+    const vault = matches[0]!;
+    return { vault, detail: this.liveDef(vault, noteId)! };
   }
 
   private keyOf(vault: string, noteId: string): string {
@@ -767,6 +1030,156 @@ export class AgentDefRegistry {
     return (await this.instantiate(vault, note)) ? "instantiated" : "skipped";
   }
 
+  // ---------------------------------------------------------------------------
+  // Def write path (the v2 API layer) — create / edit / delete a `#agent/definition`
+  // note in a configured def-vault, then reload it into a LIVE agent immediately (the
+  // per-note reload, NOT the 60s poll). The daemon owns the def-vault write token
+  // (def-vaults.ts); these methods drive its client. Validation is the registry's job
+  // (vault configured, name slug, backend valid) so the daemon route stays thin.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create a new `#agent/definition` note in `vault` (body = system prompt, metadata =
+   * name/backend/wants/extra), then reload it so the agent is LIVE immediately (no
+   * wait for the trigger or the poll). Returns the created def in the {@link
+   * AgentDefDetail} shape. Throws {@link AgentDefWriteError} on a validation failure
+   * (unknown vault, bad name, bad backend) or a write/reload failure.
+   */
+  async createDef(args: {
+    vault: string;
+    name: string;
+    backend: AgentBackendKind;
+    systemPrompt: string;
+    wants?: string;
+    metadata?: Record<string, string>;
+  }): Promise<AgentDefDetail> {
+    const client = this.clients.get(args.vault);
+    if (!client) {
+      throw new AgentDefWriteError(`unknown def-vault "${args.vault}" (configure it first)`, 400);
+    }
+    if (!NAME_SLUG_RE.test(args.name)) {
+      throw new AgentDefWriteError(
+        `name "${args.name}" must be a slug (alphanumeric, dash, underscore)`,
+        400,
+      );
+    }
+    if (args.backend !== "programmatic" && args.backend !== "channel") {
+      throw new AgentDefWriteError(`backend must be "programmatic" or "channel"`, 400);
+    }
+    // A name collision with a live def (in ANY vault — the wake channel is shared) would
+    // resurrect last-writer-wins on the channel; reject up front for a clean error.
+    for (const d of this.live.values()) {
+      if (d.name === args.name) {
+        throw new AgentDefWriteError(
+          `an agent named "${args.name}" already exists (note ${d.noteId} in "${d.vault}")`,
+          409,
+        );
+      }
+    }
+    const metadata = this.buildDefMetadata(args);
+    const created = await client.createNote({
+      content: args.systemPrompt,
+      metadata,
+      path: `Agents/${args.name}`,
+    });
+    // Reload the just-created note → instantiate it LIVE now (the immediate path).
+    await this.reload(args.vault, created.id, "created");
+    const detail = this.liveDef(args.vault, created.id);
+    if (!detail) {
+      // Instantiation didn't take (a parse/instantiate failure stamps status:error on
+      // the note + returns false). Surface that the note was written but isn't live.
+      throw new AgentDefWriteError(
+        `def note ${created.id} written to "${args.vault}" but failed to instantiate ` +
+          `(check the note's status field for the error)`,
+        502,
+      );
+    }
+    return detail;
+  }
+
+  /**
+   * Edit an existing live def note (body and/or metadata), then reload it so the change
+   * is LIVE immediately. The note MUST be a currently-live def we instantiated in a
+   * configured vault (the daemon resolves the vault; we re-guard here). Returns the
+   * updated detail. Throws {@link AgentDefWriteError} on a miss or a write/reload failure.
+   */
+  async editDef(
+    noteId: string,
+    fields: { systemPrompt?: string; wants?: string; metadata?: Record<string, string> },
+  ): Promise<AgentDefDetail> {
+    const found = this.findLiveByNote(noteId);
+    if (!found) {
+      throw new AgentDefWriteError(`note ${noteId} is not a live agent definition`, 404);
+    }
+    const client = this.clients.get(found.vault);
+    if (!client) {
+      throw new AgentDefWriteError(`unknown def-vault "${found.vault}"`, 400);
+    }
+    const patch: { content?: string; metadata?: Record<string, string> } = {};
+    if (fields.systemPrompt !== undefined) patch.content = fields.systemPrompt;
+    const metadata: Record<string, string> = { ...(fields.metadata ?? {}) };
+    if (fields.wants !== undefined) metadata.wants = fields.wants;
+    if (Object.keys(metadata).length > 0) patch.metadata = metadata;
+    if (patch.content === undefined && patch.metadata === undefined) {
+      throw new AgentDefWriteError(`nothing to edit (provide systemPrompt, wants, or metadata)`, 400);
+    }
+    await client.patchNote(noteId, patch);
+    await this.reload(found.vault, noteId, "updated");
+    const detail = this.liveDef(found.vault, noteId);
+    if (!detail) {
+      throw new AgentDefWriteError(
+        `def note ${noteId} edited but failed to re-instantiate (check the note's status field)`,
+        502,
+      );
+    }
+    return detail;
+  }
+
+  /**
+   * Delete a live def note, then deregister the agent immediately. The note MUST be a
+   * currently-live def we instantiated. Returns the (vault, name) of what was removed.
+   * Throws {@link AgentDefWriteError} on a miss or a delete failure (the deregister
+   * still runs even if it's already gone).
+   */
+  async deleteDef(noteId: string): Promise<{ vault: string; name: string }> {
+    const found = this.findLiveByNote(noteId);
+    if (!found) {
+      throw new AgentDefWriteError(`note ${noteId} is not a live agent definition`, 404);
+    }
+    const client = this.clients.get(found.vault);
+    if (!client) {
+      throw new AgentDefWriteError(`unknown def-vault "${found.vault}"`, 400);
+    }
+    await client.deleteNote(noteId);
+    // Tear the agent down + prune grants — the confirmed-removal path (a delete IS a
+    // confirmed removal); reload with "deleted" skips the (now-404) GET.
+    await this.reload(found.vault, noteId, "deleted");
+    return { vault: found.vault, name: found.detail.name };
+  }
+
+  /**
+   * Build the metadata for a created/edited def note from the API inputs. `name` +
+   * `backend` are the load-bearing config; `wants` is the comma-separated connection
+   * list (omitted when empty); any extra `metadata` the caller passes is merged FIRST
+   * so the explicit name/backend/wants win (the route can't override the validated
+   * name/backend via the metadata bag). NEVER carries a token/secret — secrets stay
+   * local (the parse path never reads creds off a note).
+   */
+  private buildDefMetadata(args: {
+    name: string;
+    backend: AgentBackendKind;
+    wants?: string;
+    metadata?: Record<string, string>;
+  }): Record<string, string> {
+    const metadata: Record<string, string> = { ...(args.metadata ?? {}) };
+    metadata.name = args.name;
+    metadata.backend = args.backend;
+    if (args.wants !== undefined && args.wants.trim().length > 0) {
+      metadata.wants = args.wants;
+    }
+    return metadata;
+  }
+
   /**
    * A CONFIRMED removed def (a `deleted` trigger, or a re-read 404): tear the agent
    * down AND prune ALL its grants (#96 grant-GC) so a deleted `#agent/definition` note
@@ -824,7 +1237,21 @@ export class AgentDefRegistry {
     // declared, enabled if nothing is). Either way the agent ALREADY ran its own-vault
     // setup above — an unapproved connection is absent at spawn, never a failure here.
     const { status, pending } = await this.resolveStatusWithGrants(def);
-    this.live.set(this.keyOf(vault, note.id), { vault, noteId: note.id, name: def.name, status });
+    const fullPrompt = def.spec.systemPrompt ?? "";
+    const systemPromptPreview =
+      fullPrompt.length > SYSTEM_PROMPT_PREVIEW_LEN
+        ? fullPrompt.slice(0, SYSTEM_PROMPT_PREVIEW_LEN)
+        : fullPrompt;
+    this.live.set(this.keyOf(vault, note.id), {
+      vault,
+      noteId: note.id,
+      name: def.name,
+      status,
+      backend: def.spec.backend ?? "programmatic",
+      systemPromptPreview,
+      pending: pending ?? [],
+      wants: def.wants.map((c) => connectionKey(c)),
+    });
     // Track this note in the per-vault seen set (a confident, freshly-parsed read) so the
     // removed-def diff (loadAll) and the reload-delete path both address it by name. This
     // covers the reload single-note path where loadAll's rebuild didn't run.

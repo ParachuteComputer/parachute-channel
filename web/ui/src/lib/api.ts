@@ -255,5 +255,9 @@ export function createAgentDef(body: CreateAgentDefBody): Promise<CreateAgentDef
  */
 export function connectSessionCommand(name: string, origin: string): string {
   const mount = apiBase().replace(/\/api$/, "");
-  return `claude mcp add --transport http --scope user ${name} ${origin}${mount}/mcp/${name}`;
+  // Server-name is `agent-<name>` to match the chat UI's connect snippet
+  // (src/daemon.ts ~1194: `var name = "agent-" + ch`), so an operator who connects
+  // the same channel from either surface registers ONE consistently-named MCP server.
+  // The URL path is the bare channel name (`/mcp/<name>`).
+  return `claude mcp add --transport http --scope user agent-${name} ${origin}${mount}/mcp/${name}`;
 }

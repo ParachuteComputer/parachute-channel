@@ -175,7 +175,7 @@ describe("CreateAgent form", () => {
 
     const connect = await screen.findByTestId("connect-session");
     const command = within(connect).getByTestId("connect-command").textContent ?? "";
-    expect(command).toMatch(/^claude mcp add --transport http --scope user eng /);
+    expect(command).toMatch(/^claude mcp add --transport http --scope user agent-eng /);
     expect(command).toContain("/mcp/eng");
     // The body was sent with backend:channel.
     expect(createAgentDef.mock.calls[0]![0].backend).toBe("channel");

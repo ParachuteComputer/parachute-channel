@@ -231,7 +231,7 @@ describe("connectSessionCommand", () => {
   it("builds the `claude mcp add` one-liner mirroring the daemon snippet", () => {
     // In vitest apiBase() is "/agent/api" → MOUNT "/agent". Origin from the arg.
     expect(connectSessionCommand("eng", "https://my.parachute.computer")).toBe(
-      "claude mcp add --transport http --scope user eng https://my.parachute.computer/agent/mcp/eng",
+      "claude mcp add --transport http --scope user agent-eng https://my.parachute.computer/agent/mcp/eng",
     );
   });
 });

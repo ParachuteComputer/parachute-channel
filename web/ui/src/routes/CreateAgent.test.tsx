@@ -37,6 +37,7 @@ function defResponse(over: Partial<api.AgentDefRow> = {}): api.CreateAgentDefRes
       noteId: "note-1",
       name: "my-agent",
       backend: "programmatic",
+      mode: "single-threaded",
       vault: "default",
       status: "enabled",
       pending: [],

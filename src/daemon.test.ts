@@ -176,36 +176,61 @@ describe("UI-facing + discovery endpoints stay open (no token, 200)", () => {
     expect(res.status).toBe(200);
   });
 
-  test("GET /ui → 200 (html)", async () => {
-    const res = await fetch(`${base}/ui`);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4c — the server-rendered HTML pages retired into the v2 SPA. Each page
+// route now 302s to the SPA (relative Location so it resolves daemon-direct AND
+// hub-proxied). The CRITICAL footgun: retiring the `/ui` PAGE must NOT touch the
+// `/ui/events` message SSE the SPA Chat depends on — that's an EXACT `=== "/ui"`
+// match, with `/ui/events` still owned by the http-ui transport. /terminal is
+// demoted (off the SPA nav) but stays a live 200.
+// ---------------------------------------------------------------------------
+describe("Phase 4c — retired pages redirect to the SPA; the data plane survives", () => {
+  for (const { path, location } of [
+    { path: "/agents", location: "app/" },
+    { path: "/jobs", location: "app/" },
+    { path: "/home", location: "app/" },
+    { path: "/admin", location: "app/" },
+    { path: "/", location: "app/" },
+    // /ui → the SPA Chat route (basename-relative `/chat`).
+    { path: "/ui", location: "app/chat" },
+  ]) {
+    test(`GET ${path} → 302 to ${location}`, async () => {
+      const res = await fetch(`${base}${path}`, { redirect: "manual" });
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe(location);
+    });
+  }
+
+  test("FOOTGUN GUARD — GET /ui/events STILL routes to the SSE handler (NOT redirected)", async () => {
+    // The /ui page retired, but /ui/events is the message SSE the SPA Chat
+    // subscribes to (owned by the http-ui transport's ingestHttp). It must NOT
+    // be swallowed by the `/ui` redirect. With no ?token= it 401s at the SSE
+    // gate — proving it reached the handler, not the 302 page route.
+    const res = await fetch(`${base}/ui/events?channel=ui1`, { redirect: "manual" });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(((await res.json()) as { error: string }).error).toBe("unauthorized");
+  });
+
+  test("GET /terminal STILL serves the page (demoted, off the SPA nav, but live)", async () => {
+    const res = await fetch(`${base}/terminal`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
   });
 
-  test("GET /ui reveals the Terminal nav if an interactive agent exists (no stranding)", async () => {
-    // Phase-1 terminal-nav cleanup hides the standalone Terminal entry by default;
-    // the chat page doesn't list agents, so it must call the shared reveal helper or
-    // it would strand an operator with a live interactive session.
-    const body = await (await fetch(`${base}/ui`)).text();
-    expect(body).toContain("revealTerminalNavIfInteractive()");
+  test("a representative /api/* route STILL works (gated, not redirected)", async () => {
+    // /api/reply with no Authorization → 401 (the data plane is intact; the
+    // route still reaches requireScope rather than a page redirect).
+    const res = await fetch(`${base}/api/reply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ channel: "ui1", text: "hi" }),
+      redirect: "manual",
+    });
+    expect(res.status).toBe(401);
   });
-
-  test("GET /home → 200 (html) — the overview landing (uiUrl points here)", async () => {
-    const res = await fetch(`${base}/home`);
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("text/html");
-    const body = await res.text();
-    expect(body).toContain("app-nav");
-  });
-
-  test("GET /admin → 200 (html) — the page loads open; its API calls are gated", async () => {
-    const res = await fetch(`${base}/admin`);
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("text/html");
-    const body = await res.text();
-    expect(body).toContain("Manage channels");
-  });
-
 });
 
 // ---------------------------------------------------------------------------

@@ -310,7 +310,7 @@ describe("GET /api/agent-defs", () => {
       id: "Agents/uni-dev",
       content: "a".repeat(500), // long prompt → preview truncates to 200.
       tags: ["#agent/definition"],
-      metadata: { name: "uni-dev", backend: "channel" },
+      metadata: { name: "uni-dev", backend: "channel", mode: "multi-threaded" },
     });
     const { reg } = registryWithFakeVault({ fake });
     await reg.loadAll(); // instantiate the seeded def.
@@ -323,6 +323,7 @@ describe("GET /api/agent-defs", () => {
     expect(d.noteId).toBe("Agents/uni-dev");
     expect(d.name).toBe("uni-dev");
     expect(d.backend).toBe("channel");
+    expect(d.mode).toBe("multi-threaded"); // the list carries the mode (edit form pre-fill).
     expect(d.vault).toBe("default");
     expect(d.status).toBe("enabled");
     expect(d.channel).toBe("uni-dev");
@@ -337,6 +338,71 @@ describe("GET /api/agent-defs", () => {
     const res = await fetch(`${base}/api/agent-defs`, { headers: readAuth });
     expect(res.status).toBe(200);
     expect((await res.json()) as { defs: unknown[] }).toEqual({ defs: [] });
+    srv.stop();
+  });
+});
+
+// ===========================================================================
+// GET /api/agent-defs/:noteId — one def, FULL (the edit-form pre-fill)
+// ===========================================================================
+describe("GET /api/agent-defs/:noteId (full def)", () => {
+  async function liveDefServer() {
+    const fake = new FakeDefVault();
+    fake.seed({
+      id: "Agents/uni-dev",
+      content: "F".repeat(500), // long body → list preview truncates; full returns all.
+      tags: ["#agent/definition"],
+      metadata: { name: "uni-dev", backend: "channel", mode: "multi-threaded", wants: "vault:research:read" },
+    });
+    const { reg } = registryWithFakeVault({ fake });
+    await reg.loadAll();
+    const { srv, base } = serverWith(emptyChannels(), { agentDefs: reg });
+    return { srv, base, fake };
+  }
+
+  test("no Authorization → 401", async () => {
+    const { srv, base } = await liveDefServer();
+    const res = await fetch(`${base}/api/agent-defs/${encodeURIComponent("Agents/uni-dev")}`);
+    expect(res.status).toBe(401);
+    srv.stop();
+  });
+
+  test("read scope is enough (mirrors GET /api/agent-defs)", async () => {
+    const { srv, base } = await liveDefServer();
+    const res = await fetch(`${base}/api/agent-defs/${encodeURIComponent("Agents/uni-dev")}`, {
+      headers: readAuth,
+    });
+    expect(res.status).toBe(200);
+    srv.stop();
+  });
+
+  test("returns the FULL system prompt (not the truncated preview) + mode/backend/wants", async () => {
+    const { srv, base } = await liveDefServer();
+    const res = await fetch(`${base}/api/agent-defs/${encodeURIComponent("Agents/uni-dev")}`, {
+      headers: readAuth,
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { def: Record<string, unknown> };
+    const d = body.def;
+    expect(d.noteId).toBe("Agents/uni-dev");
+    expect(d.name).toBe("uni-dev");
+    expect(d.backend).toBe("channel");
+    expect(d.mode).toBe("multi-threaded");
+    expect(d.vault).toBe("default");
+    expect(d.wants).toEqual(["vault:research:read"]);
+    // The FULL body — 500 chars, NOT the 200-char preview.
+    expect((d.systemPrompt as string).length).toBe(500);
+    // No token/secret leaked.
+    expect(JSON.stringify(body)).not.toContain("vtok");
+    srv.stop();
+  });
+
+  test("unknown note id → 404", async () => {
+    const { srv, base } = await liveDefServer();
+    const res = await fetch(`${base}/api/agent-defs/${encodeURIComponent("Agents/ghost")}`, {
+      headers: readAuth,
+    });
+    expect(res.status).toBe(404);
     srv.stop();
   });
 });

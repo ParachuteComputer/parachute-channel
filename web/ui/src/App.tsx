@@ -18,12 +18,14 @@
  */
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import { Agents } from "./routes/Agents.tsx";
+import { Chat } from "./routes/Chat.tsx";
 import { CreateAgentRoute } from "./routes/CreateAgent.tsx";
 
 const WORDMARK = "Parachute Agent";
 
 function subtitleFor(pathname: string): string {
   if (pathname === "/create" || pathname.startsWith("/create/")) return "new agent";
+  if (pathname === "/chat" || pathname.startsWith("/chat/")) return "chat";
   return "agents";
 }
 
@@ -40,6 +42,7 @@ export function App() {
         </Link>
         <NavSection to="/" label="Agents" exact />
         <NavSection to="/create" label="New agent" />
+        <NavSection to="/chat" label="Chat" />
         {/* Boundary: everything past here is the older daemon-rendered HTML,
             kept mounted during the migration so the operator can compare. */}
         <span className="nav-divider" aria-hidden="true" />
@@ -54,6 +57,9 @@ export function App() {
         <Route path="/agents" element={<Agents />} />
         {/* Phase 3 — the unified create-agent flow. */}
         <Route path="/create" element={<CreateAgentRoute />} />
+        {/* Phase 4d — the per-channel chat (deep-linkable to a channel). */}
+        <Route path="/chat" element={<Chat />} />
+        <Route path="/chat/:channel" element={<Chat />} />
         <Route
           path="*"
           element={

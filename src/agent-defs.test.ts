@@ -686,6 +686,61 @@ describe("AgentDefRegistry — lifecycle", () => {
     await expect(reg.deleteDef("Agents/shared")).rejects.toMatchObject({ status: 409 });
   });
 
+  test("listDetailed carries the def mode (default single-threaded; multi-threaded when declared)", async () => {
+    const { deps } = recorderDeps();
+    const fetchFn = vaultFetch({
+      defs: [
+        { id: "Agents/uni-dev", content: "role", metadata: { name: "uni-dev" } }, // no mode → default
+        { id: "Agents/digest", content: "role", metadata: { name: "digest", mode: "multi-threaded" } },
+      ],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+    await reg.loadAll();
+    const byName = new Map(reg.listDetailed().map((d) => [d.name, d]));
+    expect(byName.get("uni-dev")!.mode).toBe("single-threaded");
+    expect(byName.get("digest")!.mode).toBe("multi-threaded");
+  });
+
+  test("getFullDef returns the FULL system prompt + mode/backend/wants (not the preview)", async () => {
+    const { deps } = recorderDeps();
+    const longPrompt = "P".repeat(500); // longer than the 200-char preview cap.
+    const fetchFn = vaultFetch({
+      defs: [
+        {
+          id: "Agents/uni-dev",
+          content: longPrompt,
+          metadata: { name: "uni-dev", backend: "channel", mode: "multi-threaded", wants: "vault:research:read" },
+        },
+      ],
+      byId: {
+        "Agents/uni-dev": {
+          id: "Agents/uni-dev",
+          content: longPrompt,
+          metadata: { name: "uni-dev", backend: "channel", mode: "multi-threaded", wants: "vault:research:read" },
+        },
+      },
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+    await reg.loadAll();
+    const full = await reg.getFullDef("Agents/uni-dev");
+    expect(full).not.toBeNull();
+    expect(full!.noteId).toBe("Agents/uni-dev");
+    expect(full!.name).toBe("uni-dev");
+    expect(full!.backend).toBe("channel");
+    expect(full!.mode).toBe("multi-threaded");
+    expect(full!.vault).toBe("default");
+    expect(full!.wants).toEqual(["vault:research:read"]);
+    // The FULL body, NOT the truncated preview.
+    expect(full!.systemPrompt).toBe(longPrompt);
+    expect(full!.systemPrompt.length).toBe(500);
+  });
+
+  test("getFullDef returns null for a note that isn't a live def", async () => {
+    const { deps } = recorderDeps();
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn: vaultFetch({}) });
+    expect(await reg.getFullDef("Agents/ghost")).toBeNull();
+  });
+
   test("soleVaultName resolves the single binding (the reload-webhook default)", () => {
     const { deps } = recorderDeps();
     const reg = new AgentDefRegistry(deps, { bindings: [binding] });

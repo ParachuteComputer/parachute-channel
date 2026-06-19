@@ -559,3 +559,255 @@ tr.agent-row.selected {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ---- Write actions (Phase 4a): edit / delete a def, add / remove a def-vault ---- */
+.detail-actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-light);
+}
+
+/* A destructive (delete / remove) button — error-toned outline. */
+button.button-danger {
+  background: white;
+  color: var(--error);
+  border: 1px solid var(--error);
+}
+button.button-danger:hover {
+  background: var(--error-soft);
+}
+button.button-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* The type-to-confirm delete box (inside the detail panel). */
+.confirm-box {
+  margin-top: 1.25rem;
+  padding: 1rem;
+  border: 1px solid var(--error);
+  border-radius: 8px;
+  background: var(--error-soft);
+}
+.confirm-prompt {
+  margin: 0 0 0.75rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+}
+
+/* The inline def-vault remove confirm (in the table row). */
+.confirm-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* An inline add form (the def-vault add panel). */
+.inline-form {
+  margin: 0.75rem 0 1rem;
+}
+
+/* ---- Schedules (Phase 4b): the per-agent schedule section in the detail panel ---- */
+.schedules {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-light);
+}
+.schedules .section-head h3 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+/* The cron quick-fill preset buttons under the cron input. */
+.schedule-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.45rem;
+}
+.schedule-presets button {
+  font-size: 0.78rem;
+  padding: 0.2rem 0.55rem;
+}
+/* The run-now / delete buttons in a schedule row. */
+.schedule-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.schedule-status {
+  font-size: 0.82rem;
+  color: var(--fg-muted);
+  margin: 0.5rem 0 0;
+}
+
+/* ---- Chat (Phase 4d): the per-channel chat view ported from the daemon /ui HTML.
+   The transcript is a scrollable column of bubbles; the composer pins to the
+   bottom. Bubbles + the "watch it work" live turn reuse the THEME_CSS idioms of
+   the server-rendered chat (src/daemon.ts) so the two surfaces read the same. */
+.chat-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  margin-bottom: 1rem;
+}
+.chat-head h1 {
+  margin: 0;
+}
+.chat-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.chat-picker-label {
+  font-size: 0.82rem;
+  color: var(--fg-muted);
+}
+.chat-picker select {
+  font: inherit;
+  font-size: 0.88rem;
+  color: var(--fg);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+}
+.chat-status {
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+  margin-left: auto;
+}
+.chat-status.status-live {
+  color: var(--success);
+}
+.chat-status.status-err {
+  color: var(--error);
+}
+
+/* The scrollable transcript. A fixed-ish height so the composer stays visible;
+   newest line auto-scrolls into view (the component sets scrollTop). */
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  height: 60vh;
+  min-height: 18rem;
+  overflow-y: auto;
+  padding: 1rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px 12px 0 0;
+}
+
+/* Bubbles: "you" (operator/inbound, accent, right) / "them" (session/outbound,
+   soft surface, left) / "sys" (centered muted system line). Mirrors the daemon
+   chat's .msg styling. */
+.transcript .msg {
+  max-width: 78%;
+  padding: 0.5rem 0.75rem;
+  border-radius: 12px;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+.transcript .msg.you {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+.transcript .msg.them {
+  align-self: flex-start;
+  background: var(--bg-soft);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+.transcript .msg.sys {
+  align-self: center;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 0.8rem;
+  font-style: italic;
+  max-width: 90%;
+  text-align: center;
+}
+
+/* The live "watch it work" bubble: dashed pulsing border while running, solid
+   error-toned once a turn fails. */
+.transcript .msg.live {
+  border-style: dashed;
+  animation: chatLivePulse 1.4s ease-in-out infinite;
+}
+@keyframes chatLivePulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+.transcript .msg.live.errored {
+  border-color: var(--error);
+  color: var(--error);
+  animation: none;
+}
+.transcript .live-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.4rem;
+}
+.transcript .tool-chip {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.05rem 0.45rem;
+  border-radius: 10px;
+  background: var(--card-bg);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+}
+.transcript .live-working {
+  margin-top: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+/* The composer pinned under the transcript — input + send button in a row. */
+.composer {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.75rem 1rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-top: 0;
+  border-radius: 0 0 12px 12px;
+  margin-bottom: 1.5rem;
+}
+.composer .chat-input {
+  flex: 1;
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--fg);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.55rem 0.7rem;
+  resize: none;
+  max-height: 7.5rem;
+}
+.composer .chat-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.composer button {
+  flex: 0 0 auto;
+  align-self: flex-end;
+}

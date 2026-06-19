@@ -175,12 +175,16 @@ export class VaultJobStore {
    * runner routes each by its own `channel`).
    */
   async listAll(): Promise<Job[]> {
-    // Dedup the vault transports we query: many channels can share one vault.
-    const seen = new Set<VaultTransport>();
+    // Dedup the vaults we query by vault IDENTITY (origin + name), NOT transport
+    // instance: many channels each construct their OWN VaultTransport pointing at the
+    // SAME vault, so instance-identity dedup misses and the same job notes come back
+    // once per channel sharing that vault. Key on `vaultKey()`. (Caught live
+    // 2026-06-18: one job listed 3x with three channels on the default vault.)
+    const seen = new Set<string>();
     const transports: VaultTransport[] = [];
     for (const ch of this.channels.values()) {
-      if (ch.transport instanceof VaultTransport && !seen.has(ch.transport)) {
-        seen.add(ch.transport);
+      if (ch.transport instanceof VaultTransport && !seen.has(ch.transport.vaultKey())) {
+        seen.add(ch.transport.vaultKey());
         transports.push(ch.transport);
       }
     }

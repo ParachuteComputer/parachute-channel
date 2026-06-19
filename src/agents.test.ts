@@ -605,98 +605,17 @@ function buildServer(agentOps?: Partial<AgentOps>) {
   return { srv, base: `http://127.0.0.1:${srv.port}` };
 }
 
-describe("GET /agents — the unified create-agent page (loads open)", () => {
-  test("returns the HTML page with no token", async () => {
+describe("GET /agents — retired into the SPA (Phase 4c)", () => {
+  // The server-rendered create-agent page retired; the v2 SPA Agents view + its
+  // unified create flow replace it. The route now 302s to the SPA app root
+  // (relative Location so it resolves daemon-direct AND hub-proxied), preserving
+  // operator bookmarks. The `/api/agents` data plane below is untouched.
+  test("302 redirects to the SPA app root", async () => {
     const { srv, base } = buildServer();
     try {
-      const res = await fetch(`${base}/agents`);
-      expect(res.status).toBe(200);
-      expect(res.headers.get("content-type")).toContain("text/html");
-      const html = await res.text();
-      expect(html).toContain("parachute-agent");
-      // Phase-1 consolidation: the page leads with the unified "Create an agent"
-      // flow (fuses create-channel + spawn-agent).
-      expect(html).toContain("Create an agent");
-      expect(html).toContain('id="create-section"');
-      expect(html).toContain('id="create-go"');
-    } finally {
-      srv.stop(true);
-    }
-  });
-
-  // The unified flow's MINIMAL default: Agent name → Vault → optional System prompt
-  // → Create. Vault is the default transport; the vault picker leads the form.
-  test("minimal default flow: name + vault + optional system prompt", async () => {
-    const { srv, base } = buildServer();
-    try {
-      const html = await (await fetch(`${base}/agents`)).text();
-      expect(html).toContain('id="agent-name"');
-      expect(html).toContain('id="agent-vault"');
-      expect(html).toContain('id="agent-system-prompt"');
-      expect(html).toContain("System prompt");
-      // The Append(default)/Replace mode control lives under Advanced.
-      expect(html).toContain('<option value="append" selected>Append (default)</option>');
-      expect(html).toContain('<option value="replace">Replace</option>');
-      expect(html).toContain("Append keeps Claude Code's capable base");
-    } finally {
-      srv.stop(true);
-    }
-  });
-
-  // Backend gating (design 2026-06-16 + Aaron's gating decision): programmatic is
-  // the DEFAULT; the interactive backend is gated under the Advanced disclosure but
-  // stays fully selectable.
-  test("backend defaults to programmatic; interactive lives under Advanced", async () => {
-    const { srv, base } = buildServer();
-    try {
-      const html = await (await fetch(`${base}/agents`)).text();
-      // The programmatic <option> carries `selected` (the default); interactive does not.
-      expect(html).toMatch(/<option value="programmatic" selected>/);
-      expect(html).not.toMatch(/<option value="interactive" selected>/);
-      expect(html).toContain('<option value="interactive">');
-      // The Advanced disclosure carries the backend selector + the dynamic cases.
-      expect(html).toContain('id="advanced"');
-      expect(html).toContain('id="agent-backend"');
-      expect(html).toContain("less stable");
-    } finally {
-      srv.stop(true);
-    }
-  });
-
-  // The Advanced disclosure reveals the dynamic cases: an EXISTING channel, the
-  // telegram/http-ui transports, extra channels, isolation, mounts.
-  test("Advanced reveals existing-channel + transport + isolation", async () => {
-    const { srv, base } = buildServer();
-    try {
-      const html = await (await fetch(`${base}/agents`)).text();
-      expect(html).toContain('id="use-existing"');
-      expect(html).toContain('id="existing-channel"');
-      expect(html).toContain('id="agent-transport"');
-      // Vault is the default-selected transport for a NEW channel.
-      expect(html).toContain('<option value="vault" selected>');
-      expect(html).toContain('value="telegram"');
-      expect(html).toContain('value="http-ui"');
-      expect(html).toContain('id="fs-mode"');
-      expect(html).toContain('id="net-mode"');
-    } finally {
-      srv.stop(true);
-    }
-  });
-
-  // CLIENT-SIDE ORCHESTRATION: the create flow reuses the shared provisioning
-  // client (ChannelProvision) — the hub-mediated vault flow + daemon telegram/
-  // http-ui flow — then POSTs /api/agents. No server-side vault-token minting.
-  test("uses the shared ChannelProvision client (no new /api/agents fields)", async () => {
-    const { srv, base } = buildServer();
-    try {
-      const html = await (await fetch(`${base}/agents`)).text();
-      // The shared provisioning namespace is present + used by the create flow.
-      expect(html).toContain("window.ChannelProvision");
-      expect(html).toContain("Provision.provisionVaultChannel");
-      expect(html).toContain("Provision.provisionDaemonChannel");
-      expect(html).toContain("Provision.channelExists");
-      // The agent spawn still POSTs /api/agents (same body shape).
-      expect(html).toContain('apiJson("/api/agents", { method: "POST"');
+      const res = await fetch(`${base}/agents`, { redirect: "manual" });
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("app/");
     } finally {
       srv.stop(true);
     }

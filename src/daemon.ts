@@ -70,7 +70,6 @@ import { GrantsClient } from "./grants.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
 import { Runner, realTickDriver } from "./runner.ts";
 import { nextRunAfter } from "./cron.ts";
-import { JOBS_UI_HTML } from "./jobs-ui.ts";
 import {
   setDefaultClaudeCredential,
   setChannelClaudeCredential,
@@ -99,8 +98,6 @@ import {
 } from "./terminal.ts";
 import { TERMINAL_UI_HTML } from "./terminal-ui.ts";
 import { serveTerminalAsset } from "./terminal-assets.ts";
-import { AGENTS_UI_HTML } from "./agents-ui.ts";
-import { HOME_UI_HTML } from "./home-ui.ts";
 import { isSpaPath, serveSpa, spaDistDir } from "./spa-serve.ts";
 import {
   createRealAgentOps,
@@ -147,8 +144,6 @@ import {
   setOnSessionConnect,
   assertMcpSdkStreamContract,
 } from "./mcp-http.ts";
-import { renderAdminPage } from "./admin-ui.ts";
-import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
 
 // Re-export the shared auth surface so existing importers of the daemon module
 // keep working; the canonical home is now `auth.ts` (shared with http-ui.ts).
@@ -1014,642 +1009,6 @@ export async function reregisterProgrammaticAgents(
 }
 
 // ---------------------------------------------------------------------------
-// Built-in chat UI
-// ---------------------------------------------------------------------------
-
-/**
- * The built-in chat page — a single self-contained HTML document (no framework,
- * no build step). On load it fetches /.parachute/config, lists the http-ui
- * channels as a picker, opens an EventSource on /ui/events?channel=<sel>, and
- * POSTs sends to /api/channels/<sel>/send. This is the surface for verifying
- * messaging works end to end with no Telegram and no vault.
- */
-export const CHAT_UI_HTML = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>parachute-agent · chat</title>
-<style>
-${THEME_CSS}
-  /* ---- Chat page layout + transcript (page-specific, after the shared kit) -- */
-  html, body { height: 100%; }
-  body { display: flex; flex-direction: column; height: 100vh; }
-  .app-header { flex: 0 0 auto; }
-  #transcript {
-    flex: 1; overflow-y: auto; padding: 16px;
-    display: flex; flex-direction: column; gap: 8px;
-  }
-  /* Light-theme message bubbles. "you" = accent; "them" = soft surface; "sys" =
-     muted/italic system line; "perm" = a warn style for permission prompts. */
-  /* Bodies render Markdown (renderMarkdown -> innerHTML): newlines become <br>
-     and code blocks become <pre>, so the bubble itself wraps normally rather than
-     preserving raw whitespace (which would double the line breaks). */
-  .msg { max-width: 78%; padding: 8px 12px; border-radius: 12px; white-space: normal; word-wrap: break-word; overflow-wrap: anywhere; }
-  .msg.you { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
-  .msg.them { align-self: flex-start; background: var(--bg-soft); color: var(--fg); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
-  .msg.sys { align-self: center; background: transparent; color: var(--fg-muted); font-size: 0.8rem; font-style: italic; max-width: 90%; }
-  .msg.perm { align-self: flex-start; background: var(--warn-soft); border: 1px solid var(--warn); border-left: 3px solid var(--warn); color: var(--warn); max-width: 90%; }
-  /* Markdown bits inside a bubble: inline code + fenced blocks, links, emphasis. */
-  .msg code { font-family: var(--font-mono); font-size: 0.85em; background: rgba(0,0,0,0.06); padding: 0.05rem 0.3rem; border-radius: 4px; }
-  .msg.you code { background: rgba(255,255,255,0.22); }
-  .msg pre { margin: 6px 0; padding: 8px 10px; background: rgba(0,0,0,0.06); border-radius: 8px; overflow-x: auto; }
-  .msg pre code { background: transparent; padding: 0; font-size: 0.82em; }
-  .msg.you pre { background: rgba(255,255,255,0.18); }
-  .msg a { text-decoration: underline; }
-  .msg.you a { color: #fff; }
-  .files { margin-top: 4px; font-size: 0.8rem; opacity: .85; }
-  .files .file-name { font-family: var(--font-mono); }
-  /* Live turn view ("watch it work"): an in-progress "them" bubble that streams the
-     agent's interim text + shows which tools it's using, finalized when the durable
-     reply note arrives. A subtle pulsing border marks it as still-working. */
-  .msg.live { border-style: dashed; animation: livePulse 1.4s ease-in-out infinite; }
-  @keyframes livePulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
-  .msg .live-text { white-space: normal; }
-  .msg .live-tools { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
-  .msg .tool-chip {
-    font-family: var(--font-mono); font-size: 0.72rem; padding: 1px 7px; border-radius: 10px;
-    background: var(--bg-soft); color: var(--fg-muted); border: 1px solid var(--border);
-  }
-  .msg .live-working { margin-top: 6px; font-size: 0.75rem; color: var(--fg-muted); font-style: italic; }
-  .msg.live.errored { border-color: var(--warn); color: var(--warn); animation: none; }
-  /* Permission bubble: Approve/Deny row + the follow-up note. */
-  .perm-actions { display: flex; gap: 8px; margin-top: 8px; }
-  .perm-note { margin-top: 8px; font-size: 0.78rem; color: var(--fg-muted); font-style: italic; }
-  form {
-    display: flex; gap: 8px; padding: 12px 16px;
-    border-top: 1px solid var(--border); background: var(--card);
-  }
-  #input {
-    flex: 1; resize: none;
-    border-radius: 8px; padding: 10px 12px; max-height: 120px;
-  }
-  #send { flex: 0 0 auto; }
-  details.setup { border-bottom: 1px solid var(--border); background: var(--card); }
-  details.setup > summary {
-    cursor: pointer; padding: 8px 16px; color: var(--accent-hover); font-size: 0.85rem; user-select: none;
-  }
-  details.setup .body { padding: 4px 16px 14px; font-size: 0.85rem; color: var(--fg-muted); }
-  details.setup .body p { margin: 8px 0 4px; }
-  details.setup pre {
-    margin: 4px 0; padding: 10px 12px; background: var(--bg-soft); border: 1px solid var(--border);
-    border-radius: 8px; overflow-x: auto; color: var(--fg); font-size: 0.8rem; line-height: 1.45;
-  }
-  details.setup code { font-family: var(--font-mono); color: var(--fg); }
-  details.setup .copy {
-    float: right; padding: 1px 8px; font-size: 0.7rem; font-weight: 500; background: var(--bg-soft);
-    color: var(--fg-muted); border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
-  }
-</style>
-</head>
-<body>
-  ${appShell({
-    active: "chat",
-    tag: "chat",
-    controls: '<select id="channel" class="btn-sm" title="channel" style="width:auto;"></select>',
-  })}
-  <details class="setup">
-    <summary>Connect a Claude Code session ▾</summary>
-    <div class="body">
-      <p>Two steps — add the channel by URL (like the vault), then open a session on it:</p>
-      <p><b>1.</b> Add it (once — prompts for OAuth the first time):</p>
-      <pre><button class="copy" data-copy="snippet-add">copy</button><code id="snippet-add"></code></pre>
-      <p><b>2.</b> Open a session on it (run in any directory):</p>
-      <pre><button class="copy" data-copy="snippet-launch">copy</button><code id="snippet-launch"></code></pre>
-      <p id="setup-note"></p>
-    </div>
-  </details>
-  <div id="transcript"></div>
-  <form id="composer">
-    <textarea id="input" rows="1" placeholder="Type a message… (Enter to send, Shift+Enter for newline)" autocomplete="off"></textarea>
-    <button id="send" type="submit" class="btn btn-primary" disabled>Send</button>
-  </form>
-<script>
-${SHELL_JS}
-(function () {
-  var transcript = document.getElementById("transcript");
-  var sel = document.getElementById("channel");
-  var input = document.getElementById("input");
-  var sendBtn = document.getElementById("send");
-  var form = document.getElementById("composer");
-  var es = null;
-  // Vault-backed chat state: the selected channel's transport kind, the poll
-  // timer, and the set of note ids already rendered (dedup the poll + reconcile
-  // optimistic echoes). MOUNT, escapeHtml, fetchToken (caches on window.__token),
-  // authedFetch come from SHELL_JS. Wire the shared nav for the chat view.
-  var channelTransports = {}; // name -> transport kind ("vault" | "http-ui" | ...)
-  var pollTimer = null;
-  var seenIds = {}; // note id -> true, for the vault poll dedup
-  var POLL_MS = 3500;
-  // Streaming turn view ("watch it work", design build item #1): a per-channel SSE
-  // (/api/channels/<ch>/turn-events) that streams a PROGRAMMATIC turn's interim
-  // assistant text + tool_use, finalized when the durable reply note arrives via the
-  // poll. turnEs is the EventSource; liveTurn holds the in-progress bubble's DOM
-  // refs while a turn runs.
-  var turnEs = null;
-  var liveTurn = null; // { el, textEl, toolsEl, toolNames:{}, statusEl } | null
-  wireShell("chat");
-  // Reveal the Terminal nav entry if a live interactive agent exists (the chat page
-  // doesn't otherwise list agents, so without this it would strand a user who wants
-  // to attach to their live session). Best-effort; default-hidden on failure.
-  revealTerminalNavIfInteractive();
-
-  function transportFor(ch) { return channelTransports[ch] || ""; }
-  function isVault(ch) { return transportFor(ch) === "vault"; }
-
-  function stopPolling() {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  }
-
-  // Tear down the live turn view (SSE + any in-progress bubble). Called on a channel
-  // switch / a reconnect so a stale stream + bubble can't leak across channels.
-  function stopTurnEvents() {
-    if (turnEs) { turnEs.close(); turnEs = null; }
-    clearLiveTurn();
-  }
-
-  // ----- Layer 2 auth -----------------------------------------------------
-  // The daemon's send + SSE endpoints require a hub-issued agent JWT
-  // (aud:agent, scopes agent:read agent:send). The shared fetchToken
-  // (SHELL_JS) mints one for the logged-in portal operator at
-  // <hub-origin>/admin/agent-token (cookie-gated, ~10min TTL) and caches it on
-  // window.__token; it REJECTS on failure. ensureToken wraps it with the chat's
-  // own notice (a "sys" transcript line) so a not-authenticated load explains
-  // itself, then resolves to null — an unguarded dev daemon may still accept the
-  // calls, so we don't hard-crash.
-  function ensureToken() {
-    return fetchToken().catch(function (err) {
-      add("sys", "Not authenticated — open this UI through the hub portal (" + err + ")");
-      return null;
-    });
-  }
-
-  function updateSetup(ch) {
-    if (!ch) return;
-    // The public origin this channel is reachable at. Served through the hub
-    // expose, location.origin IS the hub origin and the channel mounts under
-    // /agent; served directly off the daemon, it's the loopback origin with
-    // no mount prefix. MOUNT (derived from the page path) captures that prefix.
-    var name = "agent-" + ch;
-    var url = window.location.origin + MOUNT + "/mcp/" + ch;
-    document.getElementById("snippet-add").textContent =
-      "claude mcp add --transport http --scope user " + name + " " + url;
-    document.getElementById("snippet-launch").textContent =
-      "claude --dangerously-load-development-channels=server:" + name + " --dangerously-skip-permissions";
-    document.getElementById("setup-note").textContent =
-      "Step 1 prompts for OAuth the first time (like adding the vault) — no local file, any machine. " +
-      "Step 2 makes that session a live responder for this channel; the flag's name MUST match step 1. " +
-      "--scope user makes it available in any directory — drop it to scope to the current project. " +
-      "Then messages you send here inject into that idle session and its replies appear here.";
-  }
-
-  document.querySelectorAll(".copy").forEach(function (btn) {
-    btn.addEventListener("click", function (e) {
-      e.preventDefault();
-      var el = document.getElementById(btn.getAttribute("data-copy") || "");
-      if (!el) return;
-      var txt = el.textContent;
-      if (navigator.clipboard) navigator.clipboard.writeText(txt);
-      var prev = btn.textContent; btn.textContent = "copied"; setTimeout(function () { btn.textContent = prev; }, 1200);
-    });
-  });
-
-  function add(kind, text, files) {
-    var el = document.createElement("div");
-    el.className = "msg " + kind;
-    // Message bodies render through renderMarkdown (SHELL_JS) — a SMALL, XSS-safe
-    // Markdown subset (escapes first, then a bounded set of patterns). Trusted
-    // HTML out, so assign via innerHTML. Phase 4's vault-backed chat reuses it.
-    el.innerHTML = renderMarkdown(text);
-    if (files && files.length) {
-      // ATTACHMENTS: a reply's files is a string[] of file PATHS on the daemon
-      // host (the bridge documents reply files as absolute paths, e.g.
-      // /abs/path.png). There is NO endpoint that serves a reply attachment
-      // as a downloadable blob: the daemon's POST /api/download goes the OTHER
-      // way (a Telegram file_id -> a server-local path) and requires
-      // agent:write, which the chat page's token (agent:read agent:send)
-      // does not hold. So we render the names clearly rather than fabricate a
-      // download link. Making these downloadable needs new backend work (a
-      // blob-serving route scoped to agent:read) — left for a follow-up.
-      var f = document.createElement("div");
-      f.className = "files";
-      var label = document.createElement("span");
-      label.textContent = "📎 ";
-      f.appendChild(label);
-      files.forEach(function (name, i) {
-        if (i) f.appendChild(document.createTextNode(", "));
-        var n = document.createElement("span");
-        n.className = "file-name";
-        // Show the basename (paths are host-local); title carries the full path.
-        var base = String(name).split("/").pop() || String(name);
-        n.textContent = base;
-        n.title = String(name);
-        f.appendChild(n);
-      });
-      el.appendChild(f);
-    }
-    transcript.appendChild(el);
-    transcript.scrollTop = transcript.scrollHeight;
-  }
-
-  // Render one vault transcript message, deduped by note id. Direction mapping:
-  // the human/operator is INBOUND -> "you" (right bubble); the session reply is
-  // OUTBOUND -> "them" (left). This mirrors the transport's direction semantics,
-  // not the chat's local point of view. Returns true if it rendered (new id).
-  function addVaultMessage(m) {
-    if (!m || !m.id || seenIds[m.id]) return false;
-    seenIds[m.id] = true;
-    var kind = m.direction === "outbound" ? "them" : "you";
-    add(kind, m.text || "");
-    return true;
-  }
-
-  // ----- Streaming turn view ("watch it work") ----------------------------
-  // Render a PROGRAMMATIC turn's live progress in an in-progress bubble: streaming
-  // assistant text + "using <tool>" chips, finalized to the durable outbound note
-  // (rendered by the poll) when the turn completes. The live bubble is EPHEMERAL —
-  // it's removed on 'done' (the durable note shows the real reply) or shown as an
-  // error on 'error', so the view never gets stuck "working".
-
-  // Tear down any in-progress live bubble (channel switch / fresh turn / cleanup).
-  function clearLiveTurn() {
-    if (liveTurn && liveTurn.el && liveTurn.el.parentNode) {
-      liveTurn.el.parentNode.removeChild(liveTurn.el);
-    }
-    liveTurn = null;
-  }
-
-  // Start a fresh in-progress bubble for a new turn (on the turn's 'init' event).
-  function startLiveTurn() {
-    clearLiveTurn();
-    var el = document.createElement("div");
-    el.className = "msg them live";
-    var textEl = document.createElement("div");
-    textEl.className = "live-text";
-    var toolsEl = document.createElement("div");
-    toolsEl.className = "live-tools";
-    var statusEl = document.createElement("div");
-    statusEl.className = "live-working";
-    statusEl.textContent = "working…";
-    el.appendChild(textEl);
-    el.appendChild(toolsEl);
-    el.appendChild(statusEl);
-    transcript.appendChild(el);
-    transcript.scrollTop = transcript.scrollHeight;
-    liveTurn = { el: el, textEl: textEl, toolsEl: toolsEl, toolNames: {}, statusEl: statusEl, text: "" };
-  }
-
-  // Append a chunk of streamed assistant text into the live bubble (render Markdown
-  // over the accumulated text so partial formatting still reads well).
-  function appendLiveText(chunk) {
-    if (!liveTurn) startLiveTurn();
-    liveTurn.text += chunk;
-    liveTurn.textEl.innerHTML = renderMarkdown(liveTurn.text);
-    transcript.scrollTop = transcript.scrollHeight;
-  }
-
-  // Show a "using <tool>" chip (deduped — one chip per distinct tool this turn).
-  function addLiveTool(tool) {
-    if (!liveTurn) startLiveTurn();
-    if (liveTurn.toolNames[tool]) return;
-    liveTurn.toolNames[tool] = true;
-    var chip = document.createElement("span");
-    chip.className = "tool-chip";
-    chip.textContent = "⚙ " + tool;
-    liveTurn.toolsEl.appendChild(chip);
-    transcript.scrollTop = transcript.scrollHeight;
-  }
-
-  // Handle one turn event from the SSE stream.
-  function onTurnEvent(d) {
-    if (!d || !d.kind) return;
-    if (d.kind === "init") { startLiveTurn(); return; }
-    if (d.kind === "text") { appendLiveText(d.text || ""); return; }
-    if (d.kind === "tool") { addLiveTool(d.tool || "tool"); return; }
-    if (d.kind === "done") {
-      // The turn finished. Drop the live bubble; the durable outbound note carries
-      // the real reply — poll once NOW so it appears immediately (not after up to a
-      // full POLL_MS). An empty reply leaves the chat clean (no note written).
-      clearLiveTurn();
-      pollVault(currentChannel());
-      return;
-    }
-    if (d.kind === "error") {
-      // The turn failed — resolve the live view to an error state (no stuck spinner).
-      if (!liveTurn) startLiveTurn();
-      liveTurn.el.className = "msg them live errored";
-      liveTurn.statusEl.textContent = "turn failed: " + (d.error || "unknown error");
-      liveTurn = null; // leave the errored bubble in place; stop treating it as live
-      return;
-    }
-  }
-
-  // Open the turn-event SSE for a vault channel. EPHEMERAL: a transient error just
-  // lets EventSource auto-reconnect; a 401 is handled by the poll's re-auth path, so
-  // we don't duplicate the refresh dance here (the live view is best-effort progress).
-  function connectTurnEvents(ch) {
-    if (turnEs) { turnEs.close(); turnEs = null; }
-    // Live turn streaming is for programmatic agents, which are always vault-transport
-    // channels today; gate the EventSource subscription on that. (The server-side SSE
-    // is transport-agnostic, so revisit if programmatic ever runs on a non-vault channel.)
-    if (!ch || !isVault(ch)) return;
-    var url = MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/turn-events";
-    if (window.__token) url += "?token=" + encodeURIComponent(window.__token);
-    turnEs = new EventSource(url);
-    turnEs.addEventListener("turn", function (e) {
-      // Ignore events that arrive after a channel switch (stale stream still closing).
-      if (ch !== currentChannel()) return;
-      try { onTurnEvent(JSON.parse(e.data)); } catch (_) {}
-    });
-    // No onerror handling beyond the browser's auto-reconnect — progress is additive.
-  }
-
-  // Poll a vault channel's transcript: re-query, append only unseen ids. This is
-  // how a session's replies + messages from other clients (Telegram, other
-  // browsers) show up. Reconciles optimistic echoes too — an echo we already
-  // rendered locally is in seenIds (we key it on the returned note id at send
-  // time), so the round-tripped note isn't double-rendered.
-  function pollVault(ch) {
-    if (!ch || ch !== currentChannel() || !isVault(ch)) return;
-    authedFetch(MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/messages").then(function (r) {
-      if (!r.ok) {
-        if (r.status === 401) { setStatus("re-authenticating…", ""); ensureToken(); return; }
-        return r.json().catch(function(){return {};}).then(function (j) {
-          setStatus("history error: " + (j.error || r.status), "err");
-        });
-      }
-      return r.json().then(function (data) {
-        // Channel may have changed while the request was in flight.
-        if (ch !== currentChannel()) return;
-        var msgs = (data && data.messages) || [];
-        var appended = 0;
-        msgs.forEach(function (m) { if (addVaultMessage(m)) appended++; });
-        setStatus("● live · " + ch, "live");
-      });
-    }).catch(function (err) { setStatus("history error: " + err, "err"); });
-  }
-
-  // Load a vault channel: clear, fetch the transcript once (render history), then
-  // start polling. Sets the composer live. authedFetch attaches the bearer.
-  function connectVault(ch) {
-    stopPolling();
-    stopTurnEvents();
-    if (es) { es.close(); es = null; }
-    seenIds = {};
-    // Open the live turn-event stream alongside the durable poll — watch programmatic
-    // turns work in real time; the poll renders the durable record when they finish.
-    connectTurnEvents(ch);
-    setStatus("loading history…", "");
-    authedFetch(MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/messages").then(function (r) {
-      if (ch !== currentChannel()) return;
-      if (!r.ok) {
-        if (r.status === 401) {
-          return ensureToken().then(function () { if (ch === currentChannel()) connectVault(ch); });
-        }
-        return r.json().catch(function(){return {};}).then(function (j) {
-          setStatus("history error: " + (j.error || r.status), "err");
-          sendBtn.disabled = false; // a transient read failure shouldn't block sending
-          pollTimer = setInterval(function () { pollVault(ch); }, POLL_MS);
-        });
-      }
-      return r.json().then(function (data) {
-        if (ch !== currentChannel()) return;
-        var msgs = (data && data.messages) || [];
-        msgs.forEach(function (m) { addVaultMessage(m); });
-        setStatus("● live · " + ch, "live");
-        sendBtn.disabled = false;
-        pollTimer = setInterval(function () { pollVault(ch); }, POLL_MS);
-      });
-    }).catch(function (err) {
-      if (ch !== currentChannel()) return;
-      setStatus("history error: " + err, "err");
-      sendBtn.disabled = false;
-      pollTimer = setInterval(function () { pollVault(ch); }, POLL_MS);
-    });
-  }
-
-  // Render a permission prompt as an interactive bubble with Approve / Deny.
-  //
-  // SCOPE NOTE (flagged): submitting a verdict has NO daemon endpoint today, and
-  // the chat page's token is agent:read + agent:send only. The existing
-  // POST /api/permission is the OUTBOUND prompt (bridge -> channel,
-  // transport.sendPermission) gated agent:write — NOT a verdict sink; the
-  // verdict path (ctx.emitPermissionVerdict -> bridges/MCP sessions) has no HTTP
-  // route the browser can call. So the buttons are wired to a clear, honest
-  // "needs backend + agent:write" state rather than a call that would 401 or
-  // hit the wrong endpoint. When the verdict route + scope land (Phase 4), swap
-  // the handler body for the real POST. We deliberately do NOT weaken the gate.
-  function addPermission(d) {
-    var el = document.createElement("div");
-    el.className = "msg perm";
-    var head = document.createElement("div");
-    head.innerHTML = renderMarkdown("🔐 **permission:** " + (d.tool_name || "") +
-      "\\n" + (d.description || "") + "\\n" + (d.input_preview || ""));
-    el.appendChild(head);
-    var actions = document.createElement("div");
-    actions.className = "perm-actions";
-    var note = document.createElement("div");
-    note.className = "perm-note";
-    function disableWithNote(verdict) {
-      approve.disabled = true; deny.disabled = true;
-      note.textContent = "Recorded your choice (" + verdict + ") in the UI. Approving/denying " +
-        "from chat needs a verdict endpoint + a agent:write token — follow-up. " +
-        "For now respond in the session's terminal.";
-    }
-    var approve = document.createElement("button");
-    approve.type = "button";
-    approve.className = "btn btn-sm btn-primary";
-    approve.textContent = "Approve";
-    approve.addEventListener("click", function () { disableWithNote("approve"); });
-    var deny = document.createElement("button");
-    deny.type = "button";
-    deny.className = "btn btn-sm btn-danger";
-    deny.textContent = "Deny";
-    deny.addEventListener("click", function () { disableWithNote("deny"); });
-    actions.appendChild(approve);
-    actions.appendChild(deny);
-    el.appendChild(actions);
-    el.appendChild(note);
-    transcript.appendChild(el);
-    transcript.scrollTop = transcript.scrollHeight;
-  }
-
-  // setStatus(text, kind) comes from SHELL_JS — it updates the shared #status
-  // element the appShell header renders. Kinds: "live" | "err" | "" (default).
-  function currentChannel() { return sel.value; }
-
-  // Guard so an SSE error triggers at most one token-refresh+reconnect per
-  // connect cycle (the token is short-lived; a stale one 401s the stream).
-  var sseRetried = false;
-
-  function connect() {
-    if (es) { es.close(); es = null; }
-    stopPolling();
-    stopTurnEvents();
-    var ch = currentChannel();
-    if (!ch) { setStatus("no channel", ""); sendBtn.disabled = true; return; }
-    updateSetup(ch);
-    // Vault channels read/write the durable #agent/message store via the daemon
-    // (load transcript + poll); http-ui channels use the ephemeral SSE path below.
-    if (isVault(ch)) { connectVault(ch); return; }
-    setStatus("connecting…", "");
-    var url = MOUNT + "/ui/events?channel=" + encodeURIComponent(ch);
-    if (window.__token) url += "&token=" + encodeURIComponent(window.__token);
-    es = new EventSource(url);
-    es.onopen = function () { sseRetried = false; setStatus("● live · " + ch, "live"); sendBtn.disabled = false; };
-    es.addEventListener("reply", function (e) {
-      try { var d = JSON.parse(e.data); add("them", d.text || "", d.files); }
-      catch (_) { add("them", e.data); }
-    });
-    es.addEventListener("edit", function (e) {
-      try { var d = JSON.parse(e.data); add("sys", "(edited) " + (d.text || "")); } catch (_) {}
-    });
-    es.addEventListener("permission", function (e) {
-      try {
-        var d = JSON.parse(e.data);
-        addPermission(d);
-      } catch (_) {}
-    });
-    es.addEventListener("close", function () { setStatus("closed", ""); });
-    es.onerror = function () {
-      // A stale/short-lived token 401s the stream. Refresh the token once and
-      // reconnect; otherwise let EventSource auto-reconnect (transient network).
-      if (!sseRetried && window.__token) {
-        sseRetried = true;
-        setStatus("re-authenticating…", "");
-        if (es) { es.close(); es = null; }
-        ensureToken().then(function () { connect(); });
-        return;
-      }
-      setStatus("reconnecting…", "");
-    };
-  }
-
-  function postSend(ch, text) {
-    var headers = { "content-type": "application/json" };
-    if (window.__token) headers.authorization = "Bearer " + window.__token;
-    return fetch(MOUNT + "/api/channels/" + encodeURIComponent(ch) + "/send", {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify({ text: text }),
-    });
-  }
-
-  // Reconcile a vault send: the POST returns the created note id. Key it into
-  // the SAME seenIds object the send started against (captured at call time as
-  // ids, NOT the live seenIds var — a channel switch reassigns seenIds to a fresh
-  // empty object, and we must not write this id into a different channel's set) so
-  // the round-tripped note isn't rendered a second time on the next poll (the
-  // optimistic echo already shows it).
-  function reconcileVaultEcho(r, ids) {
-    return r.json().catch(function(){return {};}).then(function (j) {
-      if (j && j.id) ids[j.id] = true;
-    });
-  }
-
-  function send() {
-    var text = input.value.trim();
-    var ch = currentChannel();
-    if (!text || !ch) return;
-    var vault = isVault(ch);
-    var ids = seenIds; // bind the current channel's dedup set for reconcile
-    add("you", text); // optimistic echo (vault: operator=inbound="you"; http-ui: local)
-    input.value = "";
-    autosize();
-    postSend(ch, text).then(function (r) {
-      if (r.ok) { if (vault) return reconcileVaultEcho(r, ids); return; }
-      // The token is short-lived; on a 401 refresh it once and retry the send.
-      if (r.status === 401) {
-        return ensureToken().then(function (tok) {
-          if (!tok) { add("sys", "send failed: not authenticated"); return; }
-          return postSend(ch, text).then(function (r2) {
-            if (r2.ok) { if (vault) return reconcileVaultEcho(r2, ids); return; }
-            return r2.json().catch(function(){return {};}).then(function (j) {
-              add("sys", "send failed: " + (j.error || r2.status));
-            });
-          });
-        });
-      }
-      return r.json().catch(function(){return {};}).then(function (j) {
-        add("sys", "send failed: " + (j.error || r.status));
-      });
-    }).catch(function (err) { add("sys", "send failed: " + err); });
-  }
-
-  function autosize() {
-    input.style.height = "auto";
-    input.style.height = Math.min(input.scrollHeight, 120) + "px";
-  }
-
-  form.addEventListener("submit", function (e) { e.preventDefault(); send(); });
-  input.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
-  });
-  input.addEventListener("input", autosize);
-  sel.addEventListener("change", function () {
-    transcript.innerHTML = "";
-    var url = new URL(window.location.href);
-    url.searchParams.set("channel", sel.value);
-    history.replaceState(null, "", url);
-    connect();
-  });
-
-  // No channels at all: don't dead-end. Drop a forward CTA into the transcript
-  // pointing at Config (to add a channel) + Home, and disable the composer.
-  function showNoChannelCta() {
-    setStatus("no channels", "");
-    sendBtn.disabled = true;
-    var el = document.createElement("div");
-    el.className = "msg sys";
-    var p = document.createElement("div");
-    p.textContent = "No channels yet — add one in Config →";
-    el.appendChild(p);
-    var links = document.createElement("div");
-    links.style.marginTop = "6px";
-    var add = document.createElement("a");
-    add.href = MOUNT + "/admin";
-    add.textContent = "Add a channel →";
-    var sep = document.createTextNode("   ");
-    var home = document.createElement("a");
-    home.href = MOUNT + "/home";
-    home.textContent = "Home";
-    links.appendChild(add);
-    links.appendChild(sep);
-    links.appendChild(home);
-    el.appendChild(links);
-    transcript.appendChild(el);
-  }
-
-  function loadChannelsAndConnect() {
-    return fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
-      // Show ALL channels and pick behavior by transport — vault channels read
-      // the durable transcript + poll; http-ui channels use the ephemeral SSE.
-      var chans = (cfg.channels || []);
-      channelTransports = {};
-      chans.forEach(function (c) { channelTransports[c.name] = c.transport; });
-      if (!chans.length) { showNoChannelCta(); return; }
-      var preselect = new URL(window.location.href).searchParams.get("channel");
-      chans.forEach(function (c) {
-        var opt = document.createElement("option");
-        // Tag the kind in the label so it's obvious which channels are durable.
-        opt.value = c.name; opt.textContent = c.name + " (" + c.transport + ")";
-        if (c.name === preselect) opt.selected = true;
-        sel.appendChild(opt);
-      });
-      connect();
-    }).catch(function (err) { setStatus("config load failed: " + err, "err"); });
-  }
-
-  // Fetch a hub token first (so SSE + send go out authenticated), then list the
-  // channels and connect. A token failure still proceeds — an unguarded dev
-  // daemon may accept the calls, and the failure already surfaced a notice.
-  ensureToken().then(loadChannelsAndConnect);
-})();
-</script>
-</body>
-</html>`;
-
-// ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
@@ -1658,6 +1017,21 @@ function json(data: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+/**
+ * 302-redirect a retired server-rendered page to the v2 SPA (Phase 4c). The
+ * Location is RELATIVE so the browser resolves it against the request URL,
+ * working both daemon-direct (`/ui` → `/app/...`) and hub-proxied (`/agent/ui`
+ * → `/agent/app/...`) without the daemon needing to know its public mount
+ * (the hub strips the `/agent` prefix before the daemon ever sees the path).
+ *
+ * From a single-segment page like `/ui` or `/agents`, a relative `app/` target
+ * resolves to `/app/` (and `app/chat` → `/app/chat`); the SPA's BrowserRouter
+ * (basename `/app` or `/agent/app`) then renders the matching route.
+ */
+function redirect(location: string): Response {
+  return new Response(null, { status: 302, headers: { Location: location } });
 }
 
 // ---------------------------------------------------------------------------
@@ -2008,37 +1382,24 @@ export function createFetchHandler(
       });
     }
 
-    // Agent management page (the web spawn/list/kill surface, design §4/§5) —
-    // `/agents`. Loads OPEN (like /ui, /admin, /terminal) so it can bootstrap its
-    // hub-minted agent:admin token; the `/api/agents` + `/api/credentials/*`
-    // calls it makes are what `requireScope` gates. Served by the daemon (spans
-    // every channel via the spawn form + the running-agents list).
-    if (req.method === "GET" && url.pathname === "/agents") {
-      return new Response(AGENTS_UI_HTML, {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+    // Retired server-rendered pages (Phase 4c) — the v2 SPA now covers Home /
+    // Agents / Config (the Agents view) and Schedules (the agent detail). Each
+    // page route 302s to the SPA app root so operator bookmarks keep working.
+    // The relative `app/` Location resolves daemon-direct AND hub-proxied (see
+    // `redirect`). The SPA itself is served by `serveSpa` at `/app` below; ALL
+    // the data-plane routes (`/api/*`, `/ui/events`, …) are untouched.
+    if (
+      req.method === "GET" &&
+      (url.pathname === "/agents" || url.pathname === "/jobs" || url.pathname === "/home")
+    ) {
+      return redirect("app/");
     }
 
-    // Schedules / runner page — `/jobs` (design 2026-06-17). The Schedules panel:
-    // list the scheduled jobs (channel · cron · next-run · last-status), add a job
-    // (agent picker → message → cron + presets), enable/disable, delete, "Run now."
-    // Loads OPEN (like /agents): it mints a hub-minted agent:admin token
-    // client-side; the `/api/jobs*` calls it makes are what `requireScope` gates.
-    if (req.method === "GET" && url.pathname === "/jobs") {
-      return new Response(JOBS_UI_HTML, {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
-    }
-
-    // Home / overview landing (Phase 2) — `/home`, the DEFAULT page the hub
-    // portal lands on (`uiUrl: "/agent/home"`). Loads OPEN (like /ui, /admin,
-    // /terminal, /agents): the channels card reads the public config, the agents
-    // card mints a hub-minted agent:admin token client-side and tolerates a
-    // failed mint. Served by the daemon (spans every channel + agent).
-    if (req.method === "GET" && url.pathname === "/home") {
-      return new Response(HOME_UI_HTML, {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+    // Bare root — historically a 404 (no page lived here). Send it to the SPA
+    // app root too, so a bookmark on the module root lands somewhere useful.
+    // Relative `app/` → `/app/` direct, `/agent/app/` proxied.
+    if (req.method === "GET" && url.pathname === "/") {
+      return redirect("app/");
     }
 
     // Agent UI v2 SPA (the agent-centric React surface) — served at the NEW
@@ -2728,8 +2089,11 @@ export function createFetchHandler(
     // poll). NO secrets surfaced (no tokens). Externally `<hub>/agent/api/agent-defs`.
     //
     //   GET    /api/agent-defs           → list (read-scoped) — per def: noteId, name,
-    //                                       backend, vault, status, pending,
+    //                                       backend, mode, vault, status, pending,
     //                                       systemPromptPreview, wants, channel
+    //   GET    /api/agent-defs/<noteId>  → one def, FULL (read-scoped) — noteId, name,
+    //                                       backend, vault, mode, wants, systemPrompt
+    //                                       (FULL body), status. Pre-fills the edit form.
     //   POST   /api/agent-defs           { vault, name, backend, systemPrompt, wants?,
     //                                       metadata? } → write note + reload live (admin)
     //   PATCH  /api/agent-defs/<noteId>  { systemPrompt?, wants?, metadata? } → edit +
@@ -2790,6 +2154,28 @@ export function createFetchHandler(
       } catch (err) {
         if (err instanceof AgentDefWriteError) return json({ error: err.message }, err.status);
         return json({ error: `failed to create agent def: ${(err as Error).message}` }, 502);
+      }
+    }
+
+    // GET /api/agent-defs/<noteId> — the FULL editable def (the whole system-prompt
+    // body, not the list's ~200-char preview) so the edit form pre-fills correctly.
+    // READ-scoped, mirroring GET /api/agent-defs (a listing, no secrets — the body is
+    // the prompt, never a token). 404 for an unknown id / a note that isn't a live def.
+    const defGetMatch = url.pathname.match(/^\/api\/agent-defs\/(.+)$/);
+    if (defGetMatch && req.method === "GET") {
+      const denied = await requireScope(req, url, SCOPE_READ);
+      if (denied) return denied;
+      const noteId = decodeURIComponent(defGetMatch[1]!);
+      if (!agentDefs) {
+        return json({ error: "no def-vaults configured" }, 400);
+      }
+      try {
+        const full = await agentDefs.getFullDef(noteId);
+        if (!full) return json({ error: `note ${noteId} is not a live agent definition` }, 404);
+        return json({ def: full });
+      } catch (err) {
+        if (err instanceof AgentDefWriteError) return json({ error: err.message }, err.status);
+        return json({ error: `failed to fetch agent def: ${(err as Error).message}` }, 502);
       }
     }
 
@@ -3443,27 +2829,22 @@ export function createFetchHandler(
       }
     }
 
-    // Built-in chat UI — a global channel-picker page across all channels.
-    // Served by the daemon (not a transport) because it spans every channel; the
-    // per-channel http-ui send + SSE routes live in the http-ui transport, and
-    // the vault read/send routes are the daemon-level handlers above.
+    // Retired built-in chat page (Phase 4c) — the SPA Chat view replaces it.
+    // EXACT `/ui` only (NOT a prefix): `/ui/events` is the message SSE the SPA
+    // Chat depends on and is owned by the http-ui transport's `ingestHttp` (run
+    // at the bottom of this handler) — it MUST keep routing. Redirect to the SPA
+    // Chat route: relative `app/chat` → `/app/chat` direct / `/agent/app/chat`
+    // proxied, which the SPA BrowserRouter (basename `/app`|`/agent/app`) renders
+    // as the `/chat` route (`web/ui/src/App.tsx`).
     if (req.method === "GET" && url.pathname === "/ui") {
-      return new Response(CHAT_UI_HTML, {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+      return redirect("app/chat");
     }
 
-    // Module-owned config/admin UI (modular-UI P4) — declared as `configUiUrl`
-    // in module.json so the hub frames/links it. The PAGE itself loads OPEN (no
-    // JWT) — like /ui — so it can bootstrap its hub-minted `agent:admin`
-    // token fetch; the page's `/api/channels` calls are what `requireScope`
-    // gates. Server-side mount is "" (the daemon serves the bare path); the page
-    // detects the public `/agent` prefix at runtime from window.location, so
-    // it works at `/admin` direct AND `/agent/admin` proxied.
+    // Retired config/admin page (Phase 4c) — def-vaults + the unified create
+    // flow live in the SPA now. 302 to the SPA app root. `configUiUrl` in
+    // module.json points at `/agent/app/` so the hub frames the SPA directly.
     if (req.method === "GET" && url.pathname === "/admin") {
-      return new Response(renderAdminPage(""), {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+      return redirect("app/");
     }
 
     // Stateful HTTP MCP — a session connects directly over HTTP (URL + OAuth,
@@ -3604,7 +2985,7 @@ function main(): void {
     // (via the API/UI, or hot-added) are picked up immediately. So: warn + idle.
     console.warn(
       `parachute-agent: no channels configured yet — starting idle.\n` +
-        `  Create an agent via the admin UI at /agent/admin (or add ${join(STATE_DIR, "channels.json")}).\n` +
+        `  Create an agent via the admin UI at /agent/app/ (or add ${join(STATE_DIR, "channels.json")}).\n` +
         `  The daemon stays up; channels added live are picked up immediately.`,
     );
   }
@@ -3736,8 +3117,8 @@ function main(): void {
       // `parachute restart agent` 404s and we don't survive reboot (agent#34).
       startCmd: START_CMD,
       stripPrefix: true,
-      uiUrl: "/agent/home", // portal "Open UI" link → the Home overview landing (also in module.json; written here in case hub reads it from services.json)
-      configUiUrl: "/agent/admin", // module-owned config surface (modular-UI P4); hub frames/links it. Also in module.json.
+      uiUrl: "/agent/app/", // portal "Open UI" link → the SPA (canonical in module.json, which hub prefers; written here only as a services.json fallback hint)
+      configUiUrl: "/agent/app/", // module-owned config surface (modular-UI P4); hub frames/links it. Canonical in module.json (hub prefers it); this is a services.json fallback hint.
       // WebSocket support — tells the hub's Bun-native upgrade bridge to forward
       // `Upgrade: websocket` requests on `/agent/*` to this daemon (the
       // in-page terminal, design §5.1). DENY-BY-DEFAULT in the hub: without this

@@ -685,6 +685,8 @@ interface LiveDef {
   status: AgentDefStatus;
   /** The agent backend the def selected (`programmatic` | `channel`). */
   backend: AgentBackendKind;
+  /** The execution-lifecycle mode the def selected (`single-threaded` | `multi-threaded`). */
+  mode: AgentMode;
   /** First ~200 chars of the system prompt (the note body) — a preview, NOT a secret. */
   systemPromptPreview: string;
   /** Declared connections still pending approval (the status `pending` list), if any. */
@@ -705,6 +707,8 @@ export interface AgentDefDetail {
   name: string;
   /** The agent backend (`programmatic` | `channel`). */
   backend: AgentBackendKind;
+  /** The execution-lifecycle mode (`single-threaded` | `multi-threaded`). */
+  mode: AgentMode;
   /** The def-vault this agent is defined in. */
   vault: string;
   /** The resolved liveness status (`enabled` | `pending` | `error`). */
@@ -721,6 +725,33 @@ export interface AgentDefDetail {
 
 /** How many chars of the system prompt the detail preview surfaces. */
 export const SYSTEM_PROMPT_PREVIEW_LEN = 200;
+
+/**
+ * The FULL editable view of one live vault-native agent the `GET /api/agent-defs/<id>`
+ * route returns — everything the edit form needs to pre-fill, including the FULL system
+ * prompt (the whole note body, not the {@link AgentDefDetail} ~200-char preview). NO
+ * secrets (no tokens). The list endpoint deliberately returns only the preview (cheap +
+ * non-sensitive); this single-def fetch reads the note body fresh so an edit pre-fills
+ * the actual prompt rather than a truncation.
+ */
+export interface AgentDefFull {
+  /** The vault note id (the edit/delete key). */
+  noteId: string;
+  /** The agent name (= wake channel + spec name). */
+  name: string;
+  /** The agent backend (`programmatic` | `channel`). */
+  backend: AgentBackendKind;
+  /** The def-vault this agent is defined in. */
+  vault: string;
+  /** The execution-lifecycle mode (`single-threaded` | `multi-threaded`). */
+  mode: AgentMode;
+  /** Structured `wants:` connection keys the agent declared (empty when own-vault only). */
+  wants: string[];
+  /** The FULL system prompt — the whole note body (NOT truncated). */
+  systemPrompt: string;
+  /** The resolved liveness status (`enabled` | `pending` | `error`). */
+  status: AgentDefStatus;
+}
 
 /**
  * The vault-native agent-def registry — reads `#agent/definition` notes from the
@@ -842,6 +873,7 @@ export class AgentDefRegistry {
         noteId: d.noteId,
         name: d.name,
         backend: d.backend,
+        mode: d.mode,
         vault: d.vault,
         status: d.status,
         pending: [...d.pending],
@@ -904,6 +936,7 @@ export class AgentDefRegistry {
       noteId: d.noteId,
       name: d.name,
       backend: d.backend,
+      mode: d.mode,
       vault: d.vault,
       status: d.status,
       pending: [...d.pending],
@@ -935,6 +968,37 @@ export class AgentDefRegistry {
     }
     const vault = matches[0]!;
     return { vault, detail: this.liveDef(vault, noteId)! };
+  }
+
+  /**
+   * Fetch ONE live def's FULL editable view (the `GET /api/agent-defs/<id>` route) — the
+   * same fields {@link liveDef} carries, but with the FULL system prompt read fresh from
+   * the note body (the list/detail carries only the ~200-char preview, which can't pre-
+   * fill an edit form). The note MUST be a currently-live def we instantiated in a
+   * configured vault — same guard as the PATCH/DELETE write paths (resolves the vault via
+   * {@link findLiveByNote}, so an unknown/non-def id → null and the route 404s; an
+   * ambiguous-across-vaults id throws the 409-class {@link AgentDefWriteError}). NO
+   * secrets — the body is the prompt, never a token. Returns null when the note isn't a
+   * live def OR the vault no longer vends it (a delete that races the fetch).
+   */
+  async getFullDef(noteId: string): Promise<AgentDefFull | null> {
+    const found = this.findLiveByNote(noteId);
+    if (!found) return null;
+    const client = this.clients.get(found.vault);
+    if (!client) return null;
+    const note = await client.getNote(noteId);
+    if (!note) return null;
+    const detail = found.detail;
+    return {
+      noteId: detail.noteId,
+      name: detail.name,
+      backend: detail.backend,
+      vault: detail.vault,
+      mode: detail.mode,
+      wants: [...detail.wants],
+      systemPrompt: typeof note.content === "string" ? note.content : "",
+      status: detail.status,
+    };
   }
 
   private keyOf(vault: string, noteId: string): string {
@@ -1295,6 +1359,7 @@ export class AgentDefRegistry {
       name: def.name,
       status,
       backend: def.spec.backend ?? "programmatic",
+      mode: def.spec.mode ?? "single-threaded",
       systemPromptPreview,
       pending: pending ?? [],
       wants: def.wants.map((c) => connectionKey(c)),

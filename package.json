@@ -12,9 +12,9 @@
     "daemon": "bun src/daemon.ts",
     "bridge": "bun src/bridge.ts",
     "spawn-agent": "bun scripts/spawn-agent.ts",
-    "test": "bun test ./src/",
+    "test": "bun run typecheck && bun test ./src/",
     "test:spa": "cd web/ui && bun run test",
-    "test:all": "bun test ./src/ && cd web/ui && bun run test",
+    "test:all": "bun run test && bun run test:spa",
     "test:e2e": "bun e2e/llm/run.ts",
     "typecheck": "tsc --noEmit"
   },

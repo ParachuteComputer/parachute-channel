@@ -1966,6 +1966,16 @@ export function createFetchHandler(
       if (req.method === "DELETE") {
         try {
           const removed = await agentDefs.deleteDef(noteId);
+          // FIX 5 (PR #3) — surface a PARTIAL success: the note delete completed, but if
+          // best-effort grant cleanup failed, say so (the agent's approved hub grants may
+          // be orphaned) rather than reporting a clean full success. The delete itself is
+          // still a 200 (the def IS gone — grant GC is best-effort, not delete-blocking).
+          if (!removed.grantsReconciled) {
+            console.warn(
+              `parachute-agent: deleted agent def "${removed.name}" but grant cleanup failed — ` +
+                `its approved hub grants may be orphaned.`,
+            );
+          }
           return json({ ok: true, ...removed, removed: true });
         } catch (err) {
           if (err instanceof AgentDefWriteError) return json({ error: err.message }, err.status);

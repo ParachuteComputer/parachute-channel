@@ -69,6 +69,19 @@ export interface ThreadRecord {
   ended_at: string;
   /** Optional token/cost usage for this turn (single-threaded accumulates into the note). */
   usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
+  /**
+   * MULTI-threaded only: a stable per-TURN thread id (the note's path leaf). Passing the
+   * SAME id on a re-record (e.g. flipping `ok`→`error` after an outbound-delivery failure)
+   * makes both writes hit the SAME per-fire note instead of minting a duplicate. Absent →
+   * a fresh id is minted. Single-threaded ignores it (its leaf is the deterministic name).
+   */
+  threadId?: string;
+  /**
+   * Re-record of the SAME turn (not a new turn). Single-threaded keeps the existing
+   * `turn_count` instead of incrementing (the turn was already counted by the first
+   * record). No effect on multi-threaded (turn_count is always 1).
+   */
+  sameTurn?: boolean;
 }
 
 export interface ReactArgs {

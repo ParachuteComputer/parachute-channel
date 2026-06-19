@@ -39,6 +39,7 @@
  */
 
 import type { AgentSpec } from "../sandbox/types.ts";
+import { InboundClaimConflictError } from "../transports/vault.ts";
 import type { InboundQueueNote, InboundStatus } from "../transports/vault.ts";
 
 /**
@@ -49,11 +50,27 @@ import type { InboundQueueNote, InboundStatus } from "../transports/vault.ts";
 export interface ChannelQueueStore {
   /** List this channel's inbound queue notes, ascending by ts (oldest first). */
   listInboundQueue(opts?: { limit?: number }): Promise<InboundQueueNote[]>;
-  /** Set an inbound note's claim status (+ optionally claimedAt; `null` clears it). */
-  setInboundStatus(id: string, status: InboundStatus, claimedAt?: string | null): Promise<void>;
+  /**
+   * Set an inbound note's claim status (+ optionally claimedAt; `null` clears it).
+   * When `ifUpdatedAt` is given, the write is a COMPARE-AND-SWAP (the claim only lands
+   * if the note hasn't changed since it was read) and throws {@link
+   * InboundClaimConflictError} when the race is lost (agent#101); omitting it is the
+   * prior last-write-wins behavior (release / handled / sweep).
+   */
+  setInboundStatus(
+    id: string,
+    status: InboundStatus,
+    claimedAt?: string | null,
+    ifUpdatedAt?: string,
+  ): Promise<void>;
   /** Write an outbound reply (the SAME `#agent/message/outbound` path the worker uses). */
   reply(args: { text: string; inReplyTo?: string }): Promise<{ sent: string[] }>;
 }
+
+/** Bound on the CAS re-list retries in {@link ChannelQueueRegistry.claimNext} — a
+ *  safety net against a pathological all-contended queue (each pass claims/eliminates
+ *  one note, so the loop is naturally bounded by the pending count anyway). */
+const MAX_CLAIM_ATTEMPTS = 25;
 
 /** The default in-flight claim TTL (design: 15 min comfortably covers an operator turn). */
 export const DEFAULT_CLAIM_TTL_MS = 15 * 60 * 1000;
@@ -205,32 +222,55 @@ export class ChannelQueueRegistry {
    * PATCH lands the note is no longer `pending`. Returns null when none pending (or for
    * an unregistered channel).
    *
-   * CLAIM-RACE SCOPE (honest): the claim PATCH is `force:true` (last-write-wins, no
-   * precondition), so TWO TRULY-CONCURRENT `claimNext` calls (e.g. the same channel
-   * connected from two sessions, both listing before either PATCHes) can both return the
-   * SAME note → a double-handle (two replies). The `channel` model is one-operator-
-   * session-at-a-time, so this is narrow; a double-handle is non-corrupting (a duplicate
-   * reply) and the TTL sweep can't even strand it. Hardening to a compare-and-swap claim
-   * (`if_updated_at` + re-list on 428) for the multi-session case is tracked as a
-   * follow-up (agent#101). Don't claim race-safety here that the `force:true` PATCH
-   * doesn't provide.
+   * SINGLE-CLAIM via COMPARE-AND-SWAP (agent#101). The claim PATCH carries
+   * `if_updated_at` (the note's last-seen `updated_at`), so it only lands if the note
+   * hasn't changed since this call read it. Two truly-concurrent `claimNext` calls read
+   * the SAME `updated_at`; the first claim advances it, so the second's precondition
+   * FAILS (the store throws {@link InboundClaimConflictError}) — we then RE-LIST and try
+   * the NEXT pending message, never double-claiming. The loop is bounded by the pending
+   * count (each pass either claims one or eliminates a now-contended one) plus a hard
+   * {@link MAX_CLAIM_ATTEMPTS} backstop. A note with no `updatedAt` (a vault that omitted
+   * it) falls back to the prior last-write-wins claim — the precondition is simply
+   * absent, so the narrow double-claim window remains only for that degenerate case.
+   * Returns null when none pending (or for an unregistered channel).
    */
   async claimNext(channel: string, now: () => Date = () => new Date()): Promise<ClaimedMessage | null> {
     const rec = this.byChannel.get(channel);
     if (!rec) return null;
-    const notes = await rec.store.listInboundQueue();
-    const oldest = notes.find((n) => n.status === "pending"); // listInboundQueue is ascending by ts.
-    if (!oldest) return null;
-    // Commit the claim (status → in-flight + claimedAt) BEFORE returning — the flip is
-    // the single-claim guarantee. If the PATCH throws, we don't return the note (the
-    // caller gets the error; the note stays pending for a retry).
-    await rec.store.setInboundStatus(oldest.id, "in-flight", now().toISOString());
-    return {
-      id: oldest.id,
-      text: oldest.text,
-      inReplyTo: oldest.id,
-      systemPrompt: rec.spec.systemPrompt ?? "",
-    };
+    for (let attempt = 0; attempt < MAX_CLAIM_ATTEMPTS; attempt++) {
+      // RE-LIST each attempt so a lost CAS race sees the queue as the winner left it
+      // (the contended note is now in-flight, so `find` skips past it to the next pending).
+      const notes = await rec.store.listInboundQueue();
+      const oldest = notes.find((n) => n.status === "pending"); // ascending by ts.
+      if (!oldest) return null;
+      try {
+        // Commit the claim (status → in-flight + claimedAt) BEFORE returning, guarded by
+        // the note's `updated_at` so a concurrent claimer can't also win it. A non-conflict
+        // PATCH failure propagates (the caller gets the error; the note stays pending).
+        await rec.store.setInboundStatus(
+          oldest.id,
+          "in-flight",
+          now().toISOString(),
+          oldest.updatedAt, // CAS precondition; undefined → store falls back to force.
+        );
+      } catch (err) {
+        if (err instanceof InboundClaimConflictError) {
+          // Another session claimed this note between our list and PATCH — re-list and
+          // try the next pending one (no double-claim).
+          continue;
+        }
+        throw err;
+      }
+      return {
+        id: oldest.id,
+        text: oldest.text,
+        inReplyTo: oldest.id,
+        systemPrompt: rec.spec.systemPrompt ?? "",
+      };
+    }
+    // Exhausted the retry budget under sustained contention — treat as "none claimable
+    // right now" (a connected session retries `next-message`). Non-corrupting.
+    return null;
   }
 
   /**

@@ -12,6 +12,8 @@
 import { describe, test, expect } from "bun:test";
 import {
   ProgrammaticAgentRegistry,
+  OUTBOUND_MAX_RETRIES,
+  isTransientOutboundError,
   type WriteOutbound,
   type WriteThread,
   type ThreadNote,
@@ -397,37 +399,148 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(rec.calls).toHaveLength(0);
   });
 
-  test("REGRESSION (c34db03, now BOTH modes): a turn whose outbound write THROWS still leaves exactly one #agent/thread note", async () => {
+  test("REGRESSION (c34db03, now BOTH modes): a turn whose outbound write THROWS still leaves a primary #agent/thread note (now re-recorded as error — FIX 1)", async () => {
     const backend = new FakeBackend();
     const threads = threadRecorder();
     // A THROWING WriteOutbound — the thread note is written BEFORE the additive outbound
     // (c34db03, now applied uniformly to BOTH modes), so the failed transcript write must
     // NOT cost us the primary record. Use a SINGLE-THREADED spec to prove the c34db03
     // ordering now protects single-threaded too. (`recorder()` can't throw; inline variant.)
+    // The error message carries NO HTTP status → classified TRANSIENT → it RETRIES the
+    // bounded budget (FIX 1, PR #3) before giving up, then re-records the thread as error.
     let outboundAttempts = 0;
     const throwingWriteOutbound: WriteOutbound = async () => {
       outboundAttempts++;
-      throw new Error("vault write boom");
+      throw new Error("vault write boom"); // no (NNN) status → transient → retried.
     };
     const reg = new ProgrammaticAgentRegistry({
       backend,
       writeOutbound: throwingWriteOutbound,
       writeThread: threads.fn,
+      outboundRetryBaseMs: 0,
     });
     await reg.register(specFor("eng")); // single-threaded (default) — the ordering applies here now.
 
     reg.enqueue("eng", { content: "fire it" });
-    await until(() => threads.threads.length === 1);
-    // Let the (throwing) outbound attempt settle.
+    // FIX 1: the primary `ok` thread note is written first, then after retries exhaust, a
+    // second `error` thread note re-records the UN-DELIVERED reply.
+    await until(() => threads.threads.length === 2);
+
+    // First (optimistic) record was `ok`; the second re-records the failure so the durable
+    // thread record does NOT falsely claim the reply landed.
+    expect(threads.threads[0]!.status).toBe("ok");
+    expect(threads.threads[0]!.output).toBe("reply:fire it");
+    expect(threads.threads[1]!.status).toBe("error");
+    expect(threads.threads[1]!.mode).toBe("single-threaded");
+    // The undelivered reply text is preserved in the error record for recovery.
+    expect(threads.threads[1]!.output).toContain("reply:fire it");
+    // Transient → the outbound was retried the full budget (1 initial + OUTBOUND_MAX_RETRIES).
+    expect(outboundAttempts).toBe(1 + OUTBOUND_MAX_RETRIES);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — outbound retry on transient failure (FIX 1, PR #3)", () => {
+  test("isTransientOutboundError: 5xx + network = transient; 4xx = permanent", () => {
+    expect(isTransientOutboundError(new Error("write reply failed (502) boom"))).toBe(true);
+    expect(isTransientOutboundError(new Error("write reply failed (503)"))).toBe(true);
+    expect(isTransientOutboundError(new Error("ECONNREFUSED"))).toBe(true); // no status → network.
+    expect(isTransientOutboundError(new Error("fetch failed"))).toBe(true);
+    expect(isTransientOutboundError(new Error("write reply failed (400) bad"))).toBe(false);
+    expect(isTransientOutboundError(new Error("write reply failed (401)"))).toBe(false);
+    expect(isTransientOutboundError(new Error("write reply failed (409)"))).toBe(false);
+  });
+
+  test("a transient-then-success outbound RETRIES and the reply LANDS (no loss, turn not re-run)", async () => {
+    const backend = new FakeBackend();
+    const threads = threadRecorder();
+    // Fail twice with a transient (5xx) error, then succeed — the retry must land the reply.
+    let attempts = 0;
+    const recorded: { reply: string }[] = [];
+    const flakyWriteOutbound: WriteOutbound = async (_channel, reply) => {
+      attempts++;
+      if (attempts <= 2) throw new Error("vault transport: write reply failed (502) blip");
+      recorded.push({ reply });
+    };
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: flakyWriteOutbound,
+      writeThread: threads.fn,
+      outboundRetryBaseMs: 0,
+    });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "important" });
+    await until(() => recorded.length === 1);
     await new Promise<void>((r) => setTimeout(r, 5));
 
-    // The thread note survived the outbound failure: exactly ONE, status ok, output = the reply.
+    // The reply landed on the 3rd attempt (1 initial + 2 retries == OUTBOUND_MAX_RETRIES).
+    expect(attempts).toBe(1 + OUTBOUND_MAX_RETRIES);
+    expect(recorded).toEqual([{ reply: "reply:important" }]);
+    // The backend ran the turn EXACTLY ONCE (no re-run / fork on the retry).
+    expect(backend.calls).toHaveLength(1);
+    // The thread note is the single `ok` record (the reply was ultimately delivered) — no
+    // error re-record because delivery succeeded.
     expect(threads.threads).toHaveLength(1);
     expect(threads.threads[0]!.status).toBe("ok");
-    expect(threads.threads[0]!.mode).toBe("single-threaded");
-    expect(threads.threads[0]!.output).toBe("reply:fire it");
-    // The outbound WAS attempted (and threw) — proving the thread note was written first.
-    expect(outboundAttempts).toBe(1);
+  });
+
+  test("a PERSISTENT failure surfaces an error event + re-records the thread as error + does NOT claim success", async () => {
+    const backend = new FakeBackend();
+    const threads = threadRecorder();
+    const turn = turnRecorder();
+    let attempts = 0;
+    const alwaysFail: WriteOutbound = async () => {
+      attempts++;
+      throw new Error("vault transport: write reply failed (503) down");
+    };
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: alwaysFail,
+      writeThread: threads.fn,
+      onTurnEvent: turn.fn,
+      outboundRetryBaseMs: 0,
+    });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "doomed" });
+    await until(() => threads.threads.length === 2);
+    await new Promise<void>((r) => setTimeout(r, 5));
+
+    // Retried the full budget then gave up (1 + OUTBOUND_MAX_RETRIES).
+    expect(attempts).toBe(1 + OUTBOUND_MAX_RETRIES);
+    // The live view resolved to ERROR (not `done`) — no silently-vanished reply.
+    const errorEvents = turn.events.filter((e) => e.event.kind === "error");
+    expect(errorEvents.length).toBeGreaterThanOrEqual(1);
+    expect(turn.events.some((e) => e.event.kind === "done")).toBe(false);
+    // The thread record does NOT falsely claim a clean ok: the final record is error,
+    // carrying the un-delivered reply text for recovery.
+    expect(threads.threads[1]!.status).toBe("error");
+    expect(threads.threads[1]!.output).toContain("reply:doomed");
+  });
+
+  test("a PERMANENT (4xx) outbound failure does NOT retry — gives up immediately", async () => {
+    const backend = new FakeBackend();
+    const threads = threadRecorder();
+    let attempts = 0;
+    const reject4xx: WriteOutbound = async () => {
+      attempts++;
+      throw new Error("vault transport: write reply failed (400) bad request");
+    };
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: reject4xx,
+      writeThread: threads.fn,
+      outboundRetryBaseMs: 0,
+    });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "rejected" });
+    await until(() => threads.threads.length === 2);
+    await new Promise<void>((r) => setTimeout(r, 5));
+
+    // A 4xx is a real rejection → exactly ONE attempt, no retry.
+    expect(attempts).toBe(1);
+    expect(threads.threads[1]!.status).toBe("error");
   });
 });
 

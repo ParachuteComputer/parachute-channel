@@ -1081,19 +1081,38 @@ export class AgentDefRegistry {
     this.seenDefs.set(vault, next);
   }
 
-  /** Reconcile a CONFIRMED-removed agent's grants away (prune ALL). Best-effort + no-op
-   *  without a grants client / without a known name. */
-  private async reconcileForRemovedAgent(name: string): Promise<void> {
-    if (!this.grants || !name) return;
+  /**
+   * Reconcile a CONFIRMED-removed agent's grants away (prune ALL). Best-effort + no-op
+   * without a grants client / without a known name.
+   *
+   * FIX 5 (PR #3) — make the failure NON-SILENT. A hub-unreachable reconcile used to be
+   * caught + logged + ignored, ORPHANING the agent's approved grants on the hub (a
+   * re-created same-named agent resurrects them). It's still BEST-EFFORT (we don't block
+   * the note delete on grant cleanup — the def IS gone), but we now (a) `console.warn`
+   * loudly AND (b) RETURN a structured signal so the caller can surface a PARTIAL success
+   * (delete succeeded, grant cleanup didn't) rather than claiming a clean full success.
+   * `skipped` = no grants client / no name (nothing to reconcile — a true no-op).
+   */
+  private async reconcileForRemovedAgent(
+    name: string,
+  ): Promise<{ ok: true; pruned: number } | { ok: false; error: string } | { skipped: true }> {
+    if (!this.grants || !name) return { skipped: true };
     try {
       const { pruned } = await this.grants.reconcileGrants(name, []);
       if (pruned > 0) {
         console.log(`agent-defs: pruned ${pruned} stale grant(s) for removed agent "${name}".`);
       }
+      return { ok: true, pruned };
     } catch (err) {
+      const error = (err as Error).message;
+      // NON-SILENT (FIX 5): a swallowed grant-GC failure orphans approved grants on the
+      // hub. Warn loudly + return the failure so the delete path reports partial success.
       console.warn(
-        `agent-defs: pruning grants for removed agent "${name}" failed (continuing): ${(err as Error).message}`,
+        `agent-defs: pruning grants for removed agent "${name}" FAILED — its approved hub ` +
+          `grants may be ORPHANED (re-creating a same-named agent would resurrect them); ` +
+          `the note delete still completed (best-effort grant cleanup): ${error}`,
       );
+      return { ok: false, error };
     }
   }
 
@@ -1248,11 +1267,21 @@ export class AgentDefRegistry {
 
   /**
    * Delete a live def note, then deregister the agent immediately. The note MUST be a
-   * currently-live def we instantiated. Returns the (vault, name) of what was removed.
-   * Throws {@link AgentDefWriteError} on a miss or a delete failure (the deregister
-   * still runs even if it's already gone).
+   * currently-live def we instantiated. Returns the (vault, name) of what was removed,
+   * plus a `grantsReconciled` flag (FIX 5, PR #3) — `false` when the best-effort grant
+   * cleanup FAILED so the caller can report a PARTIAL success rather than a clean one.
+   *
+   * ORDERING (FIX 4, PR #3) — the VAULT NOTE DELETE happens FIRST; only after it
+   * SUCCEEDS do we deregister the live agent. So a vault-delete 502 throws here BEFORE
+   * any in-memory teardown — the def stays REGISTERED (it reappears coherently on the
+   * next poll), never orphaned (gone from memory but still in the vault, the confusing
+   * half-state). This mirrors the `agent-vaults` removal path's "persist the durable
+   * change first, then tear down in-memory state" discipline (daemon.ts #106). Throws
+   * {@link AgentDefWriteError} on a miss; a vault-delete failure throws (un-torn-down).
    */
-  async deleteDef(noteId: string): Promise<{ vault: string; name: string }> {
+  async deleteDef(
+    noteId: string,
+  ): Promise<{ vault: string; name: string; grantsReconciled: boolean }> {
     const found = this.findLiveByNote(noteId);
     if (!found) {
       throw new AgentDefWriteError(`note ${noteId} is not a live agent definition`, 404);
@@ -1261,11 +1290,15 @@ export class AgentDefRegistry {
     if (!client) {
       throw new AgentDefWriteError(`unknown def-vault "${found.vault}"`, 400);
     }
+    // STEP 1 — delete the vault note FIRST (the durable change). A non-ok (non-404)
+    // response throws out of here, BEFORE any deregister, so the in-memory def is left
+    // intact (FIX 4): no orphan, the next poll re-converges. (404 is fine — gone is gone.)
     await client.deleteNote(noteId);
-    // Tear the agent down + prune grants — the confirmed-removal path (a delete IS a
-    // confirmed removal); reload with "deleted" skips the (now-404) GET.
-    await this.reload(found.vault, noteId, "deleted");
-    return { vault: found.vault, name: found.detail.name };
+    // STEP 2 — the note is gone → tear the agent down + prune grants (the confirmed-
+    // removal path). Capture the grant-reconcile outcome to surface a partial success.
+    const reconcile = await this.confirmedRemoval(found.vault, noteId);
+    const grantsReconciled = !("ok" in reconcile) || reconcile.ok === true;
+    return { vault: found.vault, name: found.detail.name, grantsReconciled };
   }
 
   /**
@@ -1296,15 +1329,22 @@ export class AgentDefRegistry {
    * down AND prune ALL its grants (#96 grant-GC) so a deleted `#agent/definition` note
    * doesn't orphan live approved rows. The seen-set entry is cleared so a later loadAll
    * doesn't re-detect (and re-prune) the same removal. Reconcile is best-effort.
+   *
+   * Returns the grant-reconcile outcome (FIX 5, PR #3) so the API delete path can report
+   * a PARTIAL success when grant cleanup failed (delete done, grants possibly orphaned).
    */
-  private async confirmedRemoval(vault: string, noteId: string): Promise<void> {
+  private async confirmedRemoval(
+    vault: string,
+    noteId: string,
+  ): Promise<{ ok: true; pruned: number } | { ok: false; error: string } | { skipped: true }> {
     // The grant holder name comes from the live record if present, else the last-known
     // name we tracked for this note (a def removed before it ever instantiated).
     const name =
       this.live.get(this.keyOf(vault, noteId))?.name ?? this.seenDefs.get(vault)?.get(noteId);
     await this.deregisterByNote(vault, noteId);
     this.seenDefs.get(vault)?.delete(noteId);
-    if (name) await this.reconcileForRemovedAgent(name);
+    if (!name) return { skipped: true };
+    return this.reconcileForRemovedAgent(name);
   }
 
   /**

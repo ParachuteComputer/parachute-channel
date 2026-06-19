@@ -113,6 +113,17 @@ export interface ThreadNote {
   ended_at: string;
   /** Optional token/cost usage for observability. */
   usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
+  /**
+   * MULTI-threaded only: a stable per-TURN thread id (the per-fire note's leaf). The same
+   * id on a re-record (the outbound-failure status flip) reuses the SAME note instead of
+   * minting a duplicate. Single-threaded ignores it (deterministic name leaf).
+   */
+  threadId?: string;
+  /**
+   * Re-record of the SAME turn — single-threaded keeps `turn_count` (the turn was already
+   * counted by the first record); no effect on multi-threaded.
+   */
+  sameTurn?: boolean;
 }
 
 /**
@@ -125,6 +136,37 @@ export interface ThreadNote {
  * the registry — when unwired (no vault-backed channel), a turn still runs, just no note.
  */
 export type WriteThread = (thread: ThreadNote) => Promise<void>;
+
+/** How many times the outbound write is RETRIED on a transient failure (agent — PR #3
+ *  FIX 1) before giving up. Total attempts = 1 + this. */
+export const OUTBOUND_MAX_RETRIES = 2;
+/** Base backoff (ms) between outbound retries — grows linearly (attempt 1 → BASE, 2 → 2×BASE). */
+export const OUTBOUND_RETRY_BASE_MS = 250;
+
+/**
+ * Classify an outbound-write error as TRANSIENT (worth retrying) vs PERMANENT (a real
+ * rejection). The VaultTransport's `reply()` throws `Error` whose message embeds the
+ * HTTP status as `(NNN)` for a non-ok vault response, or a raw network/fetch rejection
+ * (no status) when the vault is unreachable. So:
+ *   - a parseable 5xx (502/503/504/…) → TRANSIENT (a vault blip; retry).
+ *   - NO parseable status (a network error, DNS, connection refused) → TRANSIENT.
+ *   - a parseable 4xx (400/401/403/409/…) → PERMANENT (a real rejection — auth, bad
+ *     request; retrying just re-fails). Do NOT retry these.
+ * This keeps the retry to the case the audit flagged (a transient vault 5xx silently
+ * losing the reply) without papering over a genuine 4xx rejection.
+ */
+export function isTransientOutboundError(err: unknown): boolean {
+  const msg = (err as Error)?.message ?? "";
+  const m = msg.match(/\((\d{3})\)/);
+  if (!m) return true; // no HTTP status → a network/connection error → transient.
+  const status = Number(m[1]);
+  return status >= 500 && status <= 599; // 5xx transient; 4xx permanent.
+}
+
+/** Sleep helper for the outbound retry backoff (injectable-free; small + bounded). */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /** A queued inbound message awaiting its serial turn. */
 interface QueuedMessage {
@@ -177,17 +219,22 @@ export class ProgrammaticAgentRegistry {
   private readonly writeThread?: WriteThread;
   /** Optional streaming-view sink — push interim + lifecycle turn events per channel. */
   private readonly onTurnEvent?: TurnEventSink;
+  /** Base backoff (ms) between outbound retries (FIX 1). Injectable so tests run fast. */
+  private readonly outboundRetryBaseMs: number;
 
   constructor(deps: {
     backend: AgentBackend;
     writeOutbound: WriteOutbound;
     writeThread?: WriteThread;
     onTurnEvent?: TurnEventSink;
+    /** Override the outbound-retry backoff base (ms). Default {@link OUTBOUND_RETRY_BASE_MS}. */
+    outboundRetryBaseMs?: number;
   }) {
     this.backend = deps.backend;
     this.writeOutbound = deps.writeOutbound;
     if (deps.writeThread) this.writeThread = deps.writeThread;
     if (deps.onTurnEvent) this.onTurnEvent = deps.onTurnEvent;
+    this.outboundRetryBaseMs = deps.outboundRetryBaseMs ?? OUTBOUND_RETRY_BASE_MS;
   }
 
   /**
@@ -394,6 +441,11 @@ export class ProgrammaticAgentRegistry {
       // multi-threaded writes one note per fire. Read the mode off the spec so the
       // thread note carries it (it's the indexed query axis + governs the upsert).
       const startedAt = new Date().toISOString();
+      // A stable per-TURN thread id, passed to every recordThread for this turn. For
+      // multi-threaded it's the per-fire note's leaf, so a re-record (the outbound-failure
+      // status flip below) updates the SAME note instead of minting a duplicate; single-
+      // threaded ignores it (deterministic name leaf). One uuid per turn.
+      const turnThreadId = crypto.randomUUID();
 
       let result;
       try {
@@ -416,7 +468,7 @@ export class ProgrammaticAgentRegistry {
         // thread note captures the turn outcome, so a failed turn is still a queryable
         // `status:error` (single-threaded upserts the rolling thread; multi-threaded writes
         // a per-fire note).
-        await this.recordThread(handle, msg, "error", reason, startedAt, undefined);
+        await this.recordThread(handle, msg, "error", reason, startedAt, undefined, { threadId: turnThreadId });
         this.emitTurnEvent(channel, { kind: "error", error: reason });
         continue;
       }
@@ -431,7 +483,7 @@ export class ProgrammaticAgentRegistry {
         // BOTH modes record the failed turn (status:error) on the thread note so a failure
         // always leaves a queryable trace (single-threaded upserts the rolling thread,
         // marking it errored; multi-threaded writes a per-fire status:error note).
-        await this.recordThread(handle, msg, "error", result.error, startedAt, undefined);
+        await this.recordThread(handle, msg, "error", result.error, startedAt, undefined, { threadId: turnThreadId });
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
         continue;
       }
@@ -444,26 +496,48 @@ export class ProgrammaticAgentRegistry {
       // multi-threaded writes the per-fire note. Best-effort: a thread-note failure is
       // logged + the turn still resolves (we never re-run a `claude -p` turn — that would
       // burn quota for a duplicate).
-      await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage);
+      await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage, { threadId: turnThreadId });
 
       // The outbound reply — the channel-transcript delivery (the chat bubble). It is
       // ADDITIVE to the primary thread-note record already written above (for BOTH modes).
       // Empty reply → NO note (reviewer contract — `reply` can be ""): a turn that produced
       // no text (e.g. tool-only work) leaves the chat clean.
       if (result.reply && result.reply.length > 0) {
-        try {
-          await this.writeOutbound(channel, result.reply, msg.inReplyTo);
-        } catch (err) {
-          const reason = (err as Error).message;
+        const delivered = await this.deliverOutboundWithRetry(channel, result.reply, msg.inReplyTo);
+        if (!delivered.ok) {
+          // FIX 1 (PR #3) — the SCARY one. The reply was PRODUCED but, after the bounded
+          // retry, still NOT persisted to the transcript (a persistent vault 5xx / network
+          // fault, or a real 4xx rejection). We must NOT leave a clean `status:ok` record
+          // claiming the reply landed when it didn't:
+          //   1. RE-RECORD the thread note as `status:error` so the durable thread record
+          //      reflects the UN-DELIVERED reply (overwrites the optimistic `ok` upsert for
+          //      single-threaded; writes/overwrites the per-fire note for multi-threaded).
+          //   2. Resolve the live view to ERROR (not `done`) so the UI doesn't drop the
+          //      in-progress bubble + poll for a note that isn't there (PR #83 nit).
+          // We do NOT re-run the `claude -p` turn (that forks/burns quota) — the reply text
+          // is preserved IN the error thread note's output for an operator to recover.
           console.error(
-            `parachute-agent: programmatic outbound write for channel "${channel}" failed: ${reason}`,
+            `parachute-agent: programmatic outbound write for channel "${channel}" failed ` +
+              `after ${OUTBOUND_MAX_RETRIES} retries: ${delivered.error}`,
           );
-          // The reply was produced but NOT persisted to the transcript. Resolve the live
-          // view to ERROR, not `done` — a `done` would drop the in-progress bubble and
-          // trigger a poll that finds no note, leaving the user with a silently vanished
-          // reply. (reviewer nit, PR #83.) The thread note above already captured the reply
-          // durably (BOTH modes), so the turn's record is not lost.
-          this.emitTurnEvent(channel, { kind: "error", error: `reply produced but not saved: ${reason}` });
+          // RE-RECORD the SAME turn as status:error — reuse the per-turn thread id +
+          // `sameTurn` so this updates the note the `ok` record above just wrote (one
+          // note, no turn_count double-count) rather than minting a duplicate / advancing
+          // the count (the FIX-1 re-record bug the reviewer caught).
+          await this.recordThread(
+            handle,
+            msg,
+            "error",
+            `reply produced but NOT delivered (outbound write failed: ${delivered.error}). ` +
+              `Undelivered reply text: ${result.reply}`,
+            startedAt,
+            result.usage,
+            { threadId: turnThreadId, sameTurn: true },
+          );
+          this.emitTurnEvent(channel, {
+            kind: "error",
+            error: `reply produced but not saved: ${delivered.error}`,
+          });
           continue;
         }
       }
@@ -495,6 +569,7 @@ export class ProgrammaticAgentRegistry {
     output: string,
     startedAt: string,
     usage: ThreadNote["usage"],
+    opts: { threadId?: string; sameTurn?: boolean } = {},
   ): Promise<void> {
     if (!this.writeThread) return;
     const thread: ThreadNote = {
@@ -508,6 +583,11 @@ export class ProgrammaticAgentRegistry {
       started_at: startedAt,
       ended_at: new Date().toISOString(),
       ...(usage ? { usage } : {}),
+      // The per-turn thread id (stable across an ok→error re-record) + the same-turn flag,
+      // so a re-record updates the SAME note without minting a duplicate (multi) or
+      // double-counting turn_count (single).
+      ...(opts.threadId ? { threadId: opts.threadId } : {}),
+      ...(opts.sameTurn ? { sameTurn: true } : {}),
     };
     try {
       await this.writeThread(thread);
@@ -517,5 +597,54 @@ export class ProgrammaticAgentRegistry {
           `(continuing): ${(err as Error).message}`,
       );
     }
+  }
+
+  /**
+   * Deliver the outbound reply with a BOUNDED retry on a TRANSIENT failure (FIX 1, PR
+   * #3). A vault 5xx / network blip during the outbound write used to silently lose the
+   * reply (the turn resolved, the thread note said "ok", but the chat bubble never
+   * landed). We retry up to {@link OUTBOUND_MAX_RETRIES} times with a small linear
+   * backoff on a transient error ({@link isTransientOutboundError}: a 5xx or a
+   * no-status network error). A PERMANENT error (a 4xx — a real rejection) does NOT
+   * retry. Returns `{ ok: true }` once the write lands, or `{ ok: false, error }` after
+   * exhausting the retries / on a permanent failure — the caller then records the turn
+   * as un-delivered + surfaces it (never claims a clean success). We NEVER re-run the
+   * `claude -p` turn here (that would fork the conversation / burn quota); only the
+   * idempotent outbound WRITE is retried.
+   */
+  private async deliverOutboundWithRetry(
+    channel: string,
+    reply: string,
+    inReplyTo?: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    let lastError = "";
+    for (let attempt = 0; attempt <= OUTBOUND_MAX_RETRIES; attempt++) {
+      try {
+        await this.writeOutbound(channel, reply, inReplyTo);
+        return { ok: true };
+      } catch (err) {
+        lastError = (err as Error).message;
+        const transient = isTransientOutboundError(err);
+        const more = attempt < OUTBOUND_MAX_RETRIES;
+        if (!transient || !more) {
+          // A permanent (4xx) error never retries; a transient one that exhausted the
+          // budget falls through to the failure return below.
+          if (!transient) {
+            console.warn(
+              `parachute-agent: outbound write for channel "${channel}" failed with a ` +
+                `non-transient error (not retrying): ${lastError}`,
+            );
+          }
+          return { ok: false, error: lastError };
+        }
+        // Transient + retries remain — back off (linear) and try again.
+        console.warn(
+          `parachute-agent: outbound write for channel "${channel}" transient failure ` +
+            `(attempt ${attempt + 1}/${OUTBOUND_MAX_RETRIES + 1}), retrying: ${lastError}`,
+        );
+        await delay(this.outboundRetryBaseMs * (attempt + 1));
+      }
+    }
+    return { ok: false, error: lastError };
   }
 }

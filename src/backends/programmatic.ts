@@ -305,6 +305,19 @@ export class ProgrammaticBackend implements AgentBackend {
     // Mint the VAULT token only — no channel MCP in this backend (the daemon
     // mediates messaging). A spec with no vault gets an EMPTY mcpServers config
     // (the agent still runs; it just has no vault tools this turn).
+    //
+    // FIX 2 (PR #3) — mid-turn token expiry, ASSESSED + DEFERRED (no re-mint added).
+    // The vault write token is MINTED FRESH per turn here (no `expiresIn` override → the
+    // hub default ~90d non-ephemeral TTL), so it CANNOT expire during a single `claude -p`
+    // turn (which lasts minutes). And the vault WRITES are made by the OPAQUE `claude -p`
+    // subprocess via the token baked into its 0600 `.mcp.json` (below) — the backend has
+    // NO in-process seam to observe a 401 from those writes and re-inject a new token
+    // mid-turn. A re-mint-on-401 would require the MCP-client-in-subprocess to surface
+    // 401s back here, which the architecture doesn't provide. So a re-mint is INFEASIBLE
+    // (and unnecessary given the fresh-per-turn ~90d mint). If a future long-running /
+    // multi-day single turn or a short operator-pinned TTL ever makes mid-turn expiry
+    // real, the fix is at the MCP-client layer (refresh-on-401), tracked as a follow-up
+    // — NOT a forced backend re-mint that can't see the failure.
     let vaultArg: { url: string; entry: { name: string; token: string } } | undefined;
     if (spec.vault) {
       const v = spec.vault;

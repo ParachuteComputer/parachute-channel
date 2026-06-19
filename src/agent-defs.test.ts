@@ -1187,3 +1187,123 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
     expect(calls.registered.map((s) => s.name)).toEqual(["uni"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// FIX 4 (delete ordering: vault-delete first, then deregister) + FIX 5 (grant-GC
+// failure on delete is surfaced, not swallowed) — PR #3.
+// ---------------------------------------------------------------------------
+
+/**
+ * A fetch that serves the def list + by-id GET (so an agent instantiates) and routes
+ * a DELETE to a configurable outcome (`deleteStatus`). Records DELETEs so a test can
+ * assert the note-delete was attempted. Reconcile/PATCH succeed by default.
+ */
+function vaultFetchWithDelete(opts: {
+  defs: Array<{ id: string; content?: string; metadata?: Record<string, unknown> }>;
+  deleteStatus?: number; // the status the DELETE returns (default 204 = success)
+  deletes?: string[]; // record each DELETEd note id
+}): typeof fetch {
+  return (async (url: string | URL | Request, init?: RequestInit) => {
+    const u = String(url);
+    const method = init?.method ?? "GET";
+    if (method === "DELETE") {
+      const id = decodeURIComponent(u.split("/api/notes/")[1]!);
+      opts.deletes?.push(id);
+      const status = opts.deleteStatus ?? 204;
+      return new Response(status >= 400 ? "delete failed" : null, { status });
+    }
+    if (method === "PATCH") return new Response(null, { status: 200 });
+    if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+      return new Response(JSON.stringify(opts.defs), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("[]", { status: 200 });
+  }) as typeof fetch;
+}
+
+describe("AgentDefRegistry — deleteDef ordering + grant-GC surfacing (FIX 4/5, PR #3)", () => {
+  test("FIX 4: a vault-delete failure leaves the def REGISTERED (not orphaned)", async () => {
+    const { deps, calls } = recorderDeps();
+    const deletes: string[] = [];
+    const fetchFn = vaultFetchWithDelete({
+      defs: [{ id: "Agents/uni", content: "role", metadata: { name: "uni" } }],
+      deleteStatus: 502, // the vault note delete 502s
+      deletes,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+    await reg.loadAll();
+    expect(reg.findLiveByNote("Agents/uni")).not.toBeNull(); // live before delete.
+
+    // The delete throws (the vault note delete failed) BEFORE any deregister.
+    await expect(reg.deleteDef("Agents/uni")).rejects.toThrow(/delete def Agents\/uni failed \(502\)/);
+
+    // FIX 4 invariant: the agent is STILL registered (the in-memory def was NOT torn down
+    // on a failed vault delete) — it re-converges on the next poll rather than orphaning.
+    expect(reg.findLiveByNote("Agents/uni")).not.toBeNull();
+    expect(calls.deregistered).toEqual([]); // nothing was deregistered.
+    expect(deletes).toEqual(["Agents/uni"]); // the delete WAS attempted (and failed).
+  });
+
+  test("FIX 4: a successful vault-delete deregisters cleanly", async () => {
+    const { deps, calls } = recorderDeps();
+    const deletes: string[] = [];
+    const fetchFn = vaultFetchWithDelete({
+      defs: [{ id: "Agents/uni", content: "role", metadata: { name: "uni" } }],
+      deleteStatus: 204,
+      deletes,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+    await reg.loadAll();
+
+    const removed = await reg.deleteDef("Agents/uni");
+    expect(removed.name).toBe("uni");
+    expect(removed.grantsReconciled).toBe(true); // no grants client → nothing to reconcile = ok.
+    // Now deregistered + removed from the live set.
+    expect(reg.findLiveByNote("Agents/uni")).toBeNull();
+    expect(calls.deregistered).toEqual(["uni"]);
+    expect(deletes).toEqual(["Agents/uni"]);
+  });
+
+  test("FIX 5: a grant-reconcile failure on delete is SURFACED (grantsReconciled:false) — the note-delete still completes", async () => {
+    const { deps, calls } = recorderDeps();
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
+    const grants = fakeGrantsClient({ reconciled, reconcileFails: true }); // reconcile POST 500s
+    const deletes: string[] = [];
+    const fetchFn = vaultFetchWithDelete({
+      defs: [{ id: "Agents/uni", content: "role", metadata: { name: "uni" } }],
+      deleteStatus: 204,
+      deletes,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+    await reg.loadAll();
+    reconciled.length = 0;
+
+    // The delete must NOT throw (grant GC is best-effort) but MUST report the partial
+    // success so the caller doesn't claim a clean full success (orphaned grants).
+    const removed = await reg.deleteDef("Agents/uni");
+    expect(removed.name).toBe("uni");
+    expect(removed.grantsReconciled).toBe(false); // FIX 5: the failure is surfaced, not swallowed.
+    // The note-delete + deregister STILL completed (the def IS gone).
+    expect(reg.findLiveByNote("Agents/uni")).toBeNull();
+    expect(calls.deregistered).toEqual(["uni"]);
+    expect(deletes).toEqual(["Agents/uni"]);
+    // The reconcile WAS attempted (prune-all on the removed agent) — it just failed on the hub.
+    expect(reconciled).toEqual([{ agent: "uni", liveConnections: [] }]);
+  });
+
+  test("FIX 5: a SUCCESSFUL grant-reconcile on delete reports grantsReconciled:true", async () => {
+    const { deps } = recorderDeps();
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
+    const grants = fakeGrantsClient({ reconciled }); // reconcile succeeds
+    const fetchFn = vaultFetchWithDelete({
+      defs: [{ id: "Agents/uni", content: "role", metadata: { name: "uni" } }],
+      deleteStatus: 204,
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+    await reg.loadAll();
+    const removed = await reg.deleteDef("Agents/uni");
+    expect(removed.grantsReconciled).toBe(true);
+  });
+});

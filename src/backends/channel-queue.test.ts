@@ -16,6 +16,7 @@ import {
   type ChannelQueueStore,
 } from "./channel-queue.ts";
 import type { AgentSpec } from "../sandbox/types.ts";
+import { InboundClaimConflictError } from "../transports/vault.ts";
 import type { InboundQueueNote, InboundStatus } from "../transports/vault.ts";
 
 /**
@@ -44,7 +45,12 @@ class FakeStore implements ChannelQueueStore {
       .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
   }
 
-  async setInboundStatus(id: string, status: InboundStatus, claimedAt?: string | null): Promise<void> {
+  async setInboundStatus(
+    id: string,
+    status: InboundStatus,
+    claimedAt?: string | null,
+    ifUpdatedAt?: string,
+  ): Promise<void> {
     if (this.throwOnNextSetStatus) {
       const e = this.throwOnNextSetStatus;
       this.throwOnNextSetStatus = null;
@@ -52,6 +58,17 @@ class FakeStore implements ChannelQueueStore {
     }
     const note = this.notes.get(id);
     if (!note) throw new Error(`fake store: no note ${id}`);
+    // CAS (FIX 3): when a precondition is supplied, the claim only lands if the note's
+    // `updatedAt` still matches what the caller last saw — else the race is lost (the
+    // real vault returns 409 → InboundClaimConflictError). On a successful CAS write we
+    // ADVANCE `updatedAt` (the vault bumps it on every write) so a second concurrent
+    // claimer with the now-stale precondition fails, modelling the real round-trip.
+    if (ifUpdatedAt !== undefined) {
+      if (note.updatedAt !== ifUpdatedAt) {
+        throw new InboundClaimConflictError(id, 409);
+      }
+      note.updatedAt = `${ifUpdatedAt}::bumped`;
+    }
     note.status = status;
     if (claimedAt === null) delete note.claimedAt;
     else if (claimedAt !== undefined) note.claimedAt = claimedAt;
@@ -171,6 +188,63 @@ describe("ChannelQueueRegistry — claimNext (single-claim)", () => {
     store.throwOnNextSetStatus = new Error("vault 500");
     await expect(reg.claimNext("laptop")).rejects.toThrow(/vault 500/);
     expect(store.notes.get("a")!.status).toBe("pending"); // not lost — retryable.
+  });
+
+  test("FIX 3: a passed-through updatedAt is used as the CAS precondition on the claim", async () => {
+    const reg = new ChannelQueueRegistry();
+    const store = new FakeStore();
+    store.add({ ...inbound("a", "older", "2026-06-18T10:00:00Z"), updatedAt: "rev-1" });
+    reg.register(specFor("laptop"), store);
+    const claimed = await reg.claimNext("laptop");
+    expect(claimed!.id).toBe("a");
+    // CAS landed → the store bumped updatedAt (modelling the vault advancing it on write).
+    expect(store.notes.get("a")!.status).toBe("in-flight");
+    expect(store.notes.get("a")!.updatedAt).toBe("rev-1::bumped");
+  });
+
+  test("FIX 3: a 428/409 conflict on the claim PATCH makes claimNext skip to the NEXT pending (no double-claim)", async () => {
+    const reg = new ChannelQueueRegistry();
+    const store = new FakeStore();
+    // Two pending notes, each with a known revision for the CAS precondition.
+    store.add({ ...inbound("a", "older", "2026-06-18T10:00:00Z"), updatedAt: "rev-a" });
+    store.add({ ...inbound("b", "newer", "2026-06-18T10:05:00Z"), updatedAt: "rev-b" });
+    reg.register(specFor("laptop"), store);
+
+    // Simulate a CONCURRENT winner: between claimNext's list and its PATCH of "a",
+    // another session claims "a" and advances its revision. The next PATCH of "a" with the
+    // now-stale precondition will throw InboundClaimConflictError → re-list → claim "b".
+    const realSet = store.setInboundStatus.bind(store);
+    let firstPatch = true;
+    store.setInboundStatus = (async (id, status, claimedAt, ifUpdatedAt) => {
+      if (firstPatch && id === "a") {
+        firstPatch = false;
+        // The "other session" already claimed "a" (its revision moved on).
+        store.notes.get("a")!.updatedAt = "rev-a-claimed-by-someone-else";
+        store.notes.get("a")!.status = "in-flight";
+      }
+      return realSet(id, status, claimedAt, ifUpdatedAt);
+    }) as typeof store.setInboundStatus;
+
+    const claimed = await reg.claimNext("laptop");
+    // The conflict on "a" was caught + re-listed; we claimed "b" instead — never "a" twice.
+    expect(claimed!.id).toBe("b");
+    expect(store.notes.get("b")!.status).toBe("in-flight");
+  });
+
+  test("FIX 3: a conflict with NO other pending returns null (nothing claimable right now)", async () => {
+    const reg = new ChannelQueueRegistry();
+    const store = new FakeStore();
+    store.add({ ...inbound("a", "only", "2026-06-18T10:00:00Z"), updatedAt: "rev-a" });
+    reg.register(specFor("laptop"), store);
+    // Every CAS on "a" loses (the precondition is always stale → conflict). After the
+    // conflict, "a" is left in-flight (by the simulated winner), so the re-list finds no
+    // pending and returns null — not a double-claim, not an error.
+    store.setInboundStatus = (async (id: string) => {
+      store.notes.get(id)!.status = "in-flight";
+      throw new InboundClaimConflictError(id, 409);
+    }) as typeof store.setInboundStatus;
+    const claimed = await reg.claimNext("laptop");
+    expect(claimed).toBeNull();
   });
 });
 

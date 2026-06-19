@@ -208,10 +208,38 @@ export interface InboundQueueNote {
   status: InboundStatus;
   /** ISO timestamp the note was claimed (set with `in-flight`); used by the TTL sweep. */
   claimedAt?: string;
+  /**
+   * The note's vault `updated_at` (the last-seen revision). Threaded through so a
+   * claim can use it as the `if_updated_at` compare-and-swap precondition (agent#101):
+   * two concurrent `claimNext` reads see the SAME `updated_at`; the first claim PATCH
+   * advances it, so the second's precondition fails (vault 409) and it re-lists rather
+   * than double-claiming. Absent when the vault response omitted it.
+   */
+  updatedAt?: string;
 }
 
 const DEFAULT_VAULT_URL = "http://127.0.0.1:1940";
 const DEFAULT_PATH_PREFIX = "channel";
+
+/**
+ * Thrown by {@link VaultTransport.setInboundStatus} when a compare-and-swap claim
+ * (an `ifUpdatedAt` precondition) FAILED — the note changed since it was read, so
+ * another writer won the race (agent#101). The vault returns **409** (`error_type:
+ * "conflict"`) for a STALE `if_updated_at`, and **428** (`precondition_required`) when
+ * the precondition is absent; we treat both as "lost the claim race" so the caller
+ * (the channel queue's `claimNext`) re-lists and tries the next pending message rather
+ * than double-claiming. Distinct from a generic write error (any other non-ok status),
+ * which still throws a plain Error.
+ */
+export class InboundClaimConflictError extends Error {
+  constructor(
+    readonly id: string,
+    readonly status: number,
+  ) {
+    super(`vault transport: inbound claim ${id} lost the CAS race (${status})`);
+    this.name = "InboundClaimConflictError";
+  }
+}
 /** Parent tag (NEW, namespaced) — carried LITERALLY on every note WE write; query
  *  this + metadata.channel to see BOTH directions of a channel (the slash children
  *  are namespace, not inheritance). */
@@ -781,7 +809,11 @@ export class VaultTransport implements Transport {
     // registry enforces ONE agent per channel (byChannel index), so the collision can't
     // arise in practice.
     const safeName = (thread.name ?? thread.channel).replace(/[^a-zA-Z0-9_-]/g, "-");
-    const leaf = singleThreaded ? safeName : crypto.randomUUID();
+    // Multi-threaded leaf: a per-FIRE id. Reuse the caller's `threadId` when given (a
+    // re-record of the same turn — e.g. the outbound-failure status flip — targets the
+    // SAME per-fire note instead of minting a duplicate); else mint a fresh one. Single-
+    // threaded ignores it (deterministic name leaf so the one-per-channel note upserts).
+    const leaf = singleThreaded ? safeName : (thread.threadId ?? crypto.randomUUID());
     const path = `${THREAD_PATH_PREFIX}/${safeChannel}/${leaf}`;
 
     // For single-threaded UPSERT, read the existing thread note (by its deterministic
@@ -809,7 +841,10 @@ export class VaultTransport implements Transport {
       }
     }
 
-    const turnCount = singleThreaded ? priorTurnCount + 1 : 1;
+    // A re-record of the SAME turn (`sameTurn`) keeps the existing count — the first record
+    // already counted this turn; a status flip (ok→error on outbound-delivery failure) must
+    // not double-count it. A normal turn increments. Multi-threaded is always 1.
+    const turnCount = singleThreaded ? (thread.sameTurn ? priorTurnCount : priorTurnCount + 1) : 1;
     // `started_at` is set ONCE on create (preserve the prior on upsert); `last_turn_at`
     // advances every turn.
     const startedAt = priorStartedAt ?? thread.started_at;
@@ -1182,13 +1217,26 @@ export class VaultTransport implements Transport {
 
   /**
    * List THIS channel's INBOUND queue notes (the `#agent/message/inbound` notes),
-   * ascending by `ts` (oldest first), carrying the claim `status`/`claimedAt`. The
-   * query is index-free, mirroring {@link loadTranscript}: query by the inbound
+   * ascending by `ts` (oldest first), carrying the claim `status`/`claimedAt`/`updatedAt`.
+   * The query is index-free, mirroring {@link loadTranscript}: query by the inbound
    * CHILD tag (we want inbound only — outbound replies are not queue items) and
    * filter to this channel CLIENT-SIDE on `metadata.channel` (we don't assume a
    * `channel` index). A note with NO `status` field reads as `pending` (a fresh
    * inbound the trigger just created). Throws on a non-ok vault response so the
    * caller surfaces a clear error rather than a silently-empty queue.
+   *
+   * QUEUE-CAP TRUNCATION FIX (agent#103). Over time `handled` notes accumulate; the
+   * tag query is capped (the vault limit), so once enough `handled` notes precede the
+   * still-`pending` ones, the pending notes fall OUTSIDE the cap and are never claimed
+   * (a silently-stuck queue). The vault's `status` metadata isn't indexed (we can't
+   * assume a per-vault schema), so we can't filter `status:pending` server-side. So we
+   * EXCLUDE `handled` notes CLIENT-SIDE — the live queue is only `pending` + `in-flight`
+   * — and additionally REQUEST the cap descending (newest first) so when the raw note
+   * count itself exceeds the cap, it's the OLDEST `handled` notes that get dropped, never
+   * a recent `pending`. The two together keep the actionable queue (pending + in-flight)
+   * intact regardless of how many `handled` notes have piled up. (Declaring `status`
+   * indexed for a true server-side `status != handled` filter is a future scale
+   * optimization, not a correctness requirement.)
    */
   async listInboundQueue(opts?: { limit?: number }): Promise<InboundQueueNote[]> {
     const channel = this.channel;
@@ -1199,13 +1247,23 @@ export class VaultTransport implements Transport {
     params.set("tag", AGENT_MESSAGE_INBOUND_TAG); // → %23agent%2Fmessage%2Finbound
     params.set("include_content", "true");
     params.set("limit", String(fetchLimit));
+    // NEWEST-first at the vault (default order_by is `updated_at`) so a hard cap drops
+    // the OLDEST notes (the long-settled `handled` ones), never a recent pending. We
+    // re-sort ascending below for the queue. The vault param is `sort` (asc|desc).
+    params.set("sort", "desc");
     const url = `${this.vaultUrl}/vault/${this.vault}/api/notes?${params.toString()}`;
     const res = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
       throw new Error(`vault transport: list inbound queue failed (${res.status}) ${detail}`.trim());
     }
-    type RawNote = { id?: string; content?: string; metadata?: Record<string, unknown> };
+    type RawNote = {
+      id?: string;
+      content?: string;
+      metadata?: Record<string, unknown>;
+      updated_at?: string;
+      updatedAt?: string;
+    };
     let notes: RawNote[];
     try {
       const parsed = (await res.json()) as unknown;
@@ -1222,15 +1280,27 @@ export class VaultTransport implements Transport {
       if (typeof note.id !== "string" || !note.id) continue;
       const meta = note.metadata ?? {};
       if (meta.channel !== channel) continue; // client-side channel filter (index-free).
+      const status = coerceInboundStatus(meta[STATUS_META_KEY]);
+      // Drop `handled` notes — they are not queue items (#103). Only pending + in-flight
+      // make up the actionable queue; counting/returning handled would let them crowd
+      // the live queue out of the cap.
+      if (status === "handled") continue;
+      const updatedAt =
+        typeof note.updated_at === "string"
+          ? note.updated_at
+          : typeof note.updatedAt === "string"
+            ? note.updatedAt
+            : undefined;
       out.push({
         id: note.id,
         text: typeof note.content === "string" ? note.content : "",
         sender: typeof meta.sender === "string" ? meta.sender : "",
         ts: typeof meta.ts === "string" ? meta.ts : "",
-        status: coerceInboundStatus(meta[STATUS_META_KEY]),
+        status,
         ...(typeof meta[CLAIMED_AT_META_KEY] === "string"
           ? { claimedAt: meta[CLAIMED_AT_META_KEY] as string }
           : {}),
+        ...(updatedAt ? { updatedAt } : {}),
       });
     }
     // Ascending by ts; blank-ts notes sort first (stable, deterministic).
@@ -1241,29 +1311,49 @@ export class VaultTransport implements Transport {
   /**
    * PATCH an inbound note's claim status (+ optionally `claimedAt`), by note id.
    * Sends ONLY the changed metadata; the vault MERGES it, so the channel/direction/
-   * sender/ts are preserved. `force: true` satisfies the vault's 428 mutation
-   * precondition (the 4a precondition) — safe here: `status`/`claimedAt` are the
-   * module's OWN authoritative claim fields, the body carries no content. Passing
-   * `claimedAt: null` CLEARS the field (written as an empty string) — used on
-   * release/handled so a stale claim timestamp doesn't linger. Throws on a non-ok
-   * vault response (the caller decides whether to surface or swallow).
+   * sender/ts are preserved. Passing `claimedAt: null` CLEARS the field (written as
+   * an empty string) — used on release/handled so a stale claim timestamp doesn't
+   * linger.
+   *
+   * COMPARE-AND-SWAP (agent#101). When `ifUpdatedAt` is given, the PATCH carries
+   * `if_updated_at` (the note's last-seen `updated_at`) as the vault's optimistic-
+   * concurrency precondition instead of `force: true` — so a CLAIM only lands if the
+   * note hasn't changed since it was read. A STALE precondition (another session
+   * already claimed it) makes the vault return **409** (`conflict`); an ABSENT one (if
+   * the note carried no `updated_at` to send) would 428 — either way we throw
+   * {@link InboundClaimConflictError} so the caller re-lists and skips to the next
+   * pending message rather than double-claiming. When `ifUpdatedAt` is OMITTED (the
+   * release/handled/sweep paths, which are last-write-wins by design) the PATCH uses
+   * `force: true` as before. Any OTHER non-ok status throws a plain Error.
    */
   async setInboundStatus(
     id: string,
     status: InboundStatus,
     claimedAt?: string | null,
+    ifUpdatedAt?: string,
   ): Promise<void> {
     const metadata: Record<string, string> = { [STATUS_META_KEY]: status };
     if (claimedAt !== undefined) {
       metadata[CLAIMED_AT_META_KEY] = claimedAt === null ? "" : claimedAt;
     }
     const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(id)}`;
+    // CAS when an `ifUpdatedAt` precondition is supplied; otherwise last-write-wins via
+    // `force` (the prior behavior, kept for release/handled/sweep).
+    const body =
+      ifUpdatedAt !== undefined
+        ? { metadata, if_updated_at: ifUpdatedAt }
+        : { metadata, force: true };
     const res = await fetch(url, {
       method: "PATCH",
       headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
-      body: JSON.stringify({ metadata, force: true }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
+      // 409 (stale precondition) / 428 (precondition required) on a CAS attempt = the
+      // claim race was lost → a typed conflict the caller re-lists on.
+      if (ifUpdatedAt !== undefined && (res.status === 409 || res.status === 428)) {
+        throw new InboundClaimConflictError(id, res.status);
+      }
       const detail = await res.text().catch(() => "");
       throw new Error(
         `vault transport: set inbound status ${id} failed (${res.status}) ${detail}`.trim(),

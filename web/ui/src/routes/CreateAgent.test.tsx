@@ -13,7 +13,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../lib/api.ts";
-import { CreateAgent } from "./CreateAgent.tsx";
+import { CreateAgent, CreateAgentRoute } from "./CreateAgent.tsx";
 
 vi.mock("../lib/api.ts", async (orig) => {
   const actual = (await orig()) as typeof api;
@@ -158,12 +158,15 @@ describe("CreateAgent form", () => {
     expect(within(success).getByRole("link", { name: /back to agents/i })).toBeInTheDocument();
   });
 
-  it("does NOT show the connect one-liner for a programmatic agent", async () => {
+  it("does NOT show the connect one-liner for a programmatic agent, and echoes the chosen mode", async () => {
     renderForm();
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "prog" } });
     fireEvent.click(screen.getByRole("button", { name: /create agent/i }));
-    await screen.findByTestId("create-success");
+    const success = await screen.findByTestId("create-success");
     expect(screen.queryByTestId("connect-session")).not.toBeInTheDocument();
+    // The success banner confirms the full selection (name · mode · backend) — mode
+    // comes from the form (the def-detail response doesn't echo it). Default = single-threaded.
+    expect(success).toHaveTextContent(/single-threaded/);
   });
 
   it("shows the `claude mcp add` one-liner on a backend:channel success", async () => {
@@ -193,5 +196,29 @@ describe("CreateAgent form", () => {
     renderForm([]);
     expect(screen.getByTestId("no-def-vaults")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /create agent/i })).toBeDisabled();
+  });
+});
+
+describe("CreateAgentRoute (container)", () => {
+  const listAgentVaults = vi.mocked(api.listAgentVaults);
+
+  it("surfaces the sign-in message when the def-vault load 401s", async () => {
+    listAgentVaults.mockRejectedValue(new api.HttpError(401, "unauthorized"));
+    render(
+      <MemoryRouter>
+        <CreateAgentRoute />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(/sign in to the portal/i)).toBeInTheDocument();
+  });
+
+  it("renders the form once the def-vaults resolve", async () => {
+    listAgentVaults.mockResolvedValue({ vaults: [vaultRow()] });
+    render(
+      <MemoryRouter>
+        <CreateAgentRoute />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByLabelText("Name")).toBeInTheDocument();
   });
 });

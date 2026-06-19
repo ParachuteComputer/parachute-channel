@@ -33,7 +33,11 @@ import {
   listAgentVaults,
 } from "../lib/api.ts";
 
-/** The name field must be a slug (the daemon enforces the same `NAME_SLUG_RE`). */
+/**
+ * The name field must be a slug. Mirrors the daemon's canonical `NAME_SLUG_RE`
+ * (`src/agent-defs.ts`) byte-for-byte — keep in sync: a drift here would accept a
+ * name the daemon then 400s at submit (surfaced only after the round-trip).
+ */
 const NAME_SLUG_RE = /^[a-zA-Z0-9_-]+$/;
 
 interface CreateAgentProps {
@@ -45,7 +49,9 @@ type SubmitState =
   | { kind: "idle" }
   | { kind: "submitting" }
   | { kind: "error"; message: string }
-  | { kind: "ok"; result: CreateAgentDefResponse };
+  // Carry the chosen `mode` through: the def-detail response doesn't echo it, so the
+  // success banner re-uses the form's value to confirm what the operator selected.
+  | { kind: "ok"; result: CreateAgentDefResponse; mode: AgentMode };
 
 export function CreateAgent({ vaults }: CreateAgentProps) {
   const hasVaults = vaults.length > 0;
@@ -78,7 +84,7 @@ export function CreateAgent({ vaults }: CreateAgentProps) {
         // Only send `wants` when the operator entered something.
         ...(wants.trim().length > 0 ? { wants: wants.trim() } : {}),
       });
-      setSubmit({ kind: "ok", result });
+      setSubmit({ kind: "ok", result, mode });
     } catch (err) {
       const message =
         err instanceof HttpError
@@ -91,7 +97,7 @@ export function CreateAgent({ vaults }: CreateAgentProps) {
   }
 
   if (submit.kind === "ok") {
-    return <CreateSuccess result={submit.result} />;
+    return <CreateSuccess result={submit.result} mode={submit.mode} />;
   }
 
   return (
@@ -344,16 +350,15 @@ function RadioRow(props: {
  * to the Agents list, and — for a channel backend — surfaces the connect-your-
  * session one-liner + a copy button.
  */
-export function CreateSuccess({ result }: { result: CreateAgentDefResponse }) {
+export function CreateSuccess({ result, mode }: { result: CreateAgentDefResponse; mode: AgentMode }) {
   const def = result.def;
-  // The mode isn't echoed in the def detail shape, so re-derive it from the form
-  // is unnecessary; the def's name/backend carry the confirmation. We surface the
-  // backend (the def carries it) + the connect affordance keyed off it.
+  // `mode` comes from the form state (the def-detail response doesn't echo it) so the
+  // banner confirms the full selection: name · mode · backend.
   return (
     <div data-testid="create-success">
       <h1>Agent created</h1>
       <div className="success-banner" role="status">
-        <strong>{def.name}</strong> · {def.backend}
+        <strong>{def.name}</strong> · {mode} · {def.backend}
       </div>
 
       <p className="lede">

@@ -226,6 +226,12 @@ export function Chat() {
         turnEs.current = ts;
       }
     },
+    // `onTurnEvent` is intentionally omitted from the deps. It's declared after
+    // this callback, and adding it would force `openStreams` to be re-created (and
+    // the connect effect to re-subscribe) every render. The stale closure is safe:
+    // `onTurnEvent` only ever calls stable setters (setLiveTurn) + a stable
+    // callback (reloadTranscript) + refs — it reads no changing render state — so
+    // an older captured instance behaves identically to the latest.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [addMessage, addSys, isVault],
   );

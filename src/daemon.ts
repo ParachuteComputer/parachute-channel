@@ -2985,7 +2985,7 @@ function main(): void {
     // (via the API/UI, or hot-added) are picked up immediately. So: warn + idle.
     console.warn(
       `parachute-agent: no channels configured yet — starting idle.\n` +
-        `  Create an agent via the admin UI at /agent/admin (or add ${join(STATE_DIR, "channels.json")}).\n` +
+        `  Create an agent via the admin UI at /agent/app/ (or add ${join(STATE_DIR, "channels.json")}).\n` +
         `  The daemon stays up; channels added live are picked up immediately.`,
     );
   }
@@ -3117,8 +3117,8 @@ function main(): void {
       // `parachute restart agent` 404s and we don't survive reboot (agent#34).
       startCmd: START_CMD,
       stripPrefix: true,
-      uiUrl: "/agent/home", // portal "Open UI" link → the Home overview landing (also in module.json; written here in case hub reads it from services.json)
-      configUiUrl: "/agent/admin", // module-owned config surface (modular-UI P4); hub frames/links it. Also in module.json.
+      uiUrl: "/agent/app/", // portal "Open UI" link → the SPA (canonical in module.json, which hub prefers; written here only as a services.json fallback hint)
+      configUiUrl: "/agent/app/", // module-owned config surface (modular-UI P4); hub frames/links it. Canonical in module.json (hub prefers it); this is a services.json fallback hint.
       // WebSocket support — tells the hub's Bun-native upgrade bridge to forward
       // `Upgrade: websocket` requests on `/agent/*` to this daemon (the
       // in-page terminal, design §5.1). DENY-BY-DEFAULT in the hub: without this

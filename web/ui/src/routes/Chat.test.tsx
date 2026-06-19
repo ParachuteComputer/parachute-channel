@@ -38,6 +38,7 @@ const listChannels = vi.mocked(api.listChannels);
 const listMessages = vi.mocked(api.listMessages);
 const sendMessage = vi.mocked(api.sendMessage);
 const getAgentToken = vi.mocked(auth.getAgentToken);
+const clearCachedToken = vi.mocked(auth.clearCachedToken);
 
 // ---- a minimal fake EventSource so the SSE paths are drivable in jsdom -------
 type Listener = (e: { data: string }) => void;
@@ -151,6 +152,38 @@ describe("Chat", () => {
     const es = FakeEventSource.find("/ui/events")!;
     es.emit("reply", { id: "out-1", text: "streamed reply" });
     expect(await screen.findByText("streamed reply")).toBeInTheDocument();
+  });
+
+  it("re-mints + reconnects once on a message-stream error; the guard blocks a second re-mint", async () => {
+    renderChat();
+    // Wait for the message stream to open on /ui/events.
+    await waitFor(() => expect(FakeEventSource.find("/ui/events")).toBeTruthy());
+    const first = FakeEventSource.find("/ui/events")!;
+    const countBefore = FakeEventSource.instances.filter((es) =>
+      es.url.includes("/ui/events"),
+    ).length;
+
+    // First error → re-mint (clearCachedToken) + reconnect (new EventSource).
+    first.onerror?.();
+    await waitFor(() => expect(clearCachedToken).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(
+        FakeEventSource.instances.filter((es) => es.url.includes("/ui/events")).length,
+      ).toBe(countBefore + 1),
+    );
+    expect(first.closed).toBe(true);
+    const second = FakeEventSource.find("/ui/events")!;
+    expect(second).not.toBe(first);
+
+    // A SECOND consecutive error (no intervening onopen to reset the guard) must NOT
+    // re-mint again — the `sseRetried` guard is still set from the first reconnect.
+    second.onerror?.();
+    // Give any (erroneous) async re-mint a chance to run, then assert it didn't.
+    await Promise.resolve();
+    expect(clearCachedToken).toHaveBeenCalledTimes(1);
+    expect(
+      FakeEventSource.instances.filter((es) => es.url.includes("/ui/events")).length,
+    ).toBe(countBefore + 1);
   });
 
   it("turn events drive the live bubble; init+text+tool show, done finalizes it", async () => {

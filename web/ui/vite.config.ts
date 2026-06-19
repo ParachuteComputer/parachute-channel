@@ -38,6 +38,13 @@ export default defineConfig({
         target: process.env.AGENT_ORIGIN ?? "http://127.0.0.1:1941",
         changeOrigin: true,
       },
+      // The message SSE stream lives at `/agent/ui/events` (the human↔UI traffic
+      // surface). Without this the live chat is deaf in stand-alone dev — proxy
+      // `/agent/ui` to the same daemon as `/agent/api`. Dev-only.
+      "/agent/ui": {
+        target: process.env.AGENT_ORIGIN ?? "http://127.0.0.1:1941",
+        changeOrigin: true,
+      },
     },
   },
 });

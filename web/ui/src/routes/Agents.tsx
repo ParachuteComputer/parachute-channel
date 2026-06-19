@@ -48,6 +48,13 @@ import {
   removeAgentVault,
   runJob,
 } from "../lib/api.ts";
+import {
+  type ConnectionRow,
+  defReloadStatus,
+  ensureDefReloadConnections,
+  listConnections,
+  teardownDefReloadConnections,
+} from "../lib/hub.ts";
 
 type LoadState =
   | { kind: "loading" }
@@ -1110,10 +1117,38 @@ export function DefVaultsSection({
   const [url, setUrl] = useState("");
   const [adding, setAdding] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
+  // A non-blocking notice after add — reactive reload may or may not have wired.
+  const [addNotice, setAddNotice] = useState<string | null>(null);
   // The vault currently in the remove-confirm state (its name), or null.
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
+
+  // Reactive-reload (def-reload connectors) state. `connections` is the hub's
+  // connection list; `connLoaded` distinguishes "loaded, none match" from "the
+  // hub list is unavailable" (loopback-direct / no session) so the column can
+  // degrade to "—" instead of falsely reading "off". `toggling` names the vault
+  // mid-enable/disable.
+  const [connections, setConnections] = useState<ConnectionRow[]>([]);
+  const [connLoaded, setConnLoaded] = useState(false);
+  const [toggling, setToggling] = useState<string | null>(null);
+  const [reactiveError, setReactiveError] = useState<string | null>(null);
+
+  const refreshConnections = useCallback(async () => {
+    try {
+      const list = await listConnections();
+      setConnections(list);
+      setConnLoaded(true);
+    } catch {
+      // Hub unavailable from here (loopback-direct, no session) — the 60s poll
+      // still covers reactivity; we just can't SHOW or TOGGLE its status.
+      setConnLoaded(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshConnections();
+  }, [refreshConnections]);
 
   const nameValid = /^[a-zA-Z0-9_-]+$/.test(vaultName);
   const canAdd = nameValid && !adding;
@@ -1123,15 +1158,33 @@ export function DefVaultsSection({
     if (!canAdd) return;
     setAdding(true);
     setAddError(null);
+    setAddNotice(null);
+    const added = vaultName;
     try {
       await addAgentVault({
-        vault: vaultName,
+        vault: added,
         ...(url.trim().length > 0 ? { url: url.trim() } : {}),
       });
       setVaultName("");
       setUrl("");
       setAddOpen(false);
       onChanged();
+      // Auto-wire reactive reload (the operator's authenticated session IS the
+      // approval). Best-effort: a failure leaves the vault added with the 60s
+      // poll as the fallback, so it never blocks the add.
+      try {
+        const { ok } = await ensureDefReloadConnections(added);
+        setAddNotice(
+          ok
+            ? `Added "${added}" — reactive reload is on (def changes apply instantly).`
+            : `Added "${added}" — reactive reload partially wired; defs still converge within 60s.`,
+        );
+      } catch (err) {
+        setAddNotice(
+          `Added "${added}". Reactive reload couldn't be enabled (${errMessage(err)}) — def changes converge within 60s; you can enable it below.`,
+        );
+      }
+      await refreshConnections();
     } catch (err) {
       setAddError(errMessage(err));
     } finally {
@@ -1144,12 +1197,38 @@ export function DefVaultsSection({
     setRemoveError(null);
     try {
       await removeAgentVault(name);
+      // Best-effort teardown of this vault's def-reload connectors — the vault
+      // is no longer a def-vault, so its triggers are stale. A failure is
+      // non-fatal (the connector just reloads a vault nothing reads).
+      try {
+        await teardownDefReloadConnections(name, connections);
+      } catch {
+        // ignore — leaves a harmless stale connector, removable in the hub UI.
+      }
       setConfirmRemove(null);
       onChanged();
+      await refreshConnections();
     } catch (err) {
       setRemoveError(errMessage(err));
     } finally {
       setRemoving(null);
+    }
+  }
+
+  async function onToggleReactive(name: string, currentlyActive: boolean) {
+    setToggling(name);
+    setReactiveError(null);
+    try {
+      if (currentlyActive) {
+        await teardownDefReloadConnections(name, connections);
+      } else {
+        await ensureDefReloadConnections(name);
+      }
+      await refreshConnections();
+    } catch (err) {
+      setReactiveError(errMessage(err));
+    } finally {
+      setToggling(null);
     }
   }
 
@@ -1171,8 +1250,20 @@ export function DefVaultsSection({
       </div>
       <p className="muted">
         Vaults this module reads <code>#agent/definition</code> notes from. Removing one
-        deregisters every agent defined in it.
+        deregisters every agent defined in it. <strong>Reactive reload</strong> wires a vault
+        trigger so def changes apply instantly instead of waiting up to 60s.
       </p>
+
+      {addNotice ? (
+        <div className="info-banner" role="status" data-testid="add-def-vault-notice">
+          {addNotice}
+        </div>
+      ) : null}
+      {reactiveError ? (
+        <div className="error-banner" role="alert" data-testid="reactive-reload-error">
+          {reactiveError}
+        </div>
+      ) : null}
 
       {addOpen ? (
         <form className="inline-form" onSubmit={onAdd} aria-label="Add def-vault" data-testid="add-def-vault-form">
@@ -1234,11 +1325,14 @@ export function DefVaultsSection({
               <th>Vault</th>
               <th>URL</th>
               <th>Token</th>
+              <th>Reactive reload</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
-            {vaults.map((v) => (
+            {vaults.map((v) => {
+              const reactive = defReloadStatus(v.vault, connections);
+              return (
               <tr key={v.vault} data-testid={`def-vault-${v.vault}`}>
                 <td className="cell-name">{v.vault}</td>
                 <td className="cell-dim">{v.url}</td>
@@ -1247,6 +1341,38 @@ export function DefVaultsSection({
                     <span className="pill status-enabled">present</span>
                   ) : (
                     <span className="pill status-error">missing</span>
+                  )}
+                </td>
+                <td data-testid={`reactive-reload-cell-${v.vault}`}>
+                  {!connLoaded ? (
+                    <span className="cell-dim" title="Open the agent app via your hub origin to manage reactive reload.">
+                      —
+                    </span>
+                  ) : (
+                    <span className="confirm-inline">
+                      {reactive.active ? (
+                        <span className="pill status-enabled" data-testid={`reactive-on-${v.vault}`}>
+                          on
+                        </span>
+                      ) : (
+                        <span className="pill" data-testid={`reactive-off-${v.vault}`}>
+                          off
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        className="cancel-link"
+                        data-testid={`reactive-toggle-${v.vault}`}
+                        disabled={toggling === v.vault}
+                        onClick={() => void onToggleReactive(v.vault, reactive.active)}
+                      >
+                        {toggling === v.vault
+                          ? "Working…"
+                          : reactive.active
+                            ? "Disable"
+                            : "Enable"}
+                      </button>
+                    </span>
                   )}
                 </td>
                 <td>
@@ -1284,7 +1410,8 @@ export function DefVaultsSection({
                   )}
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       )}

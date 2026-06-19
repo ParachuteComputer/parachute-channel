@@ -193,6 +193,15 @@ h3 {
   margin-bottom: 1rem;
   font-size: 0.9rem;
 }
+.info-banner {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--fg);
+  padding: 0.65rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.88rem;
+}
 .empty {
   border: 1px dashed var(--border);
   border-radius: 10px;

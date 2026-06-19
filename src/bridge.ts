@@ -76,17 +76,31 @@ const mcp = new Server(
 // Permission relay — receive permission_request from CC, forward to daemon
 // ---------------------------------------------------------------------------
 
-mcp.setNotificationHandler(
-  z.object({
-    method: z.literal("notifications/claude/agent/permission_request"),
-    params: z.object({
-      request_id: z.string(),
-      tool_name: z.string(),
-      description: z.string(),
-      input_preview: z.string(),
-    }),
+// The permission-request notification. The Zod schema does the runtime validation;
+// the params shape is hand-typed below. WHY the cast: the MCP SDK's
+// `setNotificationHandler<T>` computes `SchemaOutput<T>` over the schema, which trips
+// TS2589 ("type instantiation is excessively deep") on this nested inline Zod object —
+// a known SDK/Zod inference limit, NOT a runtime problem (the schema validates fine and
+// bun runs it). Passing the schema as the SDK's loose first-arg constraint sidesteps the
+// deep inference; the handler reads `params` via the explicit `PermissionNotifParams`.
+const PermissionNotifSchema = z.object({
+  method: z.literal("notifications/claude/agent/permission_request"),
+  params: z.object({
+    request_id: z.string(),
+    tool_name: z.string(),
+    description: z.string(),
+    input_preview: z.string(),
   }),
-  async ({ params }) => {
+});
+// Derived from the schema so the two can't drift (plain z.infer of this shallow
+// schema is fine — the TS2589 depth blowup is in the SDK's SchemaOutput<T> on the
+// setNotificationHandler generic path, not in a basic type alias).
+type PermissionNotifParams = z.infer<typeof PermissionNotifSchema>["params"];
+
+mcp.setNotificationHandler(
+  PermissionNotifSchema as unknown as Parameters<typeof mcp.setNotificationHandler>[0],
+  async (notification) => {
+    const { params } = notification as { params: PermissionNotifParams };
     try {
       await fetch(`${DAEMON_URL}/api/permission`, {
         method: "POST",

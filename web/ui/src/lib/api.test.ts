@@ -12,6 +12,8 @@ vi.mock("./auth.ts", () => ({
 import * as auth from "./auth.ts";
 import {
   apiBase,
+  connectSessionCommand,
+  createAgentDef,
   HttpError,
   listAgentDefs,
   listAgentVaults,
@@ -153,5 +155,83 @@ describe("listAgents / listAgentDefs / listAgentVaults", () => {
       vi.fn(async () => new Response("", { status: 401 })),
     );
     await expect(listAgents()).rejects.toBeInstanceOf(HttpError);
+  });
+});
+
+describe("createAgentDef (POST)", () => {
+  it("POSTs the JSON body with the Bearer + content-type to /agent/api/agent-defs", async () => {
+    const fetchMock = fetchFn(async () => jsonResponse(201, { ok: true, def: { name: "eng" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = {
+      vault: "default",
+      name: "eng",
+      backend: "channel" as const,
+      systemPrompt: "You are…",
+      metadata: { mode: "single-threaded" },
+    };
+    const res = await createAgentDef(body);
+
+    expect(res.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/agent-defs");
+    expect(init?.method).toBe("POST");
+    const headers = new Headers(init?.headers);
+    expect(headers.get("authorization")).toBe("Bearer jwt-tok");
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(JSON.parse(String(init?.body))).toEqual(body);
+  });
+
+  it("re-mints and retries once on a 401, then succeeds", async () => {
+    getAgentToken.mockResolvedValueOnce("stale").mockResolvedValueOnce("fresh");
+    const fetchMock = fetchFn(async () => jsonResponse(201, { ok: true, def: { name: "a" } }));
+    fetchMock
+      .mockResolvedValueOnce(new Response("", { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse(201, { ok: true, def: { name: "a" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await createAgentDef({
+      vault: "default",
+      name: "a",
+      backend: "programmatic",
+      systemPrompt: "",
+      metadata: { mode: "single-threaded" },
+    });
+
+    expect(clearCachedToken).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(new Headers(fetchMock.mock.calls[0]![1]?.headers).get("authorization")).toBe(
+      "Bearer stale",
+    );
+    expect(new Headers(fetchMock.mock.calls[1]![1]?.headers).get("authorization")).toBe(
+      "Bearer fresh",
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("throws HttpError with the daemon error message on a 400", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(400, { error: "no def-vaults configured" })),
+    );
+    await expect(
+      createAgentDef({
+        vault: "default",
+        name: "x",
+        backend: "programmatic",
+        systemPrompt: "",
+        metadata: { mode: "single-threaded" },
+      }),
+    ).rejects.toMatchObject({ name: "HttpError", status: 400, message: "no def-vaults configured" });
+  });
+});
+
+describe("connectSessionCommand", () => {
+  it("builds the `claude mcp add` one-liner mirroring the daemon snippet", () => {
+    // In vitest apiBase() is "/agent/api" → MOUNT "/agent". Origin from the arg.
+    expect(connectSessionCommand("eng", "https://my.parachute.computer")).toBe(
+      "claude mcp add --transport http --scope user agent-eng https://my.parachute.computer/agent/mcp/eng",
+    );
   });
 });

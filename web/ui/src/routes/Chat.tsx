@@ -160,12 +160,41 @@ export function Chat() {
       // stale — bail before creating streams that would escape the cleanup.
       if (gen !== connectGen.current) return;
 
-      // 1. Message stream — inbound/outbound deltas (reply / edit / permission).
-      const ms = new EventSource(messageStreamUrl(ch, token));
-      ms.onopen = () => {
+      const transport = transportFor(ch);
+
+      // Shared stream lifecycle: `onopen` marks the chat live + clears the retry latch;
+      // `onerror` re-mints the token ONCE (a stale/short-lived token 401s the stream)
+      // then reconnects, else falls back to the browser's auto-reconnect. Both streams
+      // share the same token, so either erroring re-mints + re-opens both.
+      const onStreamOpen = () => {
         sseRetried.current = false;
         setStatus({ text: `live - ${ch}`, kind: "live" });
       };
+      const onStreamError = () => {
+        if (!sseRetried.current && token) {
+          sseRetried.current = true;
+          setStatus({ text: "re-authenticating...", kind: "" });
+          msgEs.current?.close();
+          msgEs.current = null;
+          turnEs.current?.close();
+          turnEs.current = null;
+          clearCachedToken();
+          void openStreams(ch);
+          return;
+        }
+        setStatus({ text: "reconnecting...", kind: "" });
+      };
+
+      // 1. Message stream — the http-ui transport's inbound/outbound deltas
+      //    (reply / edit / permission). It is served ONLY for an `http-ui` channel; a
+      //    `vault` channel 404s it (its live updates come from the turn-event stream +
+      //    reload-on-done below). So open it ONLY for http-ui — opening it for a vault
+      //    channel would just spin a doomed EventSource (404 → error → wasted re-mint)
+      //    on every chat load. Interactive/http-ui is retired, so in practice this is
+      //    rarely taken; it's kept for any lingering http-ui channel.
+      if (transport === "http-ui") {
+      const ms = new EventSource(messageStreamUrl(ch, token));
+      ms.onopen = onStreamOpen;
       ms.addEventListener("reply", (e) => {
         try {
           const d = JSON.parse((e as MessageEvent).data) as { id?: string; text?: string };
@@ -195,25 +224,19 @@ export function Chat() {
           /* ignore */
         }
       });
-      ms.onerror = () => {
-        // A stale/short-lived token 401s the stream. Re-mint once + reconnect; else
-        // let the browser auto-reconnect (transient network).
-        if (!sseRetried.current && token) {
-          sseRetried.current = true;
-          setStatus({ text: "re-authenticating...", kind: "" });
-          ms.close();
-          if (msgEs.current === ms) msgEs.current = null;
-          clearCachedToken();
-          void openStreams(ch);
-          return;
-        }
-        setStatus({ text: "reconnecting...", kind: "" });
-      };
+      ms.onerror = onStreamError;
       msgEs.current = ms;
+      }
 
-      // 2. Turn-event stream — the "watch it work" view (vault/programmatic only).
+      // 2. Turn-event stream — the "watch it work" view + the live record for a
+      //    vault/programmatic channel (this is the PRIMARY stream for a vault channel;
+      //    the durable outbound arrives via reload-on-done). Carries the same onopen
+      //    (marks live) + onerror (re-mint-once) as the message stream, so a vault
+      //    channel — which has no message stream — still shows "live" and recovers from
+      //    a stale token.
       if (isVault(ch)) {
         const ts = new EventSource(turnEventsUrl(ch, token));
+        ts.onopen = onStreamOpen;
         ts.addEventListener("turn", (e) => {
           try {
             onTurnEvent(JSON.parse((e as MessageEvent).data) as TurnEvent, ch);
@@ -221,8 +244,7 @@ export function Chat() {
             /* ignore */
           }
         });
-        // Best-effort: rely on the browser's auto-reconnect (progress is additive,
-        // and the durable record arrives via the message stream + reload-on-done).
+        ts.onerror = onStreamError;
         turnEs.current = ts;
       }
     },
@@ -233,7 +255,7 @@ export function Chat() {
     // callback (reloadTranscript) + refs — it reads no changing render state — so
     // an older captured instance behaves identically to the latest.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [addMessage, addSys, isVault],
+    [addMessage, addSys, isVault, transportFor],
   );
 
   /** Reload the durable transcript once (after a turn `done`) to pick up the note. */

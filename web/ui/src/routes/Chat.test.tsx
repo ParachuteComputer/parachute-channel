@@ -145,22 +145,34 @@ describe("Chat", () => {
     expect(await screen.findByText("ping")).toBeInTheDocument();
   });
 
-  it("appends a delivered message-stream `reply` event to the transcript", async () => {
+  it("appends a delivered message-stream `reply` event (http-ui channel) to the transcript", async () => {
+    // The message stream (/ui/events) is the http-ui transport's delta stream — it is
+    // opened ONLY for an http-ui channel (a vault channel would 404 it; see the gating
+    // test below). So drive this path with an http-ui channel.
+    listChannels.mockResolvedValue({ channels: [chanRow({ transport: "http-ui" })] });
     renderChat();
-    // Wait for the message stream to open on /ui/events.
     await waitFor(() => expect(FakeEventSource.find("/ui/events")).toBeTruthy());
     const es = FakeEventSource.find("/ui/events")!;
     es.emit("reply", { id: "out-1", text: "streamed reply" });
     expect(await screen.findByText("streamed reply")).toBeInTheDocument();
   });
 
-  it("re-mints + reconnects once on a message-stream error; the guard blocks a second re-mint", async () => {
+  it("a VAULT channel opens the turn-event stream but NOT the http-ui /ui/events stream", async () => {
+    renderChat(); // default channel is vault
+    await waitFor(() => expect(FakeEventSource.find("/turn-events")).toBeTruthy());
+    // /ui/events is http-ui-only — opening it for a vault channel would spin a doomed
+    // EventSource (404 → error → wasted re-mint) every load. It must NOT be opened.
+    expect(FakeEventSource.find("/ui/events")).toBeFalsy();
+  });
+
+  it("re-mints + reconnects once on a stream error; the guard blocks a second re-mint", async () => {
+    // For a vault channel the turn-event stream is the primary (and only) stream, and it
+    // carries the same re-mint-once onerror as the http-ui message stream.
     renderChat();
-    // Wait for the message stream to open on /ui/events.
-    await waitFor(() => expect(FakeEventSource.find("/ui/events")).toBeTruthy());
-    const first = FakeEventSource.find("/ui/events")!;
+    await waitFor(() => expect(FakeEventSource.find("/turn-events")).toBeTruthy());
+    const first = FakeEventSource.find("/turn-events")!;
     const countBefore = FakeEventSource.instances.filter((es) =>
-      es.url.includes("/ui/events"),
+      es.url.includes("/turn-events"),
     ).length;
 
     // First error → re-mint (clearCachedToken) + reconnect (new EventSource).
@@ -168,21 +180,20 @@ describe("Chat", () => {
     await waitFor(() => expect(clearCachedToken).toHaveBeenCalledTimes(1));
     await waitFor(() =>
       expect(
-        FakeEventSource.instances.filter((es) => es.url.includes("/ui/events")).length,
+        FakeEventSource.instances.filter((es) => es.url.includes("/turn-events")).length,
       ).toBe(countBefore + 1),
     );
     expect(first.closed).toBe(true);
-    const second = FakeEventSource.find("/ui/events")!;
+    const second = FakeEventSource.find("/turn-events")!;
     expect(second).not.toBe(first);
 
     // A SECOND consecutive error (no intervening onopen to reset the guard) must NOT
     // re-mint again — the `sseRetried` guard is still set from the first reconnect.
     second.onerror?.();
-    // Give any (erroneous) async re-mint a chance to run, then assert it didn't.
     await Promise.resolve();
     expect(clearCachedToken).toHaveBeenCalledTimes(1);
     expect(
-      FakeEventSource.instances.filter((es) => es.url.includes("/ui/events")).length,
+      FakeEventSource.instances.filter((es) => es.url.includes("/turn-events")).length,
     ).toBe(countBefore + 1);
   });
 

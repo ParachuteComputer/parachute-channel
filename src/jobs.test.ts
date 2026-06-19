@@ -138,6 +138,40 @@ describe("VaultJobStore — vault-native CRUD", () => {
     expect(jobs[1]!.enabled).toBe(false); // "false" string → disabled
   });
 
+  test("listAll dedups by vault IDENTITY across SEPARATE transport instances sharing one vault (regression)", async () => {
+    // Two vault channels, each with its OWN VaultTransport INSTANCE pointing at the
+    // SAME vault "default" — the real shape (each channel constructs its own
+    // transport). Instance-identity dedup misses this; vaultKey() dedup must catch it.
+    // Caught live 2026-06-18: one job listed 3x with three channels on the default vault.
+    const cfg = { vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "write-token" };
+    const channels = new Map<string, Channel>();
+    for (const name of ["uni-a", "uni-b"]) {
+      channels.set(name, {
+        name,
+        transport: new VaultTransport(cfg), // a DISTINCT instance per channel
+        entry: { name, transport: "vault", config: { vault: "default", token: "write-token" } },
+      });
+    }
+    const urls: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      urls.push(String(url));
+      return new Response(
+        JSON.stringify([
+          { id: "Channels/uni-a/jobs/j1", content: "do it", metadata: { channel: "uni-a", cron: "0 9 * * *", enabled: "true" } },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const store = new VaultJobStore(channels);
+    const jobs = await store.listAll();
+    // Queried the shared vault EXACTLY once (not once per channel), and the job
+    // appears EXACTLY once (not duplicated per channel that shares the vault).
+    expect(urls.filter((u) => u.includes("/api/notes")).length).toBe(1);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]!.id).toBe("Channels/uni-a/jobs/j1");
+  });
+
   test("upsert writes a #agent/job note via the target channel's vault", async () => {
     const { channels } = channelsWithVault();
     const calls: { url: string; init: RequestInit }[] = [];

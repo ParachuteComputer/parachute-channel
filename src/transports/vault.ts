@@ -588,6 +588,17 @@ export class VaultTransport implements Transport {
     this.pathPrefix = (config.notePathPrefix ?? DEFAULT_PATH_PREFIX).replace(/\/$/, "");
   }
 
+  /**
+   * Stable identity of the backing vault (origin + name) — NOT the transport
+   * instance. Many channels each construct their OWN VaultTransport pointing at the
+   * SAME vault; callers that must query a vault once (e.g. the job-store's `listAll`)
+   * dedup by THIS key, not by object identity, or the same notes come back once per
+   * channel that shares the vault.
+   */
+  vaultKey(): string {
+    return `${this.vaultUrl}::${this.vault}`;
+  }
+
   async start(ctx: TransportContext): Promise<void> {
     this.ctx = ctx;
     // Declare the tag schema this module manages in the connected vault. Strictly

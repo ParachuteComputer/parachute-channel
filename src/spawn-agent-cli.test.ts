@@ -51,7 +51,7 @@ describe("parseArgs — name + channels + vault + egress + mounts → the right 
     ]);
   });
 
-  test("a bare --channel defaults to write (back-compat resident session)", () => {
+  test("a bare --channel defaults to write (back-compat single-threaded session)", () => {
     const { spec } = parseArgs(["a", "--channel", "c"]);
     expect(spec!.channels).toEqual([{ name: "c" }]);
   });

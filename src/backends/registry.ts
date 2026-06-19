@@ -30,9 +30,19 @@
  * which tags the note `#agent/message/outbound` — the vault inbound trigger keys on
  * `#agent/message/inbound` only, so writing the reply CANNOT re-trigger the inbound
  * webhook (no loop).
+ *
+ * ── Thread note (the UNIFIED model: definition -> thread -> message) ───────────────
+ * BOTH execution-lifecycle modes now MATERIALIZE a `#agent/thread` note (the structural
+ * unification — everything is a thread; a "run" was always a thread with one turn). It is
+ * the PRIMARY record of the turn, written BEFORE the additive outbound (the c34db03
+ * ordering, now uniform) so the record survives an outbound failure. The MODE governs the
+ * thread's identity (resolved transport-side): `single-threaded` upserts ONE thread note
+ * per channel (named after the def, rolling turn_count + cumulative usage),
+ * `multi-threaded` writes one thread note per fire. The thread note carries
+ * `['#agent/thread']` EXACTLY — never a message tag — so it can never wake a session.
  */
 
-import type { AgentSpec } from "../sandbox/types.ts";
+import type { AgentSpec, AgentMode } from "../sandbox/types.ts";
 import { normalizeChannel } from "../sandbox/types.ts";
 import type { AgentBackend, AgentHandle, InterimTurnEvent } from "./types.ts";
 
@@ -72,6 +82,49 @@ export type WriteOutbound = (
   reply: string,
   inReplyTo?: string,
 ) => Promise<void>;
+
+/**
+ * One turn's input to materializing a `#agent/thread` note (the UNIFIED model
+ * `definition -> thread -> message`) — the data the registry hands {@link WriteThread}.
+ * BOTH execution-lifecycle modes materialize a thread note (the structural unification:
+ * everything is a thread; a "run" was always a thread with one turn). Mirrors {@link
+ * ThreadRecord} in transport.ts; kept local here so the registry doesn't import the
+ * transport layer.
+ */
+export interface ThreadNote {
+  channel: string;
+  /**
+   * The agent/def name — single-threaded's thread is "named after the definition" (the
+   * transport sanitizes it into the deterministic upsert path). Falls back to the channel.
+   */
+  name?: string;
+  /** The `#agent/definition` note id (provenance; plain id string). */
+  definition?: string;
+  /** The mode the turn ran under — governs thread identity + whether the note upserts. */
+  mode: AgentMode;
+  /** Outcome — `ok` (success) or `error` (the turn failed). */
+  status: "ok" | "error";
+  /** The inbound text handed to the turn (the `-p` prompt). */
+  input: string;
+  /** The reply on success, or the failure reason on error. */
+  output: string;
+  /** ISO start/end of the turn. */
+  started_at: string;
+  ended_at: string;
+  /** Optional token/cost usage for observability. */
+  usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
+}
+
+/**
+ * Materialize a `#agent/thread` note for a completed turn — the seam the registry posts a
+ * thread note through. The daemon wires this to the channel transport's `writeThread()` (a
+ * VaultTransport writes a `#agent/thread` note). Called for BOTH modes now (the structural
+ * unification — every turn materializes a thread note): single-threaded upserts one note
+ * per channel, multi-threaded writes one per fire. A write failure is the implementation's
+ * to surface (the registry logs whatever it throws); it never re-runs the turn. Optional on
+ * the registry — when unwired (no vault-backed channel), a turn still runs, just no note.
+ */
+export type WriteThread = (thread: ThreadNote) => Promise<void>;
 
 /** A queued inbound message awaiting its serial turn. */
 interface QueuedMessage {
@@ -120,12 +173,20 @@ export class ProgrammaticAgentRegistry {
 
   private readonly backend: AgentBackend;
   private readonly writeOutbound: WriteOutbound;
+  /** Optional thread-note sink — materialize an `#agent/thread` note (BOTH modes). */
+  private readonly writeThread?: WriteThread;
   /** Optional streaming-view sink — push interim + lifecycle turn events per channel. */
   private readonly onTurnEvent?: TurnEventSink;
 
-  constructor(deps: { backend: AgentBackend; writeOutbound: WriteOutbound; onTurnEvent?: TurnEventSink }) {
+  constructor(deps: {
+    backend: AgentBackend;
+    writeOutbound: WriteOutbound;
+    writeThread?: WriteThread;
+    onTurnEvent?: TurnEventSink;
+  }) {
     this.backend = deps.backend;
     this.writeOutbound = deps.writeOutbound;
+    if (deps.writeThread) this.writeThread = deps.writeThread;
     if (deps.onTurnEvent) this.onTurnEvent = deps.onTurnEvent;
   }
 
@@ -326,6 +387,14 @@ export class ProgrammaticAgentRegistry {
       if (!handle) return; // deregistered mid-drain — stop.
       const msg = queue.shift()!;
 
+      // The UNIFIED model (the structural unification): BOTH modes materialize a
+      // `#agent/thread` note — everything is a thread; a "run" was always a thread with one
+      // turn. The MODE difference is the thread's identity (resolved transport-side):
+      // single-threaded upserts ONE note per channel (rolling turn_count + usage),
+      // multi-threaded writes one note per fire. Read the mode off the spec so the
+      // thread note carries it (it's the indexed query axis + governs the upsert).
+      const startedAt = new Date().toISOString();
+
       let result;
       try {
         // Forward each interim event to the streaming-view sink (keyed by channel)
@@ -343,6 +412,11 @@ export class ProgrammaticAgentRegistry {
           `parachute-agent: programmatic turn for channel "${channel}" threw ` +
             `(should be a value): ${reason}`,
         );
+        // BOTH modes materialize a thread note even on a (defensive-catch) failure — the
+        // thread note captures the turn outcome, so a failed turn is still a queryable
+        // `status:error` (single-threaded upserts the rolling thread; multi-threaded writes
+        // a per-fire note).
+        await this.recordThread(handle, msg, "error", reason, startedAt, undefined);
         this.emitTurnEvent(channel, { kind: "error", error: reason });
         continue;
       }
@@ -354,12 +428,28 @@ export class ProgrammaticAgentRegistry {
         console.warn(
           `parachute-agent: programmatic turn for channel "${channel}" failed: ${result.error}`,
         );
+        // BOTH modes record the failed turn (status:error) on the thread note so a failure
+        // always leaves a queryable trace (single-threaded upserts the rolling thread,
+        // marking it errored; multi-threaded writes a per-fire status:error note).
+        await this.recordThread(handle, msg, "error", result.error, startedAt, undefined);
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
         continue;
       }
 
-      // Empty reply → NO note (reviewer contract — `reply` can be ""). A turn that
-      // legitimately produced no text (e.g. tool-only work) leaves the chat clean.
+      // The THREAD NOTE comes FIRST — it is the PRIMARY record of the turn (status:ok now
+      // that the turn succeeded), so it must survive even if the ADDITIVE outbound transcript
+      // write below fails (that path `continue`s past here). Writing it before the outbound
+      // (the c34db03 ordering — now applied UNIFORMLY to both modes) guarantees the turn's
+      // record survives an outbound failure: single-threaded upserts the rolling thread,
+      // multi-threaded writes the per-fire note. Best-effort: a thread-note failure is
+      // logged + the turn still resolves (we never re-run a `claude -p` turn — that would
+      // burn quota for a duplicate).
+      await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage);
+
+      // The outbound reply — the channel-transcript delivery (the chat bubble). It is
+      // ADDITIVE to the primary thread-note record already written above (for BOTH modes).
+      // Empty reply → NO note (reviewer contract — `reply` can be ""): a turn that produced
+      // no text (e.g. tool-only work) leaves the chat clean.
       if (result.reply && result.reply.length > 0) {
         try {
           await this.writeOutbound(channel, result.reply, msg.inReplyTo);
@@ -368,10 +458,11 @@ export class ProgrammaticAgentRegistry {
           console.error(
             `parachute-agent: programmatic outbound write for channel "${channel}" failed: ${reason}`,
           );
-          // The reply was produced but NOT persisted. Resolve the live view to ERROR,
-          // not `done` — a `done` would drop the in-progress bubble and trigger a poll
-          // that finds no note, leaving the user with a silently vanished reply.
-          // (reviewer nit, PR #83)
+          // The reply was produced but NOT persisted to the transcript. Resolve the live
+          // view to ERROR, not `done` — a `done` would drop the in-progress bubble and
+          // trigger a poll that finds no note, leaving the user with a silently vanished
+          // reply. (reviewer nit, PR #83.) The thread note above already captured the reply
+          // durably (BOTH modes), so the turn's record is not lost.
           this.emitTurnEvent(channel, { kind: "error", error: `reply produced but not saved: ${reason}` });
           continue;
         }
@@ -383,6 +474,48 @@ export class ProgrammaticAgentRegistry {
       // Reached only when the outbound write SUCCEEDED, or there was no reply to write
       // (empty/tool-only turn → clean resolve, no note expected).
       this.emitTurnEvent(channel, { kind: "done", reply: result.reply ?? "" });
+    }
+  }
+
+  /**
+   * Materialize the `#agent/thread` note for a completed turn — the UNIFIED model, written
+   * for BOTH modes (the structural unification). A no-op when no {@link WriteThread} sink is
+   * wired (a channel with no durable store). The timing is captured by the caller
+   * (`startedAt` before the turn; `ended_at` is now). The MODE rides on the note so the
+   * transport resolves the thread identity (single-threaded upserts one note per channel,
+   * multi-threaded writes one per fire) + the upsert aggregation. The thread `name` is the
+   * agent name (single-threaded's thread is "named after the definition"). Best-effort: a
+   * write failure is LOGGED, never thrown out — a missing thread note must not strand the
+   * queue, and the turn is never re-run (it would burn quota for a duplicate `claude -p`).
+   */
+  private async recordThread(
+    handle: ProgrammaticAgentHandle,
+    msg: QueuedMessage,
+    status: "ok" | "error",
+    output: string,
+    startedAt: string,
+    usage: ThreadNote["usage"],
+  ): Promise<void> {
+    if (!this.writeThread) return;
+    const thread: ThreadNote = {
+      channel: handle.channel,
+      name: handle.spec.name,
+      ...(handle.spec.definition ? { definition: handle.spec.definition } : {}),
+      mode: handle.spec.mode ?? "single-threaded",
+      status,
+      input: msg.content,
+      output,
+      started_at: startedAt,
+      ended_at: new Date().toISOString(),
+      ...(usage ? { usage } : {}),
+    };
+    try {
+      await this.writeThread(thread);
+    } catch (err) {
+      console.error(
+        `parachute-agent: writing #agent/thread note for channel "${handle.channel}" failed ` +
+          `(continuing): ${(err as Error).message}`,
+      );
     }
   }
 }

@@ -42,6 +42,7 @@
 import {
   type AgentSpec,
   type AgentBackendKind,
+  type AgentMode,
   type SystemPromptMode,
   type AgentMount,
 } from "./sandbox/types.ts";
@@ -180,6 +181,9 @@ function nameOfDefNote(note: { metadata?: Record<string, unknown> }): string | u
  *   - note BODY (`content`)  → `spec.systemPrompt` (the agent's role, in prose).
  *   - `metadata.name`        → `spec.name` (REQUIRED, slug) = the wake channel.
  *   - `metadata.backend`     → `spec.backend` (default `programmatic`).
+ *   - `metadata.mode`        → `spec.mode` (default `single-threaded`; `multi-threaded`
+ *     ok; the legacy aliases `resident`/`one-shot`/`per-thread` are DUAL-ACCEPTED and
+ *     mapped silently). The note id → `spec.definition` (provenance).
  *   - `metadata.systemPromptMode` → `spec.systemPromptMode` (default `append`).
  *   - `metadata.workspace`   → `spec.workspace` (optional absolute host cwd).
  *   - `metadata.filesystem`  → `spec.filesystem` (`workspace` | `full`).
@@ -245,10 +249,53 @@ export function parseAgentDef(note: {
     backend = rawBackend;
   }
 
+  // Execution-lifecycle mode (the Phase-3 prerequisite). An agent is SINGLE-THREADED
+  // or MULTI-THREADED. Default `single-threaded` (= today: one persistent session per
+  // channel, resumed + persisted each turn). `multi-threaded` is thread-keyed — today
+  // (no inbound thread id yet) every fire mints a fresh thread (no resume, no persist).
+  // BOTH modes now materialize an `#agent/thread` note (the unified model
+  // `definition -> thread -> message`): single-threaded upserts ONE thread note per
+  // channel (named after the def, rolling summary + turn_count); multi-threaded writes
+  // one thread note per fire.
+  //
+  // DUAL-ACCEPT the legacy aliases, mapping silently (no operator-facing break, no
+  // migration of already-authored notes):
+  //   legacy value   → canonical value
+  //   ─────────────────────────────────
+  //   resident       → single-threaded
+  //   one-shot       → multi-threaded   (one-shot was just multi-threaded's degenerate
+  //                                       first turn — the term retires)
+  //   per-thread     → multi-threaded   (per-thread continuation is the DEFERRED
+  //                                       increment of multi-threaded, not its own mode)
+  //
+  // Any OTHER value is rejected with a clear, actionable error (→ status:error on the
+  // note) rather than silently demoting (which would hide the operator's intent).
+  let mode: AgentMode = "single-threaded";
+  const rawMode = metaStr(meta.mode);
+  if (rawMode !== undefined) {
+    if (rawMode === "single-threaded" || rawMode === "resident") {
+      mode = "single-threaded";
+    } else if (
+      rawMode === "multi-threaded" ||
+      rawMode === "one-shot" ||
+      rawMode === "per-thread"
+    ) {
+      mode = "multi-threaded";
+    } else {
+      throw new AgentDefParseError(
+        `#agent/definition note ${noteId}: mode must be "single-threaded" or "multi-threaded"`,
+      );
+    }
+  }
+
   const spec: AgentSpec = {
     name,
     channels: [name], // wake channel = the agent name (agent ≡ channel)
     backend,
+    mode,
+    // The def note id — provenance carried into the `#agent/thread` note (BOTH modes;
+    // interim plain id string; typed link fields are a future vault feature).
+    definition: noteId,
     // Own-vault binding (4a): the def-vault, write-scoped. NOT sourced from the note
     // — it's the vault the note LIVES in (passed in by the caller).
     vault: { name: binding.vault, access: "write" },

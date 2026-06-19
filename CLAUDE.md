@@ -165,7 +165,8 @@ vault: the note's `channel` metadata routes it.
 `design/2026-06-17-vault-native-agents.md`). Every vault object this module manages
 hangs off the `#agent` prefix: `#agent/definition` (a vault-native agent def — body
 is the system prompt, metadata is the config), `#agent/message{,/inbound,/outbound}`
-(a conversation turn), `#agent/job` (a scheduled trigger). The tag schema declares
+(a conversation turn), `#agent/job` (a scheduled trigger), `#agent/thread` (the durable
+record of one thread — see the `#agent/thread` subsection below). The tag schema declares
 `parent_names` so a human `tag:#agent` query rolls up to everything the module owns.
 The module always queries the EXACT leaf tag (never relies on prefix magic), and
 keeps the "tag both queryable parent + directional child literally" floor so loop
@@ -233,6 +234,43 @@ Bearer `vault:<name>:write`).
    auth block on the trigger is a follow-up. The daemon defends in depth too:
    `ingestInbound` drops any note tagged `#agent/message/outbound`, so a reply can
    never wake its own session.
+
+### `#agent/thread` — the thread record (the unified model)
+
+The unified model is `definition -> thread -> message`: **everything is a thread**, and
+EVERY completed turn materializes a `#agent/thread` note (a "run" was always a thread with
+one turn — the older `#agent/run` tag retired into this). The note is the durable,
+queryable record of one thread: its BODY is a rolling SUMMARY (`## Summary` /
+`## Latest turn`), and its metadata carries the thread state — `channel`, `definition`,
+`mode`, `status`, `started_at`, `last_turn_at`, `turn_count`, and cumulative `usage`. The
+INDEXED `status`/`definition`/`mode` fields make threads operator-queryable ("all failed
+threads", "all threads of agent X", "all multi-threaded threads").
+
+**v1 OVERWRITES the `## Summary` section every turn.** The module regenerates the whole
+body from the rolled-up metadata each turn (it never reads the prior note's content), so
+`## Summary` is a module-owned default, not a preserved slot. It is EARMARKED for a future
+summarizer agent, but summarizer-agent enrichment needs a read-prior-content → merge path
+(to preserve a summarizer-owned section across the regenerate), which is DEFERRED. "May
+own" means earmarked, not preserved.
+
+**Both execution modes materialize a thread note** — the mode governs the thread's
+IDENTITY (its path leaf) + whether it upserts:
+
+- **`single-threaded`** — exactly ONE thread note per channel at the DETERMINISTIC path
+  `Threads/<safeChannel>/<safeName>` (named after the definition). It UPSERTS in place
+  across turns: the transport READs the existing note, then writes the rolled-up
+  aggregates (`turn_count` incremented, `usage` summed, original `started_at` preserved,
+  `last_turn_at` advanced). Safe today because the drain is serial per channel and
+  single-threaded is one-thread-per-channel; concurrent-threads-per-channel (the deferred
+  continuation increment) will re-derive aggregates from the `#agent/message` children or
+  a vault atomic-merge instead.
+- **`multi-threaded`** — one thread note PER FIRE at `Threads/<safeChannel>/<uuid>`
+  (`turn_count` 1; usage = this fire's). No upsert.
+
+**Loop safety:** the thread note carries `['#agent/thread']` EXACTLY — never a message tag,
+never the inbound child — so it can never wake a session. It is also the PRIMARY record of
+the turn, written BEFORE the additive outbound transcript write, so a turn's record
+survives an outbound failure.
 
 ## Environment variables
 

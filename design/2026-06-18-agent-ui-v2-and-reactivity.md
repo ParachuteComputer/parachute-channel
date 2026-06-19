@@ -90,6 +90,60 @@ save looks broken (the ch-verify confusion, in the operator's face). **Connector
 hard prerequisite for the def-authoring UI** (cheap → do first). Connector 2 (delete) is
 *not* a blocker (ship with a ≤60s delete-convergence note). Connector 3 optional.
 
+## Execution lifecycle: everything is a thread
+
+**The unified model: `definition -> thread -> message`.** EVERYTHING is a thread. A
+`#agent/definition` instantiates an agent; each agent runs THREADS; each thread holds
+MESSAGES (the conversation turns). A "run" was always just a thread with one turn — so the
+term retires, the `#agent/run` note becomes the `#agent/thread` note, and **BOTH execution
+modes materialize a thread note** (the structural unification). A `#agent/thread` note is
+the durable, queryable record of one thread; its BODY holds a rolling SUMMARY of the
+thread (a future summarizer agent may own/enrich the `## Summary` slot — module-owned in
+v1), and its metadata carries the thread state (`channel`, `definition`, `mode`, `status`,
+`started_at`, `last_turn_at`, `turn_count`, cumulative `usage`). The indexed
+`status`/`definition`/`mode` fields make threads operator-queryable.
+
+A `#agent/definition`'s `metadata.mode` declares its EXECUTION-LIFECYCLE shape — how a
+turn relates to the agent's thread, and the thread note's IDENTITY. An agent is one of
+exactly two kinds (defined by `claude -p` session-id semantics):
+
+- **`single-threaded`** (DEFAULT; = today's behavior) — ONE persistent session per
+  channel. Each turn `--resume`s the stored session id and persists the returned id; the
+  **channel transcript IS the conversation**. It materializes exactly ONE `#agent/thread`
+  note per channel, **named after the definition** (the deterministic stable path
+  `Threads/<channel>/<name>`), UPSERTED in place across turns — the body holds a rolling
+  summary, and `turn_count` + cumulative `usage` roll up each turn. A scheduled job for a
+  single-threaded def is a synthetic inbound that resumes that one thread (continuing the
+  chat) + upserts its one thread note.
+- **`multi-threaded`** — turns are THREAD-KEYED. Every fire mints a fresh thread, runs an
+  independent turn, and materializes ONE `#agent/thread` note **per fire**
+  (`Threads/<channel>/<uuid>`; `turn_count` 1; usage = this fire's). Its per-fire
+  observability record (input + reply + status + timing).
+
+The thread note is the PRIMARY record of the turn, written BEFORE the additive outbound
+transcript write (the c34db03 ordering, now applied UNIFORMLY to both modes) so the turn's
+record survives an outbound failure. It carries `['#agent/thread']` EXACTLY — never a
+message tag — so it can never wake a session (loop safety).
+
+**The retired term.** "one-shot" was never its own mode — it was only ever the
+**degenerate first turn of a multi-threaded agent**, so the name retires. The parser
+DUAL-ACCEPTS the legacy values (`resident`→`single-threaded`, `one-shot`→`multi-threaded`,
+`per-thread`→`multi-threaded`), mapping silently, so already-authored def notes keep
+working with no migration.
+
+**Ships now in its degenerate form.** TODAY no inbound carries a thread id, so a
+multi-threaded agent mints a FRESH thread on every fire (no `--resume` read; the returned
+session id is NOT persisted to the channel store), and the single-threaded thread-note
+aggregates are computed by READING the existing note then writing — SAFE because the drain
+is serial per channel and single-threaded is one-thread-per-channel today. The **deferred
+continuation increment**: thread-id routing on the inbound, a thread-keyed session store,
+per-thread drain serialization, message-level per-turn usage, and recording the minted
+session/thread id into the thread note so a specific prior thread becomes resumable (at
+which point single-threaded's read-modify-write aggregation switches to re-deriving from
+the `#agent/message` children or a vault atomic-merge, to avoid lost-update). When that
+lands, the SAME mode gains continuation **with no operator-facing change and no
+migration** — the fresh-per-fire shape that ships now is simply its degenerate case.
+
 ## Phased build order
 - **Phase 0 — Connector 1** (def create+edit reactive): manifest `definition.reload`
   action + `created`+`updated` template; provision; verify a def edit reflects live.

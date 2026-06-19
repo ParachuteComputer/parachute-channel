@@ -79,7 +79,7 @@ export interface OtherMcpSpec {
  */
 /**
  * A channel binding for an arm. A bare string is shorthand for `{ name, access:
- * "write" }` (back-compat — the common read+write resident session); the object
+ * "write" }` (back-compat — the common read+write single-threaded session); the object
  * form scopes a channel read-only so an arm that only *watches* a channel mints
  * `agent:read` and never `agent:write` (the "scope an arm to channel X
  * read-only" use case).
@@ -153,6 +153,43 @@ export type AgentBackendKind = "interactive" | "programmatic" | "channel";
  * and would force metered billing off the subscription).
  */
 export type SystemPromptMode = "append" | "replace";
+
+/**
+ * The agent's EXECUTION-LIFECYCLE mode — how a turn relates to the agent's
+ * conversation thread (the architecture synthesis, Phase 3 prerequisite). The UNIFIED
+ * model is `definition -> thread -> message`: EVERYTHING is a thread, and BOTH modes
+ * materialize a `#agent/thread` note (the structural unification — a "run" was always a
+ * thread with one turn). An agent is either SINGLE-THREADED or MULTI-THREADED; the
+ * distinction is defined entirely by `claude -p` session-id semantics + the thread's
+ * identity:
+ *
+ *  - `"single-threaded"` (DEFAULT; = today's behavior): ONE persistent session id
+ *    per channel. Each turn `--resume`s the stored id and persists the returned id
+ *    after — the channel transcript IS the thread. It materializes exactly ONE
+ *    `#agent/thread` note per channel, named after the definition, UPSERTED in place
+ *    each turn; the note body holds a rolling SUMMARY of the conversation (turn_count +
+ *    cumulative usage roll up). A scheduled runner job for a single-threaded def is a
+ *    synthetic inbound that RESUMES that one thread (continuing the chat). This is
+ *    exactly what every agent does today (plus the now-materialized thread note).
+ *
+ *  - `"multi-threaded"`: turns are THREAD-KEYED. TODAY — because no inbound carries
+ *    a thread id yet — every fire mints a FRESH thread: do NOT read the prior session
+ *    id (no `--resume`) and do NOT persist the returned id to the channel store, so
+ *    each fire is a clean, independent invocation with no conversation continuity. It
+ *    materializes ONE `#agent/thread` note per FIRE (the per-fire record: input + reply
+ *    + status + timing). This is what an operator reaches for when a scheduled job
+ *    should be a clean task run, NOT a silent continuation of the chat thread.
+ *
+ *    ("one-shot" was the prior name for this mode — it was only ever the DEGENERATE
+ *    FIRST-TURN of a multi-threaded agent, so the term retires. Continuation-by-
+ *    thread-id — resuming a SPECIFIC prior thread — is a DEFERRED increment: it needs
+ *    thread-id routing on the inbound, a thread-keyed session store, per-thread drain
+ *    serialization, and recording the minted session/thread id into the thread note so
+ *    a thread becomes resumable. When it lands, the SAME mode simply gains continuation
+ *    with NO operator-facing change and NO migration; the fresh-per-fire shape that ships
+ *    now is its degenerate case.)
+ */
+export type AgentMode = "single-threaded" | "multi-threaded";
 
 export interface AgentSpec {
   /** Human-readable arm name; used as the tmux session + workspace slug. */
@@ -277,6 +314,29 @@ export interface AgentSpec {
    * {@link SystemPromptMode}.
    */
   systemPromptMode?: SystemPromptMode;
+  /**
+   * The execution-lifecycle mode (the Phase-3 prerequisite). `"single-threaded"`
+   * (DEFAULT, = today): one persistent session per channel, `--resume`d + persisted
+   * each turn, the channel transcript is the thread. `"multi-threaded"`: thread-keyed —
+   * today (no inbound thread id yet) every fire mints a fresh thread (no `--resume`, the
+   * returned session id is NOT persisted to the channel store). BOTH modes now materialize
+   * an `#agent/thread` note (the unified model `definition -> thread -> message`): a
+   * single-threaded agent upserts ONE thread note per channel (named after the def, rolling
+   * summary); a multi-threaded agent writes one thread note per fire. Read at the
+   * session-handling chokepoint (the programmatic backend's `deliver` resume block) +
+   * governs the thread note's identity (one-per-channel upsert vs one-per-fire). Persisted
+   * in spec.json (set from the def's `metadata.mode`). See {@link AgentMode}.
+   */
+  mode?: AgentMode;
+  /**
+   * The `#agent/definition` note id this agent was instantiated from — the
+   * provenance carried into the `#agent/thread` note a turn materializes (so a thread
+   * record links back to its def; BOTH modes). A plain id STRING for now (interim — typed
+   * link fields are a future vault feature). Set by {@link parseAgentDef} from the note
+   * id; unset for a spec not sourced from a def note (then the thread note carries no
+   * definition link).
+   */
+  definition?: string;
 }
 
 /**

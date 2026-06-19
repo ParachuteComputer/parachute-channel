@@ -10,6 +10,8 @@
  * so a non-Telegram transport never has to invent Telegram fields.
  */
 
+import type { AgentMode } from "./sandbox/types.ts";
+
 /** An inbound message, routed by the daemon to the bridges subscribed to `channel`. */
 export interface InboundMessage {
   /** The named channel this message arrived on. */
@@ -28,6 +30,45 @@ export interface ReplyArgs {
   files?: string[];
   reply_to?: string;
   meta?: Record<string, string>;
+}
+
+/**
+ * One turn's input to materializing a `#agent/thread` note — the UNIFIED model
+ * (`definition -> thread -> message`). BOTH execution-lifecycle modes materialize a thread
+ * note (the structural unification: everything is a thread; a "run" was always a thread
+ * with one turn). The transport that backs the channel persists this; only the
+ * VaultTransport implements it (a `#agent/thread` note) — other transports omit the
+ * optional method.
+ *
+ * MODE difference (resolved transport-side): `single-threaded` upserts ONE thread note per
+ * channel at a deterministic path named after the def and rolls up turn_count + usage;
+ * `multi-threaded` writes one thread note PER FIRE. The carrier shape is the same.
+ */
+export interface ThreadRecord {
+  /** The channel the turn ran on. */
+  channel: string;
+  /**
+   * The agent/def name — the single-threaded thread is "named after the definition": this
+   * sanitizes to the deterministic path leaf so the one-per-channel note upserts in place.
+   * Omitted falls back to the channel (the 1:1 default, where channel == name).
+   */
+  name?: string;
+  /** The `#agent/definition` note id this thread came from (provenance; plain id string). */
+  definition?: string;
+  /** The mode the turn ran under — governs thread identity + whether the note upserts. */
+  mode: AgentMode;
+  /** Outcome of THIS turn — `ok` (success) or `error` (the turn failed). */
+  status: "ok" | "error";
+  /** The inbound text the turn was handed (the `-p` prompt). */
+  input: string;
+  /** The reply text on success, or the failure reason on error. */
+  output: string;
+  /** ISO timestamp the turn started (single-threaded preserves the FIRST turn's). */
+  started_at: string;
+  /** ISO timestamp the turn ended (becomes the thread's `last_turn_at`). */
+  ended_at: string;
+  /** Optional token/cost usage for this turn (single-threaded accumulates into the note). */
+  usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
 }
 
 export interface ReactArgs {
@@ -95,6 +136,14 @@ export interface Transport {
   sendPermission?(args: PermissionArgs): Promise<{ sent: string[] }>;
   /** Optional: fetch an attachment, returning a local path. */
   download?(args: DownloadArgs): Promise<{ path: string }>;
+  /**
+   * Optional: materialize a `#agent/thread` note for a completed turn (the VaultTransport's
+   * `#agent/thread` note). Only meaningful for a vault-backed channel; transports without a
+   * durable store omit it. The daemon calls it for BOTH execution-lifecycle modes (the
+   * structural unification — every turn materializes a thread note): single-threaded upserts
+   * one note per channel, multi-threaded writes one per fire. Returns the written note id(s).
+   */
+  writeThread?(thread: ThreadRecord): Promise<{ sent: string[] }>;
   /**
    * Optional: handle an HTTP request the daemon didn't handle itself. The
    * daemon owns `Bun.serve`; a transport that needs to contribute routes (e.g.

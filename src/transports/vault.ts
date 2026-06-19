@@ -64,6 +64,7 @@ import type {
   Transport,
   TransportContext,
   ReplyArgs,
+  ThreadRecord,
 } from "../transport.ts";
 
 /** Config for a vault transport instance (from the channel registry entry). */
@@ -237,6 +238,56 @@ function coerceInboundStatus(v: unknown): InboundStatus {
   return "pending";
 }
 
+/**
+ * Coerce a raw metadata value (the vault stores metadata as STRINGS) to a finite number,
+ * defaulting to 0. Used to roll up a single-threaded thread's cumulative aggregates
+ * (`turn_count`, token/cost usage) read back from the prior note.
+ */
+function numFromMeta(v: unknown): number {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Build the `#agent/thread` note BODY — the rolling SUMMARY of the thread (design
+ * 2026-06-18: "hold a summary of this thread in the content; maybe another agent
+ * facilitates that"). The MODULE writes a useful default, STRUCTURED (`## Summary` /
+ * `## Latest turn`) so the `## Summary` section is the slot a future summarizer agent is
+ * EARMARKED to own/enrich; the `## Latest turn` block + the metadata roll-up are always
+ * module-owned. The same shape serves both modes (multi-threaded = one turn).
+ *
+ * v1 LIMITATION — the module OVERWRITES the `## Summary` section every turn. This function
+ * REGENERATES the whole body from scratch using only the rolled-up aggregates (passed in
+ * from `prior.metadata`); it NEVER reads `prior.content`. So a summarizer agent's
+ * enrichment of `## Summary` would be CLOBBERED on the next turn. Summarizer-agent
+ * enrichment needs a read-prior-content → merge path (preserve a summarizer-owned section
+ * across the regenerate), which is DEFERRED. Until then, "may own" means EARMARKED, not
+ * PRESERVED.
+ */
+function buildThreadSummaryBody(t: {
+  name: string;
+  mode: string;
+  turnCount: number;
+  status: "ok" | "error";
+  lastTurnAt: string;
+  input: string;
+  output: string;
+}): string {
+  const turns = t.turnCount === 1 ? "1 turn" : `${t.turnCount} turns`;
+  const auto = `${t.mode} thread for ${t.name} — ${turns}, last ${t.status} at ${t.lastTurnAt}.`;
+  const turnHeading = t.status === "ok" ? "Reply" : "Error";
+  // `## Summary` is EARMARKED for a future summarizer agent — but v1 OVERWRITES it every
+  // turn (this body is fully regenerated from metadata; `prior.content` is never read), so
+  // it's a module-owned default for now, NOT a preserved slot (see the function doc).
+  // The `## Latest turn` block + the metadata roll-up are always module-owned.
+  return (
+    `## Summary\n\n${auto}\n\n` +
+    `## Latest turn\n\n` +
+    `**Input:** ${t.input}\n\n` +
+    `**${turnHeading}:** ${t.output}\n`
+  );
+}
+
 // ---------------------------------------------------------------------------
 // PRIOR tags (pre-namespace) — DUAL-READ only. We never WRITE these going forward,
 // but we recognize them on READ so pre-namespace history loads + a still-live prior
@@ -294,6 +345,32 @@ const AGENT_JOB_TAG = "#agent/job";
 const JOB_PATH_PREFIX = "Channels";
 
 /**
+ * Thread tag — the UNIFIED model: `definition -> thread -> message`. EVERYTHING is a
+ * thread; a `#agent/thread` note is the durable, queryable record of one conversation
+ * thread, written for BOTH execution-lifecycle modes (the structural unification —
+ * "a run was always a thread with one turn"). The note BODY is a rolling SUMMARY of the
+ * thread (a future summarizer agent may own/enrich the `## Summary` slot — module-owned
+ * in v1); metadata = `{ channel, definition, mode, status, started_at, last_turn_at,
+ * turn_count, usage }`. The INDEXED string fields (`status`, `definition`, `mode`) make
+ * "all failed threads" / "all threads of agent X" / "all multi-threaded threads"
+ * operator-queryable. `definition` is a plain note-id string for now (interim — typed
+ * link fields are a future vault feature).
+ *
+ * The MODE difference is the thread's IDENTITY (path leaf) + whether it upserts:
+ *  - `single-threaded` — exactly ONE thread note per channel, at the DETERMINISTIC stable
+ *    path `Threads/<safeChannel>/<safeName>` ("named after the definition"), UPSERTED in
+ *    place across turns (turn_count increments, usage accumulates).
+ *  - `multi-threaded` — one thread note per fire, at `Threads/<safeChannel>/<uuid>` (today
+ *    one fire = one thread = one note; turn_count = 1; usage = this turn's). No upsert.
+ *
+ * The note carries `['#agent/thread']` EXACTLY — NOT a message tag, NOT the inbound
+ * child — so it can never wake a session (no loop).
+ */
+export const AGENT_THREAD_TAG = "#agent/thread";
+/** Default path prefix under which thread notes are written: `Threads/<ch>/<leaf>`. */
+const THREAD_PATH_PREFIX = "Threads";
+
+/**
  * The tag schema this module manages in any vault it's connected to.
  *
  * This is the declarative complement to the "tag both parent + child" fail-safe
@@ -329,6 +406,14 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
   name: string;
   description?: string;
   parent_names?: string[];
+  /**
+   * Indexed metadata field declarations (the vault's `update-tag` `fields` shape) —
+   * `{ <field>: { type, indexed } }`. Declared so the field gets a generated column +
+   * index, making it queryable via metadata operator objects. Used by `#agent/thread`
+   * (status/definition/mode) so an operator can query "all failed threads" / "all threads
+   * of agent X" / "all multi-threaded threads".
+   */
+  fields?: Record<string, { type: "string" | "boolean" | "integer"; indexed?: boolean }>;
 }> = [
   {
     name: AGENT_ROOT_TAG,
@@ -358,6 +443,22 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     name: AGENT_JOB_TAG,
     parent_names: [AGENT_ROOT_TAG],
     description: "A scheduled job — the runner injects this note's message on its cron schedule.",
+  },
+  {
+    name: AGENT_THREAD_TAG,
+    parent_names: [AGENT_ROOT_TAG],
+    description:
+      "A thread record (definition -> thread -> message) — body is a rolling summary, metadata is the thread state. Written for BOTH modes.",
+    // The three indexed query axes carry over from the run record VERBATIM — an operator
+    // can query threads by outcome / agent / mode:
+    //  - status     → "all failed threads" (status:error)
+    //  - definition → "all threads of agent X" (the def note id)
+    //  - mode       → "all multi-threaded threads"
+    fields: {
+      status: { type: "string", indexed: true },
+      definition: { type: "string", indexed: true },
+      mode: { type: "string", indexed: true },
+    },
   },
   // --- Interim (dual-read) — the flat `#agent-message*` tags that preceded the
   //     `#agent/*` namespace. Declared so pre-namespace history keeps its
@@ -525,9 +626,14 @@ export class VaultTransport implements Transport {
         // Single-segment, percent-encoded name: `#agent/message/inbound` →
         // `%23agent%2Fmessage%2Finbound`. The vault decodes it back to the literal.
         const url = `${this.vaultUrl}/vault/${this.vault}/api/tags/${encodeURIComponent(entry.name)}`;
-        const body: { description?: string; parent_names?: string[] } = {};
+        const body: {
+          description?: string;
+          parent_names?: string[];
+          fields?: Record<string, { type: "string" | "boolean" | "integer"; indexed?: boolean }>;
+        } = {};
         if (entry.description !== undefined) body.description = entry.description;
         if (entry.parent_names !== undefined) body.parent_names = entry.parent_names;
+        if (entry.fields !== undefined) body.fields = entry.fields;
 
         const res = await fetch(url, {
           method: "PUT",
@@ -623,6 +729,212 @@ export class VaultTransport implements Transport {
       // Non-JSON / empty body — keep the proposed id.
     }
     return { sent: [noteId] };
+  }
+
+  /**
+   * Materialize a `#agent/thread` note for ONE completed turn — the UNIFIED model
+   * (`definition -> thread -> message`). Written for BOTH execution-lifecycle modes
+   * (the structural unification): EVERYTHING is a thread, a "run" was always a thread
+   * with one turn. The note BODY is a rolling SUMMARY of the thread; the metadata is the
+   * thread state. The INDEXED fields (`status`/`definition`/`mode`) make threads
+   * operator-queryable. This note carries `['#agent/thread']` EXACTLY — NOT a
+   * `#agent/message`, NO inbound child — so it can never wake a session (no loop).
+   *
+   * The MODE governs the thread's IDENTITY + whether it upserts:
+   *  - `single-threaded` — ONE thread note per channel at the DETERMINISTIC stable path
+   *    `Threads/<safeChannel>/<safeName>` (named after the definition). It UPSERTS in
+   *    place across turns: we READ the existing note first, then write the rolled-up
+   *    aggregates (`turn_count` incremented, cumulative `usage`, original `started_at`).
+   *  - `multi-threaded` — one thread note PER FIRE at `Threads/<safeChannel>/<uuid>`
+   *    (today one fire = one thread; turn_count = 1; usage = this turn's). NO upsert.
+   *
+   * SAFETY of the read-modify-write for single-threaded: the drain is SERIAL per channel
+   * AND single-threaded is one-thread-per-channel today, so there's no concurrent writer
+   * to lose an update against. WHEN CONTINUATION brings concurrent threads per channel,
+   * switch to re-deriving aggregates from the `#agent/message` children or a vault
+   * atomic-merge, to avoid lost-update.
+   *
+   * Best-effort caller-side: a throw is surfaced to the registry, which logs it (a missing
+   * thread note never re-runs the turn — same "don't retry" posture as outbound).
+   */
+  async writeThread(thread: ThreadRecord): Promise<{ sent: string[] }> {
+    const safeChannel = thread.channel.replace(/[^a-zA-Z0-9_-]/g, "-");
+    const singleThreaded = thread.mode === "single-threaded";
+
+    // IDENTITY by mode (HARD CONSTRAINT 3 — the path leaf IS the thread's identity; no
+    // ambiguous `thread_id` metadata field). single-threaded: a DETERMINISTIC leaf named
+    // after the def (the agent/spec name, sanitized) so the SAME note upserts across turns.
+    // multi-threaded: a fresh uuid per fire (one fire = one thread = one note today).
+    // COLLISION NOTE: two single-threaded agents whose names collapse to the SAME safeName
+    // on the same channel would upsert each other's thread note. Acceptable because the
+    // registry enforces ONE agent per channel (byChannel index), so the collision can't
+    // arise in practice.
+    const safeName = (thread.name ?? thread.channel).replace(/[^a-zA-Z0-9_-]/g, "-");
+    const leaf = singleThreaded ? safeName : crypto.randomUUID();
+    const path = `${THREAD_PATH_PREFIX}/${safeChannel}/${leaf}`;
+
+    // For single-threaded UPSERT, read the existing thread note (by its deterministic
+    // path) to roll up the aggregates. SAFE because the drain is serial per channel and
+    // single-threaded is one-thread-per-channel today (see the method doc) — there's no
+    // concurrent writer to lose an update against.
+    //   WHEN CONTINUATION brings concurrent threads per channel, switch to re-deriving
+    //   aggregates from the #agent/message children or a vault atomic-merge, to avoid
+    //   lost-update.
+    let priorTurnCount = 0;
+    let priorInputTokens = 0;
+    let priorOutputTokens = 0;
+    let priorCostUsd = 0;
+    let priorStartedAt: string | undefined;
+    if (singleThreaded) {
+      const prior = await this.readThreadNote(path);
+      if (prior) {
+        priorTurnCount = numFromMeta(prior.metadata?.turn_count);
+        priorInputTokens = numFromMeta(prior.metadata?.input_tokens);
+        priorOutputTokens = numFromMeta(prior.metadata?.output_tokens);
+        priorCostUsd = numFromMeta(prior.metadata?.total_cost_usd);
+        if (typeof prior.metadata?.started_at === "string" && prior.metadata.started_at) {
+          priorStartedAt = prior.metadata.started_at;
+        }
+      }
+    }
+
+    const turnCount = singleThreaded ? priorTurnCount + 1 : 1;
+    // `started_at` is set ONCE on create (preserve the prior on upsert); `last_turn_at`
+    // advances every turn.
+    const startedAt = priorStartedAt ?? thread.started_at;
+    const lastTurnAt = thread.ended_at;
+
+    // Cumulative usage: single-threaded SUMS this turn into the prior totals; multi-threaded
+    // carries just this turn's (one fire = one thread).
+    const inputTokens =
+      (singleThreaded ? priorInputTokens : 0) + (thread.usage?.inputTokens ?? 0);
+    const outputTokens =
+      (singleThreaded ? priorOutputTokens : 0) + (thread.usage?.outputTokens ?? 0);
+    const costUsd = (singleThreaded ? priorCostUsd : 0) + (thread.usage?.totalCostUsd ?? 0);
+
+    // Indexed string fields (queryable) + the thread-state observability fields. The
+    // vault stores metadata as strings; numbers are stringified.
+    const metadata: Record<string, string> = {
+      channel: thread.channel,
+      mode: thread.mode,
+      status: thread.status,
+      started_at: startedAt,
+      last_turn_at: lastTurnAt,
+      turn_count: String(turnCount),
+    };
+    if (thread.definition) metadata.definition = thread.definition;
+    // Usage is always present once a turn carried it OR we accumulated any — emit the
+    // running totals so a query sees cumulative cost for the thread.
+    if (singleThreaded || thread.usage) {
+      if (inputTokens) metadata.input_tokens = String(inputTokens);
+      if (outputTokens) metadata.output_tokens = String(outputTokens);
+      // Round the accumulated cost to 9 decimals before serializing — summing floats
+      // (e.g. 0.1 + 0.2) accrues IEEE-754 drift, so a naive String() yields
+      // "0.30000000000000004". 9 decimals covers sub-cent costs without losing precision.
+      if (costUsd) metadata.total_cost_usd = String(Math.round(costUsd * 1e9) / 1e9);
+    }
+
+    const body = buildThreadSummaryBody({
+      name: thread.name ?? thread.channel,
+      mode: thread.mode,
+      turnCount,
+      status: thread.status,
+      lastTurnAt,
+      input: thread.input,
+      output: thread.output,
+    });
+
+    // Upsert by path via PATCH + `if_missing: "create"` (vault#309) — NOT POST. POST
+    // /api/notes 409s `path_conflict` on an existing path (it does not upsert), so a
+    // single-threaded thread note would create on turn 1 and 409 on every turn after.
+    // PATCH-by-path is the real upsert: the vault resolves the (decoded) path, UPDATES it
+    // when present (single-threaded turn 2+: content replaced, metadata merged) or CREATES
+    // it when missing (turn 1, and every multi-threaded fresh-uuid fire). `force: true`
+    // satisfies the vault's 428 mutation precondition (mirrors `setInboundStatus`). The
+    // path is one URL segment (percent-encoded `/`); the route `decodeURIComponent`s it.
+    // The `tags` array is consumed ONLY by the create branch. VERIFIED against the vault
+    // (`routes.ts`): the PATCH UPDATE branch reads `tags.add` / `tags.remove` (the delta
+    // shape), NOT a plain `tags` array — so sending `tags: [AGENT_THREAD_TAG]` here is
+    // INERT on update (the note's existing tag is preserved untouched) and only takes
+    // effect on the if_missing:create branch. So the single tag is set once at create and
+    // preserved across every subsequent upsert (HARD CONSTRAINT 4 — loop-safe single tag).
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(path)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        content: body,
+        path,
+        tags: [AGENT_THREAD_TAG],
+        metadata,
+        if_missing: "create",
+        force: true,
+      }),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`vault transport: write thread note failed (${res.status}) ${detail}`.trim());
+    }
+
+    let noteId: string = path;
+    try {
+      const created = (await res.json()) as { id?: string; note?: { id?: string } };
+      noteId = created?.id ?? created?.note?.id ?? path;
+    } catch {
+      // Non-JSON / empty body — keep the path as the addressable id.
+    }
+    return { sent: [noteId] };
+  }
+
+  /**
+   * Read a single thread note by its deterministic PATH (the single-threaded upsert
+   * read-back). The vault's `GET .../api/notes/<id-or-path>` resolves a note by id OR
+   * path; we percent-encode the path's `/` so it's one URL segment. Returns the note
+   * (metadata + content) or undefined when it doesn't exist yet (a 404 on the first
+   * turn) or the vault is unreachable — the caller treats "no prior" as turn_count 0.
+   * Throws on an UNEXPECTED non-ok response (not 404) so a misconfig surfaces.
+   */
+  private async readThreadNote(
+    path: string,
+  ): Promise<{ metadata?: Record<string, unknown>; content?: string } | undefined> {
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(path)}`;
+    let res: Response;
+    try {
+      res = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
+    } catch (err) {
+      // Vault unreachable — treat as "no prior" (we'll create fresh; aggregates reset).
+      // SURFACE it: a flaky vault silently resetting a thread's turn_count/usage is a
+      // data-quality bug we want visible in logs. Still return undefined so the upsert
+      // proceeds (don't strand the queue on a transient network blip).
+      console.warn(
+        `parachute-agent: readThreadNote network error — thread aggregates reset for ${path}: ${(err as Error).message}`,
+      );
+      return undefined;
+    }
+    if (res.status === 404) return undefined; // first turn — note doesn't exist yet.
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`vault transport: read thread note failed (${res.status}) ${detail}`.trim());
+    }
+    try {
+      const parsed = (await res.json()) as unknown;
+      // Tolerate a bare note object OR a `{ note: {...} }` envelope OR a 1-element array.
+      if (Array.isArray(parsed)) {
+        return parsed[0] as { metadata?: Record<string, unknown>; content?: string } | undefined;
+      }
+      const obj = parsed as { note?: unknown; metadata?: unknown; content?: unknown };
+      if (obj.note && typeof obj.note === "object") {
+        return obj.note as { metadata?: Record<string, unknown>; content?: string };
+      }
+      return obj as { metadata?: Record<string, unknown>; content?: string };
+    } catch {
+      // Bad JSON — treat as no prior (don't strand the write on a parse hiccup).
+      return undefined;
+    }
   }
 
   // react / edit / download: vault has no reactions; v1 is reply-only. Omitted.

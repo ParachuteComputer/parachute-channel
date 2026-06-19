@@ -121,6 +121,7 @@ import {
 import {
   ProgrammaticAgentRegistry,
   type WriteOutbound,
+  type WriteThread,
   type TurnEventSink,
 } from "./backends/registry.ts";
 import {
@@ -724,6 +725,42 @@ export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutboun
 }
 
 /**
+ * Build the {@link WriteThread} the programmatic registry posts each turn's thread note
+ * through — the UNIFIED model, called for BOTH modes (the structural unification: every
+ * turn materializes a thread note). Resolve the channel's transport from the live
+ * `channels` map and call its `writeThread()` (a VaultTransport writes a `#agent/thread`
+ * note; single-threaded upserts one note per channel, multi-threaded writes one per fire).
+ * A transport without a durable store (telegram) has no `writeThread`; we no-op there (the
+ * turn still runs — it just leaves no thread note). A missing transport (channel
+ * deregistered between the turn + its thread record) throws; the registry logs it and moves
+ * on (it never re-runs the turn).
+ */
+export function buildWriteThread(channels: Map<string, Channel>): WriteThread {
+  return async (thread) => {
+    const ch = channels.get(thread.channel);
+    if (!ch) {
+      throw new Error(
+        `no live transport for channel "${thread.channel}" — cannot write the thread note`,
+      );
+    }
+    // Only a transport with a durable store implements writeThread (the VaultTransport).
+    if (!ch.transport.writeThread) return;
+    await ch.transport.writeThread({
+      channel: thread.channel,
+      ...(thread.name ? { name: thread.name } : {}),
+      ...(thread.definition ? { definition: thread.definition } : {}),
+      mode: thread.mode,
+      status: thread.status,
+      input: thread.input,
+      output: thread.output,
+      started_at: thread.started_at,
+      ended_at: thread.ended_at,
+      ...(thread.usage ? { usage: thread.usage } : {}),
+    });
+  };
+}
+
+/**
  * Build the REAL programmatic-agent registry — the {@link ProgrammaticBackend}
  * wired to the env-resolved spawn deps + the per-channel session-id store, plus the
  * outbound-write callback over the live `channels`. Lazily defaulted by
@@ -779,6 +816,7 @@ export function createDefaultProgrammaticRegistry(
   return new ProgrammaticAgentRegistry({
     backend,
     writeOutbound: buildWriteOutbound(channels),
+    writeThread: buildWriteThread(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }

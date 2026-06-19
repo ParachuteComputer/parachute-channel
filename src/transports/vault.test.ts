@@ -26,7 +26,7 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { VaultTransport, AGENT_VAULT_TAG_SCHEMA } from "./vault.ts";
+import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG } from "./vault.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
 
@@ -147,6 +147,397 @@ describe("VaultTransport — reply (outbound note write)", () => {
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
     await expect(t.reply({ channel: "eng", text: "x" })).rejects.toThrow(/write reply failed/);
+  });
+});
+
+describe("VaultTransport — writeThread (#agent/thread note, the unified model)", () => {
+  test("MULTI-THREADED: writeThread() PATCH-upserts (if_missing:create) a fresh-per-fire #agent/thread note with indexed status/definition/mode + timing + Bearer (NO read-back)", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ id: "thread-note-1" }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const result = await t.writeThread({
+      channel: "eng",
+      name: "digest",
+      definition: "Agents/digest",
+      mode: "multi-threaded",
+      status: "ok",
+      input: "run the daily digest",
+      output: "digest complete: 3 items",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:12.000Z",
+      usage: { inputTokens: 100, outputTokens: 40, totalCostUsd: 0.002 },
+    });
+
+    expect(result.sent).toEqual(["thread-note-1"]);
+    // start() also fires ensureSchema() (PUT .../api/tags/*); isolate the thread-note
+    // write. The write is a PATCH-by-path upsert (NOT POST — POST 409s on an existing
+    // path), so it targets /api/notes/<encoded-path>, discriminated by method.
+    const noteCalls = calls.filter((c) => c.url.includes("/api/notes/") && c.init.method === "PATCH");
+    expect(noteCalls).toHaveLength(1);
+    // Multi-threaded does NO read-back (no GET to /api/notes/<path>) — fresh per fire.
+    const getCalls = calls.filter((c) => c.url.includes("/api/notes/") && (c.init.method ?? "GET") === "GET");
+    expect(getCalls).toHaveLength(0);
+    const call = noteCalls[0]!;
+    expect(decodeURIComponent(call.url)).toContain("/vault/default/api/notes/Threads/eng/");
+    expect(call.init.method).toBe("PATCH");
+    expect((call.init.headers as Record<string, string>).authorization).toBe("Bearer write-token-xyz");
+
+    const sent = JSON.parse(String(call.init.body)) as {
+      content: string;
+      path: string;
+      tags: string[];
+      metadata: Record<string, string>;
+      if_missing: string;
+      force: boolean;
+    };
+    // The upsert verb: PATCH + `if_missing: "create"` (creates when missing — every
+    // multi-threaded fire — updates when present) + `force: true` (the 428 precondition).
+    expect(sent.if_missing).toBe("create");
+    expect(sent.force).toBe(true);
+    // LOOP SAFETY (HARD CONSTRAINT 4): the thread note carries the thread tag EXACTLY —
+    // NOT a message tag + NOT the inbound child — so it can never wake a session.
+    expect(sent.tags).toEqual([AGENT_THREAD_TAG]);
+    expect(sent.tags).not.toContain("#agent/message");
+    expect(sent.tags).not.toContain("#agent/message/inbound");
+    // Indexed/queryable fields.
+    expect(sent.metadata.status).toBe("ok");
+    expect(sent.metadata.definition).toBe("Agents/digest");
+    expect(sent.metadata.mode).toBe("multi-threaded");
+    // Thread-state + channel + usage (stringified for the vault).
+    expect(sent.metadata.channel).toBe("eng");
+    expect(sent.metadata.started_at).toBe("2026-06-18T07:00:00.000Z");
+    expect(sent.metadata.last_turn_at).toBe("2026-06-18T07:00:12.000Z");
+    expect(sent.metadata.turn_count).toBe("1");
+    expect(sent.metadata.input_tokens).toBe("100");
+    expect(sent.metadata.output_tokens).toBe("40");
+    expect(sent.metadata.total_cost_usd).toBe("0.002");
+    // The body is a rolling SUMMARY with the two documented sections.
+    expect(sent.content).toContain("## Summary");
+    expect(sent.content).toContain("## Latest turn");
+    expect(sent.content).toContain("run the daily digest");
+    expect(sent.content).toContain("digest complete: 3 items");
+    // Multi-threaded path leaf is a fresh uuid under Threads/<channel>/.
+    expect(sent.path.startsWith("Threads/eng/")).toBe(true);
+  });
+
+  test("SINGLE-THREADED: writeThread() upserts ONE deterministic-path note named after the def (reads existing first)", async () => {
+    const posts: { url: string; init: RequestInit }[] = [];
+    const gets: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        gets.push(u);
+        // First turn: the note doesn't exist yet (404 → turn_count starts at 0).
+        return new Response("not found", { status: 404 });
+      }
+      // The write is a PATCH-by-path upsert (if_missing:create), NOT POST.
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        posts.push({ url: u, init: init ?? {} });
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 }); // ensureSchema PUTs
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      input: "hello",
+      output: "hi there",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z",
+      usage: { inputTokens: 10, outputTokens: 5 },
+    });
+
+    // It READ the existing note first (the upsert read-back), by the DETERMINISTIC path.
+    expect(gets).toHaveLength(1);
+    expect(decodeURIComponent(gets[0]!)).toContain("/api/notes/Threads/eng/eng");
+    // Then UPSERTED via PATCH (if_missing:create) to the same deterministic path.
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.init.method).toBe("PATCH");
+    expect(decodeURIComponent(posts[0]!.url)).toContain("/api/notes/Threads/eng/eng");
+    const sent = JSON.parse(String(posts[0]!.init.body)) as {
+      path: string;
+      tags: string[];
+      metadata: Record<string, string>;
+      content: string;
+      if_missing: string;
+      force: boolean;
+    };
+    expect(sent.if_missing).toBe("create"); // upsert verb (not POST — POST 409s).
+    expect(sent.force).toBe(true);
+    expect(sent.tags).toEqual([AGENT_THREAD_TAG]); // loop safety.
+    expect(sent.path).toBe("Threads/eng/eng"); // deterministic, named after the def.
+    expect(sent.metadata.mode).toBe("single-threaded");
+    expect(sent.metadata.turn_count).toBe("1"); // first turn (no prior).
+    expect(sent.metadata.started_at).toBe("2026-06-18T07:00:00.000Z");
+    expect(sent.metadata.last_turn_at).toBe("2026-06-18T07:00:05.000Z");
+    expect(sent.content).toContain("## Summary");
+    expect(sent.content).toContain("single-threaded thread for eng");
+  });
+
+  test("SINGLE-THREADED over TWO turns: same deterministic path, turn_count==2, summed usage, preserved started_at", async () => {
+    // Simulate a vault: the second turn reads back the note the FIRST turn wrote.
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      // PATCH-by-path with if_missing:create is the upsert (turn 1 creates, turn 2 updates).
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content }; // the vault upserts it.
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      input: "turn one",
+      output: "reply one",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z",
+      usage: { inputTokens: 10, outputTokens: 5, totalCostUsd: 0.001 },
+    });
+    expect(stored!.metadata.turn_count).toBe("1");
+
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      input: "turn two",
+      output: "reply two",
+      started_at: "2026-06-18T08:00:00.000Z", // a LATER start — must NOT overwrite the first.
+      ended_at: "2026-06-18T08:00:09.000Z",
+      usage: { inputTokens: 20, outputTokens: 8, totalCostUsd: 0.002 },
+    });
+
+    // ONE note, upserted: turn_count incremented, usage SUMMED, started_at PRESERVED,
+    // last_turn_at advanced.
+    expect(stored!.metadata.turn_count).toBe("2");
+    expect(stored!.metadata.input_tokens).toBe("30"); // 10 + 20
+    expect(stored!.metadata.output_tokens).toBe("13"); // 5 + 8
+    expect(stored!.metadata.total_cost_usd).toBe("0.003"); // 0.001 + 0.002
+    expect(stored!.metadata.started_at).toBe("2026-06-18T07:00:00.000Z"); // first turn's, preserved.
+    expect(stored!.metadata.last_turn_at).toBe("2026-06-18T08:00:09.000Z"); // latest turn.
+    // The body's summary reflects 2 turns + the latest turn's content.
+    expect(stored!.content).toContain("2 turns");
+    expect(stored!.content).toContain("turn two");
+    expect(stored!.content).toContain("reply two");
+  });
+
+  test("SINGLE-THREADED error on turn 2: turn_count==2, status:error, started_at preserved, last_turn_at advanced", async () => {
+    // Same stored-note simulation as the two-turn test: turn 2 reads back turn 1's note.
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    // Turn 1 — ok.
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      input: "turn one",
+      output: "reply one",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z",
+    });
+    expect(stored!.metadata.status).toBe("ok");
+
+    // Turn 2 — ERROR. The single-threaded thread keeps upserting (the failure is part of
+    // the rolling thread record); the status reflects this latest turn.
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "error",
+      input: "turn two",
+      output: "claude -p exited 1: boom",
+      started_at: "2026-06-18T08:00:00.000Z", // later — must NOT overwrite the first.
+      ended_at: "2026-06-18T08:00:09.000Z",
+    });
+
+    expect(stored!.metadata.turn_count).toBe("2"); // incremented despite the error.
+    expect(stored!.metadata.status).toBe("error"); // the latest turn's outcome.
+    expect(stored!.metadata.started_at).toBe("2026-06-18T07:00:00.000Z"); // preserved.
+    expect(stored!.metadata.last_turn_at).toBe("2026-06-18T08:00:09.000Z"); // advanced.
+    // The body's latest-turn section is the Error block.
+    expect(stored!.content).toContain("**Error:**");
+    expect(stored!.content).toContain("claude -p exited 1: boom");
+  });
+
+  test("SINGLE-THREADED: a 500 on the read-back GET rejects (not a silent aggregate reset)", async () => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      // The single-threaded read-back GET returns a 500 (an UNEXPECTED non-404 error) →
+      // readThreadNote throws → writeThread rejects, surfacing the misconfig rather than
+      // silently resetting the thread's aggregates.
+      if (u.includes("/api/notes/") && method === "GET") {
+        return new Response("boom", { status: 500 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await expect(
+      t.writeThread({
+        channel: "eng",
+        name: "eng",
+        mode: "single-threaded",
+        status: "ok",
+        input: "x",
+        output: "y",
+        started_at: "2026-06-18T07:00:00.000Z",
+        ended_at: "2026-06-18T07:00:01.000Z",
+      }),
+    ).rejects.toThrow(/read thread note failed/);
+  });
+
+  test("SINGLE-THREADED cost rounding: 0.1 + 0.2 serializes as \"0.3\" (no IEEE-754 drift)", async () => {
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      input: "one",
+      output: "r1",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z",
+      usage: { totalCostUsd: 0.1 },
+    });
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      input: "two",
+      output: "r2",
+      started_at: "2026-06-18T08:00:00.000Z",
+      ended_at: "2026-06-18T08:00:09.000Z",
+      usage: { totalCostUsd: 0.2 },
+    });
+
+    // The naive sum 0.1 + 0.2 === 0.30000000000000004; the round-to-9-decimals guard
+    // serializes it cleanly as "0.3".
+    expect(stored!.metadata.total_cost_usd).toBe("0.3");
+  });
+
+  test("writeThread() on a MULTI-THREADED error turn records status:error + the failure reason in the body (NO read-back)", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    let captured: { tags: string[]; metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      if (String(url).includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
+        captured = JSON.parse(String(init?.body));
+      }
+      return new Response(JSON.stringify({ id: "thread-err-1" }), { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.writeThread({
+      channel: "eng",
+      mode: "multi-threaded",
+      status: "error",
+      input: "do the thing",
+      output: "claude -p exited 1: boom",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:01.000Z",
+    });
+
+    expect(captured!.metadata.status).toBe("error");
+    // No definition → the field is absent (not an empty string).
+    expect("definition" in captured!.metadata).toBe(false);
+    // The body's latest-turn section is the Error block on a failure.
+    expect(captured!.content).toContain("**Error:**");
+    expect(captured!.content).toContain("claude -p exited 1: boom");
+    // Multi-threaded does NO read-back even on the error path (fresh per fire).
+    expect(
+      calls.filter((c) => c.url.includes("/api/notes/") && (c.init.method ?? "GET") === "GET"),
+    ).toHaveLength(0);
+  });
+
+  test("writeThread() throws on a non-ok vault response (PATCH)", async () => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      // multi-threaded → no GET; the PATCH upsert fails.
+      if (String(url).includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
+        return new Response("boom", { status: 500 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await expect(
+      t.writeThread({
+        channel: "eng",
+        mode: "multi-threaded",
+        status: "ok",
+        input: "x",
+        output: "y",
+        started_at: "2026-06-18T07:00:00.000Z",
+        ended_at: "2026-06-18T07:00:01.000Z",
+      }),
+    ).rejects.toThrow(/write thread note failed/);
   });
 });
 
@@ -626,12 +1017,13 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(jobBody.parent_names).toEqual(["#agent"]);
   });
 
-  test("schema declares the #agent/* namespace rollup PLUS the interim + legacy families (dual-read, 12 entries)", async () => {
+  test("schema declares the #agent/* namespace rollup PLUS the interim + legacy families (dual-read, 13 entries)", async () => {
     // The `#agent/*` namespace (design 2026-06-17-vault-native-agents) rolls up
-    // definitions, messages, and jobs to the `#agent` root. DUAL-READ: the schema
+    // definitions, messages, jobs, AND threads to the `#agent` root. DUAL-READ: the schema
     // ALSO keeps declaring the interim flat `#agent-message*` AND legacy
     // `#channel-message*` inheritance so pre-namespace history keeps its parent/child
-    // expansion until the one-time re-tag run lands. Exactly 12 entries.
+    // expansion until the one-time re-tag run lands. Exactly 13 entries (12 + the
+    // execution-lifecycle `#agent/thread` record tag).
     const names = AGENT_VAULT_TAG_SCHEMA.map((e) => e.name);
     expect(names).toEqual([
       "#agent",
@@ -640,6 +1032,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
       "#agent/message/inbound",
       "#agent/message/outbound",
       "#agent/job",
+      "#agent/thread",
       "#agent-message",
       "#agent-message/inbound",
       "#agent-message/outbound",
@@ -652,6 +1045,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(byName("#agent/definition").parent_names).toEqual(["#agent"]);
     expect(byName("#agent/message").parent_names).toEqual(["#agent"]);
     expect(byName("#agent/job").parent_names).toEqual(["#agent"]);
+    expect(byName("#agent/thread").parent_names).toEqual(["#agent"]);
     expect(byName("#agent/message/inbound").parent_names).toEqual(["#agent/message"]);
     expect(byName("#agent/message/outbound").parent_names).toEqual(["#agent/message"]);
     // The interim + legacy children still declare their own parents (inheritance preserved).
@@ -659,6 +1053,14 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(byName("#agent-message/outbound").parent_names).toEqual(["#agent-message"]);
     expect(byName("#channel-message/inbound").parent_names).toEqual(["#channel-message"]);
     expect(byName("#channel-message/outbound").parent_names).toEqual(["#channel-message"]);
+    // `#agent/thread` declares INDEXED string fields so threads are operator-queryable —
+    // "all failed threads" (status), "all threads of agent X" (definition), "all
+    // multi-threaded threads" (mode). The three axes carry over from the run record VERBATIM.
+    expect(byName("#agent/thread").fields).toEqual({
+      status: { type: "string", indexed: true },
+      definition: { type: "string", indexed: true },
+      mode: { type: "string", indexed: true },
+    });
   });
 
   test("schema is sourced from AGENT_VAULT_TAG_SCHEMA — declares exactly its entries", async () => {
@@ -672,6 +1074,24 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     await t.ensureSchema();
 
     expect(declared).toEqual(AGENT_VAULT_TAG_SCHEMA.map((e) => e.name));
+  });
+
+  test("ensureSchema sends the indexed `fields` body for #agent/thread", async () => {
+    let threadBody: { fields?: Record<string, unknown> } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const name = decodeURIComponent(String(url).split("/api/tags/")[1]!);
+      if (name === AGENT_THREAD_TAG) threadBody = JSON.parse(String(init?.body));
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.ensureSchema();
+
+    expect(threadBody?.fields).toEqual({
+      status: { type: "string", indexed: true },
+      definition: { type: "string", indexed: true },
+      mode: { type: "string", indexed: true },
+    });
   });
 
   test("best-effort: a rejecting fetch does NOT throw out of ensureSchema", async () => {

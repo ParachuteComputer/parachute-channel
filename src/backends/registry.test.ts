@@ -13,6 +13,8 @@ import { describe, test, expect } from "bun:test";
 import {
   ProgrammaticAgentRegistry,
   type WriteOutbound,
+  type WriteThread,
+  type ThreadNote,
   type TurnEventSink,
   type TurnLifecycleEvent,
 } from "./registry.ts";
@@ -92,6 +94,23 @@ function recorder(): { calls: { channel: string; reply: string; inReplyTo?: stri
   };
   return { calls, fn };
 }
+
+/** A recorder WriteThread — captures every `#agent/thread` note the registry writes. */
+function threadRecorder(): { threads: ThreadNote[]; fn: WriteThread } {
+  const threads: ThreadNote[] = [];
+  const fn: WriteThread = async (thread) => {
+    threads.push(thread);
+  };
+  return { threads, fn };
+}
+
+/** A multi-threaded spec (materializes one `#agent/thread` note per fire). */
+const specMultiThreaded = (name: string, channel = name, definition?: string): AgentSpec => ({
+  name,
+  channels: [channel],
+  mode: "multi-threaded",
+  ...(definition ? { definition } : {}),
+});
 
 /** A recorder TurnEventSink — captures every (channel, event) the registry emits. */
 function turnRecorder(): { events: { channel: string; event: TurnLifecycleEvent }[]; fn: TurnEventSink } {
@@ -219,6 +238,196 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
     // Both turns ran; the throw on the first didn't strand the second.
     expect(backend.calls.map((c) => c.message)).toEqual(["first (throws)", "second (ok)"]);
     expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:second (ok)" }]);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, BOTH modes)", () => {
+  test("a completed MULTI-THREADED turn materializes an #agent/thread note (status ok) carrying input/output/definition/mode/name", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register(specMultiThreaded("digest", "digest", "Agents/digest"));
+
+    reg.enqueue("digest", { content: "run the digest" });
+    await until(() => threads.threads.length === 1);
+
+    expect(threads.threads).toHaveLength(1);
+    const thread = threads.threads[0]!;
+    expect(thread.channel).toBe("digest");
+    expect(thread.name).toBe("digest");
+    expect(thread.status).toBe("ok");
+    expect(thread.mode).toBe("multi-threaded");
+    expect(thread.definition).toBe("Agents/digest");
+    expect(thread.input).toBe("run the digest");
+    expect(thread.output).toBe("reply:run the digest");
+    expect(typeof thread.started_at).toBe("string");
+    expect(typeof thread.ended_at).toBe("string");
+    // The dual-write is ADDITIVE: a non-empty reply writes EXACTLY one outbound
+    // (the chat delivery) AND exactly one thread note (the primary record).
+    await until(() => rec.calls.length === 1);
+    expect(rec.calls.length).toBe(1);
+    expect(threads.threads.length).toBe(1);
+  });
+
+  test("a SINGLE-THREADED turn ALSO materializes ONE #agent/thread note (the unified model — named after the def)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    // specFor → no mode → single-threaded (the default).
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => threads.threads.length === 1);
+
+    // BOTH modes materialize a thread note now (the structural unification): a
+    // single-threaded turn writes ONE, mode single-threaded, NAMED AFTER THE DEF (the
+    // deterministic upsert key the transport derives the stable path from).
+    expect(threads.threads).toHaveLength(1);
+    expect(threads.threads[0]!.mode).toBe("single-threaded");
+    expect(threads.threads[0]!.name).toBe("eng");
+    expect(threads.threads[0]!.channel).toBe("eng");
+    expect(threads.threads[0]!.input).toBe("hello");
+    expect(threads.threads[0]!.output).toBe("reply:hello");
+    // The single-threaded outbound reply was still written (no regression).
+    expect(rec.calls).toHaveLength(1);
+  });
+
+  test("a single-threaded agent over TWO turns records ONE thread (same name/channel — the upsert key) both turns, status carries forward", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register(specFor("eng")); // single-threaded (default).
+
+    // Two turns on the same channel — drained serially, FIFO.
+    reg.enqueue("eng", { content: "turn one" });
+    reg.enqueue("eng", { content: "turn two" });
+    await until(() => threads.threads.length === 2);
+
+    // recordThread is called for BOTH turns (the registry seam can't simulate the
+    // transport's read-existing upsert, so we assert the UPSERT KEY is stable across
+    // turns — same channel + same name + same mode — which the transport maps to the
+    // SAME deterministic path `Threads/<channel>/<name>`, overwriting in place. The
+    // per-turn turn_count/usage aggregation is covered at the vault-transport layer).
+    expect(threads.threads).toHaveLength(2);
+    const [t1, t2] = threads.threads;
+    expect(t1!.mode).toBe("single-threaded");
+    expect(t2!.mode).toBe("single-threaded");
+    expect(t1!.name).toBe("eng");
+    expect(t2!.name).toBe("eng"); // SAME upsert key → same note, upserted.
+    expect(t1!.channel).toBe("eng");
+    expect(t2!.channel).toBe("eng");
+    expect(t1!.input).toBe("turn one");
+    expect(t2!.input).toBe("turn two");
+  });
+
+  test("a multi-threaded fire writes a thread note per fire (each carries this fire's turn — distinct records)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register(specMultiThreaded("digest"));
+
+    reg.enqueue("digest", { content: "fire A" });
+    reg.enqueue("digest", { content: "fire B" });
+    await until(() => threads.threads.length === 2);
+
+    // One thread note PER FIRE (today one fire = one thread = one note; the transport
+    // assigns each a fresh uuid path, so they're distinct records).
+    expect(threads.threads).toHaveLength(2);
+    expect(threads.threads.map((t) => t.input)).toEqual(["fire A", "fire B"]);
+    expect(threads.threads.every((t) => t.mode === "multi-threaded")).toBe(true);
+  });
+
+  test("a FAILED MULTI-THREADED turn still materializes an #agent/thread note with status:error + the reason", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: false, error: "mint refused" });
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register(specMultiThreaded("digest"));
+
+    reg.enqueue("digest", { content: "do it" });
+    await until(() => threads.threads.length === 1);
+
+    expect(threads.threads).toHaveLength(1);
+    expect(threads.threads[0]!.mode).toBe("multi-threaded");
+    expect(threads.threads[0]!.status).toBe("error");
+    expect(threads.threads[0]!.output).toBe("mint refused");
+    // No outbound note for a failed turn (unchanged behavior).
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  test("a FAILED SINGLE-THREADED turn ALSO materializes an #agent/thread note with status:error (substantiates BOTH modes)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: false, error: "mint refused" });
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    // specFor → no mode → single-threaded (the default).
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "do it" });
+    await until(() => threads.threads.length === 1);
+
+    expect(threads.threads).toHaveLength(1);
+    expect(threads.threads[0]!.mode).toBe("single-threaded");
+    expect(threads.threads[0]!.name).toBe("eng");
+    expect(threads.threads[0]!.status).toBe("error");
+    expect(threads.threads[0]!.output).toBe("mint refused");
+    // No outbound note for a failed turn (unchanged behavior).
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  test("a turn with an empty reply STILL materializes a thread note (status ok, empty output)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: true, reply: "" });
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register(specMultiThreaded("digest"));
+
+    reg.enqueue("digest", { content: "tool-only run" });
+    await until(() => threads.threads.length === 1);
+    expect(threads.threads[0]!.status).toBe("ok");
+    expect(threads.threads[0]!.output).toBe("");
+    // Empty reply → no outbound message note (the thread note IS the record).
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  test("REGRESSION (c34db03, now BOTH modes): a turn whose outbound write THROWS still leaves exactly one #agent/thread note", async () => {
+    const backend = new FakeBackend();
+    const threads = threadRecorder();
+    // A THROWING WriteOutbound — the thread note is written BEFORE the additive outbound
+    // (c34db03, now applied uniformly to BOTH modes), so the failed transcript write must
+    // NOT cost us the primary record. Use a SINGLE-THREADED spec to prove the c34db03
+    // ordering now protects single-threaded too. (`recorder()` can't throw; inline variant.)
+    let outboundAttempts = 0;
+    const throwingWriteOutbound: WriteOutbound = async () => {
+      outboundAttempts++;
+      throw new Error("vault write boom");
+    };
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: throwingWriteOutbound,
+      writeThread: threads.fn,
+    });
+    await reg.register(specFor("eng")); // single-threaded (default) — the ordering applies here now.
+
+    reg.enqueue("eng", { content: "fire it" });
+    await until(() => threads.threads.length === 1);
+    // Let the (throwing) outbound attempt settle.
+    await new Promise<void>((r) => setTimeout(r, 5));
+
+    // The thread note survived the outbound failure: exactly ONE, status ok, output = the reply.
+    expect(threads.threads).toHaveLength(1);
+    expect(threads.threads[0]!.status).toBe("ok");
+    expect(threads.threads[0]!.mode).toBe("single-threaded");
+    expect(threads.threads[0]!.output).toBe("reply:fire it");
+    // The outbound WAS attempted (and threw) — proving the thread note was written first.
+    expect(outboundAttempts).toBe(1);
   });
 });
 

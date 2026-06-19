@@ -34,10 +34,16 @@
  *   CLAUDE_CONFIG_DIR          claude config dir bound read-only into the sandbox (default ~/.claude).
  */
 
+// PARKED: the interactive (tmux) backend was retired 2026-06-19 (design
+// 2026-06-19-retire-interactive-backend.md). This CLI launches a tmux session and is
+// therefore part of the parked interactive spawner — it imports the spawner from
+// `src/_parked/interactive-spawn.ts`, not the live tree. Kept buildable for the
+// future terminal/process-mgmt revival, but not a live agent-launch path.
 import {
   spawnAgent,
+  realTmuxLauncher,
   type SpawnAgentDeps,
-} from "../src/spawn-agent.ts";
+} from "../src/_parked/interactive-spawn.ts";
 import { CredentialNotConfiguredError } from "../src/credentials.ts";
 import { resolveSpawnDeps } from "../src/spawn-deps.ts";
 import { channelEntryKey, vaultEntryKey } from "../src/agent-mcp-config.ts";
@@ -280,7 +286,9 @@ async function main(): Promise<number> {
 
   let deps: SpawnAgentDeps;
   try {
-    deps = resolveSpawnDeps();
+    // The shared base deps + the (parked) real tmux launcher — the live
+    // `resolveSpawnDeps` no longer carries a tmux launcher (interactive retired).
+    deps = { ...resolveSpawnDeps(), tmux: realTmuxLauncher() };
   } catch (err) {
     process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
     return 1;

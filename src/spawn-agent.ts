@@ -1,52 +1,35 @@
 /**
- * Spawn/scope command — graduate `scripts/launch-session.sh` into a real module
- * (design §4). Given an agent spec:
+ * SHARED spawn helpers — the sandbox/filesystem/env/spec-persistence primitives
+ * that BOTH live agent backends build on:
  *
- *   1. Mint one scoped token PER resource via the hub mint API (attenuated to the
- *      manager's own bearer): `agent:read[+write]` per channel, `vault:<name>:<verb>`
- *      (optionally tag-scoped) for the vault — one token per `aud` (§4.2 step 1, §4.3).
- *   2. Build the multi-entry strict MCP config from those tokens (§4.2 step 2).
- *   3. Launch `claude` WRAPPED BY THE SANDBOX in a tmux session, with a scrubbed
- *      env: inject the per-channel OAuth credential as `CLAUDE_CODE_OAUTH_TOKEN`,
- *      and NEVER set `ANTHROPIC_API_KEY` (which would silently route the session
- *      onto API billing, §6). `--strict-mcp-config` closes the MCP surface to
- *      exactly the spec.
+ *   - the PROGRAMMATIC backend (`src/backends/programmatic.ts`) — `claude -p` turns;
+ *   - the PARKED interactive spawner (`src/_parked/interactive-spawn.ts`) — the
+ *     retired tmux backend, kept for future terminal/process-mgmt (design
+ *     2026-06-19-retire-interactive-backend.md).
  *
- * The credential is resolved at launch from the per-channel secret store
- * (`credentials.ts`, design §6): the spec's wake channel's per-channel override,
- * falling back to the default/operator token, erroring when neither is set. The
- * resolver is injectable (`deps.resolveClaudeToken`) so tests run hermetically
- * without touching a real store.
+ * What lives here:
+ *   - {@link wrapArgvInSandbox} — the ONE place the sandbox/egress/filesystem policy
+ *     is applied to a launch argv (every launch gets the same egress floor + scoped-
+ *     read confinement);
+ *   - {@link seedAgentHome} — the per-session writable HOME (the stability keystone);
+ *   - {@link buildAgentChildEnv} — the scrubbed child env (NEVER `ANTHROPIC_API_KEY`;
+ *     the session runs on the subscription via `CLAUDE_CODE_OAUTH_TOKEN`, §6);
+ *   - {@link resolveAgentCwd} / {@link sessionWorkspace} / {@link persistSpec} /
+ *     {@link readPersistedSpec} / {@link shellJoin} — the spec/path/quoting helpers.
  *
- * Env-scrubbing follows runner's `buildChildEnv` instinct
- * (`parachute-runner/src/spawn.ts`): pass only what claude needs, drop everything
- * else — but UNLIKE runner, we deliberately do NOT pass `ANTHROPIC_API_KEY`
- * through (runner is the API-key path; the channel session is the interactive
- * subscription path).
+ * The interactive tmux SPAWNER itself (the `claude` argv, the launch script, the
+ * dev-channels-consent auto-answer, `spawnAgent`, the `TmuxLauncher`) was PARKED to
+ * `src/_parked/interactive-spawn.ts` when the interactive backend retired — it
+ * imports these helpers, it didn't fork them.
  */
 
 import { writeFileSync, mkdirSync, chmodSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentSpec, BaseBinds } from "./sandbox/types.ts";
-import { normalizeChannel } from "./sandbox/types.ts";
 import { Sandbox, type SandboxEngine, type WrappedCommand } from "./sandbox/index.ts";
 import type { EgressBaseInput } from "./sandbox/egress.ts";
-import {
-  buildAgentMcpConfigJson,
-  channelEntryKey,
-  type ChannelMcpEntry,
-  type VaultMcpEntry,
-  type OtherMcpEntry,
-} from "./agent-mcp-config.ts";
-import {
-  mintScopedToken,
-  agentScope,
-  vaultScope,
-  type MintTokenDeps,
-  type MintResult,
-} from "./mint-token.ts";
-import { resolveClaudeCredential, resolveChannelEnv, DENYLISTED_ENV } from "./credentials.ts";
+import { DENYLISTED_ENV } from "./credentials.ts";
 
 /**
  * Slug guard for `spec.name`. The name is used UNESCAPED as a tmux session
@@ -110,8 +93,9 @@ export interface WrapArgvInSandboxInput {
 
 /**
  * Sandbox-wrap an argv for one launch — the SHARED sandbox seam both the
- * interactive {@link spawnAgent} (tmux `claude`) and the programmatic backend
- * (`claude -p`) call. Extracted so the sandbox/egress/filesystem policy lives in
+ * programmatic backend (`claude -p`) and the parked interactive spawner (tmux
+ * `claude`, `src/_parked/interactive-spawn.ts`) call. Extracted so the sandbox/
+ * egress/filesystem policy lives in
  * exactly ONE place: every launch, regardless of backend, gets the same egress
  * floor (§4.4) + scoped-read confinement (§4.5) baked into its argv.
  *
@@ -142,40 +126,17 @@ export async function wrapArgvInSandbox(input: WrapArgvInSandboxInput): Promise<
   );
 }
 
-/** A tmux launcher seam — real impl spawns tmux; tests inject a recorder. */
-export interface TmuxLauncher {
-  /**
-   * Create a detached tmux session `name` that runs `argv` with `env` from `cwd`.
-   * Returns the spawned argv (for assertion). Must not block on the session.
-   *
-   * `cwd` is the agent's WORKING dir (the spec's `workspace` when set, else the
-   * private session dir). `scriptDir` is the agent's PRIVATE session dir, where the
-   * per-session `.launch.sh` is written 0600 — kept separate so a SHARED working
-   * dir is never littered with the (private) launch script. When `scriptDir` is
-   * omitted it defaults to `cwd` (back-compat: today's callers that don't set a
-   * `workspace` pass the private dir as the cwd anyway).
-   */
-  newSession(opts: {
-    name: string;
-    argv: string[];
-    env: Record<string, string | undefined>;
-    cwd: string;
-    scriptDir?: string;
-  }): Promise<void>;
-  /** Whether a session by this name already exists (idempotency). */
-  hasSession(name: string): Promise<boolean>;
-  /**
-   * Auto-answer claude's `--dangerously-load-development-channels` consent gate
-   * once it appears in the session's pane (agent#70). A headless tmux spawn has
-   * nobody at the keyboard, so the interactive "I am using this for local
-   * development" prompt would hang the session forever and the MCP never connects.
-   * We answer it by sending Enter to the pane. Returns the outcome; NEVER throws
-   * (a spawn must not fail because the prompt didn't show / capture failed).
-   */
-  confirmDevChannelsPrompt(session: string): Promise<"confirmed" | "already-running" | "timeout">;
-}
-
-export interface SpawnAgentDeps {
+/**
+ * The SHARED, NON-tmux deps a real session launch needs (hub origin + manager
+ * bearer for minting, channel/vault URLs, the sessions dir, the runtime read binds,
+ * the per-channel credential/env resolvers, sandbox/ripgrep overrides). The
+ * programmatic backend reads its slice of these; `resolveSpawnDeps` builds them.
+ *
+ * The PARKED interactive spawner extends this with a `tmux` launcher
+ * (`SpawnAgentDeps` in `src/_parked/interactive-spawn.ts`); the live tree never
+ * carries a tmux launcher in its deps.
+ */
+export interface SpawnAgentBaseDeps {
   /** Hub origin + manager bearer for minting (§4.3). */
   hubOrigin: string;
   managerBearer: string;
@@ -193,27 +154,20 @@ export interface SpawnAgentDeps {
   /**
    * Resolve the Claude OAuth token to inject as `CLAUDE_CODE_OAUTH_TOKEN`, given
    * the spec's wake channel. Defaults to the real per-channel secret store
-   * (`credentials.ts` — channel override ?? default/operator ?? throw). Tests
-   * inject a stub so they never read a real store. The store throws
-   * `CredentialNotConfiguredError` when neither an override nor a default is set,
-   * which aborts the launch BEFORE any tmux session is created (no session ever
-   * runs without auth).
+   * (`credentials.ts` — channel override ?? default/operator ?? throw). The store
+   * throws `CredentialNotConfiguredError` when neither is set, which aborts the
+   * launch BEFORE any side effect (no session ever runs without auth).
    */
   resolveClaudeToken?: (channel: string) => string;
   /**
    * Resolve the per-channel ENV vars (the GH_TOKEN/CLOUDFLARE_* slice) to inject
-   * into the sandboxed child, given the spec's wake channel. Defaults to the real
-   * env store (`credentials.ts` — `{ ...default, ...channels[ch] }`, denylisted
-   * keys stripped). Tests inject a stub so they never read a real store. Read at
-   * spawn time so a var set via the config API applies on the next spawn / restart
-   * without a daemon restart. A missing/empty store resolves to `{}` (a channel
-   * with no scoped env is fine — unlike the Claude token, env injection is optional).
+   * into the sandboxed child. Read at spawn time so a var set via the config API
+   * applies on the next spawn without a daemon restart. A missing/empty store
+   * resolves to `{}` (env injection is optional).
    */
   resolveChannelEnv?: (channel: string) => Record<string, string>;
   /** Sandbox engine override (tests inject a fake). */
   sandboxEngine?: SandboxEngine;
-  /** tmux launcher (tests inject a recorder). */
-  tmux: TmuxLauncher;
   /** fetch override for the mint client (tests). */
   fetchFn?: typeof fetch;
   /** Parent env to scrub from. Defaults to process.env. */
@@ -225,33 +179,6 @@ export interface SpawnAgentDeps {
    * a real `rg` binary; pass one when the host has none on PATH).
    */
   ripgrep?: { command: string; args?: string[] };
-}
-
-export interface SpawnAgentResult {
-  /** tmux session name (`<spec.name>-agent`). */
-  session: string;
-  /** Per-session workspace dir. */
-  workspace: string;
-  /** The minted tokens, by resource key (channel name / `vault:<name>` / mcp name). */
-  tokens: Record<string, MintResult>;
-  /** The inline MCP config JSON written for the session. */
-  mcpConfigJson: string;
-  /** The sandbox-wrapped argv + env + config the session was launched with. */
-  wrapped: WrappedCommand;
-  /** Already-running? (idempotent no-op). */
-  alreadyRunning: boolean;
-  /**
-   * Outcome of auto-answering the dev-channels consent gate (agent#70):
-   * `"confirmed"` (we sent Enter), `"already-running"` (claude was past the prompt),
-   * or `"timeout"` (the prompt never appeared in the window — non-fatal). Absent on
-   * the already-running idempotent no-op path (no launch happened).
-   */
-  devChannelsPrompt?: "confirmed" | "already-running" | "timeout";
-}
-
-/** tmux session name for a spec — matches launch-session.sh's `<name>-agent`. */
-export function sessionName(specName: string): string {
-  return `${specName}-agent`;
 }
 
 /** Per-session workspace dir under the sessions base. */
@@ -317,29 +244,6 @@ export function readPersistedSpec(workspace: string): AgentSpec | null {
   } catch {
     return null;
   }
-}
-
-/**
- * Interpret the backend of a PERSISTED spec (backward-compat, design
- * 2026-06-16 + Aaron's gating decision 2026-06-16).
- *
- * A stored `spec.json` with NO `backend` field predates the field — it was written
- * by an OLDER build whose only backend was the tmux/interactive path (e.g. the live
- * `uni-dev` agent). Such a spec MUST read as `"interactive"`, never `"programmatic"`:
- * an existing interactive agent is never silently migrated to programmatic by a
- * daemon restart.
- *
- * This is DELIBERATELY the OPPOSITE default from a NEW spawn request, where an
- * omitted `backend` now means `"programmatic"` ({@link buildSpecFromBody} in
- * `agents.ts`). The two defaults are distinct on purpose — "omitted" means
- * "programmatic" for a fresh request but "interactive" for a file on disk — so the
- * flip applies only going forward and never reinterprets already-running agents.
- *
- * Use this anywhere a stored spec's backend is interpreted (boot re-register, etc.)
- * rather than reading `spec.backend` raw, so the back-compat default is in one place.
- */
-export function interpretPersistedBackend(spec: AgentSpec): "interactive" | "programmatic" {
-  return spec.backend === "programmatic" ? "programmatic" : "interactive";
 }
 
 /**
@@ -549,287 +453,6 @@ export function seedAgentHome(
 }
 
 /**
- * Build the `claude` invocation argv (pre-sandbox-wrap). Interactive `claude`
- * (NOT `claude -p` — the session runs on the subscription, §1/§6) with the
- * strict, multi-entry MCP config and the dev-channels flag for the first channel
- * (the wake transport). `--strict-mcp-config` closes the MCP surface to the spec.
- *
- * `--dangerously-skip-permissions`: a spawned agent runs AUTONOMOUSLY — there is no
- * human at the terminal to answer claude's in-app permission prompts, and the OS
- * sandbox (+ scoped reads / egress when confined) is the real containment, so
- * claude's own permission prompts are redundant friction. Skipping them is what lets
- * the agent reach a usable state hands-off. (The meta "are you sure" for THIS flag is
- * pre-suppressed via the seeded settings.json `skipDangerousModePermissionPrompt` —
- * see seedAgentHome.)
- *
- * NOTE: `skipDangerousModePermissionPrompt` (and every other settings.json key / env
- * var) suppresses ONLY the skip-permissions meta-prompt — it does NOT cover the
- * SEPARATE `--dangerously-load-development-channels` consent gate ("I am using this
- * for local development"), which has no skip flag and which `--channels` (the
- * allowlist path) doesn't satisfy for custom `server:` channels. That gate is
- * auto-answered post-launch by `confirmDevChannelsPrompt` (agent#70), not here.
- *
- * SYSTEM PROMPT (design 2026-06-16-channel-system-prompt.md): for backend-parity
- * with the programmatic path, when the spec carries a `systemPrompt` the per-session
- * prompt FILE is passed via the `-file` variant — `--append-system-prompt-file`
- * (append, keeps CC's default) or `--system-prompt-file` (replace). Interactive is a
- * long-lived session, so one-time at launch is sufficient (no per-turn re-pass).
- */
-export function buildAgentClaudeArgs(opts: {
-  mcpConfigPath: string;
-  firstChannelEntryKey: string;
-  claudeBin?: string;
-  /** Path to the per-session system-prompt file (omitted = no system-prompt flag). */
-  systemPromptFile?: string;
-  /** How the system prompt composes — append (default) keeps CC's base; replace overrides it. */
-  systemPromptMode?: "append" | "replace";
-}): string[] {
-  const bin = opts.claudeBin ?? "claude";
-  const argv = [
-    bin,
-    "--dangerously-skip-permissions",
-    "--strict-mcp-config",
-    "--mcp-config",
-    opts.mcpConfigPath,
-    `--dangerously-load-development-channels=server:${opts.firstChannelEntryKey}`,
-  ];
-  if (opts.systemPromptFile) {
-    const flag = opts.systemPromptMode === "replace" ? "--system-prompt-file" : "--append-system-prompt-file";
-    argv.push(flag, opts.systemPromptFile);
-  }
-  return argv;
-}
-
-/**
- * Spawn a sandboxed agent session from a spec. Idempotent: an existing tmux
- * session is a no-op (returns `alreadyRunning: true`).
- *
- * Order: validate name → mint per-resource tokens → write MCP config → build
- * claude argv → sandbox-wrap → tmux launch with scrubbed env.
- *
- * **Concurrency-safe.** The sandbox-runtime singleton's initialize→wrap window is
- * serialized process-wide (see `withSpawnLock`), so concurrent `spawnAgent` calls
- * don't clobber each other's sandbox config. Each produces an independent MCP
- * config + wrapped argv; the spawned processes then run independently.
- */
-export async function spawnAgent(
-  spec: AgentSpec,
-  deps: SpawnAgentDeps,
-): Promise<SpawnAgentResult> {
-  // SECURITY: the name lands UNESCAPED in a tmux `-t` target and a path segment;
-  // reject anything that isn't a strict slug BEFORE any fs/tmux side effect.
-  if (!AGENT_NAME_SLUG.test(spec.name)) {
-    throw new Error(
-      `spawnAgent: spec name "${spec.name}" must be a slug (alphanumeric, dash, underscore only)`,
-    );
-  }
-
-  const session = sessionName(spec.name);
-  const workspace = sessionWorkspace(deps.sessionsDir, spec.name);
-
-  if (await deps.tmux.hasSession(session)) {
-    return {
-      session,
-      workspace,
-      tokens: {},
-      mcpConfigJson: "",
-      wrapped: { argv: [], env: {}, config: { network: { allowedDomains: [], deniedDomains: [] }, filesystem: { denyRead: [], allowWrite: [], denyWrite: [] } } },
-      alreadyRunning: true,
-    };
-  }
-
-  if (spec.channels.length === 0) {
-    throw new Error(`spawnAgent: spec "${spec.name}" declares no channels`);
-  }
-
-  // Resolve the Claude OAuth credential from the per-channel store keyed on the
-  // wake channel (the first channel — the one whose dev-channel flag the session
-  // launches under). A missing credential throws here (CredentialNotConfigured),
-  // BEFORE any mint or fs/tmux side effect, so a session never launches without
-  // auth. The token is read at spawn time so a rotate via the config API takes
-  // effect on the next spawn without a daemon restart.
-  const wakeChannel = normalizeChannel(spec.channels[0]!).name;
-  const resolveToken = deps.resolveClaudeToken ?? ((ch: string) => resolveClaudeCredential(ch));
-  const claudeOauthToken = resolveToken(wakeChannel);
-
-  // Resolve the per-channel env injection (GH_TOKEN/CLOUDFLARE_*/…). Keyed on the
-  // wake channel, like the Claude credential, and read at spawn time so a var set
-  // (or a per-session restart's re-source) takes effect without a daemon restart.
-  // Empty when nothing is configured — env injection is optional.
-  const resolveEnv = deps.resolveChannelEnv ?? ((ch: string) => resolveChannelEnv(ch));
-  const channelEnv = resolveEnv(wakeChannel);
-
-  const mintDeps: MintTokenDeps = {
-    hubOrigin: deps.hubOrigin,
-    managerBearer: deps.managerBearer,
-    ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
-  };
-
-  // 1. Mint one token per resource (one aud each, attenuated). Any over-broad or
-  //    unauthorized scope fails here (the hub's canGrant), so we never launch a
-  //    session with a credential the manager couldn't actually grant (§4.3).
-  const tokens: Record<string, MintResult> = {};
-  const channelEntries: ChannelMcpEntry[] = [];
-  for (const rawChannel of spec.channels) {
-    const { name: channel, access } = normalizeChannel(rawChannel);
-    // A read-only channel mints `agent:read` only — the arm is woken + reads
-    // but cannot reply; a write channel mints `agent:read agent:write`.
-    const minted = await mintScopedToken(
-      { scope: agentScope({ write: access === "write" }), audience: "agent" },
-      mintDeps,
-    );
-    tokens[channel] = minted;
-    channelEntries.push({ channel, token: minted.token });
-  }
-
-  let vaultArg: { url: string; entry: VaultMcpEntry } | undefined;
-  if (spec.vault) {
-    const v = spec.vault;
-    const minted = await mintScopedToken(
-      {
-        scope: vaultScope(v.name, v.access),
-        audience: `vault.${v.name}`,
-        ...(v.tags && v.tags.length > 0 ? { permissions: { scoped_tags: v.tags } } : {}),
-      },
-      mintDeps,
-    );
-    tokens[`vault:${v.name}`] = minted;
-    vaultArg = {
-      url: deps.vaultUrl ?? deps.hubOrigin,
-      entry: { name: v.name, token: minted.token },
-    };
-  }
-
-  const otherEntries: OtherMcpEntry[] = [];
-  for (const o of spec.otherMcps ?? []) {
-    let token: string | undefined;
-    if (o.scope) {
-      const minted = await mintScopedToken(
-        { scope: o.scope, ...(o.audience ? { audience: o.audience } : {}) },
-        mintDeps,
-      );
-      tokens[o.name] = minted;
-      token = minted.token;
-    }
-    otherEntries.push({ name: o.name, url: o.url, ...(token ? { token } : {}) });
-  }
-
-  // 2. Build the multi-entry strict MCP config + write it 0600 (it inlines tokens).
-  const mcpConfigJson = buildAgentMcpConfigJson({
-    channelUrl: deps.channelUrl,
-    channels: channelEntries,
-    ...(vaultArg ? { vault: vaultArg } : {}),
-    ...(otherEntries.length > 0 ? { otherMcps: otherEntries } : {}),
-  });
-  mkdirSync(workspace, { recursive: true });
-  // Persist the spec so a per-session restart can reproduce this exact launch
-  // (channels/vault/network/mounts) without re-asking the operator. Non-secret —
-  // credentials are re-resolved at each (re)spawn from the stores.
-  persistSpec(workspace, spec);
-  const mcpConfigPath = join(workspace, ".mcp.json");
-  // `mode: 0o600` on the write is sufficient here — the file is always newly
-  // created per-launch under the per-session workspace, so there's no pre-existing
-  // looser-perms file to tighten (unlike registry.ts's read-modify-write).
-  writeFileSync(mcpConfigPath, mcpConfigJson, { mode: 0o600 });
-
-  // Per-channel system prompt (design 2026-06-16-channel-system-prompt.md). When the
-  // spec carries one, write it 0600 to a per-session file and pass the `-file` flag.
-  // The interactive session is long-lived, so this is one-time at launch (the
-  // programmatic backend re-writes + re-passes per turn). Unset → no flag, no file.
-  // The file's lifecycle is tied to the workspace (like .mcp.json), 0600 alike.
-  let systemPromptFile: string | undefined;
-  if (typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0) {
-    systemPromptFile = join(workspace, "system-prompt.txt");
-    writeFileSync(systemPromptFile, spec.systemPrompt, { mode: 0o600 });
-  }
-
-  // 3. Build the claude argv, sandbox-wrap it, launch in tmux with scrubbed env.
-  // `wakeChannel` (resolved above) is the first channel — the dev-channel flag's
-  // server name + the key the credential was resolved under.
-  const claudeArgs = buildAgentClaudeArgs({
-    mcpConfigPath,
-    firstChannelEntryKey: channelEntryKey(wakeChannel),
-    ...(deps.claudeBin ? { claudeBin: deps.claudeBin } : {}),
-    ...(systemPromptFile
-      ? { systemPromptFile, systemPromptMode: spec.systemPromptMode ?? "append" }
-      : {}),
-  });
-
-  // Sandbox-wrap via the shared seam (also used by the programmatic backend) so
-  // both backends get the identical egress floor + scoped-read confinement, and
-  // the sandbox-runtime singleton's initialize→wrap window is serialized
-  // process-wide. The policy is baked into the returned argv; outside the lock the
-  // spawned process runs independently.
-  const wrapped = await wrapArgvInSandbox({
-    spec,
-    workspace,
-    runtimeReadOnly: deps.runtimeReadOnly,
-    hubOrigin: deps.hubOrigin,
-    ...(deps.vaultUrl ? { vaultUrl: deps.vaultUrl } : {}),
-    argv: claudeArgs,
-    ...(deps.sandboxEngine ? { sandboxEngine: deps.sandboxEngine } : {}),
-    ...(deps.ripgrep ? { ripgrep: deps.ripgrep } : {}),
-  });
-
-  // The agent's WORKING dir: the spec's `workspace` (a shared real dir) when set,
-  // else the private session dir (today's behavior). The cwd is decoupled from the
-  // private session dir — `.mcp.json`/`system-prompt.txt`/seeded home all stay in
-  // the private dir (passed by absolute path), so a shared workspace never receives
-  // the agent's secrets. The launch script also stays private via `scriptDir`.
-  const cwd = resolveAgentCwd(spec, workspace);
-
-  // The agent's private, writable, pre-seeded HOME + temp dirs (the stability
-  // keystone — see seedAgentHome). Everything claude reads/writes about ITSELF
-  // lives under the PRIVATE workspace (the sandbox's writable region) regardless of
-  // the cwd. The MCP server names (from the config we just wrote) are pre-approved
-  // in the seed so claude doesn't prompt to trust the project's .mcp.json — and the
-  // pre-trusted project is the agent's actual cwd (the shared working dir when set).
-  const mcpServerNames = Object.keys(
-    (JSON.parse(mcpConfigJson) as { mcpServers?: Record<string, unknown> }).mcpServers ?? {},
-  );
-  const homeEnv = seedAgentHome(workspace, { mcpServers: mcpServerNames, projectRoot: cwd });
-
-  // Layer the scrubbed agent env UNDER the sandbox wrapper's env: the engine's
-  // proxy vars / sandbox markers win over our childEnv on conflict;
-  // CLAUDE_CODE_OAUTH_TOKEN + the passthrough fundamentals come from us;
-  // ANTHROPIC_API_KEY is absent. EXCEPTION: the HOME/config/temp vars are layered
-  // LAST so they override even the engine's own (e.g. its non-writable TMPDIR) —
-  // pointing claude at its private writable home is what stops the EPERM /
-  // "could not start" deaths.
-  const childEnv = buildAgentChildEnv(deps.parentEnv ?? process.env, claudeOauthToken, channelEnv);
-  const launchEnv: Record<string, string | undefined> = {
-    ...childEnv,
-    ...wrapped.env,
-    ...homeEnv,
-  };
-
-  await deps.tmux.newSession({
-    name: session,
-    argv: wrapped.argv,
-    env: launchEnv,
-    cwd,
-    scriptDir: workspace,
-  });
-
-  // Auto-answer claude's `--dangerously-load-development-channels` consent gate
-  // (agent#70). Without this, the headless tmux session hangs at the interactive
-  // "I am using this for local development" prompt forever and the MCP never
-  // connects. A non-"confirmed" result (already-running / timeout) is NON-FATAL —
-  // confirmDevChannelsPrompt never throws — so the spawn always returns.
-  const devChannelsPrompt = await deps.tmux.confirmDevChannelsPrompt(session);
-
-  return {
-    session,
-    workspace,
-    tokens,
-    mcpConfigJson,
-    wrapped,
-    alreadyRunning: false,
-    devChannelsPrompt,
-  };
-}
-
-/**
  * Minimal POSIX shell-quote for joining argv into the single command string the
  * sandbox engine wraps (`wrapWithSandboxArgv` takes a command string). Quotes any
  * arg containing shell-significant chars; safe for the controlled argv we build
@@ -843,231 +466,4 @@ function shellQuote(arg: string): string {
   if (arg.length > 0 && /^[A-Za-z0-9_@%+=:,./-]+$/.test(arg)) return arg;
   // Single-quote, escaping embedded single quotes the POSIX way.
   return `'${arg.replace(/'/g, `'\\''`)}'`;
-}
-
-/**
- * Build the per-session **launch script** body for an already-sandbox-wrapped argv.
- *
- * Why a script and not inline argv: on macOS `wrapWithSandboxArgv` returns
- * `["/bin/bash","-c","<command embedding the ~84 KB Seatbelt -p profile inline>"]`.
- * Passing that ~84 KB string as a tmux argument exceeds tmux's per-argument /
- * command buffer, so `tmux new-session -- /bin/bash -c <84KB>` fails. Instead we
- * write the wrapped command to a file and have tmux run only the short
- * `/bin/bash <script-path>` argv — the 84 KB profile lives in the file, never on
- * the tmux command line.
- *
- * Two argv shapes are handled generally:
- *  - macOS Seatbelt: `["/bin/bash","-c", cmd]` → the script body IS `cmd` (it
- *    already embeds the sandbox-exec invocation + the claude command).
- *  - General argv (e.g. Linux bubblewrap `["bwrap", ...args, "claude", ...]`) →
- *    the body `exec`s the argv with POSIX quoting (reusing `shellJoin`).
- *
- * The injected secret (CLAUDE_CODE_OAUTH_TOKEN) is passed via the environment by
- * `newSession` (`-e KEY=VAL`), NOT written into the script — so the launch script
- * body is token-free.
- */
-export function buildLaunchScript(argv: string[]): string {
-  const header = "#!/bin/bash\nset -euo pipefail\n";
-  // The canonical macOS shape: `/bin/bash -c "<cmd>"`. The command string already
-  // is a complete shell program (it embeds the sandbox-exec call and the claude
-  // invocation), so the script body is exactly that command.
-  if (argv.length === 3 && argv[0] === "/bin/bash" && argv[1] === "-c") {
-    return `${header}${argv[2]}\n`;
-  }
-  // General argv: exec it directly with proper quoting so a giant arg (or many
-  // args) stays in the file, not on the tmux command line. `exec` so the wrapped
-  // process replaces this shell (no extra PID, signals reach claude directly).
-  return `${header}exec ${shellJoin(argv)}\n`;
-}
-
-/** Per-session launch-script path under the session workspace (`cwd`). */
-function launchScriptPath(cwd: string): string {
-  return join(cwd, ".launch.sh");
-}
-
-/** The prompt marker for the dev-channels consent gate (agent#70). */
-export const DEV_CHANNELS_PROMPT_MARKER = "I am using this for local development";
-/**
- * The ready marker shown once claude is running interactively. Our sessions always
- * launch with `--dangerously-skip-permissions`, so the footer reads "bypass
- * permissions on". Seeing it means the prompt is already past (or a future claude
- * build dropped it) — short-circuit so we don't burn the full timeout.
- *
- * Coupling note: this is a claude-code UI-footer string (stable as of the claude-code
- * we run today). If a future claude renames the footer, the worst case is we wait the
- * full timeout before returning "timeout" — never a wrong keystroke — so the failure
- * mode is benign. Update this string if the footer changes.
- */
-export const DEV_CHANNELS_READY_MARKER = "bypass permissions on";
-
-/**
- * Auto-confirm claude's `--dangerously-load-development-channels` consent gate in a
- * detached tmux session (agent#70). The gate is INTERACTIVE — claude shows
- *
- *   WARNING: Loading development channels
- *   ❯ 1. I am using this for local development
- *     2. Exit
- *
- * on EVERY launch, and no settings.json key / env var / `--channels` flag suppresses
- * it for custom `server:` channels. In a headless spawn nobody answers it, so claude
- * hangs at the prompt forever and its MCP never connects (`/health` → `mcp_sessions:
- * 0`). Because our sessions are interactive tmux panes (the operator attaches via the
- * web terminal), we answer it the way a human would: send Enter to the pane.
- *
- * A BOUNDED poll loop — `capture-pane` every `intervalMs`, up to `timeoutMs`:
- *  - prompt marker present → `send-keys Enter` → "confirmed".
- *  - ready marker present (claude already running, prompt past / absent) →
- *    "already-running" (no keystroke) — so a future claude that drops the prompt
- *    doesn't make us wait the whole timeout.
- *  - timeout → warn + "timeout". NEVER throws: the prompt not showing must not fail
- *    a spawn (it may already have been past, or claude may render it differently),
- *    and a capture/send subprocess failure degrades to best-effort.
- *
- * `spawnFn` / `timeoutMs` / `intervalMs` / `sleepFn` are injectable so tests run
- * fast and hermetically (tiny timeout + no-op sleep). `Date.now()` is fine here —
- * this is daemon code, not a workflow script.
- */
-export async function confirmDevChannelsPrompt(
-  session: string,
-  opts: {
-    spawnFn?: typeof Bun.spawn;
-    timeoutMs?: number;
-    intervalMs?: number;
-    sleepFn?: (ms: number) => Promise<void>;
-  } = {},
-): Promise<"confirmed" | "already-running" | "timeout"> {
-  const spawnFn = opts.spawnFn ?? Bun.spawn;
-  const timeoutMs = opts.timeoutMs ?? 15_000;
-  const intervalMs = opts.intervalMs ?? 400;
-  const sleep = opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-
-  // Capture the pane text; any subprocess failure degrades to "" (best-effort).
-  async function capture(): Promise<string> {
-    try {
-      const proc = spawnFn(["tmux", "capture-pane", "-t", session, "-p"], {
-        stdout: "pipe",
-        stderr: "ignore",
-      });
-      const text = await new Response(proc.stdout as ReadableStream<Uint8Array>).text();
-      await proc.exited;
-      return text;
-    } catch {
-      return "";
-    }
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  // Poll at least once even if timeoutMs <= 0 (do-while), so a present prompt is
-  // caught immediately without waiting an interval.
-  do {
-    const pane = await capture();
-    if (pane.includes(DEV_CHANNELS_PROMPT_MARKER)) {
-      try {
-        const proc = spawnFn(["tmux", "send-keys", "-t", session, "Enter"], {
-          stdout: "ignore",
-          stderr: "ignore",
-        });
-        await proc.exited;
-        return "confirmed";
-      } catch {
-        // The send subprocess failed — we saw the prompt but couldn't answer it.
-        // Don't claim "confirmed" (that would be a diagnostic lie); fall through to
-        // the warn + "timeout" so the operator is told to press Enter themselves.
-        break;
-      }
-    }
-    if (pane.includes(DEV_CHANNELS_READY_MARKER)) {
-      return "already-running";
-    }
-    if (Date.now() >= deadline) break;
-    await sleep(intervalMs);
-  } while (Date.now() < deadline);
-
-  console.warn(
-    `parachute-agent: dev-channels consent prompt for tmux session "${session}" did not ` +
-      `appear within ${timeoutMs}ms (agent#70). If \`mcp_sessions\` stays 0, attach to the ` +
-      `session and press Enter in its terminal to clear the gate.`,
-  );
-  return "timeout";
-}
-
-/**
- * The real tmux launcher — `tmux new-session -d` running the sandboxed argv via a
- * per-session **launch script**. The env is applied via `tmux new-session`'s
- * `-e KEY=VAL` (tmux ≥3.0) so the child inherits exactly the launch env (scrubbed
- * agent env + sandbox proxy vars), not the operator's shell env.
- *
- * `argv` is the sandbox wrapper's argv (on macOS already
- * `["/bin/bash","-c", "<sandbox-exec … claude …>"]` where the command embeds the
- * ~84 KB Seatbelt `-p` profile inline). That string is far too large to pass as a
- * tmux argument — `tmux new-session -- /bin/bash -c <84KB>` overruns tmux's
- * command buffer and fails. So we write the wrapped command to a per-session
- * launch script (`<workspace>/.launch.sh`, 0600) and hand tmux only the SHORT argv
- * `/bin/bash <script-path>`; the 84 KB profile lives in the file, off the command
- * line. See `buildLaunchScript` for how the two argv shapes are handled.
- *
- * The script carries NO secret: the OAuth credential is injected via `-e` into the
- * env, not written into the script body. Injected here (not used by tests, which
- * use a recorder) so the module is a real command, not just a planner.
- */
-export function realTmuxLauncher(spawnFn: typeof Bun.spawn = Bun.spawn): TmuxLauncher {
-  return {
-    async hasSession(name: string): Promise<boolean> {
-      // Read-only existence probe — it inherits the parent's full env, which is
-      // fine and intentional: it only checks whether a session exists and starts
-      // no child process. The scrubbed-env discipline applies to `newSession`
-      // (which actually launches the agent), not to this side-effect-free query.
-      const proc = spawnFn(["tmux", "has-session", "-t", name], {
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      const code = await proc.exited;
-      return code === 0;
-    },
-    async newSession(opts): Promise<void> {
-      // Write the wrapped command to a per-session launch script so tmux receives
-      // a short argv (the ~84 KB macOS Seatbelt profile would overrun tmux's
-      // command buffer if passed inline). The script lives in the agent's PRIVATE
-      // session dir alongside .mcp.json, 0600 — NEVER in a shared working dir — and
-      // it carries no secret (the OAuth token rides the env via `-e`, below).
-      const scriptPath = launchScriptPath(opts.scriptDir ?? opts.cwd);
-      writeFileSync(scriptPath, buildLaunchScript(opts.argv), { mode: 0o600 });
-      // Defensive: guarantee 0600 even under a permissive umask (the file is
-      // freshly created per-launch, so there's no looser-perms predecessor).
-      chmodSync(scriptPath, 0o600);
-
-      const envArgs: string[] = [];
-      for (const [k, v] of Object.entries(opts.env)) {
-        if (typeof v === "string") envArgs.push("-e", `${k}=${v}`);
-      }
-      const argv = [
-        "tmux",
-        "new-session",
-        "-d",
-        "-s",
-        opts.name,
-        "-c",
-        opts.cwd,
-        "-x",
-        "220",
-        "-y",
-        "50",
-        ...envArgs,
-        "--",
-        "/bin/bash",
-        scriptPath,
-      ];
-      const proc = spawnFn(argv, { stdout: "pipe", stderr: "pipe" });
-      const code = await proc.exited;
-      if (code !== 0) {
-        const err = await new Response(proc.stderr as ReadableStream<Uint8Array>).text();
-        throw new Error(`tmux new-session failed (exit ${code}): ${err.trim()}`);
-      }
-    },
-    async confirmDevChannelsPrompt(session) {
-      // Delegate to the standalone helper, threading this launcher's spawnFn so the
-      // real tmux subprocesses are used (tests inject a recorder via the helper).
-      return confirmDevChannelsPrompt(session, { spawnFn });
-    },
-  };
 }

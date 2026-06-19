@@ -124,6 +124,12 @@ export class DeliveryState {
    * The last-delivered mark for a channel: the persisted value, or the daemon's
    * boot-time default when this channel has never delivered. Always an ISO string,
    * so callers can compare note timestamps against it with a plain string `>`.
+   *
+   * NOTE (post-2026-06-19, interactive retirement): the only EXTERNAL reader of the
+   * mark was `replayBacklog`, now retired — so today this is an ADVANCE-ONLY path
+   * (the live caller is `advance`'s own monotonic check below). Kept public + durable:
+   * the channel backend uses note `status` claim-state, not replay, and a future
+   * replay-style feature can read the mark again without re-plumbing the store.
    */
   getLastDelivered(channel: string): string {
     return this.marks.get(channel) ?? this.defaultMark;

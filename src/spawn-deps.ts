@@ -1,27 +1,22 @@
 /**
- * Resolve the REAL {@link SpawnAgentDeps} from the environment — the hub origin,
+ * Resolve the REAL {@link SpawnAgentBaseDeps} from the environment — the hub origin,
  * the manager bearer (`~/.parachute/operator.token`), the channel/vault URLs, the
- * sessions dir, the read-only runtime binds, the per-channel Claude-credential
- * resolver, and the real tmux launcher.
+ * sessions dir, the read-only runtime binds, and the per-channel Claude-credential +
+ * env resolvers.
  *
- * This is the one place the spawn side-effects get their concrete wiring, shared
- * by BOTH callers that launch a real session:
- *   - the operator CLI (`scripts/spawn-agent.ts`), and
- *   - the daemon's web spawn endpoint (`POST /api/agents`, daemon.ts).
- *
- * Keeping it in `src/` (not the CLI script) lets the daemon import it without
- * reaching across into `scripts/`, and means the CLI and the web flow resolve
- * EXACTLY the same deps — a session launched from the page is byte-for-byte the
- * same least-privilege launch as one from the terminal.
+ * This is the one place the spawn side-effects get their concrete wiring. The
+ * PROGRAMMATIC backend reads its slice of these for each `claude -p` turn
+ * (`createDefaultProgrammaticRegistry`, daemon.ts). The deps deliberately carry NO
+ * tmux launcher — the interactive (tmux) backend was retired 2026-06-19 (design
+ * 2026-06-19-retire-interactive-backend.md); its parked spawner
+ * (`src/_parked/interactive-spawn.ts`) wires its own `realTmuxLauncher` if ever
+ * revived.
  */
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve, join, dirname } from "node:path";
-import {
-  realTmuxLauncher,
-  type SpawnAgentDeps,
-} from "./spawn-agent.ts";
+import { type SpawnAgentBaseDeps } from "./spawn-agent.ts";
 import { resolveClaudeCredential, resolveChannelEnv } from "./credentials.ts";
 import { defaultStateDir } from "./registry.ts";
 import { agentEnv } from "./env-compat.ts";
@@ -114,12 +109,11 @@ export function operatorTokenPath(): string {
 }
 
 /**
- * Build the real {@link SpawnAgentDeps} from the environment. Throws
+ * Build the real {@link SpawnAgentBaseDeps} from the environment. Throws
  * {@link SpawnDepsError} when the operator token is missing (no manager bearer →
- * no mint → no launch). Pure aside from reading the env + the token file; the
- * returned deps carry the real mint client, sandbox engine, and tmux launcher.
+ * no mint → no launch). Pure aside from reading the env + the token file.
  */
-export function resolveSpawnDeps(): SpawnAgentDeps {
+export function resolveSpawnDeps(): SpawnAgentBaseDeps {
   const managerBearer = readManagerBearer();
   if (!managerBearer) {
     throw new SpawnDepsError(
@@ -158,8 +152,6 @@ export function resolveSpawnDeps(): SpawnAgentDeps {
     resolveClaudeToken: (channel: string) => resolveClaudeCredential(channel, stateDir),
     // The real per-channel env resolver (GH_TOKEN/CLOUDFLARE_*/… — { default, channel } merged).
     resolveChannelEnv: (channel: string) => resolveChannelEnv(channel, stateDir),
-    // The real tmux launcher (writes the per-session launch script, runs tmux).
-    tmux: realTmuxLauncher(),
     // Absolute claude path so the sandbox doesn't depend on PATH resolution at run
     // (and matches the bound binary). Omitted → spawnAgent defaults to "claude".
     ...(claude ? { claudeBin: claude.bin } : {}),

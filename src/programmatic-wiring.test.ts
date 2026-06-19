@@ -56,7 +56,7 @@ import type { AgentSpec } from "./sandbox/types.ts";
 import { VaultTransport } from "./transports/vault.ts";
 import { persistSpec, sessionWorkspace } from "./spawn-agent.ts";
 import type { Channel } from "./registry.ts";
-import type { AgentOps, AgentInfo, SpawnRequestError } from "./agents.ts";
+import type { AgentInfo } from "./agents.ts";
 
 const adminAuth = { authorization: "Bearer " + ADMIN_TOKEN };
 
@@ -151,38 +151,6 @@ class FakeBackend implements AgentBackend {
   }
 }
 
-/** A stub interactive AgentOps that records spawns + lists, with no real tmux. */
-function stubAgentOps(initial: AgentInfo[] = []): AgentOps & { spawned: AgentSpec[]; killed: string[] } {
-  const spawned: AgentSpec[] = [];
-  const killed: string[] = [];
-  return {
-    spawned,
-    killed,
-    async spawn(spec) {
-      spawned.push(spec);
-      // Minimal SpawnAgentResult — enough for redactSpawnResult.
-      return {
-        session: spec.name + "-agent",
-        workspace: "/tmp/ws/" + spec.name,
-        tokens: {},
-        mcpConfigJson: "{}",
-        wrapped: { argv: [], env: {}, config: { network: { allowedDomains: [], deniedDomains: [] }, filesystem: { denyRead: [], allowWrite: [], denyWrite: [] } } },
-        alreadyRunning: false,
-      };
-    },
-    async list() {
-      return initial;
-    },
-    async kill(name) {
-      killed.push(name);
-      return { killed: true };
-    },
-    async restart() {
-      throw new Error("not used") as unknown as SpawnRequestError;
-    },
-  };
-}
-
 function recorder(): { calls: { channel: string; reply: string; inReplyTo?: string }[]; fn: WriteOutbound } {
   const calls: { channel: string; reply: string; inReplyTo?: string }[] = [];
   const fn: WriteOutbound = async (channel, reply, inReplyTo) => {
@@ -206,7 +174,6 @@ function vaultChannel(
 
 function buildServer(opts: {
   channels: Map<string, Channel>;
-  agentOps?: AgentOps;
   programmatic: ProgrammaticAgentRegistry;
   deliveryState?: DeliveryState;
 }) {
@@ -216,7 +183,6 @@ function buildServer(opts: {
     hostname: "127.0.0.1",
     idleTimeout: 0,
     fetch: createFetchHandler(opts.channels, registry, {
-      ...(opts.agentOps ? { agentOps: opts.agentOps } : {}),
       programmatic: opts.programmatic,
       ...(opts.deliveryState ? { deliveryState: opts.deliveryState } : {}),
     }),
@@ -238,7 +204,6 @@ describe("spawn with backend:'programmatic'", () => {
       const backend = new FakeBackend();
       const rec = recorder();
       const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
-      const ops = stubAgentOps();
       // Seed a default Claude credential so setupProgrammaticSpawn's early resolve
       // succeeds against the temp store (no real store touched).
       const { writeFileSync } = await import("node:fs");
@@ -246,7 +211,6 @@ describe("spawn with backend:'programmatic'", () => {
 
       const { srv, base } = buildServer({
         channels: new Map(),
-        agentOps: ops,
         programmatic,
       });
       try {
@@ -261,8 +225,6 @@ describe("spawn with backend:'programmatic'", () => {
         expect(body.name).toBe("eng");
         expect(body.channel).toBe("eng");
 
-        // No tmux spawn happened (the interactive AgentOps.spawn was never called).
-        expect(ops.spawned).toHaveLength(0);
         // The agent is registered in the live registry.
         expect(programmatic.hasName("eng")).toBe(true);
         expect(programmatic.hasChannel("eng")).toBe(true);
@@ -385,7 +347,8 @@ describe("boot re-register", () => {
     const dir = mkdtempSync(join(tmpdir(), "prog-boot-"));
     try {
       const sessionsDir = join(dir, "sessions");
-      // Persist an interactive spec (should be SKIPPED) + a programmatic spec.
+      // Persist a legacy NO-backend spec (a pre-field/retired-interactive spec → inert,
+      // SKIPPED) + a programmatic spec.
       persistSpec(sessionWorkspace(sessionsDir, "watcher"), { name: "watcher", channels: ["watch"] });
       persistSpec(sessionWorkspace(sessionsDir, "eng"), { name: "eng", channels: ["eng"], backend: "programmatic" });
 
@@ -394,11 +357,11 @@ describe("boot re-register", () => {
       const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
 
       // Both wake channels ("eng", "watch") are live — so the ONLY skip is the
-      // back-compat interactive one, not the channel-existence guard.
+      // no-backend (retired-interactive) one, not the channel-existence guard.
       const count = await reregisterProgrammaticAgents(programmatic, liveChannels(["eng", "watch"]), sessionsDir);
       expect(count).toBe(1);
       expect(programmatic.hasName("eng")).toBe(true);
-      // The interactive spec was NOT re-registered as programmatic.
+      // The no-backend spec was NOT re-registered (inert; never migrated to programmatic).
       expect(programmatic.hasName("watcher")).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -502,22 +465,20 @@ describe("/health + GET /api/agents include programmatic agents", () => {
     }
   });
 
-  test("GET /api/agents merges interactive + programmatic agents", async () => {
+  test("GET /api/agents lists registered programmatic agents (no interactive tmux merge)", async () => {
     const backend = new FakeBackend();
     const rec = recorder();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
     await programmatic.register({ name: "eng", channels: ["eng"], backend: "programmatic" });
 
-    const ops = stubAgentOps([
-      { name: "aaron", session: "aaron-agent", attached: true, workspace: "/s/aaron", hasWorkspace: true, backend: "interactive" },
-    ]);
-    const { srv, base } = buildServer({ channels: new Map(), agentOps: ops, programmatic });
+    const { srv, base } = buildServer({ channels: new Map(), programmatic });
     try {
       const res = await fetch(`${base}/api/agents`, { headers: adminAuth });
       expect(res.status).toBe(200);
       const body = (await res.json()) as { agents: AgentInfo[] };
       const byName = Object.fromEntries(body.agents.map((a) => [a.name, a]));
-      expect(byName.aaron!.backend).toBe("interactive");
+      // Only the programmatic agent — the interactive tmux merge was retired.
+      expect(Object.keys(byName)).toEqual(["eng"]);
       expect(byName.eng!.backend).toBe("programmatic");
       expect(byName.eng!.status).toBe("idle");
     } finally {
@@ -526,35 +487,13 @@ describe("/health + GET /api/agents include programmatic agents", () => {
   });
 });
 
-describe("mutual exclusion (design step 7)", () => {
-  test("programmatic spawn when an interactive tmux session holds the name → 409", async () => {
-    const backend = new FakeBackend();
-    const rec = recorder();
-    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
-    const ops = stubAgentOps([
-      { name: "eng", session: "eng-agent", attached: true, workspace: "/s/eng", hasWorkspace: true, backend: "interactive" },
-    ]);
-    const { srv, base } = buildServer({ channels: new Map(), agentOps: ops, programmatic });
-    try {
-      const res = await fetch(`${base}/api/agents`, {
-        method: "POST",
-        headers: { ...adminAuth, "content-type": "application/json" },
-        body: JSON.stringify({ name: "eng", channels: ["eng"], backend: "programmatic" }),
-      });
-      expect(res.status).toBe(409);
-      expect(programmatic.hasName("eng")).toBe(false);
-    } finally {
-      srv.stop(true);
-    }
-  });
-
+describe("channel exclusion", () => {
   test("a DIFFERENT programmatic name onto an already-claimed channel → 409 (no orphan)", async () => {
     const backend = new FakeBackend();
     const rec = recorder();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
     await programmatic.register({ name: "eng-a", channels: ["eng"], backend: "programmatic" });
-    const ops = stubAgentOps();
-    const { srv, base } = buildServer({ channels: new Map(), agentOps: ops, programmatic });
+    const { srv, base } = buildServer({ channels: new Map(), programmatic });
     try {
       const res = await fetch(`${base}/api/agents`, {
         method: "POST",
@@ -569,78 +508,54 @@ describe("mutual exclusion (design step 7)", () => {
       srv.stop(true);
     }
   });
-
-  test("interactive spawn when a programmatic agent holds the channel → 409 (tmux NOT spawned)", async () => {
-    const backend = new FakeBackend();
-    const rec = recorder();
-    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
-    await programmatic.register({ name: "eng", channels: ["eng"], backend: "programmatic" });
-    const ops = stubAgentOps();
-    const { srv, base } = buildServer({ channels: new Map(), agentOps: ops, programmatic });
-    try {
-      const res = await fetch(`${base}/api/agents`, {
-        method: "POST",
-        headers: { ...adminAuth, "content-type": "application/json" },
-        body: JSON.stringify({ name: "eng", channels: ["eng"], backend: "interactive" }), // explicit interactive (default is now programmatic)
-      });
-      expect(res.status).toBe(409);
-      expect(ops.spawned).toHaveLength(0);
-    } finally {
-      srv.stop(true);
-    }
-  });
 });
 
-describe("backend default flip + interactive path", () => {
-  // Default flip (design 2026-06-16 + Aaron's gating decision): a NEW request that
-  // OMITS `backend` now routes to the PROGRAMMATIC registry, not the interactive
-  // tmux AgentOps. Interactive is still fully reachable by passing it explicitly.
-  test("a default (no backend) spawn now hits the PROGRAMMATIC registry (not tmux)", async () => {
+describe("backend default + interactive rejection", () => {
+  // A NEW request that OMITS `backend` routes to the PROGRAMMATIC registry (the
+  // default since 2026-06-16); the interactive backend is retired (rejected, below).
+  test("a default (no backend) spawn hits the PROGRAMMATIC registry", async () => {
     // Temp-dir isolation via withTempStateDir (agent#75) — the spawn persists a
     // spec.json under defaultSessionsDir, which must resolve under the temp dir.
     await withTempStateDir(async (dir) => {
       const backend = new FakeBackend();
       const rec = recorder();
       const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
-      const ops = stubAgentOps();
       // Seed a default Claude credential so setupProgrammaticSpawn's early credential
       // resolve succeeds (no real store).
       const { writeFileSync } = await import("node:fs");
       writeFileSync(join(dir, "credentials.json"), JSON.stringify({ claude: { default: "oat_test" } }), { mode: 0o600 });
 
-      const { srv, base } = buildServer({ channels: new Map(), agentOps: ops, programmatic });
+      const { srv, base } = buildServer({ channels: new Map(), programmatic });
       try {
         const res = await fetch(`${base}/api/agents`, {
           method: "POST",
           headers: { ...adminAuth, "content-type": "application/json" },
-          body: JSON.stringify({ name: "aaron", channels: ["aaron"] }), // no backend → programmatic now
+          body: JSON.stringify({ name: "aaron", channels: ["aaron"] }), // no backend → programmatic
         });
         expect(res.status).toBe(200);
         expect(((await res.json()) as { backend: string }).backend).toBe("programmatic");
-        // It landed in the programmatic registry; the interactive tmux AgentOps was untouched.
+        // It landed in the programmatic registry.
         expect(programmatic.hasName("aaron")).toBe(true);
-        expect(ops.spawned).toHaveLength(0);
       } finally {
         srv.stop(true);
       }
     });
   });
 
-  test("an explicit backend:\"interactive\" spawn still hits the interactive tmux AgentOps", async () => {
+  test("an explicit backend:\"interactive\" spawn is REJECTED (retired) → 400", async () => {
     const backend = new FakeBackend();
     const rec = recorder();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
-    const ops = stubAgentOps();
-    const { srv, base } = buildServer({ channels: new Map(), agentOps: ops, programmatic });
+    const { srv, base } = buildServer({ channels: new Map(), programmatic });
     try {
       const res = await fetch(`${base}/api/agents`, {
         method: "POST",
         headers: { ...adminAuth, "content-type": "application/json" },
         body: JSON.stringify({ name: "aaron", channels: ["aaron"], backend: "interactive" }),
       });
-      expect(res.status).toBe(200);
-      // The interactive AgentOps.spawn ran; nothing landed in the programmatic registry.
-      expect(ops.spawned.map((s) => s.name)).toEqual(["aaron"]);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("retired");
+      // Nothing landed in the programmatic registry.
       expect(programmatic.hasName("aaron")).toBe(false);
     } finally {
       srv.stop(true);
@@ -652,8 +567,7 @@ describe("backend default flip + interactive path", () => {
     const rec = recorder();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
     await programmatic.register({ name: "eng", channels: ["eng"], backend: "programmatic" });
-    const ops = stubAgentOps();
-    const { srv, base } = buildServer({ channels: new Map(), agentOps: ops, programmatic });
+    const { srv, base } = buildServer({ channels: new Map(), programmatic });
     try {
       const res = await fetch(`${base}/api/agents/eng`, { method: "DELETE", headers: adminAuth });
       expect(res.status).toBe(200);
@@ -661,8 +575,6 @@ describe("backend default flip + interactive path", () => {
       expect(body.backend).toBe("programmatic");
       expect(body.killed).toBe(true);
       expect(programmatic.hasName("eng")).toBe(false);
-      // The interactive kill (tmux) was NOT called for the programmatic agent.
-      expect(ops.killed).toHaveLength(0);
     } finally {
       srv.stop(true);
     }

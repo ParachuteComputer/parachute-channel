@@ -100,13 +100,10 @@ import { TERMINAL_UI_HTML } from "./terminal-ui.ts";
 import { serveTerminalAsset } from "./terminal-assets.ts";
 import { isSpaPath, serveSpa, spaDistDir } from "./spa-serve.ts";
 import {
-  createRealAgentOps,
   buildSpecFromBody,
-  redactSpawnResult,
   setupProgrammaticSpawn,
   SpawnRequestError,
   AGENT_NAME_SLUG,
-  type AgentOps,
   type AgentInfo,
 } from "./agents.ts";
 import { SpawnDepsError, sessionsDir as defaultSessionsDir, resolveSpawnDeps } from "./spawn-deps.ts";
@@ -126,7 +123,7 @@ import {
   type ChannelQueueStore,
 } from "./backends/channel-queue.ts";
 import { AgentSessionState } from "./agent-session-state.ts";
-import { readPersistedSpec, interpretPersistedBackend, sessionWorkspace } from "./spawn-agent.ts";
+import { readPersistedSpec, sessionWorkspace } from "./spawn-agent.ts";
 import { normalizeChannel } from "./sandbox/types.ts";
 import { CredentialNotConfiguredError } from "./credentials.ts";
 import { MintError } from "./mint-token.ts";
@@ -141,7 +138,6 @@ import {
   pushToChannel as mcpPushToChannel,
   pushPermissionVerdict as mcpPushPermissionVerdict,
   mcpSessionCount,
-  setOnSessionConnect,
   assertMcpSdkStreamContract,
 } from "./mcp-http.ts";
 
@@ -320,133 +316,6 @@ export function contextFor(
       mcpPushPermissionVerdict(channel, v);
     },
   };
-}
-
-/** The replayed-message shape handed to a per-session / per-stream `deliverOne`.
- *  Mirrors what `contextFor.emit` fans out so a replayed wake is indistinguishable
- *  from a live one to the receiving session. */
-export interface ReplayMessage {
-  content: string;
-  meta: Record<string, string>;
-  source: string;
-}
-
-/** Hard cap on how many backlog messages a single (re)connect replays — newest N.
- *  A long deaf window shouldn't dump hundreds of messages onto a freshly-attached
- *  session; the older ones stay durable in the vault and visible in the transcript. */
-export const REPLAY_CAP = 50;
-
-/**
- * Replay the inbound backlog a channel missed onto a SINGLE newly-(re)connected
- * subscriber — the recovery half of the no-silent-loss fix.
- *
- * On (re)connect (an MCP session attaching, or an SSE bridge reopening `/events`)
- * we load the channel's durable transcript, keep the INBOUND messages with `ts`
- * strictly newer than the delivery high-water-mark (the ones emitted while nobody
- * was listening, or that arrived during the daemon's restart deaf window), and
- * hand each — oldest-first — to `deliverOne`, which targets ONLY this one new
- * subscriber (a per-session MCP push / a write to this one SSE stream). Targeting
- * a single subscriber is deliberate: a broadcast would re-wake sessions that
- * already saw these messages.
- *
- * VAULT-ONLY. Replay needs a durable transcript to read; only `VaultTransport`
- * has one. http-ui / telegram channels are skipped (a non-vault transport, or a
- * channel with no transport, returns 0 — nothing to replay).
- *
- * CAPPED. At most `REPLAY_CAP` (the NEWEST) messages are replayed; a longer
- * backlog is truncated with a log note. The older messages remain durable in the
- * vault and render in the transcript — they're just not pushed as fresh wakes.
- *
- * MARK ADVANCE. After a successful replay the mark advances to the newest replayed
- * `ts` (monotonic), so a second connect on the same channel replays nothing. A
- * `deliverOne` that throws aborts before advancing that message's ts, so a failed
- * push doesn't silently mark the message delivered.
- *
- * Returns the number of messages delivered (0 for a non-vault / missing channel,
- * or an empty backlog). Best-effort on the load: a transcript read failure is
- * logged and treated as an empty backlog — a (re)connect must never fail because
- * the vault was briefly unreachable.
- */
-export async function replayBacklog(
-  channels: Map<string, Channel>,
-  deliveryState: DeliveryState,
-  channel: string,
-  deliverOne: (msg: ReplayMessage) => void,
-): Promise<number> {
-  const ch = channels.get(channel);
-  const transport = ch?.transport;
-  // VAULT-ONLY: a durable transcript is the prerequisite for replay.
-  if (!(transport instanceof VaultTransport)) return 0;
-
-  const mark = deliveryState.getLastDelivered(channel);
-
-  let transcript;
-  try {
-    // Reuse the index-free, tag-only transcript read (no metadata-operator query —
-    // `channel` isn't indexed). It returns BOTH directions sorted ascending by ts.
-    transcript = await transport.loadTranscript();
-  } catch (err) {
-    // The vault was unreachable / errored — don't fail the connect. Nothing to
-    // replay this time; the mark stays put so a later connect retries the backlog.
-    console.warn(
-      `parachute-agent: replayBacklog for "${channel}" — transcript load failed (${(err as Error).message}); ` +
-        `skipping replay (backlog stays durable in the vault).`,
-    );
-    return 0;
-  }
-
-  // Keep only INBOUND messages newer than the mark, with a usable ts (we advance
-  // the mark by ts, so a blank-ts message can't be tracked → skip it). Ascending
-  // by ts already (loadTranscript sorts), but filter preserves order.
-  let pending = transcript.filter(
-    (m) => m.direction === "inbound" && typeof m.ts === "string" && m.ts > mark,
-  );
-  if (pending.length === 0) return 0;
-
-  // Cap at the NEWEST REPLAY_CAP — drop the oldest overflow (they stay in the vault).
-  if (pending.length > REPLAY_CAP) {
-    const dropped = pending.length - REPLAY_CAP;
-    console.log(
-      `parachute-agent: replayBacklog for "${channel}" — backlog of ${pending.length} exceeds cap ${REPLAY_CAP}; ` +
-        `replaying the newest ${REPLAY_CAP}, ${dropped} older message(s) left in the vault transcript.`,
-    );
-    pending = pending.slice(pending.length - REPLAY_CAP);
-  }
-
-  let delivered = 0;
-  for (const m of pending) {
-    // Re-read the LIVE mark each iteration. `mark` above was snapshotted BEFORE the
-    // `await loadTranscript()`, so a concurrent emit (a live delivery) or a racing
-    // second (re)connect on the same channel may have advanced the mark past this
-    // message in the meantime. Skip anything already delivered so two near-
-    // simultaneous connects can't double-deliver the same backlog. (Reviewer nit, PR #67.)
-    if (m.ts <= deliveryState.getLastDelivered(channel)) continue;
-    // Shape the replayed wake to match a live `ingestInbound` emit: content +
-    // flattened meta (carrying the ORIGINAL ts so the receiving session sees the
-    // real arrival time) + provenance fields the session keys off.
-    const meta: Record<string, string> = {
-      ts: m.ts,
-      sender: m.sender,
-      source: "vault",
-      note_id: m.id,
-      direction: "inbound",
-      replay: "true", // marks this as a backlog replay (vs. a live wake) for any consumer that cares
-    };
-    if (m.inReplyTo) meta.in_reply_to = m.inReplyTo;
-    // deliverOne targets ONLY this one new subscriber (the SSE caller writes to
-    // its own stream; the MCP caller pushes to its own session). Both current
-    // callers swallow a dead-stream/dead-session error internally, so the loop
-    // runs to completion in practice. The `advance` BELOW (after deliverOne) is
-    // the load-bearing safety property: were deliverOne ever to throw, we abort
-    // before advancing THIS message's ts, so it's never silently marked delivered.
-    deliverOne({ content: m.text, meta, source: "vault" });
-    // Advance per-message (monotonic). Ordering matters: advancing only after a
-    // successful deliverOne means a (hypothetical) mid-loop throw leaves the mark
-    // at the last delivered ts, so the next connect resumes from there.
-    deliveryState.advance(channel, m.ts);
-    delivered++;
-  }
-  return delivered;
 }
 
 /**
@@ -968,12 +837,12 @@ export async function reregisterProgrammaticAgents(
   for (const name of entries) {
     const workspace = sessionWorkspace(sessionsDirPath, name);
     const spec = readPersistedSpec(workspace);
-    // A persisted spec with NO `backend` field predates the field → INTERACTIVE
-    // (interpretPersistedBackend) and is SKIPPED here — its tmux session survives a
-    // restart on its own. Only specs that explicitly persisted `backend:
-    // "programmatic"` are re-registered. This is the back-compat guard that keeps an
-    // existing interactive agent (e.g. uni-dev) from being migrated to programmatic.
-    if (!spec || interpretPersistedBackend(spec) !== "programmatic") continue;
+    // Re-register ONLY specs that explicitly persisted `backend: "programmatic"`.
+    // A spec with no `backend` field (pre-field, was interactive) or the retired
+    // `backend: "interactive"` value is SKIPPED — the interactive backend was retired
+    // 2026-06-19 (design 2026-06-19-retire-interactive-backend.md), so a stale
+    // interactive spec on disk is inert: never migrated to programmatic, never launched.
+    if (!spec || spec.backend !== "programmatic") continue;
     // ORPHAN GUARD: a spec with no wake channel, or whose wake channel isn't a live
     // channel, has nothing to receive for — skip it so a leaked/stale spec dir can't
     // resurrect a phantom agent. Keyed exactly as the registry keys the channel.
@@ -1160,7 +1029,6 @@ export function createFetchHandler(
   channels: Map<string, Channel>,
   registry: ClientRegistry,
   opts?: {
-    agentOps?: AgentOps;
     deliveryState?: DeliveryState;
     programmatic?: ProgrammaticAgentRegistry;
     /**
@@ -1216,11 +1084,6 @@ export function createFetchHandler(
     }>;
   },
 ): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
-  // Spawn/list/kill operations behind the web agents surface. Lazily defaulted to
-  // the real ops (resolve-deps + real tmux); tests inject a stub so the routes are
-  // exercised without a hub, a sandbox, or a tmux server. Built once per handler.
-  const agentOps: AgentOps = opts?.agentOps ?? createRealAgentOps();
-
   // The per-channel turn-event SSE registry — subscribers of the live "watch it
   // work" stream. Defaulted to a fresh instance so a plain createFetchHandler still
   // serves the route; `main` shares its boot instance so the lazily-defaulted
@@ -1243,11 +1106,11 @@ export function createFetchHandler(
   // agents registered until one is instantiated). Tests inject a fake-store-backed one.
   const channelQueue: ChannelQueueRegistry = opts?.channelQueue ?? new ChannelQueueRegistry();
 
-  // Per-channel delivery high-water-mark store (the no-silent-loss spine). The
-  // daemon's `main` passes the boot-time instance; tests that don't care get a
-  // throwaway instance whose default mark is "now" — so a test channel never
-  // surprise-replays its whole transcript on connect. The MCP connect hook +
-  // the SSE `/events` replay below both run `replayBacklog` against it.
+  // Per-channel delivery high-water-mark store (durable infra). `contextFor.emit`
+  // advances it on a real delivery; the daemon's `main` passes the boot-time
+  // instance, tests get a throwaway whose default mark is "now". (The deaf-on-restart
+  // backlog replay that used to READ this mark was retired with the interactive
+  // backend — design 2026-06-19-retire-interactive-backend.md.)
   const deliveryState: DeliveryState = opts?.deliveryState ?? new DeliveryState();
 
   // The vault-native scheduled-job store (runner, design 2026-06-17). Defaulted to
@@ -1267,15 +1130,6 @@ export function createFetchHandler(
   // resulting binding's non-secret view (name + url + token-present).
   const addDefVault = opts?.addDefVault ?? defaultAddDefVault(agentDefs);
 
-  // Install the MCP connect hook: when an MCP session's GET push stream goes live
-  // (mcp-http's handleMcp GET branch → fireConnectReplay — NOT at registration,
-  // which precedes the stream and would drop the pushes), replay its missed backlog
-  // to THAT session only. Last-handler-wins is fine — one live daemon; tests reset it.
-  setOnSessionConnect((channel, pushToThisSession) => {
-    void replayBacklog(channels, deliveryState, channel, (msg) =>
-      pushToThisSession(msg.content, msg.meta),
-    );
-  });
   /** Resolve the transport for a channel name, or null on miss. */
   function transportFor(channel: string | undefined): Transport | null {
     if (!channel) return null;
@@ -1872,20 +1726,19 @@ export function createFetchHandler(
     }
 
     // ---------------------------------------------------------------------
-    // Agent management API (the web spawn/list/kill surface, design §4/§5) —
-    // the SAME least-privilege launch path as the operator CLI
-    // (`scripts/spawn-agent.ts`), driven from the browser. Operator-gated on
-    // `agent:admin` (a launched session is the most powerful thing this module
-    // does, so the whole surface uses the same gate as the terminal).
+    // Agent management API (the web spawn/list/kill surface, design §4/§5).
+    // Operator-gated on `agent:admin`. The interactive (tmux) backend was retired
+    // 2026-06-19 (design 2026-06-19-retire-interactive-backend.md): there is no
+    // tmux session to list/spawn/kill anymore. The two live backends are
+    // PROGRAMMATIC (daemon-run `claude -p` turns) + CHANNEL (a Claude Code session
+    // the operator connects handles the turn; vault-native — defined as an
+    // #agent/definition note, not via this POST).
     //
-    //   GET    /api/agents          → list running agent tmux sessions (no secrets)
-    //   POST   /api/agents          { name, channels, vault?, egress?, mounts? } → spawn
-    //   DELETE /api/agents/:name    → kill the session
+    //   GET    /api/agents          → list registered programmatic + channel agents
+    //   POST   /api/agents          { name, channels, vault?, ... } → register a programmatic agent
+    //   DELETE /api/agents/:name    → deregister the agent
     //
     // Externally hub strips `/agent`, so these are `<hub>/agent/api/agents`.
-    // The spawn response surfaces scopes/audiences but NEVER the minted token
-    // values (redactSpawnResult); the launch resolves its deps lazily so a
-    // credential set via the creds API takes effect without a daemon restart.
     // ---------------------------------------------------------------------
     if (url.pathname === "/api/agents" && (req.method === "GET" || req.method === "POST")) {
       const denied = await requireScope(req, url, SCOPE_ADMIN);
@@ -1893,22 +1746,21 @@ export function createFetchHandler(
 
       if (req.method === "GET") {
         try {
-          // The list MERGES interactive tmux sessions + registered programmatic
-          // agents (design 2026-06-16 step 6) + registered CHANNEL-backend agents
-          // (#102 — the v2 API layer stops rejecting `channel`). Neither programmatic
-          // nor channel agents have a tmux session, so they carry their `backend` +
-          // a live `status` (idle|working|queued:N) instead of `attached`/`mcp_sessions`;
-          // a channel agent also surfaces its wake `channel` + backing `vault`.
-          const interactive = await agentOps.list();
+          // The list merges registered PROGRAMMATIC agents (design 2026-06-16 step 6)
+          // + registered CHANNEL-backend agents (#102). Neither has a tmux session, so
+          // each carries its `backend` + a live `status` (idle|working|queued:N); a
+          // channel agent also surfaces its wake `channel` + backing `vault`.
           const programmaticInfos = listProgrammaticAgents(programmatic);
           const channelInfos = await listChannelAgents(channelQueue);
-          return json({ agents: [...interactive, ...programmaticInfos, ...channelInfos] });
+          return json({ agents: [...programmaticInfos, ...channelInfos] });
         } catch (err) {
           return json({ error: `failed to list agents: ${(err as Error).message}` }, 500);
         }
       }
 
-      // POST — spawn a sandboxed agent from a spec.
+      // POST — register a programmatic agent from a spec. `buildSpecFromBody` accepts
+      // only `backend: "programmatic"` (the default); a `channel` agent is vault-native
+      // and an `interactive` backend is retired — both rejected with a clear 400.
       let spawnBody: unknown;
       try {
         spawnBody = await req.json();
@@ -1923,110 +1775,43 @@ export function createFetchHandler(
         throw err;
       }
 
-      // MUTUAL EXCLUSION (design 2026-06-16 step 7). A given agent name must not run
-      // BOTH backends at once — they'd collide on the same per-session workspace +
-      // spec.json. The wake channel is shared too (one wake source). Reject a spawn
-      // that conflicts with the OTHER backend already active for this name/channel.
-      const wantsProgrammatic = spec.backend === "programmatic";
+      // CHANNEL EXCLUSION: a channel routes inbound to at most one agent. Refuse a
+      // spawn for a DIFFERENT programmatic agent onto an already-occupied wake channel
+      // (re-spawning the SAME name onto its OWN channel is the idempotent-replace path).
       const wakeChannel = normalizeChannel(spec.channels[0]!).name;
-      if (wantsProgrammatic) {
-        // Refuse if an INTERACTIVE tmux session already holds this name.
-        let interactiveLive = false;
-        try {
-          interactiveLive = (await agentOps.list()).some((a) => a.name === spec.name);
-        } catch {
-          // A tmux-list failure shouldn't block a programmatic spawn — proceed.
-        }
-        if (interactiveLive) {
-          return json(
-            {
-              error: `agent "${spec.name}" is already running as an INTERACTIVE (tmux) session. ` +
-                `Kill it first, or spawn the programmatic agent under a different name.`,
-            },
-            409,
-          );
-        }
-        // Refuse if a DIFFERENT programmatic agent already claims this wake channel
-        // — a channel routes inbound to at most one agent, and re-registering a new
-        // name onto an occupied channel would orphan the prior one. Re-spawning the
-        // SAME name onto its OWN channel is the idempotent-replace path (allowed).
-        if (programmatic.hasChannel(wakeChannel) && programmatic.getByChannel(wakeChannel)?.name !== spec.name) {
-          return json(
-            {
-              error: `programmatic agent "${programmatic.getByChannel(wakeChannel)?.name}" already ` +
-                `serves channel "${wakeChannel}". Kill it first, or pick a different channel.`,
-            },
-            409,
-          );
-        }
-      } else {
-        // Interactive spawn — refuse if a PROGRAMMATIC agent already holds this
-        // name OR the wake channel (a channel routes inbound to at most one backend).
-        if (programmatic.hasName(spec.name) || programmatic.hasChannel(wakeChannel)) {
-          return json(
-            {
-              error: `a PROGRAMMATIC agent is already registered for ` +
-                `${programmatic.hasName(spec.name) ? `name "${spec.name}"` : `channel "${wakeChannel}"`}. ` +
-                `Kill it first, or pick a different name/channel for the interactive session.`,
-            },
-            409,
-          );
-        }
+      if (programmatic.hasChannel(wakeChannel) && programmatic.getByChannel(wakeChannel)?.name !== spec.name) {
+        return json(
+          {
+            error: `programmatic agent "${programmatic.getByChannel(wakeChannel)?.name}" already ` +
+              `serves channel "${wakeChannel}". Kill it first, or pick a different channel.`,
+          },
+          409,
+        );
       }
 
       // PROGRAMMATIC spawn — no tmux. Validate + persist spec.json (the no-tmux
       // setup), then register in the live registry (so inbound for the channel
       // enqueues). Boot re-registers from the persisted spec on the next restart.
-      if (wantsProgrammatic) {
-        try {
-          const setup = setupProgrammaticSpawn(spec);
-          await programmatic.register({ ...spec, backend: "programmatic" });
-          return json(setup);
-        } catch (err) {
-          if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
-          if (err instanceof CredentialNotConfiguredError) return json({ error: err.message }, 400);
-          return json({ error: (err as Error).message }, 400);
-        }
-      }
-
-      // INTERACTIVE spawn (the existing tmux path, UNCHANGED).
       try {
-        const result = await agentOps.spawn(spec);
-        return json(redactSpawnResult(result));
+        const setup = setupProgrammaticSpawn(spec);
+        await programmatic.register({ ...spec, backend: "programmatic" });
+        return json(setup);
       } catch (err) {
-        // A missing operator token (no manager bearer) → 503: the daemon can't
-        // mint child tokens until the hub is provisioned.
-        if (err instanceof SpawnDepsError) return json({ error: err.message }, 503);
-        // A missing Claude credential → 400 with the fix (set it via the creds API
-        // / the page's credential form).
+        if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
         if (err instanceof CredentialNotConfiguredError) return json({ error: err.message }, 400);
-        // An over-broad / refused mint (the hub's canGrant) → surface the hub's status.
-        if (err instanceof MintError) {
-          return json({ error: `token mint failed: ${err.message}` }, err.status >= 400 && err.status < 600 ? err.status : 502);
-        }
-        // A bad slug (spawnAgent's guard) or any other launch fault.
         return json({ error: (err as Error).message }, 400);
       }
     }
 
-    // PER-SESSION restart — POST /api/agents/:name/restart (agent:admin). Kills
-    // `<name>-agent`, then re-spawns from the persisted spec, re-resolving the env
-    // store + Claude credential, so a newly-set credential applies in ONE click.
-    // PER-SESSION ONLY — no blanket "restart all" (the operator controls each
-    // session; restarting one never disrupts another). Must match BEFORE the
-    // single-segment DELETE below (this is a 2-segment subpath). Same error→status
-    // mapping as the spawn route (a missing spec / bad slug → 400; no operator token
-    // → 503; a refused mint → the hub status; a missing credential → 400 with the fix).
+    // PER-SESSION restart — POST /api/agents/:name/restart (agent:admin). For a
+    // programmatic agent this RESETS the conversation (clears the persisted session id
+    // so the next message starts fresh; the agent stays registered) — there is no
+    // resident process to restart. Must match BEFORE the single-segment DELETE below.
     const restartMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/restart$/);
     if (restartMatch && req.method === "POST") {
       const denied = await requireScope(req, url, SCOPE_ADMIN);
       if (denied) return denied;
       const name = decodeURIComponent(restartMatch[1]!);
-      // PROGRAMMATIC restart — there is no tmux session to kill + re-spawn (the
-      // interactive restart's whole job). The closest analog is RESETTING the
-      // conversation: clear the persisted session id so the next message starts
-      // fresh. The agent stays registered. (design 2026-06-16 step 6 — the
-      // per-session restart is interactive-only; programmatic resets session-state.)
       if (programmatic.hasName(name)) {
         await programmatic.resetSession(name);
         return json({
@@ -2037,18 +1822,12 @@ export function createFetchHandler(
           note: "programmatic agent — conversation reset (next message starts a fresh session); no process to restart.",
         });
       }
-      try {
-        const result = await agentOps.restart(name);
-        return json(result);
-      } catch (err) {
-        if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
-        if (err instanceof SpawnDepsError) return json({ error: err.message }, 503);
-        if (err instanceof CredentialNotConfiguredError) return json({ error: err.message }, 400);
-        if (err instanceof MintError) {
-          return json({ error: `token mint failed: ${err.message}` }, err.status >= 400 && err.status < 600 ? err.status : 502);
-        }
-        return json({ error: (err as Error).message }, 400);
-      }
+      // No programmatic agent by that name — nothing to restart (a channel agent has
+      // no daemon-run turn to reset; the interactive backend is retired).
+      return json(
+        { error: `no programmatic agent named "${name}" to restart` },
+        404,
+      );
     }
 
     const agentMatch = url.pathname.match(/^\/api\/agents\/([^/]+)$/);
@@ -2057,18 +1836,14 @@ export function createFetchHandler(
       if (denied) return denied;
       const name = decodeURIComponent(agentMatch[1]!);
       // PROGRAMMATIC delete — deregister (drop the channel/name indexes + queue,
-      // clear the backend session). No tmux to kill (design 2026-06-16 step 6).
+      // clear the backend session). No tmux to kill (the interactive backend retired).
       if (programmatic.hasName(name)) {
         const deregistered = await programmatic.deregister(name);
         return json({ ok: true, name, backend: "programmatic", killed: deregistered });
       }
-      try {
-        const { killed } = await agentOps.kill(name);
-        return json({ ok: true, name, killed });
-      } catch (err) {
-        if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
-        return json({ error: `failed to kill agent: ${(err as Error).message}` }, 500);
-      }
+      // No live agent by that name (interactive tmux sessions are no longer managed
+      // here) — a no-op success so a delete of an already-gone agent is idempotent.
+      return json({ ok: true, name, killed: false });
     }
 
     // Installed vault instances (for the agents page's vault picker) — derived
@@ -2392,21 +2167,10 @@ export function createFetchHandler(
             enqueue: (payload) => controller.enqueue(payload),
           });
           controller.enqueue(": connected\n\n");
-          // Replay any backlog this (re)connecting stdio bridge missed while it
-          // was detached — written to THIS stream only (a per-stream `message`
-          // frame, the same event the live route emits), so a reconnect after a
-          // daemon restart / a deaf window picks up the messages that arrived in
-          // the gap. Fire-and-forget: a vault read failure inside replayBacklog is
-          // logged + treated as an empty backlog, never failing the connect.
-          void replayBacklog(channels, deliveryState, subscribedChannel, (msg) => {
-            try {
-              controller.enqueue(
-                sseFrame("message", { content: msg.content, meta: msg.meta, source: msg.source }),
-              );
-            } catch {
-              // Stream already closed — drop; the next connect retries the backlog.
-            }
-          });
+          // (The deaf-on-restart BACKLOG REPLAY that used to fire here — replaying the
+          // messages a reconnecting stdio bridge missed while detached — was retired
+          // with the interactive backend: design 2026-06-19-retire-interactive-
+          // backend.md. The live route still pushes new inbound to subscribed clients.)
         },
         cancel() {
           registry.remove(clientId);

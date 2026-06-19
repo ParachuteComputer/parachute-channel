@@ -100,12 +100,13 @@ export type AgentChannel = string | AgentChannelSpec;
 
 /**
  * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md +
- * 2026-06-18-channel-backend.md):
+ * 2026-06-18-channel-backend.md). There are exactly TWO — the `interactive` (tmux)
+ * backend was RETIRED 2026-06-19 (design 2026-06-19-retire-interactive-backend.md);
+ * `channel` is what it was reaching for, done right:
  *
- *  - `"programmatic"` (the DEFAULT for a NEW spawn request, per Aaron's gating
- *    decision 2026-06-16): NO resident process. An inbound message becomes one
- *    on-demand `claude -p --resume <sid>` turn ({@link AgentBackend}); the reply is
- *    posted back as an outbound `#agent/message/outbound` note. No idle session →
+ *  - `"programmatic"` (the DEFAULT): NO resident process. An inbound message becomes
+ *    one on-demand `claude -p --resume <sid>` turn ({@link AgentBackend}); the reply
+ *    is posted back as an outbound `#agent/message/outbound` note. No idle session →
  *    nothing to go deaf, no reconnect, no replay, no consent gate. The reliable
  *    primary path; best for clean per-message "do a task, report back" turns.
  *  - `"channel"` (design 2026-06-18-channel-backend.md): the turn is delivered over
@@ -118,21 +119,14 @@ export type AgentChannel = string | AgentChannelSpec;
  *    {@link ChannelQueueRegistry}, entirely bypassing the programmatic serial worker
  *    (the daemon routing fork). Claim state lives on the inbound note's `status`
  *    (`pending | in-flight | handled`), so it's restart-safe.
- *  - `"interactive"` (the original tmux path; now RETIRED — design 2026-06-18
- *    "Retiring interactive"): an idle interactive `claude` in a tmux pane, fed
- *    inbound by pushing onto a subscribed MCP development channel. Carries the
- *    deaf-on-restart machinery (#67/#68/#70/#71). Kept in the type for back-compat
- *    of already-persisted specs; NOT selectable for a vault-native def (parseAgentDef
- *    rejects it). `channel` supersedes the human-driven-CC need it hedged.
  *
- * DEFAULT-RESOLUTION NOTE — the omitted-field default differs by context, on
- * purpose: a NEW request that omits `backend` resolves to `"programmatic"`
- * ({@link buildSpecFromBody} in `agents.ts`), but a PERSISTED `spec.json` that omits
- * `backend` predates the field and resolves to `"interactive"`
- * ({@link interpretPersistedBackend} in `spawn-agent.ts`) — so the flip applies going
- * forward without silently migrating already-running interactive agents.
+ * BACK-COMPAT: a persisted `spec.json` that carries the retired `backend:"interactive"`
+ * value (or omits `backend` entirely — pre-field specs were interactive) is no longer
+ * re-registered on boot (the boot re-register reads `spec.backend === "programmatic"`
+ * exactly; anything else is skipped — see daemon.ts), so a stale interactive spec on
+ * disk is inert, never migrated and never launched.
  */
-export type AgentBackendKind = "interactive" | "programmatic" | "channel";
+export type AgentBackendKind = "programmatic" | "channel";
 
 /**
  * How a channel's {@link AgentSpec.systemPrompt} composes with Claude Code's own
@@ -287,13 +281,11 @@ export interface AgentSpec {
    */
   credentialRef?: string;
   /**
-   * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md).
-   * A NEW spawn request that omits this defaults to `"programmatic"` (on-demand
-   * `claude -p` turns, no resident process — the reliable primary path, per Aaron's
-   * gating decision 2026-06-16); `"interactive"` (the original tmux path) is the
-   * opt-in/"advanced" backend. A PERSISTED spec.json that omits this resolves to
-   * `"interactive"` instead (back-compat — it predates the field). See
-   * {@link AgentBackendKind} for the full default-resolution note. Persisted in
+   * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md +
+   * 2026-06-18-channel-backend.md) — `"programmatic"` (the default; on-demand
+   * `claude -p` turns, no resident process) or `"channel"` (handled by a Claude Code
+   * session the operator connects to the channel's MCP endpoint). The `interactive`
+   * (tmux) backend was retired 2026-06-19. See {@link AgentBackendKind}. Persisted in
    * spec.json so a daemon restart re-registers a programmatic agent on boot.
    */
   backend?: AgentBackendKind;

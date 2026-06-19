@@ -1,28 +1,59 @@
 # parachute-agent
 
-Messaging gateway for Claude Code. Telegram today, anything tomorrow.
+Vault-native agents for Claude Code. A `#agent/definition` note in a Parachute vault
+defines an agent; inbound messages (chat / vault note / scheduled job) become a turn;
+the reply flows back as an outbound `#agent/message/outbound` note. Telegram today,
+anything tomorrow.
+
+## The model: agents + two backends
+
+An agent is a `#agent/definition` note (body = system prompt, metadata = config). Its
+**backend** is the axis, and there are exactly **two**
+(design [`2026-06-18-channel-backend.md`](./design/2026-06-18-channel-backend.md)):
+
+- **`programmatic`** (the DEFAULT) — the daemon runs each turn headless via
+  `claude -p --resume` (sandboxed, always-on). No resident process; an inbound message
+  becomes one on-demand turn, the reply is written as an outbound note.
+- **`channel`** — the turn is delivered over a channel to a Claude Code session **you
+  run yourself** (your machine, your env/creds, unsandboxed) and have connected to the
+  channel's MCP endpoint. The daemon runs no turn; the inbound notes accumulate as a
+  durable queue and your session **pulls** the next message, works, and **replies** via
+  MCP tools.
+
+> **Retired: the `interactive` (tmux) backend** (2026-06-19, design
+> [`2026-06-19-retire-interactive-backend.md`](./design/2026-06-19-retire-interactive-backend.md)).
+> It puppeted a tmux pane with send-keys and pushed onto an idle MCP stream to fake
+> message injection — and carried the deaf-on-restart / backlog-replay / idle-wake
+> fragility class. `channel` supersedes it. The PTY/tmux spawner is **parked** at
+> [`src/_parked/interactive-spawn.ts`](./src/_parked/interactive-spawn.ts) for future
+> terminal/process-management (a general capability, decoupled from the agent backend),
+> not maintained as a live backend.
 
 ## Architecture
 
-Two components — daemon and bridge — connected by SSE:
+The **daemon** (port 1941, long-running, one per machine) is the only process that
+touches a transport's external API (e.g. Telegram's getUpdates long-poll — exclusive,
+no multi-consumer races). It owns the channel registry, routes inbound to the right
+backend (the **daemon routing fork**: `programmatic` → `ProgrammaticAgentRegistry`'s
+serial worker runs `claude -p`; `channel` → `ChannelQueueRegistry`, the durable
+note-queue a connected session pulls from), and writes outbound notes.
 
-```
-Telegram API
-    ↕ getUpdates / sendMessage / etc.
-daemon (port 1941, long-running, one per machine)
-    ↕ SSE for inbound, HTTP for outbound
-bridge (stdio MCP, spawned per-session by Claude Code)
-    ↕ stdio MCP notifications + tools
-Claude Code session
-```
+A Claude Code session connects to a channel two ways:
 
-The **daemon** is the only process that touches the Telegram API. It owns the getUpdates long-poll exclusively — no multi-consumer races by construction. Multiple bridges can connect simultaneously.
-
-The **bridge** is a stateless MCP server that Claude Code spawns as a subprocess. It declares `claude/agent` capability so Claude Code registers a notification listener. It connects to the daemon's SSE `/events` stream and forwards each event as a `notifications/claude/agent` MCP notification. Outbound tool calls (reply, react, edit, download) proxy to the daemon's HTTP API.
+- **HTTP MCP (primary)** — the session adds `<hub>/agent/mcp/<channel>` as a pure HTTP
+  MCP server (URL + OAuth), exactly like the vault. The daemon serves a stateful
+  Streamable-HTTP MCP endpoint (`src/mcp-http.ts`): for a `channel`-backend agent it
+  exposes the **pull surface** (`pending` / `next-message` / `reply` / `release`); the
+  live `pushToChannel` wake streams the programmatic backend's interim "watch it work"
+  text + the live inbound wake onto the session's GET stream.
+- **stdio bridge (`src/bridge.ts`)** — the session spawns the bridge, which subscribes
+  to the daemon's SSE `/events` and forwards each event as a `notifications/claude/agent`
+  MCP notification; outbound tool calls proxy to the daemon's HTTP `/api/*`. Still
+  supported; the HTTP-MCP path is what the UI + launcher steer toward.
 
 ## Why not the official telegram plugin?
 
-The official plugin has a known bug (anthropics/claude-code#38098, open): every Claude Code session with the plugin enabled at any scope auto-spawns a Telegram poller child, even without `--channels`. This causes multi-consumer races that drop ~50% of messages. The plugin system's `enabledPlugins` resolution is session-global and can't be scoped to one session. This gateway solves the problem by design: one daemon, any number of bridges.
+The official plugin has a known bug (anthropics/claude-code#38098, open): every Claude Code session with the plugin enabled at any scope auto-spawns a Telegram poller child, even without `--channels`. This causes multi-consumer races that drop ~50% of messages. The plugin system's `enabledPlugins` resolution is session-global and can't be scoped to one session. This gateway solves the problem by design: one daemon, any number of subscribers.
 
 ## Running
 
@@ -30,14 +61,26 @@ The official plugin has a known bug (anthropics/claude-code#38098, open): every 
 
 ```bash
 bun src/daemon.ts
-# or via launchd — see below
+# or via the hub supervisor / launchd — see below
 ```
 
-Telegram channels carry a per-channel bot token in `channels.json` config — the daemon does NOT read a global `TELEGRAM_BOT_TOKEN`. Define channels via the admin UI at `/agent/admin` (or by writing `~/.parachute/agent/channels.json` directly).
+Telegram channels carry a per-channel bot token in `channels.json` config — the daemon does NOT read a global `TELEGRAM_BOT_TOKEN`. Define channels via the admin SPA at `/agent/app/` (or by writing `~/.parachute/agent/channels.json` directly).
 
-### Bridge (registered in .mcp.json, Claude Code spawns it)
+### Connecting a `channel`-backend session (the easy path)
 
-Registered in `~/UnforcedAGI/.mcp.json`:
+```bash
+claude mcp add --transport http agent <hub-origin>/agent/mcp/<channel>
+```
+
+It prompts for OAuth the first time (like the vault). Then the session runs the pull
+loop: `pending` → `next-message` (claims the oldest inbound + returns the agent's system
+prompt to adopt) → do the work → `reply { inReplyTo, text }` (writes the outbound note +
+marks the inbound handled). A claimed message auto-releases after a TTL so a crashed
+session never strands the queue.
+
+### stdio bridge (alternative)
+
+Registered in a session's `.mcp.json`:
 ```json
 {
   "mcpServers": {
@@ -58,58 +101,26 @@ claude --dangerously-load-development-channels=server:parachute-agent
 The `=` binding is load-bearing. Space-separating the value (`--dangerously-load-development-channels server:parachute-agent`) works in `--print` mode but in interactive mode the parser swallows `server:parachute-agent` as the initial-prompt positional, leaving the flag with an empty channels list. At runtime this surfaces as `"server:parachute-agent · no MCP server configured with that name"`, which points operators at the wrong suspect (the MCP config is fine; the flag-parser is what dropped the value). Always use the `=` form — it's unambiguous in every mode. See [#8](https://github.com/ParachuteComputer/parachute-agent/issues/8).
 
 If you hit an adjacent issue:
-- The bridge now warns on stderr if the capability isn't registered, so this misconfig surfaces immediately instead of looking like everything is fine until a message arrives — see [#9](https://github.com/ParachuteComputer/parachute-agent/issues/9).
+- The bridge warns on stderr if the capability isn't registered, so this misconfig surfaces immediately instead of looking like everything is fine until a message arrives — see [#9](https://github.com/ParachuteComputer/parachute-agent/issues/9).
 - A cosmetic `/mcp` display warning may appear even with the correct flag — expected, ignore. See [#10](https://github.com/ParachuteComputer/parachute-agent/issues/10).
-
-## Sessions (launcher scripts)
-
-The module is now a **fabric**: one daemon hosts named channels (each bound to a
-transport — `telegram`, `http-ui`, …), and each Claude Code session runs a bridge
-subscribed to one channel by name (`PARACHUTE_CHANNEL_NAME`). Full design + status:
-[`PLAN.md`](./PLAN.md).
-
-Spin a session up wired to a channel with one command:
-
-```bash
-./scripts/launch-session.sh <name> <channel>   # e.g. aaron aaron
-./scripts/list-sessions.sh                      # running sessions + per-channel client counts
-./scripts/stop-session.sh <name>
-```
-
-`launch-session.sh` is idempotent, writes the session's `.mcp.json` + a reinforcing
-`CLAUDE.md` (so it always replies via the `reply` tool), auto-accepts the first-launch
-prompts (folder-trust + dev-channels), and waits for the bridge to attach. Override the
-daemon with `PARACHUTE_AGENT_URL` (default `http://127.0.0.1:1941`). `<name>`/`<channel>`
-must be slugs (alphanumeric/dash/underscore).
-
-**Note:** launched sessions run `claude --dangerously-skip-permissions` — the session has
-full machine access. Acceptable for an owner-operated, trusted-network box today;
-hub-scoped JWT auth (for the UI) and VM/Docker session isolation (for the session itself)
-are the planned hardening steps.
 
 ## Hub integration
 
 Agent self-registers into `~/.parachute/services.json` at boot and ships
 `.parachute/module.json`, so hub lists it in the portal and reverse-proxies
 `<expose>/agent/*` → the loopback daemon (`stripPrefix:true`; SSE survives the proxy).
-The built-in chat UI is reachable at `<hub-origin>/agent/ui` over the expose, and at
-`http://127.0.0.1:1941/ui` locally.
+The admin / agents SPA is reachable at `<hub-origin>/agent/app/` over the expose, and at
+`http://127.0.0.1:1941/agent/app/` locally. (`/agents` `302`s to the SPA app root; the
+old server-rendered HTML pages — the `/ui` chat, the six-page nav — retired in Phase 4.
+`/terminal` remains as a demoted attach-to-a-tmux-session tool, not a backend.)
 
-## Connecting a session over HTTP MCP (primary)
+## HTTP MCP endpoint detail (the discovery contract)
 
-A Claude Code session connects to a channel as a **pure HTTP MCP server** — by URL +
-OAuth, exactly like adding the vault. No local `.mcp.json` pointing at `bun src/bridge.ts`,
-no machine-local file: the session adds `<hub-origin>/agent/mcp/<channel>` and the daemon
-serves a stateful Streamable-HTTP MCP endpoint (`src/mcp-http.ts`) that pushes the idle-wake
-`notifications/claude/agent` onto the session's SSE stream.
-
-```bash
-claude mcp add --transport http agent <hub-origin>/agent/mcp/<channel>
-```
-
-It prompts for OAuth the first time (like the vault). Discovery is RFC 9728 + RFC 8414, in
-the **path-insertion** form a Claude Code HTTP-MCP client probes (mirrors vault's
-`src/oauth-discovery.ts`), served PUBLIC (no auth) by the daemon:
+The `<hub-origin>/agent/mcp/<channel>` endpoint a session adds (see "Connecting a
+`channel`-backend session" above) is a stateful Streamable-HTTP MCP server
+(`src/mcp-http.ts`). Discovery is RFC 9728 + RFC 8414, in the **path-insertion** form a
+Claude Code HTTP-MCP client probes (mirrors vault's `src/oauth-discovery.ts`), served
+PUBLIC (no auth) by the daemon:
 
 - `GET /.well-known/oauth-protected-resource/mcp/<channel>` → `resource` (the public MCP
   URL, built from `X-Forwarded-Host`), `authorization_servers: [<hub-origin>]`,
@@ -121,14 +132,12 @@ the **path-insertion** form a Claude Code HTTP-MCP client probes (mirrors vault'
   spec OAuth client follows to start the flow. (Only `/mcp/*` carries the challenge; `/events`
   + `/api/*` stay plain 401.)
 
-The built-in chat UI's "Connect a session" panel now shows this one-liner (computed from
-`window.location.origin` so it's the hub origin over the expose). `scripts/launch-session.sh`
-writes the session's `.mcp.json` as an HTTP server config (`{ "type": "http", "url": …,
-"headers": { "Authorization": "Bearer <minted-token>" } }`) for the headless/local launch —
-the minted token is the header; remote/manual users go through OAuth.
-
-The stdio `bridge.ts` over `/events` + `/api/*` still works (Layer 1 below) — the HTTP MCP
-endpoint is **additive**, and is now the path the UI + launcher steer toward.
+For a `channel`-backend agent the endpoint serves the PULL surface
+(`pending` / `next-message` / `reply` / `release`, dispatched to `ChannelQueueRegistry`);
+the live `pushToChannel` wake streams the programmatic backend's interim text + the live
+inbound wake onto a session's GET stream. The stdio `bridge.ts` over `/events` + `/api/*`
+still works (Layer 1 below) — the HTTP MCP endpoint is **additive**, and is the path the
+SPA + the `claude mcp add` connect step steer toward.
 
 ## Auth
 
@@ -336,12 +345,27 @@ Private DMs to the bot have `chat.id === user_id` (Telegram convention). To perm
 
 ## MCP tools exposed to Claude
 
+The channel MCP endpoint serves ONE of two tool surfaces, resolved at connect time by
+the channel's backend (`src/mcp-http.ts`):
+
+**Push surface** (a non-channel channel / the bridge — the session is woken, then replies):
+
 | Tool | Description |
 |---|---|
 | `reply` | Send text + file attachments to a chat. Images → photos, .ogg → voice, others → documents. |
 | `react` | Add emoji reaction to a message |
 | `edit_message` | Edit a previously sent message |
 | `download_attachment` | Download a Telegram file by file_id, returns local path |
+
+**Pull surface** (a `channel`-backend agent — the session pulls the durable queue,
+dispatched to `ChannelQueueRegistry`):
+
+| Tool | Description |
+|---|---|
+| `pending` | How many inbound messages await + a peek (read-only, claims nothing) |
+| `next-message` | Claim the oldest unhandled inbound; returns `{ id, text, inReplyTo, systemPrompt }` and marks it in-flight |
+| `reply` | `{ inReplyTo, text }` → write the outbound note + mark the inbound handled |
+| `release` | Un-claim an in-flight message back to pending |
 
 ## Testing
 
@@ -357,12 +381,16 @@ curl -X POST http://127.0.0.1:1941/api/reply \
 
 ## Future
 
-The daemon + bridge split makes adding new backends straightforward:
-- Discord: add `src/discord/` with a Discord gateway poller, register alongside telegram
-- SMS/iMessage: same pattern
-- Custom web frontend: same pattern — the bridge doesn't change
+Two orthogonal axes extend cleanly:
 
-The bridge's MCP contract (`notifications/claude/agent` + tool surface) stays the same regardless of backend.
+- **New transports** (how a channel reaches the outside world — Telegram, http-ui,
+  vault, …): add `src/transports/<name>.ts` implementing the `Transport` contract and
+  register it alongside the others. The session-facing MCP contract is unchanged.
+- **The two backends** (`programmatic` | `channel`) are the settled execution axis; the
+  retired `interactive` (tmux) path is parked, not extended (design
+  [`2026-06-19-retire-interactive-backend.md`](./design/2026-06-19-retire-interactive-backend.md)).
+  A future revival of the parked PTY code lands as a general terminal/process-management
+  capability, decoupled from the agent backend.
 
 ## Post-merge hygiene
 

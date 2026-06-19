@@ -349,9 +349,144 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(stored!.content).toContain("reply two");
   });
 
-  test("writeThread() on an error turn records status:error + the failure reason in the body", async () => {
+  test("SINGLE-THREADED error on turn 2: turn_count==2, status:error, started_at preserved, last_turn_at advanced", async () => {
+    // Same stored-note simulation as the two-turn test: turn 2 reads back turn 1's note.
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    // Turn 1 — ok.
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      input: "turn one",
+      output: "reply one",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z",
+    });
+    expect(stored!.metadata.status).toBe("ok");
+
+    // Turn 2 — ERROR. The single-threaded thread keeps upserting (the failure is part of
+    // the rolling thread record); the status reflects this latest turn.
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "error",
+      input: "turn two",
+      output: "claude -p exited 1: boom",
+      started_at: "2026-06-18T08:00:00.000Z", // later — must NOT overwrite the first.
+      ended_at: "2026-06-18T08:00:09.000Z",
+    });
+
+    expect(stored!.metadata.turn_count).toBe("2"); // incremented despite the error.
+    expect(stored!.metadata.status).toBe("error"); // the latest turn's outcome.
+    expect(stored!.metadata.started_at).toBe("2026-06-18T07:00:00.000Z"); // preserved.
+    expect(stored!.metadata.last_turn_at).toBe("2026-06-18T08:00:09.000Z"); // advanced.
+    // The body's latest-turn section is the Error block.
+    expect(stored!.content).toContain("**Error:**");
+    expect(stored!.content).toContain("claude -p exited 1: boom");
+  });
+
+  test("SINGLE-THREADED: a 500 on the read-back GET rejects (not a silent aggregate reset)", async () => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      // The single-threaded read-back GET returns a 500 (an UNEXPECTED non-404 error) →
+      // readThreadNote throws → writeThread rejects, surfacing the misconfig rather than
+      // silently resetting the thread's aggregates.
+      if (u.includes("/api/notes/") && method === "GET") {
+        return new Response("boom", { status: 500 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await expect(
+      t.writeThread({
+        channel: "eng",
+        name: "eng",
+        mode: "single-threaded",
+        status: "ok",
+        input: "x",
+        output: "y",
+        started_at: "2026-06-18T07:00:00.000Z",
+        ended_at: "2026-06-18T07:00:01.000Z",
+      }),
+    ).rejects.toThrow(/read thread note failed/);
+  });
+
+  test("SINGLE-THREADED cost rounding: 0.1 + 0.2 serializes as \"0.3\" (no IEEE-754 drift)", async () => {
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      input: "one",
+      output: "r1",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z",
+      usage: { totalCostUsd: 0.1 },
+    });
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      input: "two",
+      output: "r2",
+      started_at: "2026-06-18T08:00:00.000Z",
+      ended_at: "2026-06-18T08:00:09.000Z",
+      usage: { totalCostUsd: 0.2 },
+    });
+
+    // The naive sum 0.1 + 0.2 === 0.30000000000000004; the round-to-9-decimals guard
+    // serializes it cleanly as "0.3".
+    expect(stored!.metadata.total_cost_usd).toBe("0.3");
+  });
+
+  test("writeThread() on a MULTI-THREADED error turn records status:error + the failure reason in the body (NO read-back)", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
     let captured: { tags: string[]; metadata: Record<string, string>; content: string } | undefined;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
       if (String(url).includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
         captured = JSON.parse(String(init?.body));
       }
@@ -376,6 +511,10 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // The body's latest-turn section is the Error block on a failure.
     expect(captured!.content).toContain("**Error:**");
     expect(captured!.content).toContain("claude -p exited 1: boom");
+    // Multi-threaded does NO read-back even on the error path (fresh per fire).
+    expect(
+      calls.filter((c) => c.url.includes("/api/notes/") && (c.init.method ?? "GET") === "GET"),
+    ).toHaveLength(0);
   });
 
   test("writeThread() throws on a non-ok vault response (PATCH)", async () => {

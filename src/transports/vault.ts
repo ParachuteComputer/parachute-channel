@@ -251,10 +251,18 @@ function numFromMeta(v: unknown): number {
 /**
  * Build the `#agent/thread` note BODY — the rolling SUMMARY of the thread (design
  * 2026-06-18: "hold a summary of this thread in the content; maybe another agent
- * facilitates that"). v1 the MODULE writes a useful default, STRUCTURED so a future
- * summarizer agent can own/enrich the `## Summary` section: that section is the slot a
- * summarizer may later own; the `## Latest turn` section + the metadata roll-up are
- * always MODULE-OWNED. The same shape serves both modes (multi-threaded = one turn).
+ * facilitates that"). The MODULE writes a useful default, STRUCTURED (`## Summary` /
+ * `## Latest turn`) so the `## Summary` section is the slot a future summarizer agent is
+ * EARMARKED to own/enrich; the `## Latest turn` block + the metadata roll-up are always
+ * module-owned. The same shape serves both modes (multi-threaded = one turn).
+ *
+ * v1 LIMITATION — the module OVERWRITES the `## Summary` section every turn. This function
+ * REGENERATES the whole body from scratch using only the rolled-up aggregates (passed in
+ * from `prior.metadata`); it NEVER reads `prior.content`. So a summarizer agent's
+ * enrichment of `## Summary` would be CLOBBERED on the next turn. Summarizer-agent
+ * enrichment needs a read-prior-content → merge path (preserve a summarizer-owned section
+ * across the regenerate), which is DEFERRED. Until then, "may own" means EARMARKED, not
+ * PRESERVED.
  */
 function buildThreadSummaryBody(t: {
   name: string;
@@ -268,8 +276,10 @@ function buildThreadSummaryBody(t: {
   const turns = t.turnCount === 1 ? "1 turn" : `${t.turnCount} turns`;
   const auto = `${t.mode} thread for ${t.name} — ${turns}, last ${t.status} at ${t.lastTurnAt}.`;
   const turnHeading = t.status === "ok" ? "Reply" : "Error";
-  // `## Summary` is the SUMMARIZER-OWNABLE slot (module writes a default in v1); the
-  // `## Latest turn` block + the metadata roll-up are always module-owned.
+  // `## Summary` is EARMARKED for a future summarizer agent — but v1 OVERWRITES it every
+  // turn (this body is fully regenerated from metadata; `prior.content` is never read), so
+  // it's a module-owned default for now, NOT a preserved slot (see the function doc).
+  // The `## Latest turn` block + the metadata roll-up are always module-owned.
   return (
     `## Summary\n\n${auto}\n\n` +
     `## Latest turn\n\n` +
@@ -755,6 +765,10 @@ export class VaultTransport implements Transport {
     // ambiguous `thread_id` metadata field). single-threaded: a DETERMINISTIC leaf named
     // after the def (the agent/spec name, sanitized) so the SAME note upserts across turns.
     // multi-threaded: a fresh uuid per fire (one fire = one thread = one note today).
+    // COLLISION NOTE: two single-threaded agents whose names collapse to the SAME safeName
+    // on the same channel would upsert each other's thread note. Acceptable because the
+    // registry enforces ONE agent per channel (byChannel index), so the collision can't
+    // arise in practice.
     const safeName = (thread.name ?? thread.channel).replace(/[^a-zA-Z0-9_-]/g, "-");
     const leaf = singleThreaded ? safeName : crypto.randomUUID();
     const path = `${THREAD_PATH_PREFIX}/${safeChannel}/${leaf}`;
@@ -814,7 +828,10 @@ export class VaultTransport implements Transport {
     if (singleThreaded || thread.usage) {
       if (inputTokens) metadata.input_tokens = String(inputTokens);
       if (outputTokens) metadata.output_tokens = String(outputTokens);
-      if (costUsd) metadata.total_cost_usd = String(costUsd);
+      // Round the accumulated cost to 9 decimals before serializing — summing floats
+      // (e.g. 0.1 + 0.2) accrues IEEE-754 drift, so a naive String() yields
+      // "0.30000000000000004". 9 decimals covers sub-cent costs without losing precision.
+      if (costUsd) metadata.total_cost_usd = String(Math.round(costUsd * 1e9) / 1e9);
     }
 
     const body = buildThreadSummaryBody({
@@ -835,8 +852,12 @@ export class VaultTransport implements Transport {
     // it when missing (turn 1, and every multi-threaded fresh-uuid fire). `force: true`
     // satisfies the vault's 428 mutation precondition (mirrors `setInboundStatus`). The
     // path is one URL segment (percent-encoded `/`); the route `decodeURIComponent`s it.
-    // The `tags` array is consumed by the create branch and is a no-op on update (the
-    // update branch reads `tags.add`/`tags.remove`), so the tag is set once and preserved.
+    // The `tags` array is consumed ONLY by the create branch. VERIFIED against the vault
+    // (`routes.ts`): the PATCH UPDATE branch reads `tags.add` / `tags.remove` (the delta
+    // shape), NOT a plain `tags` array — so sending `tags: [AGENT_THREAD_TAG]` here is
+    // INERT on update (the note's existing tag is preserved untouched) and only takes
+    // effect on the if_missing:create branch. So the single tag is set once at create and
+    // preserved across every subsequent upsert (HARD CONSTRAINT 4 — loop-safe single tag).
     const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(path)}`;
     const res = await fetch(url, {
       method: "PATCH",
@@ -884,8 +905,14 @@ export class VaultTransport implements Transport {
     let res: Response;
     try {
       res = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
-    } catch {
+    } catch (err) {
       // Vault unreachable — treat as "no prior" (we'll create fresh; aggregates reset).
+      // SURFACE it: a flaky vault silently resetting a thread's turn_count/usage is a
+      // data-quality bug we want visible in logs. Still return undefined so the upsert
+      // proceeds (don't strand the queue on a transient network blip).
+      console.warn(
+        `parachute-agent: readThreadNote network error — thread aggregates reset for ${path}: ${(err as Error).message}`,
+      );
       return undefined;
     }
     if (res.status === 404) return undefined; // first turn — note doesn't exist yet.

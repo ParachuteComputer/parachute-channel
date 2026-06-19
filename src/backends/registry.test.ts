@@ -341,7 +341,7 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(threads.threads.every((t) => t.mode === "multi-threaded")).toBe(true);
   });
 
-  test("a FAILED turn (BOTH modes) still materializes an #agent/thread note with status:error + the reason", async () => {
+  test("a FAILED MULTI-THREADED turn still materializes an #agent/thread note with status:error + the reason", async () => {
     const backend = new FakeBackend();
     backend.resultFor = () => ({ ok: false, error: "mint refused" });
     const rec = recorder();
@@ -353,6 +353,28 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     await until(() => threads.threads.length === 1);
 
     expect(threads.threads).toHaveLength(1);
+    expect(threads.threads[0]!.mode).toBe("multi-threaded");
+    expect(threads.threads[0]!.status).toBe("error");
+    expect(threads.threads[0]!.output).toBe("mint refused");
+    // No outbound note for a failed turn (unchanged behavior).
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  test("a FAILED SINGLE-THREADED turn ALSO materializes an #agent/thread note with status:error (substantiates BOTH modes)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: false, error: "mint refused" });
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    // specFor → no mode → single-threaded (the default).
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "do it" });
+    await until(() => threads.threads.length === 1);
+
+    expect(threads.threads).toHaveLength(1);
+    expect(threads.threads[0]!.mode).toBe("single-threaded");
+    expect(threads.threads[0]!.name).toBe("eng");
     expect(threads.threads[0]!.status).toBe("error");
     expect(threads.threads[0]!.output).toBe("mint refused");
     // No outbound note for a failed turn (unchanged behavior).

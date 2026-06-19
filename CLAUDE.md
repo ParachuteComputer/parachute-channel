@@ -240,13 +240,18 @@ Bearer `vault:<name>:write`).
 The unified model is `definition -> thread -> message`: **everything is a thread**, and
 EVERY completed turn materializes a `#agent/thread` note (a "run" was always a thread with
 one turn — the older `#agent/run` tag retired into this). The note is the durable,
-queryable record of one thread: its BODY is a rolling SUMMARY (the `## Summary` section is
-a slot a future summarizer agent may own/enrich — module-owned in v1; the `## Latest turn`
-section + the metadata roll-up are always module-owned), and its metadata carries the
-thread state — `channel`, `definition`, `mode`, `status`, `started_at`, `last_turn_at`,
-`turn_count`, and cumulative `usage`. The INDEXED `status`/`definition`/`mode` fields make
-threads operator-queryable ("all failed threads", "all threads of agent X", "all
-multi-threaded threads").
+queryable record of one thread: its BODY is a rolling SUMMARY (`## Summary` /
+`## Latest turn`), and its metadata carries the thread state — `channel`, `definition`,
+`mode`, `status`, `started_at`, `last_turn_at`, `turn_count`, and cumulative `usage`. The
+INDEXED `status`/`definition`/`mode` fields make threads operator-queryable ("all failed
+threads", "all threads of agent X", "all multi-threaded threads").
+
+**v1 OVERWRITES the `## Summary` section every turn.** The module regenerates the whole
+body from the rolled-up metadata each turn (it never reads the prior note's content), so
+`## Summary` is a module-owned default, not a preserved slot. It is EARMARKED for a future
+summarizer agent, but summarizer-agent enrichment needs a read-prior-content → merge path
+(to preserve a summarizer-owned section across the regenerate), which is DEFERRED. "May
+own" means earmarked, not preserved.
 
 **Both execution modes materialize a thread note** — the mode governs the thread's
 IDENTITY (its path leaf) + whether it upserts:

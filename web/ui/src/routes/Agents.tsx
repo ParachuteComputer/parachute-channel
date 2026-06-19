@@ -1199,9 +1199,12 @@ export function DefVaultsSection({
       await removeAgentVault(name);
       // Best-effort teardown of this vault's def-reload connectors — the vault
       // is no longer a def-vault, so its triggers are stale. A failure is
-      // non-fatal (the connector just reloads a vault nothing reads).
+      // non-fatal (the connector just reloads a vault nothing reads). Fetch the
+      // connection list FRESH (fall back to the snapshot) so a builder-made
+      // connector with a hub-derived id is caught even if our state is stale.
       try {
-        await teardownDefReloadConnections(name, connections);
+        const fresh = await listConnections().catch(() => connections);
+        await teardownDefReloadConnections(name, fresh);
       } catch {
         // ignore — leaves a harmless stale connector, removable in the hub UI.
       }

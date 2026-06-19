@@ -170,7 +170,11 @@ export async function ensureDefReloadConnections(
 ): Promise<{ ok: boolean; failures: string[] }> {
   const kinds: Array<"create" | "edit"> = ["create", "edit"];
   const failures: string[] = [];
+  // First failure's status + RAW server detail, kept separate from the
+  // per-kind formatted messages so the total-failure throw maps the status once
+  // (no double-wrapping through hubErrorMessage).
   let firstStatus = 0;
+  let firstDetail = "";
   for (const kind of kinds) {
     const res = await hubFetch("/admin/connections", {
       method: "POST",
@@ -178,13 +182,17 @@ export async function ensureDefReloadConnections(
       body: JSON.stringify(defReloadBody(vault, kind)),
     });
     if (!res.ok) {
-      if (firstStatus === 0) firstStatus = res.status;
-      failures.push(`${kind}: ${hubErrorMessage(res.status, await errorDetail(res))}`);
+      const detail = await errorDetail(res);
+      if (firstStatus === 0) {
+        firstStatus = res.status;
+        firstDetail = detail;
+      }
+      failures.push(`${kind}: ${hubErrorMessage(res.status, detail)}`);
     }
   }
   if (failures.length === kinds.length) {
     // Total failure — surface the (uniform) reason as a single thrown error.
-    throw new HubError(firstStatus, hubErrorMessage(firstStatus, failures[0] ?? "provisioning failed"));
+    throw new HubError(firstStatus, hubErrorMessage(firstStatus, firstDetail || "provisioning failed"));
   }
   return { ok: failures.length === 0, failures };
 }

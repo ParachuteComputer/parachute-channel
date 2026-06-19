@@ -116,7 +116,9 @@ describe("defReloadStatus", () => {
 
 describe("ensureDefReloadConnections", () => {
   it("POSTs both connectors with the canonical ids, events, filter, and sink", async () => {
-    const fetchMock = vi.fn(async () => jsonResponse(200, { ok: true }));
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      jsonResponse(200, { ok: true }),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     const result = await ensureDefReloadConnections("research");
@@ -165,11 +167,27 @@ describe("ensureDefReloadConnections", () => {
       status: 401,
     });
   });
+
+  it("throws HubError(400) when the hub rejects both bodies (the validation failure mode)", async () => {
+    // The pre-fix hub 400'd every def-reload POST ("agent sink requires
+    // sink.params.channel"); guard the total-failure throw carries that status
+    // (not a generic wrap) so the UI surfaces the real reason.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(400, { error: "invalid_request", error_description: "bad" })),
+    );
+    await expect(ensureDefReloadConnections("research")).rejects.toMatchObject({
+      name: "HubError",
+      status: 400,
+    });
+  });
 });
 
 describe("teardownDefReloadConnections", () => {
   it("DELETEs the canonical ids AND any semantically-matching connection id", async () => {
-    const fetchMock = vi.fn(async () => jsonResponse(200, { ok: true }));
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      jsonResponse(200, { ok: true }),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     // A pair wired via the hub builder carries hub-derived ids, not ours.

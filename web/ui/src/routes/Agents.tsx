@@ -1188,8 +1188,11 @@ export function SecretsSection({
   }, [load]);
 
   // Client-side guard mirroring the daemon (a friendlier pre-submit error than a 400).
+  // EXACT match (no case-fold): the daemon's denylist is case-sensitive + SCREAMING_CASE,
+  // and env vars are case-sensitive on Unix — a lowercase `anthropic_api_key` is a
+  // different, harmless var the daemon accepts, so we must not block it here.
   const trimmedName = name.trim();
-  const nameDenylisted = DENYLISTED_ENV_NAMES.has(trimmedName.toUpperCase());
+  const nameDenylisted = DENYLISTED_ENV_NAMES.has(trimmedName);
   const nameShapeOk = trimmedName.length === 0 || ENV_NAME_RE.test(trimmedName);
   const canSave =
     trimmedName.length > 0 && nameShapeOk && !nameDenylisted && value.length > 0 && !saving;
@@ -1256,7 +1259,7 @@ export function SecretsSection({
       </p>
 
       {addOpen ? (
-        <form className="inline-form" onSubmit={onAdd} aria-label="Add secret" data-testid="add-secret-form">
+        <form className="inline-form" onSubmit={onAdd} aria-label="Add secret" aria-busy={saving} data-testid="add-secret-form">
           {addError ? (
             <div className="error-banner" role="alert" data-testid="add-secret-error">
               {addError}
@@ -1281,7 +1284,7 @@ export function SecretsSection({
             ) : null}
             {nameDenylisted ? (
               <p className="field-error" data-testid="secret-name-denylisted">
-                Reserved — {trimmedName.toUpperCase()} would hijack the agent's managed billing/auth.
+                Reserved — {trimmedName} would hijack the agent's managed billing/auth.
               </p>
             ) : null}
           </div>
@@ -1296,7 +1299,7 @@ export function SecretsSection({
               spellCheck={false}
               onChange={(e) => setValue(e.target.value)}
             />
-            <p className="field-hint">Stored encrypted-at-rest-adjacent (0600). Write-only — never re-displayed.</p>
+            <p className="field-hint">Stored 0600 on disk (access-controlled, not encrypted). Write-only — never re-displayed.</p>
           </div>
           <div className="form-actions">
             <button type="submit" disabled={!canSave}>

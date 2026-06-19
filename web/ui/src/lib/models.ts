@@ -16,11 +16,14 @@ export interface ModelOption {
   label: string;
 }
 
+// Labels intentionally carry NO version number — the values are CC aliases that
+// follow the latest build of each family, so a pinned "4.8" would rot (and lie)
+// the moment a newer Opus ships. The family + capability descriptor stays true.
 export const MODEL_OPTIONS: readonly ModelOption[] = [
-  { value: "", label: "Default (Claude Code's default — Sonnet today)" },
-  { value: "opus", label: "Opus 4.8 — most capable" },
-  { value: "sonnet", label: "Sonnet 4.6 — balanced" },
-  { value: "haiku", label: "Haiku 4.5 — fastest" },
+  { value: "", label: "Default (Claude Code's default)" },
+  { value: "opus", label: "Opus — most capable" },
+  { value: "sonnet", label: "Sonnet — balanced" },
+  { value: "haiku", label: "Haiku — fastest" },
 ];
 
 /**

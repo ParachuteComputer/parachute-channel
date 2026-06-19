@@ -8,9 +8,9 @@
  * with the existing daemon-rendered HTML pages — operators compare the two
  * during the incremental migration; the HTML retires in Phase 4.
  *
- * Home IS the Agents list (the design's "Home becomes the Agents list"). Later
- * phases add the unified create flow (Phase 3) and the def-vault editor +
- * schedules fold-in (Phase 4); this shell leaves room for those nav entries.
+ * Home IS the Agents list (the design's "Home becomes the Agents list"). Phase 3
+ * adds the unified create flow (`/create`); the def-vault editor + schedules
+ * fold-in are Phase 4; this shell leaves room for those nav entries.
  *
  * Auth: the SPA loads OPEN, then mints a hub `agent:admin` Bearer from
  * `<origin>/admin/agent-token` (the operator's hub session cookie) — see
@@ -18,15 +18,18 @@
  */
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import { Agents } from "./routes/Agents.tsx";
+import { CreateAgentRoute } from "./routes/CreateAgent.tsx";
 
 const WORDMARK = "Parachute Agent";
 
-// Single view today (the Agents list). When create/config views land (Phase 3-4),
-// derive the subtitle from the route then.
-const SUBTITLE = "agents";
+function subtitleFor(pathname: string): string {
+  if (pathname === "/create" || pathname.startsWith("/create/")) return "new agent";
+  return "agents";
+}
 
 export function App() {
-  const subtitle = SUBTITLE;
+  const { pathname } = useLocation();
+  const subtitle = subtitleFor(pathname);
 
   return (
     <div className="page">
@@ -36,6 +39,7 @@ export function App() {
           <span className="sub">{subtitle}</span>
         </Link>
         <NavSection to="/" label="Agents" exact />
+        <NavSection to="/create" label="New agent" />
         {/* Boundary: everything past here is the older daemon-rendered HTML,
             kept mounted during the migration so the operator can compare. */}
         <span className="nav-divider" aria-hidden="true" />
@@ -48,6 +52,8 @@ export function App() {
         {/* Home is the Agents list (design: "Home becomes the Agents list"). */}
         <Route path="/" element={<Agents />} />
         <Route path="/agents" element={<Agents />} />
+        {/* Phase 3 — the unified create-agent flow. */}
+        <Route path="/create" element={<CreateAgentRoute />} />
         <Route
           path="*"
           element={

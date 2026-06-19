@@ -22,6 +22,7 @@
  * operator the full picture.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   type AgentDefRow,
   type AgentRow,
@@ -178,8 +179,13 @@ export function Agents() {
           <section className="card" aria-label="Agents">
             <div className="section-head">
               <h2>All agents</h2>
-              <span className="count" data-testid="agents-count">
-                {merged.length} {merged.length === 1 ? "agent" : "agents"}
+              <span className="section-head-actions">
+                <span className="count" data-testid="agents-count">
+                  {merged.length} {merged.length === 1 ? "agent" : "agents"}
+                </span>
+                <Link to="/create" className="button-link" data-testid="new-agent-link">
+                  New agent
+                </Link>
               </span>
             </div>
             {merged.length === 0 ? (

@@ -649,6 +649,71 @@ describe("AgentDefRegistry — lifecycle", () => {
     expect(calls.deregistered).toEqual(["uni-dev"]);
   });
 
+  test("loadAll TEARS DOWN a removed def — deregister + removeChannel (the no-delete-trigger path)", async () => {
+    // There is no vault `deleted` trigger (the hub maps only created/updated), so a def
+    // deleted out-of-band never fires the reactive teardown — the poll is the ONLY
+    // convergence path and must deregister, not just prune grants. Regression for the
+    // orphan-agent bug (a deleted agent kept answering until the daemon restarted).
+    const { deps, calls } = recorderDeps();
+    const present: Array<{ id: string; content?: string; metadata?: Record<string, unknown> }> = [
+      { id: "Agents/uni", content: "role", metadata: { name: "uni" } },
+      { id: "Agents/researcher", content: "role", metadata: { name: "researcher" } },
+    ];
+    const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (method === "PATCH") return new Response(null, { status: 200 });
+      if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+        return new Response(JSON.stringify(present), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("[]", { status: 200 });
+    }) as typeof fetch;
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+    await reg.loadAll(); // both live
+    expect(calls.deregistered).toEqual([]); // nothing torn down on a clean load
+    present.splice(1, 1); // delete researcher out-of-band (no delete trigger fires)
+    await reg.loadAll(); // confident read now sees only uni → researcher is a confirmed removal
+    expect(calls.deregistered).toEqual(["researcher"]);
+    expect(calls.removed).toEqual(["researcher"]);
+    expect(reg.list().map((d) => d.name)).toEqual(["uni"]); // gone from the live set
+  });
+
+  test("loadAll SKIPS removed-def teardown on a truncated (page-cap) read — no spurious deregister", async () => {
+    // A list at the page cap may be partial. Since the removed-def diff now does a
+    // DESTRUCTIVE teardown, a truncated read that omits the tail must NOT be mistaken for
+    // deletions — the guard defers the diff rather than tearing down live agents.
+    const { deps, calls } = recorderDeps();
+    const initial: Array<{ id: string; content?: string; metadata?: Record<string, unknown> }> = [
+      { id: "Agents/uni", content: "role", metadata: { name: "uni" } },
+      { id: "Agents/researcher", content: "role", metadata: { name: "researcher" } },
+    ];
+    // A full page (>= the 500 cap) that omits both originals — a truncated page, NOT a
+    // signal that both were deleted.
+    const truncated = Array.from({ length: 500 }, (_, i) => ({
+      id: `Agents/filler-${i}`,
+      content: "role",
+      metadata: { name: `filler-${i}` },
+    }));
+    let current = initial;
+    const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (method === "PATCH") return new Response(null, { status: 200 });
+      if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+        return new Response(JSON.stringify(current), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("[]", { status: 200 });
+    }) as typeof fetch;
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+    await reg.loadAll(); // confident: uni + researcher live
+    expect(calls.deregistered).toEqual([]);
+    current = truncated; // the next poll returns a truncated page
+    await reg.loadAll();
+    // Guard tripped → NO teardown despite the originals being absent from the page.
+    expect(calls.deregistered).toEqual([]);
+    expect(calls.removed).toEqual([]);
+  });
+
   test("reload for an unknown def-vault is a safe skip", async () => {
     const { deps } = recorderDeps();
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn: vaultFetch({}) });
@@ -1025,8 +1090,8 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
     expect(reconciled).toEqual([{ agent: "uni", liveConnections: [] }]);
   });
 
-  test("a REMOVED def (present in a prior load, gone now) → reconcile(agent, [])", async () => {
-    const { deps } = recorderDeps();
+  test("a REMOVED def (present in a prior load, gone now) → reconcile(agent, []) + teardown", async () => {
+    const { deps, calls } = recorderDeps();
     const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     // Two notes present at first; the second load drops "researcher".
@@ -1072,6 +1137,9 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
     // uni (still present, no wants) reconciles with [] too — that's its clean-load prune,
     // NOT a removal; distinguished by the agent name.
     expect(reconciled.find((r) => r.agent === "uni")).toEqual({ agent: "uni", liveConnections: [] });
+    // AND it's torn down (not just grant-pruned): the only auto path for a delete.
+    expect(calls.deregistered).toEqual(["researcher"]);
+    expect(calls.removed).toEqual(["researcher"]);
   });
 
   test("a delete reload → reconcile(agent, []) (confirmed removal)", async () => {

@@ -1215,9 +1215,11 @@ describe("ProgrammaticAgentRegistry — agent-to-agent callbacks (reply_to)", ()
     // completes and delivers a callback BACK to the orchestrator's channel. Those callbacks
     // arrive as inbound on the orchestrator's channel and are handled by ITS per-channel
     // serial drain — one at a time, FIFO, never concurrent (its --resume session carries
-    // state across them). We simulate the orchestrator side directly: enqueue N callback-
-    // shaped inbound messages on one channel + assert they drain in order, none lost, and
-    // the backend never ran two concurrently.
+    // state across them). We exercise the DRAIN-SIDE FIFO property directly here (enqueue N
+    // callback-shaped inbound messages on one channel + assert they drain in order, none
+    // lost, the backend never ran two concurrently) — NOT the real vault-IPC delivery path
+    // (callback note → trigger → /api/vault/inbound → emit), which the wiring + vault suites
+    // cover. The serial drain is the same machinery either way, so this pins the invariant.
     const backend = new FakeBackend();
     backend.resultFor = (m) => ({ ok: true, reply: "ack:" + m });
     const out = recorderWithId();

@@ -269,9 +269,11 @@ export function callbackFieldsFromMeta(
   if (typeof meta.correlation_id === "string" && meta.correlation_id) {
     out.correlationId = meta.correlation_id;
   }
-  // Coerce the string-typed depth to a finite non-negative integer; anything unparseable
-  // (absent, "", "abc", a negative) reads as 0 — a safe floor (a turn at depth 0 always
-  // gets to call back; the ceiling is what stops a runaway chain).
+  // Coerce the string-typed depth to a finite positive integer. Anything else — absent, "",
+  // "abc", a negative, OR a literal "0" — is OMITTED here; the drain's `?? 0` fallback
+  // (maybeDeliverCallback) treats an absent `delegationDepth` as 0, so a depth-0 message
+  // still gets to call back (the ceiling, not the floor, is what stops a runaway chain).
+  // We only bother storing a value when it's a meaningful positive depth.
   const depth = Number(meta.delegation_depth);
   if (Number.isFinite(depth) && depth > 0) out.delegationDepth = Math.floor(depth);
   return out;

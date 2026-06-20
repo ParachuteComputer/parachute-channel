@@ -369,10 +369,15 @@ export class ProgrammaticAgentRegistry {
       // The name moved to a different wake channel — drop the old channel index.
       // An in-flight drain on the old channel self-terminates (it re-reads
       // `byChannel`, now empty for that channel); we drop its `draining` flag too so
-      // the entry doesn't leak until that promise happens to settle.
+      // the entry doesn't leak until that promise happens to settle. Also drop the old
+      // channel's EXPECTED mark + any stranded pending buffer — nothing routes there now,
+      // so a residual mark/buffer would leak (reviewer nit; defense-in-depth — the normal
+      // flow only ever expects the NEW channel before this register).
       this.byChannel.delete(priorChannel);
       this.queues.delete(priorChannel);
       this.draining.delete(priorChannel);
+      this.expectedChannels.delete(priorChannel);
+      this.pending.delete(priorChannel);
     }
     const backendHandle = await this.backend.start(spec);
     const handle: ProgrammaticAgentHandle = {

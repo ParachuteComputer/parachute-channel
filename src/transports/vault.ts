@@ -312,7 +312,10 @@ function buildThreadSummaryBody(t: {
   // moment processing starts; the end-record overwrites this body with the real ok/error
   // reply once the turn completes.
   if (t.status === "working") {
-    const auto = `${t.mode} thread for ${t.name} — ${turns}, currently working (awaiting reply).`;
+    // No turn has COMPLETED yet, so don't print a (confusing) "0 turns" count — the prior
+    // completed count rides in the metadata for queries; the body just says it's working.
+    const priorTurns = t.turnCount === 0 ? "first turn" : `${turns} so far`;
+    const auto = `${t.mode} thread for ${t.name} — working on the ${t.turnCount === 0 ? "first turn" : "next turn"} (${priorTurns}, awaiting reply).`;
     return (
       `## Summary\n\n${auto}\n\n` +
       `## Latest turn\n\n` +

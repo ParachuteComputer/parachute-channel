@@ -863,6 +863,26 @@ describe("ProgrammaticAgentRegistry — pending-inbound queue + replay-on-regist
     expect(reg.queuePending("eng", { content: "after" })).toBe("unknown");
   });
 
+  test("a channel-move re-register clears the OLD channel's expected mark + pending buffer (no leak)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+
+    // Register the agent on channel "old", then buffer a pending inbound for "old".
+    await reg.register({ name: "mover", channels: ["old"] });
+    reg.expectChannel("old");
+    reg.queuePending("old", { content: "stranded" });
+    expect(reg.pendingCount("old")).toBe(1);
+
+    // Re-register the SAME name onto a DIFFERENT wake channel — the old channel's indexes,
+    // expected mark, and pending buffer must all be dropped (nothing routes to "old" now).
+    await reg.register({ name: "mover", channels: ["new"] });
+    expect(reg.hasChannel("old")).toBe(false);
+    expect(reg.isExpected("old")).toBe(false);
+    expect(reg.pendingCount("old")).toBe(0);
+    expect(reg.hasChannel("new")).toBe(true);
+  });
+
   test("a pending inbound that arrives DURING a drain (after register) still replays in order", async () => {
     const backend = new FakeBackend();
     const rec = recorder();

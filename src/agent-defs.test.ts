@@ -712,6 +712,16 @@ describe("AgentDefRegistry — lifecycle", () => {
     // Guard tripped → NO teardown despite the originals being absent from the page.
     expect(calls.deregistered).toEqual([]);
     expect(calls.removed).toEqual([]);
+
+    // The guard DEFERS the decision, it doesn't LOSE it: the truncated pass left the
+    // seen-set intact (it skipped rebuildSeenDefs), so a later CONFIDENT pass that
+    // genuinely drops researcher still catches it as a removal and tears it down.
+    current = [{ id: "Agents/uni", content: "role", metadata: { name: "uni" } }];
+    calls.deregistered.length = 0;
+    calls.removed.length = 0;
+    await reg.loadAll();
+    expect(calls.deregistered).toContain("researcher");
+    expect(calls.removed).toContain("researcher");
   });
 
   test("reload for an unknown def-vault is a safe skip", async () => {

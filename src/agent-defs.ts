@@ -1074,6 +1074,8 @@ export class AgentDefRegistry {
       // (re)instantiate what we got — instantiate only adds/updates, never tears down.
       // Practically unreachable at today's agent counts; the guard makes the teardown safe
       // by construction.
+      // `< cap` ⇒ the result fit on one page → it cannot be truncated; `>= cap` is the
+      // (possibly-)truncated case the `else` defers.
       const confident = notes.length < DEF_LIST_LIMIT;
       if (confident) {
         // Detect removed defs by diffing the prior seen set (noteId→name) against the ids

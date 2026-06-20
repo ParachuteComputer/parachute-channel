@@ -203,10 +203,15 @@ export interface CallbackMeta {
   /** The channel/def whose turn just finished (the recipient) — provenance for the sender. */
   source_channel: string;
   /**
-   * The recipient's `#agent/thread` note path/leaf for THIS turn — the orchestrator
-   * pulls the full thread record (input/output/usage) from here. The per-turn thread id
-   * the drain minted (multi-threaded: the per-fire note leaf; single-threaded: the
-   * per-turn correlation id).
+   * The per-turn thread id the drain minted. RESOLVABILITY DIFFERS BY MODE:
+   *  - multi-threaded: this IS the per-fire note's leaf — the orchestrator can pull the
+   *    thread note at `Threads/<channel>/<source_thread>`.
+   *  - single-threaded: this is a per-turn CORRELATION id, NOT the note leaf (the
+   *    single-threaded note lives at the deterministic `Threads/<channel>/<name>`), so it
+   *    is NOT directly resolvable. Use `source_message` as the reliable pull-link for a
+   *    single-threaded recipient. Making this a resolvable thread id for both modes
+   *    (widen the writeThread seam to return the written note id) is tracked as a
+   *    follow-up (parachute-agent#124).
    */
   source_thread: string;
   /**

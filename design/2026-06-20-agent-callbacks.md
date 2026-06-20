@@ -74,7 +74,7 @@ delivers a callback via the new `WriteCallback` seam:
   | `callback` | `"true"` — distinguishes a callback inbound from an ordinary one |
   | `status` | `"ok"` \| `"error"` |
   | `source_channel` | the recipient channel/def whose turn finished |
-  | `source_thread` | the recipient's per-turn `#agent/thread` id (the orchestrator pulls the full thread record from here) |
+  | `source_thread` | the recipient's per-turn `#agent/thread` id. Resolvable for multi-threaded (the per-fire note leaf); for single-threaded it's a per-turn correlation id, NOT the note leaf — use `source_message` as the reliable pull-link there (resolvable `source_thread` for both modes is tracked in #124) |
   | `source_message` | the recipient's OUTBOUND reply note id, when a reply was produced + delivered (absent on an error / empty turn) |
   | `correlation_id` | echoed from the request when present |
   | `delegation_depth` | incoming depth + 1 |
@@ -135,6 +135,8 @@ order with `maxConcurrent === 1`.
 - Multi-threaded `source_thread` is the per-fire note leaf (an exact link); single-threaded
   `source_thread` is the per-turn correlation id (the deterministic thread note's leaf is the
   def name — the same single-threaded outbound→note-by-stable-path linkage gap that already
-  exists for `metadata.thread`).
+  exists for `metadata.thread`). Making `source_thread` a resolvable note id for both modes
+  (widen the writeThread seam to return the written id) is tracked in **#124**; until then,
+  `source_message` is the reliable pull-link for single-threaded recipients.
 - `correlation_id` is opaque end-to-end; no daemon-side request/response registry (the
   orchestrator's own session memory matches replies to requests).

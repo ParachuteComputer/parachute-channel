@@ -284,6 +284,29 @@ export function contextFor(
         });
         return;
       }
+      // PENDING-INBOUND BUFFER (agent#121). No LIVE programmatic agent for this channel —
+      // but if the channel is EXPECTED to gain one (a def maps here; instantiation may be
+      // in flight, or a brief channel/agent desync), we must OWN the message, not drop it:
+      // the vault trigger acks success on our 200 and NEVER retries, so a silent drop is a
+      // PERMANENT loss (0 turns, 0 threads, no reply — the bug). Buffer it; `register()`
+      // replays the buffer in order once the agent is live. A genuinely UNKNOWN channel
+      // (nothing maps to it) returns "unknown": nothing to deliver to, so we log + fall
+      // through to the push path (which reaches no one) and still 200. We do NOT advance the
+      // delivery high-water-mark here (no real delivery happened; the durable note + the
+      // pending buffer / replay is the durability).
+      if (programmatic) {
+        const outcome = programmatic.queuePending(channel, {
+          content: msg.content,
+          ...(msg.meta?.note_id ? { inReplyTo: msg.meta.note_id } : {}),
+        });
+        if (outcome === "queued") return;
+        // outcome === "unknown" — not an expected programmatic channel. It may still be a
+        // genuine push/bridge channel (telegram, a connected session), so fall through to
+        // the normal SSE/MCP push below rather than dropping outright. If THAT also reaches
+        // no one (0 subscribers), the message is logged-as-undelivered by leaving the
+        // high-water-mark behind (the existing no-silent-loss behavior), and for a truly
+        // orphaned channel there is, by definition, nothing more we can do.
+      }
       // Route on the bound `channel`, NOT msg.channel — the transport's own
       // channel is authoritative. This makes it impossible for a transport to
       // emit onto another channel (closing a silent cross-channel-leak footgun)
@@ -423,6 +446,15 @@ export function buildInstantiateDeps(
 ): InstantiateDeps {
   return {
     ensureChannel: async (name, binding) => {
+      // EXPECT-BEFORE-LIVE (agent#121). Mark this channel EXPECTED to gain a programmatic
+      // agent BEFORE we bring the channel transport live — closing the desync window: once
+      // the channel is live the vault trigger can fire an inbound, but the agent isn't
+      // `register()`ed until `setupAndRegister` runs (a later step). An inbound landing in
+      // that window now QUEUES PENDING (owned, replayed on register) instead of dropping.
+      // Harmless for a `channel`-backend agent — its inbound is handled by the channelQueue
+      // routing fork first, so the expected mark is never consulted for it. The mark is
+      // cleared on register (the live index takes over) or on teardown (unexpectChannel).
+      programmatic.expectChannel(normalizeChannel(name).name);
       await addChannelLive(
         channels,
         registry,
@@ -458,8 +490,13 @@ export function buildInstantiateDeps(
     // deregister is a no-op (returns false) where it isn't registered. OR the two so
     // a reload/delete tears the agent down regardless of its backend.
     deregister: async (name) => {
+      // Capture the wake channel BEFORE deregister drops the indexes, so we can clear the
+      // EXPECTED mark + any stranded pending buffer for a genuinely-removed agent (agent#121
+      // teardown — a deleted def must not leave its channel marked expected forever).
+      const wakeChannel = programmatic.getByName(name)?.channel;
       const fromProgrammatic = await programmatic.deregister(name);
       const fromChannel = channelQueue.deregister(name);
+      if (wakeChannel) programmatic.unexpectChannel(wakeChannel);
       return fromProgrammatic || fromChannel;
     },
     removeChannel: async (name) => removeChannelLive(channels, name),
@@ -575,15 +612,22 @@ export function channelQueueStoreFor(
  * fork the conversation).
  */
 export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutbound {
-  return async (channel, reply, inReplyTo) => {
+  return async (channel, reply, inReplyTo, threadId) => {
     const ch = channels.get(channel);
     if (!ch) {
       throw new Error(`no live transport for channel "${channel}" — cannot post the reply`);
     }
+    // Carry the in-reply-to + the per-turn thread id through the transport's `meta` escape
+    // hatch. The vault transport stamps `meta.thread` into the outbound note's
+    // `metadata.thread` — the explicit definition→thread→message link the outbound note
+    // gets (multi-threaded: the per-fire note leaf; single-threaded: a per-turn id).
+    const meta: Record<string, string> = {};
+    if (inReplyTo) meta.in_reply_to = inReplyTo;
+    if (threadId) meta.thread = threadId;
     await ch.transport.reply({
       channel,
       text: reply,
-      ...(inReplyTo ? { meta: { in_reply_to: inReplyTo } } : {}),
+      ...(Object.keys(meta).length > 0 ? { meta } : {}),
     });
   };
 }
@@ -620,6 +664,15 @@ export function buildWriteThread(channels: Map<string, Channel>): WriteThread {
       started_at: thread.started_at,
       ended_at: thread.ended_at,
       ...(thread.usage ? { usage: thread.usage } : {}),
+      // Forward the per-turn thread id + same-turn flag + lifecycle phase to the transport.
+      // These are LOAD-BEARING (not optional decoration):
+      //  - threadId — multi-threaded targets the SAME per-fire note across the start-ensure,
+      //    the end-record, AND the outbound-failure re-record (else each mints a duplicate).
+      //  - sameTurn — the outbound-failure re-record keeps turn_count (no double-count).
+      //  - phase    — `start` (working-ensure: turn_count UNCHANGED) vs `end` (turn counted).
+      ...(thread.threadId ? { threadId: thread.threadId } : {}),
+      ...(thread.sameTurn ? { sameTurn: true } : {}),
+      ...(thread.phase ? { phase: thread.phase } : {}),
     });
   };
 }

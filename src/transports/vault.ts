@@ -296,18 +296,32 @@ function buildThreadSummaryBody(t: {
   name: string;
   mode: string;
   turnCount: number;
-  status: "ok" | "error";
+  status: "ok" | "error" | "working";
   lastTurnAt: string;
   input: string;
   output: string;
 }): string {
   const turns = t.turnCount === 1 ? "1 turn" : `${t.turnCount} turns`;
-  const auto = `${t.mode} thread for ${t.name} — ${turns}, last ${t.status} at ${t.lastTurnAt}.`;
-  const turnHeading = t.status === "ok" ? "Reply" : "Error";
   // `## Summary` is EARMARKED for a future summarizer agent — but v1 OVERWRITES it every
   // turn (this body is fully regenerated from metadata; `prior.content` is never read), so
   // it's a module-owned default for now, NOT a preserved slot (see the function doc).
   // The `## Latest turn` block + the metadata roll-up are always module-owned.
+  //
+  // WORKING (the thread-as-container start-ensure, before the turn finishes): show the input
+  // and a clear "awaiting reply" state — NEVER print a fake reply. The thread is visible the
+  // moment processing starts; the end-record overwrites this body with the real ok/error
+  // reply once the turn completes.
+  if (t.status === "working") {
+    const auto = `${t.mode} thread for ${t.name} — ${turns}, currently working (awaiting reply).`;
+    return (
+      `## Summary\n\n${auto}\n\n` +
+      `## Latest turn\n\n` +
+      `**Input:** ${t.input}\n\n` +
+      `**Status:** working — awaiting reply.\n`
+    );
+  }
+  const auto = `${t.mode} thread for ${t.name} — ${turns}, last ${t.status} at ${t.lastTurnAt}.`;
+  const turnHeading = t.status === "ok" ? "Reply" : "Error";
   return (
     `## Summary\n\n${auto}\n\n` +
     `## Latest turn\n\n` +
@@ -733,6 +747,13 @@ export class VaultTransport implements Transport {
     // Thread the reply to the inbound note id when the bridge passes it through.
     const inReplyTo = args.meta?.in_reply_to;
     if (inReplyTo) metadata.in_reply_to = inReplyTo;
+    // The explicit definition→thread→message link: stamp the outbound note with its thread
+    // id (the programmatic worker passes the per-turn thread id through `meta.thread`). For a
+    // multi-threaded turn this IS the per-fire `#agent/thread` note's leaf; for a
+    // single-threaded turn it's a per-turn correlation id. INBOUND-note stamping is deferred
+    // (those notes are written externally, before the turn knows its thread).
+    const threadId = args.meta?.thread;
+    if (threadId) metadata.thread = threadId;
 
     const res = await fetch(`${this.vaultUrl}/vault/${this.vault}/api/notes`, {
       method: "POST",
@@ -828,6 +849,7 @@ export class VaultTransport implements Transport {
     let priorOutputTokens = 0;
     let priorCostUsd = 0;
     let priorStartedAt: string | undefined;
+    let priorLastTurnAt: string | undefined;
     if (singleThreaded) {
       const prior = await this.readThreadNote(path);
       if (prior) {
@@ -838,17 +860,35 @@ export class VaultTransport implements Transport {
         if (typeof prior.metadata?.started_at === "string" && prior.metadata.started_at) {
           priorStartedAt = prior.metadata.started_at;
         }
+        if (typeof prior.metadata?.last_turn_at === "string" && prior.metadata.last_turn_at) {
+          priorLastTurnAt = prior.metadata.last_turn_at;
+        }
       }
     }
 
-    // A re-record of the SAME turn (`sameTurn`) keeps the existing count — the first record
-    // already counted this turn; a status flip (ok→error on outbound-delivery failure) must
-    // not double-count it. A normal turn increments. Multi-threaded is always 1.
-    const turnCount = singleThreaded ? (thread.sameTurn ? priorTurnCount : priorTurnCount + 1) : 1;
-    // `started_at` is set ONCE on create (preserve the prior on upsert); `last_turn_at`
-    // advances every turn.
+    // ── THREAD-AS-CONTAINER turn_count discipline (the no-double-count invariant) ─────────
+    // `phase: "start"` is the WORKING-ENSURE written BEFORE the turn — NO turn has completed
+    // yet, so it must NOT advance turn_count: single-threaded writes `turn_count = prior`
+    // (UNCHANGED), multi-threaded writes 0 (the per-fire note is being created mid-turn).
+    // `phase: "end"` (or absent — back-compat) is the FINAL record AFTER the turn, which is
+    // where the turn is COUNTED: single-threaded increments `prior + 1` (UNLESS `sameTurn`,
+    // the ok→error outbound-failure re-record, which keeps the already-counted value), and
+    // multi-threaded is 1 (one fire = one thread = one turn). So across the start+end pair a
+    // turn is counted EXACTLY ONCE (on `end`) — never double-counted.
+    const isStart = thread.phase === "start";
+    let turnCount: number;
+    if (isStart) {
+      turnCount = singleThreaded ? priorTurnCount : 0;
+    } else if (singleThreaded) {
+      turnCount = thread.sameTurn ? priorTurnCount : priorTurnCount + 1;
+    } else {
+      turnCount = 1;
+    }
+    // `started_at` is set ONCE on create (preserve the prior on upsert). `last_turn_at`
+    // advances only when a turn COMPLETES (the `end` write); a `start` working-ensure leaves
+    // it at the prior value (single) or empty (multi-create — no turn has completed yet).
     const startedAt = priorStartedAt ?? thread.started_at;
-    const lastTurnAt = thread.ended_at;
+    const lastTurnAt = isStart ? (priorLastTurnAt ?? "") : thread.ended_at;
 
     // Cumulative usage: single-threaded SUMS this turn into the prior totals; multi-threaded
     // carries just this turn's (one fire = one thread).
@@ -865,9 +905,12 @@ export class VaultTransport implements Transport {
       mode: thread.mode,
       status: thread.status,
       started_at: startedAt,
-      last_turn_at: lastTurnAt,
       turn_count: String(turnCount),
     };
+    // `last_turn_at` is only meaningful once a turn has COMPLETED. A `start` working-ensure on
+    // a brand-new thread (no prior turn) has no last-turn time yet → omit it rather than
+    // stamp an empty string (which would index as a present-but-blank value).
+    if (lastTurnAt) metadata.last_turn_at = lastTurnAt;
     if (thread.definition) metadata.definition = thread.definition;
     // Usage is always present once a turn carried it OR we accumulated any — emit the
     // running totals so a query sees cumulative cost for the thread.

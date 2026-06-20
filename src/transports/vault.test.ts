@@ -131,6 +131,23 @@ describe("VaultTransport — reply (outbound note write)", () => {
     expect(captured!.in_reply_to).toBe("inbound-99");
   });
 
+  test("reply() stamps metadata.thread from args.meta.thread (the definition→thread→message link)", async () => {
+    let captured: Record<string, string> | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith("/api/notes")) {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string> };
+        captured = body.metadata;
+      }
+      return new Response(JSON.stringify({ id: "n3" }), { status: 201 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.reply({ channel: "eng", text: "re", meta: { in_reply_to: "inbound-99", thread: "fire-7" } });
+    expect(captured!.thread).toBe("fire-7");
+    expect(captured!.in_reply_to).toBe("inbound-99");
+  });
+
   test("reply() falls back to the proposed id when the response has no id", async () => {
     globalThis.fetch = (async () =>
       new Response("", { status: 201 })) as unknown as typeof fetch;
@@ -603,6 +620,135 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
         ended_at: "2026-06-18T07:00:01.000Z",
       }),
     ).rejects.toThrow(/write thread note failed/);
+  });
+
+  // ── Thread-as-container: the phase:"start" working-ensure (Part B) ────────────────────
+  // A turn now writes TWO thread notes: a `phase:"start"` working-ensure BEFORE the turn
+  // (status:working, NO reply, turn_count UNCHANGED) and a `phase:"end"` final record after
+  // (status:ok/error, turn counted). turn_count must be counted EXACTLY ONCE — on `end` —
+  // never double-counted across the start+end pair. These assert that at the transport.
+
+  test("SINGLE-THREADED start→end does NOT double-count: turn 1 start writes turn_count 0 (working), end writes 1", async () => {
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    // START-ENSURE (before the turn): status working, turn_count UNCHANGED (prior 0 → 0).
+    await t.writeThread({
+      channel: "eng", name: "eng", mode: "single-threaded", status: "working",
+      input: "turn one", output: "", started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:00.000Z", threadId: "t1", phase: "start",
+    });
+    expect(stored!.metadata.status).toBe("working");
+    expect(stored!.metadata.turn_count).toBe("0"); // NOT counted yet.
+    // The working body shows the input + an awaiting-reply state — NO fake reply.
+    expect(stored!.content).toContain("turn one");
+    expect(stored!.content).toContain("working");
+    expect(stored!.content).not.toContain("**Reply:**");
+    // last_turn_at is not stamped on a brand-new working-ensure (no turn completed yet).
+    expect(stored!.metadata.last_turn_at).toBeUndefined();
+
+    // END (after the turn): status ok, turn_count now 1 (counted exactly once).
+    await t.writeThread({
+      channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
+      input: "turn one", output: "reply one", started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z", threadId: "t1", phase: "end",
+    });
+    expect(stored!.metadata.status).toBe("ok");
+    expect(stored!.metadata.turn_count).toBe("1"); // counted ONCE across start+end.
+    expect(stored!.metadata.last_turn_at).toBe("2026-06-18T07:00:05.000Z");
+    expect(stored!.content).toContain("reply one");
+  });
+
+  test("SINGLE-THREADED turn 2 start preserves prior count (1), end increments to 2 — start never double-counts", async () => {
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const tn = (status: "working" | "ok", input: string, output: string, ended: string, phase: "start" | "end") => ({
+      channel: "eng", name: "eng", mode: "single-threaded" as const, status,
+      input, output, started_at: "2026-06-18T07:00:00.000Z", ended_at: ended, phase,
+    });
+
+    // Turn 1 — start (0) then end (1).
+    await t.writeThread(tn("working", "one", "", "2026-06-18T07:00:00.000Z", "start"));
+    expect(stored!.metadata.turn_count).toBe("0");
+    await t.writeThread(tn("ok", "one", "reply one", "2026-06-18T07:00:05.000Z", "end"));
+    expect(stored!.metadata.turn_count).toBe("1");
+
+    // Turn 2 — start reads prior=1 → writes 1 (UNCHANGED, the no-double-count invariant),
+    // then end increments to 2. The start working-ensure must NOT bump the count.
+    await t.writeThread(tn("working", "two", "", "2026-06-18T08:00:00.000Z", "start"));
+    expect(stored!.metadata.turn_count).toBe("1"); // start preserves the count.
+    expect(stored!.metadata.status).toBe("working");
+    expect(stored!.metadata.started_at).toBe("2026-06-18T07:00:00.000Z"); // first turn's, preserved.
+    await t.writeThread(tn("ok", "two", "reply two", "2026-06-18T08:00:09.000Z", "end"));
+    expect(stored!.metadata.turn_count).toBe("2"); // counted twice total — once per turn.
+    expect(stored!.metadata.last_turn_at).toBe("2026-06-18T08:00:09.000Z");
+  });
+
+  test("MULTI-THREADED start writes turn_count 0 (working) at the per-fire path; end writes 1 at the SAME path", async () => {
+    const patches: { path: string; metadata: Record<string, string>; content: string }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as {
+          path: string; metadata: Record<string, string>; content: string;
+        };
+        patches.push({ path: decodeURIComponent(u), metadata: body.metadata, content: body.content });
+        return new Response(JSON.stringify({ id: "x" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const base = {
+      channel: "eng", name: "d", mode: "multi-threaded" as const, input: "q",
+      started_at: "2026-06-18T07:00:00.000Z", threadId: "fire-1",
+    };
+    // START — working, turn_count 0, the per-fire note created.
+    await t.writeThread({ ...base, status: "working", output: "", ended_at: "2026-06-18T07:00:00.000Z", phase: "start" });
+    // END — ok, turn_count 1, the SAME per-fire path (same threadId).
+    await t.writeThread({ ...base, status: "ok", output: "a", ended_at: "2026-06-18T07:00:05.000Z", phase: "end" });
+
+    expect(patches).toHaveLength(2);
+    expect(patches[0]!.metadata.status).toBe("working");
+    expect(patches[0]!.metadata.turn_count).toBe("0");
+    expect(patches[1]!.metadata.status).toBe("ok");
+    expect(patches[1]!.metadata.turn_count).toBe("1");
+    // Both writes hit the SAME per-fire path (the reused threadId) — start updates, not dupes.
+    expect(patches[0]!.path).toContain("/Threads/eng/fire-1");
+    expect(patches[1]!.path).toContain("/Threads/eng/fire-1");
+    // The working body shows no fake reply; the end body carries the real reply.
+    expect(patches[0]!.content).not.toContain("**Reply:**");
+    expect(patches[1]!.content).toContain("a");
   });
 });
 

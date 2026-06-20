@@ -404,9 +404,22 @@ class ModeFakeBackend implements AgentBackend {
 }
 
 const noopOutbound: WriteOutbound = async () => {};
-function threadRec(): { threads: ThreadNote[]; fn: WriteThread } {
+// A thread recorder that splits the thread-as-container start-ensure (phase:start) from the
+// final record (phase:end), so a test asserts the FINAL turn record without counting the
+// working-ensure the registry now writes before every turn.
+function threadRec(): {
+  threads: ThreadNote[];
+  ends: () => ThreadNote[];
+  starts: () => ThreadNote[];
+  fn: WriteThread;
+} {
   const threads: ThreadNote[] = [];
-  return { threads, fn: async (t) => void threads.push(t) };
+  return {
+    threads,
+    ends: () => threads.filter((t) => t.phase !== "start"),
+    starts: () => threads.filter((t) => t.phase === "start"),
+    fn: async (t) => void threads.push(t),
+  };
 }
 async function flushTurns(pred: () => boolean, tries = 200): Promise<void> {
   for (let i = 0; i < tries && !pred(); i++) await new Promise<void>((r) => setTimeout(r, 1));
@@ -438,15 +451,17 @@ describe("Runner — a scheduled fire honors the def's mode", () => {
     // runNow needs the job in the store; drive `fire` directly (the runner's fire is
     // what we're testing routes through the mode-aware deliver).
     await r["fire"](job({ id: "digest-job", channel: "digest", message: "run the digest" }));
-    await flushTurns(() => threads.threads.length === 1);
+    await flushTurns(() => threads.ends().length === 1);
 
     // Fresh-per-fire: the scheduled fire did NOT resume the chat thread.
     expect(backend.resumed.get("digest")).toBe(false);
-    // …and it materialized one thread note per fire (the multi-threaded record).
-    expect(threads.threads).toHaveLength(1);
-    expect(threads.threads[0]!.mode).toBe("multi-threaded");
-    expect(threads.threads[0]!.status).toBe("ok");
-    expect(threads.threads[0]!.input).toBe("run the digest");
+    // …and it materialized one FINAL thread note per fire (the multi-threaded record), after a
+    // working-ensure (thread-as-container — the thread is visible the moment the fire starts).
+    expect(threads.starts()).toHaveLength(1);
+    expect(threads.ends()).toHaveLength(1);
+    expect(threads.ends()[0]!.mode).toBe("multi-threaded");
+    expect(threads.ends()[0]!.status).toBe("ok");
+    expect(threads.ends()[0]!.input).toBe("run the digest");
   });
 
   test("REGRESSION: a SINGLE-THREADED def's scheduled fire RESUMES the thread + materializes ONE thread note", async () => {
@@ -459,14 +474,15 @@ describe("Runner — a scheduled fire honors the def's mode", () => {
 
     const r = wireRunner(reg);
     await r["fire"](job({ id: "uni-job", channel: "uni-dev", message: "daily check-in" }));
-    await flushTurns(() => threads.threads.length === 1);
+    await flushTurns(() => threads.ends().length === 1);
 
     // A single-threaded def's scheduled fire RESUMES the existing chat thread (today's behavior).
     expect(backend.resumed.get("uni-dev")).toBe(true);
-    // …and materializes ONE thread note (the unified model — single-threaded now writes a
-    // thread note too, named after the def, holding a rolling summary).
-    expect(threads.threads).toHaveLength(1);
-    expect(threads.threads[0]!.mode).toBe("single-threaded");
-    expect(threads.threads[0]!.name).toBe("uni-dev");
+    // …and materializes ONE FINAL thread note (the unified model — single-threaded now writes a
+    // thread note too, named after the def, holding a rolling summary), after a working-ensure.
+    expect(threads.starts()).toHaveLength(1);
+    expect(threads.ends()).toHaveLength(1);
+    expect(threads.ends()[0]!.mode).toBe("single-threaded");
+    expect(threads.ends()[0]!.name).toBe("uni-dev");
   });
 });

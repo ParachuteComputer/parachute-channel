@@ -330,6 +330,84 @@ describe("inbound for a programmatic channel → deliver → outbound note", () 
   });
 });
 
+describe("inbound for an EXPECTED-but-not-yet-registered channel → queued pending, not dropped (agent#121)", () => {
+  async function inbound(base: string, channel: string, noteId: string, content: string) {
+    return fetch(`${base}/api/vault/inbound`, {
+      method: "POST",
+      headers: { ...adminAuth, "content-type": "application/json" },
+      body: JSON.stringify({
+        note: {
+          id: noteId,
+          content,
+          tags: ["#agent/message", "#agent/message/inbound"],
+          metadata: { channel, direction: "inbound", sender: "aaron", ts: "2026-06-16T00:00:01Z" },
+        },
+      }),
+    });
+  }
+
+  test("the inbound handler 200s AND the message is buffered pending (not dropped); register() replays it", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    // The desync: the channel is LIVE + EXPECTED (the def-instantiation path marked it) but
+    // the programmatic agent is NOT yet registered. Before the fix, emit() would fall through
+    // to a 0-subscriber push and DROP the message (the vault 200s + never retries → lost).
+    programmatic.expectChannel("eng");
+    expect(programmatic.hasChannel("eng")).toBe(false);
+
+    const registry = new ClientRegistry();
+    const deliveryState = new DeliveryState();
+    const channels = new Map<string, Channel>([
+      ["eng", vaultChannel("eng", registry, deliveryState, programmatic)],
+    ]);
+    const { srv, base } = buildServer({ channels, programmatic, deliveryState });
+    try {
+      // Inbound arrives BEFORE the agent is live → handler still 200s (the daemon now OWNS
+      // the message; a 4xx/5xx would strand it in the vault's _pending_at forever).
+      const res = await inbound(base, "eng", "note-1", "early message");
+      expect(res.status).toBe(200);
+      // It was buffered pending — NOT delivered to the (absent) worker, NOT dropped.
+      await until(() => programmatic.pendingCount("eng") === 1);
+      expect(programmatic.pendingCount("eng")).toBe(1);
+      expect(backend.calls).toHaveLength(0);
+
+      // The agent registers (instantiation completes) → the pending buffer replays.
+      await programmatic.register({ name: "eng", channels: ["eng"], backend: "programmatic" });
+      await until(() => rec.calls.length === 1);
+      expect(backend.calls).toEqual([{ channel: "eng", message: "early message" }]);
+      expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:early message", inReplyTo: "note-1" }]);
+      expect(programmatic.pendingCount("eng")).toBe(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("an inbound for an UNEXPECTED channel still 200s (no 4xx that would strand the vault trigger)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    // NOT expected, NOT registered — nothing maps to it. The handler must still 200 (a non-2xx
+    // would leave the vault webhook stuck in _pending_at), even though there's nothing to run.
+    const registry = new ClientRegistry();
+    const deliveryState = new DeliveryState();
+    const channels = new Map<string, Channel>([
+      ["orphan", vaultChannel("orphan", registry, deliveryState, programmatic)],
+    ]);
+    const { srv, base } = buildServer({ channels, programmatic, deliveryState });
+    try {
+      const res = await inbound(base, "orphan", "note-1", "to nobody");
+      expect(res.status).toBe(200);
+      await new Promise<void>((r) => setTimeout(r, 5));
+      // Nothing queued (not expected), nothing ran — logged + dropped, but never a 4xx.
+      expect(programmatic.pendingCount("orphan")).toBe(0);
+      expect(backend.calls).toHaveLength(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+});
+
 /** A live channels map containing `names` as keys — only membership matters to the
  *  boot re-register channel-existence guard (`channels.has(wakeChannel)`), so the
  *  transport is an inert stub. Mirrors a channels.json-derived map at the keys level. */

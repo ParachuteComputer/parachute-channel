@@ -57,16 +57,38 @@ export interface ThreadRecord {
   definition?: string;
   /** The mode the turn ran under — governs thread identity + whether the note upserts. */
   mode: AgentMode;
-  /** Outcome of THIS turn — `ok` (success) or `error` (the turn failed). */
-  status: "ok" | "error";
+  /**
+   * Outcome / lifecycle state of the thread after THIS write:
+   *  - `working` — the turn has STARTED but not finished (the thread-as-container
+   *    start-ensure, written BEFORE `deliver()`): the input is shown, NO reply yet.
+   *    Only valid with `phase: "start"`.
+   *  - `ok` — the turn finished successfully (the reply landed in `output`).
+   *  - `error` — the turn failed (the reason is in `output`).
+   */
+  status: "ok" | "error" | "working";
   /** The inbound text the turn was handed (the `-p` prompt). */
   input: string;
-  /** The reply text on success, or the failure reason on error. */
+  /** The reply text on success, the failure reason on error, or "" while `working`. */
   output: string;
   /** ISO timestamp the turn started (single-threaded preserves the FIRST turn's). */
   started_at: string;
-  /** ISO timestamp the turn ended (becomes the thread's `last_turn_at`). */
+  /** ISO timestamp the turn ended (becomes the thread's `last_turn_at`; not advanced on a start-ensure). */
   ended_at: string;
+  /**
+   * The LIFECYCLE PHASE of this write — the thread-as-container model (`definition ->
+   * thread -> message`):
+   *  - `"start"` — the WORKING-ENSURE, written BEFORE the turn runs. The thread note is
+   *    materialized in a `working` state (input shown, no reply). It does NOT count a
+   *    turn — single-threaded writes `turn_count = prior` (UNCHANGED) and does NOT
+   *    advance `last_turn_at` (no turn completed yet). Idempotent-upsert for
+   *    single-threaded; CREATE for multi-threaded (the per-fire note).
+   *  - `"end"` (DEFAULT when absent — back-compat) — the FINAL record, written AFTER the
+   *    turn. Single-threaded increments `turn_count` (unless `sameTurn`) and advances
+   *    `last_turn_at`; this is exactly the pre-thread-as-container behavior.
+   * So `turn_count` is counted EXACTLY ONCE per turn, on the `end` write — never
+   * double-counted across the start+end pair.
+   */
+  phase?: "start" | "end";
   /** Optional token/cost usage for this turn (single-threaded accumulates into the note). */
   usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
   /**

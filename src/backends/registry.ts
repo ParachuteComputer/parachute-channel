@@ -81,6 +81,15 @@ export type WriteOutbound = (
   channel: string,
   reply: string,
   inReplyTo?: string,
+  /**
+   * The per-turn thread id this reply belongs to — the explicit definition→thread→message
+   * link the outbound note carries (stamped into `metadata.thread`). For multi-threaded it
+   * IS the per-fire thread note's leaf (an exact link); for single-threaded it's a per-turn
+   * correlation id (the note's stable deterministic leaf is the def name — single-threaded
+   * outbound→note linkage by the stable path is a follow-up). INBOUND-note stamping is
+   * deferred (those notes are externally written; see the PR notes).
+   */
+  threadId?: string,
 ) => Promise<void>;
 
 /**
@@ -102,13 +111,17 @@ export interface ThreadNote {
   definition?: string;
   /** The mode the turn ran under — governs thread identity + whether the note upserts. */
   mode: AgentMode;
-  /** Outcome — `ok` (success) or `error` (the turn failed). */
-  status: "ok" | "error";
+  /**
+   * Outcome / lifecycle state after THIS write — `working` (the start-ensure, written
+   * BEFORE the turn: input shown, no reply yet), `ok` (success), or `error` (failed).
+   * `working` is only valid alongside `phase: "start"`.
+   */
+  status: "ok" | "error" | "working";
   /** The inbound text handed to the turn (the `-p` prompt). */
   input: string;
-  /** The reply on success, or the failure reason on error. */
+  /** The reply on success, the failure reason on error, or "" while `working`. */
   output: string;
-  /** ISO start/end of the turn. */
+  /** ISO start/end of the turn (a start-ensure does not advance the thread's last_turn_at). */
   started_at: string;
   ended_at: string;
   /** Optional token/cost usage for observability. */
@@ -124,6 +137,13 @@ export interface ThreadNote {
    * counted by the first record); no effect on multi-threaded.
    */
   sameTurn?: boolean;
+  /**
+   * The lifecycle PHASE of this write (thread-as-container). `"start"` = the WORKING-ENSURE
+   * before the turn (status `working`, turn_count UNCHANGED — no turn completed yet);
+   * `"end"` (DEFAULT when absent) = the final record after the turn (turn_count increments
+   * on the `end` write). So a turn is counted EXACTLY ONCE — on `end`, never on `start`.
+   */
+  phase?: "start" | "end";
 }
 
 /**
@@ -136,6 +156,15 @@ export interface ThreadNote {
  * the registry — when unwired (no vault-backed channel), a turn still runs, just no note.
  */
 export type WriteThread = (thread: ThreadNote) => Promise<void>;
+
+/**
+ * Cap on the per-channel PENDING-INBOUND queue (the agent#121 pre-registration buffer).
+ * A buffer that grows without bound is a memory-leak / DoS footgun if a channel's agent
+ * never comes up; past the cap the OLDEST pending message is dropped (FIFO eviction) with
+ * a loud log — bounded loss is better than unbounded growth, and the durable inbound notes
+ * still exist in the vault for the agent to re-read once it's live.
+ */
+export const PENDING_INBOUND_CAP = 50;
 
 /** How many times the outbound write is RETRIED on a transient failure (agent — PR #3
  *  FIX 1) before giving up. Total attempts = 1 + this. */
@@ -212,6 +241,26 @@ export class ProgrammaticAgentRegistry {
   private readonly queues = new Map<string, QueuedMessage[]>();
   /** channel → the in-flight drain promise (its presence == a worker is running). */
   private readonly draining = new Map<string, Promise<void>>();
+  /**
+   * channel → FIFO queue of PENDING-INBOUND messages that arrived BEFORE a live
+   * programmatic agent was registered for the channel (the agent#121 fix). The daemon
+   * OWNS these — it must never drop an inbound it can't yet process (the vault trigger
+   * acks success on the daemon's 200 and never retries, so a drop is permanent). On
+   * {@link register} the channel's pending queue is DRAINED into the normal {@link
+   * enqueue} path, so the queued turns run in arrival order once the agent is live.
+   * IN-MEMORY only (v1): a daemon restart loses pending, which is fine — the durable
+   * inbound notes still exist in the vault and `loadAll` + the 60s def-poll reconverge.
+   */
+  private readonly pending = new Map<string, QueuedMessage[]>();
+  /**
+   * Channels EXPECTED to gain a live programmatic agent (a def maps here / the
+   * instantiate path has started bringing one up) — the gate for {@link queuePending}.
+   * Only an EXPECTED channel queues a pre-registration inbound; a genuinely unknown
+   * channel (nothing maps to it) is logged + dropped (there's nothing to deliver to).
+   * Marked by {@link expectChannel} (the def-instantiation path) and by {@link register}
+   * itself; cleared by {@link unexpectChannel} (deregister/teardown).
+   */
+  private readonly expectedChannels = new Set<string>();
 
   private readonly backend: AgentBackend;
   private readonly writeOutbound: WriteOutbound;
@@ -334,7 +383,102 @@ export class ProgrammaticAgentRegistry {
     };
     this.byChannel.set(channel, handle);
     this.nameToChannel.set(spec.name, channel);
+    // The channel now has a live agent — it's no longer merely "expected" (the gate that
+    // let pre-registration inbound queue pending); the live byChannel index is the truth now.
+    this.expectedChannels.delete(channel);
+    // REPLAY-ON-REGISTER (agent#121): drain any inbound that arrived BEFORE this agent was
+    // live — they were buffered in the pending queue (never dropped). Feed them through the
+    // NORMAL enqueue path, in arrival order (FIFO), so the queued turns run exactly as if
+    // they'd arrived after registration. enqueue() requires the channel to be in byChannel,
+    // which it now is. Do this AFTER the indexes are set so enqueue routes correctly.
+    this.drainPending(channel);
     return handle;
+  }
+
+  /**
+   * Mark a channel as EXPECTED to gain a live programmatic agent — the gate that lets an
+   * inbound arriving BEFORE registration be QUEUED PENDING instead of dropped (agent#121).
+   * The def-instantiation path calls this BEFORE it brings the channel + agent up, so the
+   * narrow desync window (channel live, agent not yet registered) buffers rather than loses.
+   * Idempotent. {@link register} also marks-then-clears it; {@link unexpectChannel} clears it
+   * on teardown.
+   */
+  expectChannel(channel: string): void {
+    this.expectedChannels.add(channel);
+  }
+
+  /**
+   * Drop a channel's EXPECTED mark + any buffered pending inbound — called on teardown
+   * (deregister) of an agent that will NOT come back, so a stale def can't leave inbound
+   * stranded in the pending buffer forever. (deregister of a still-expected agent that WILL
+   * re-register should NOT call this — only a genuine removal.)
+   */
+  unexpectChannel(channel: string): void {
+    this.expectedChannels.delete(channel);
+    this.pending.delete(channel);
+  }
+
+  /**
+   * QUEUE an inbound that arrived before a live programmatic agent exists for the channel
+   * (agent#121). Returns:
+   *  - `"queued"`  — the channel is EXPECTED (a def maps here / instantiation in flight); the
+   *                  message is buffered (FIFO, capped at {@link PENDING_INBOUND_CAP}) and
+   *                  will replay on {@link register}. The daemon now OWNS it (never dropped).
+   *  - `"unknown"` — nothing maps to this channel (not expected, not registered): there is
+   *                  nothing to deliver to, so the caller logs + drops (still 200 — the vault
+   *                  must not retry into a permanent `_pending_at` stall).
+   *
+   * NOTE: a channel with a LIVE agent never reaches here — {@link enqueue} handles it. This is
+   * strictly the pre-registration / desync buffer.
+   */
+  queuePending(channel: string, msg: QueuedMessage): "queued" | "unknown" {
+    if (!this.expectedChannels.has(channel)) return "unknown";
+    const queue = this.pending.get(channel) ?? [];
+    queue.push(msg);
+    // Bounded buffer: past the cap, evict the OLDEST (FIFO) so we keep the most recent
+    // context and never grow unbounded. Loud log — a capped pending queue means an agent
+    // isn't coming up in time (a real operational signal), and the dropped message is still
+    // durable in the vault for the agent to re-read once live.
+    if (queue.length > PENDING_INBOUND_CAP) {
+      queue.shift();
+      console.warn(
+        `parachute-agent: pending-inbound queue for channel "${channel}" hit the cap ` +
+          `(${PENDING_INBOUND_CAP}) — dropped the oldest buffered message (still durable in ` +
+          `the vault). The programmatic agent for this channel is not coming up in time.`,
+      );
+    }
+    this.pending.set(channel, queue);
+    return "queued";
+  }
+
+  /**
+   * Drain a channel's PENDING-INBOUND buffer into the live serial queue — called by
+   * {@link register} once the agent is live. FIFO: the oldest pending inbound is enqueued
+   * first, so the buffered turns run in arrival order. A no-op when the buffer is empty.
+   */
+  private drainPending(channel: string): void {
+    const buffered = this.pending.get(channel);
+    if (!buffered || buffered.length === 0) return;
+    this.pending.delete(channel);
+    console.log(
+      `parachute-agent: replaying ${buffered.length} pending inbound message(s) for ` +
+        `channel "${channel}" now that its programmatic agent is registered.`,
+    );
+    for (const msg of buffered) {
+      // enqueue() routes to the serial worker (the channel is now in byChannel). FIFO order
+      // is preserved by iterating the buffer oldest-first.
+      this.enqueue(channel, msg);
+    }
+  }
+
+  /** How many inbound are buffered pending for a channel (tests + /health observability). */
+  pendingCount(channel: string): number {
+    return this.pending.get(channel)?.length ?? 0;
+  }
+
+  /** Is a channel currently marked EXPECTED (the pending-queue gate)? (tests) */
+  isExpected(channel: string): boolean {
+    return this.expectedChannels.has(channel);
   }
 
   /**
@@ -447,6 +591,25 @@ export class ProgrammaticAgentRegistry {
       // threaded ignores it (deterministic name leaf). One uuid per turn.
       const turnThreadId = crypto.randomUUID();
 
+      // ── THREAD-AS-CONTAINER (the user's model: definition -> thread -> message). ENSURE
+      // the thread note in a `working` state BEFORE the turn runs, so the thread is visible
+      // the moment processing starts (status `working` → `ok`/`error`), not only as a
+      // by-product of a completed turn. The SAME per-turn thread id ties this start-ensure
+      // to the end-record below: single-threaded UPSERTS its deterministic note (and the
+      // end-record overwrites it `working` → `ok`/`error`); multi-threaded CREATES the
+      // per-fire note (and the end-record updates the SAME note via `turnThreadId`).
+      //
+      // turn_count is NOT touched here. `phase: "start"` tells the transport to write
+      // `turn_count = prior` (UNCHANGED — no turn has completed) and NOT advance
+      // `last_turn_at`. The turn is counted EXACTLY ONCE, on the `end` record below — so
+      // start+end never double-count. Best-effort: a start-ensure write failure is logged
+      // (inside recordThread) and the turn STILL runs — a missing/stale working note must
+      // never strand the queue or skip the turn.
+      await this.recordThread(handle, msg, "working", "", startedAt, undefined, {
+        threadId: turnThreadId,
+        phase: "start",
+      });
+
       let result;
       try {
         // Forward each interim event to the streaming-view sink (keyed by channel)
@@ -468,7 +631,10 @@ export class ProgrammaticAgentRegistry {
         // thread note captures the turn outcome, so a failed turn is still a queryable
         // `status:error` (single-threaded upserts the rolling thread; multi-threaded writes
         // a per-fire note).
-        await this.recordThread(handle, msg, "error", reason, startedAt, undefined, { threadId: turnThreadId });
+        await this.recordThread(handle, msg, "error", reason, startedAt, undefined, {
+          threadId: turnThreadId,
+          phase: "end",
+        });
         this.emitTurnEvent(channel, { kind: "error", error: reason });
         continue;
       }
@@ -483,7 +649,10 @@ export class ProgrammaticAgentRegistry {
         // BOTH modes record the failed turn (status:error) on the thread note so a failure
         // always leaves a queryable trace (single-threaded upserts the rolling thread,
         // marking it errored; multi-threaded writes a per-fire status:error note).
-        await this.recordThread(handle, msg, "error", result.error, startedAt, undefined, { threadId: turnThreadId });
+        await this.recordThread(handle, msg, "error", result.error, startedAt, undefined, {
+          threadId: turnThreadId,
+          phase: "end",
+        });
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
         continue;
       }
@@ -496,14 +665,22 @@ export class ProgrammaticAgentRegistry {
       // multi-threaded writes the per-fire note. Best-effort: a thread-note failure is
       // logged + the turn still resolves (we never re-run a `claude -p` turn — that would
       // burn quota for a duplicate).
-      await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage, { threadId: turnThreadId });
+      await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage, {
+        threadId: turnThreadId,
+        phase: "end",
+      });
 
       // The outbound reply — the channel-transcript delivery (the chat bubble). It is
       // ADDITIVE to the primary thread-note record already written above (for BOTH modes).
       // Empty reply → NO note (reviewer contract — `reply` can be ""): a turn that produced
       // no text (e.g. tool-only work) leaves the chat clean.
       if (result.reply && result.reply.length > 0) {
-        const delivered = await this.deliverOutboundWithRetry(channel, result.reply, msg.inReplyTo);
+        const delivered = await this.deliverOutboundWithRetry(
+          channel,
+          result.reply,
+          msg.inReplyTo,
+          turnThreadId,
+        );
         if (!delivered.ok) {
           // FIX 1 (PR #3) — the SCARY one. The reply was PRODUCED but, after the bounded
           // retry, still NOT persisted to the transcript (a persistent vault 5xx / network
@@ -532,7 +709,7 @@ export class ProgrammaticAgentRegistry {
               `Undelivered reply text: ${result.reply}`,
             startedAt,
             result.usage,
-            { threadId: turnThreadId, sameTurn: true },
+            { threadId: turnThreadId, sameTurn: true, phase: "end" },
           );
           this.emitTurnEvent(channel, {
             kind: "error",
@@ -565,11 +742,11 @@ export class ProgrammaticAgentRegistry {
   private async recordThread(
     handle: ProgrammaticAgentHandle,
     msg: QueuedMessage,
-    status: "ok" | "error",
+    status: "ok" | "error" | "working",
     output: string,
     startedAt: string,
     usage: ThreadNote["usage"],
-    opts: { threadId?: string; sameTurn?: boolean } = {},
+    opts: { threadId?: string; sameTurn?: boolean; phase?: "start" | "end" } = {},
   ): Promise<void> {
     if (!this.writeThread) return;
     const thread: ThreadNote = {
@@ -588,6 +765,9 @@ export class ProgrammaticAgentRegistry {
       // double-counting turn_count (single).
       ...(opts.threadId ? { threadId: opts.threadId } : {}),
       ...(opts.sameTurn ? { sameTurn: true } : {}),
+      // The lifecycle phase — `start` (working-ensure, no turn counted) vs `end` (final
+      // record, turn counted). Absent → `end` at the transport (back-compat).
+      ...(opts.phase ? { phase: opts.phase } : {}),
     };
     try {
       await this.writeThread(thread);
@@ -616,11 +796,12 @@ export class ProgrammaticAgentRegistry {
     channel: string,
     reply: string,
     inReplyTo?: string,
+    threadId?: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     let lastError = "";
     for (let attempt = 0; attempt <= OUTBOUND_MAX_RETRIES; attempt++) {
       try {
-        await this.writeOutbound(channel, reply, inReplyTo);
+        await this.writeOutbound(channel, reply, inReplyTo, threadId);
         return { ok: true };
       } catch (err) {
         lastError = (err as Error).message;

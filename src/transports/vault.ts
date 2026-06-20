@@ -65,6 +65,7 @@ import type {
   TransportContext,
   ReplyArgs,
   ThreadRecord,
+  CallbackMetadata,
 } from "../transport.ts";
 
 /** Config for a vault transport instance (from the channel registry entry). */
@@ -1177,7 +1178,18 @@ export class VaultTransport implements Transport {
    * Returns the created note id so the chat can dedup its optimistic local echo
    * against the same id when the note round-trips through the next poll.
    */
-  async writeInbound(text: string, sender?: string): Promise<{ id: string }> {
+  async writeInbound(
+    text: string,
+    sender?: string,
+    /**
+     * Extra metadata to STAMP onto the inbound note (e.g. the agent-to-agent callback
+     * contract). Merged AFTER the base fields but BEFORE the non-overridable invariants
+     * (`channel`/`direction` always win — an inbound note must route + be inbound). A caller
+     * must NEVER pass `reply_to` here for a CALLBACK note (the terminal-callback loop guard);
+     * see {@link writeCallback}.
+     */
+    extraMeta?: Record<string, string>,
+  ): Promise<{ id: string }> {
     const channel = this.channel;
     const ts = new Date().toISOString();
     const id = crypto.randomUUID();
@@ -1185,6 +1197,8 @@ export class VaultTransport implements Transport {
     const path = `${this.pathPrefix}/${safeChannel}/${id}`;
 
     const metadata: Record<string, string> = {
+      // Caller-supplied extra fields first, so the invariants below cannot be clobbered.
+      ...(extraMeta ?? {}),
       channel,
       direction: "inbound",
       sender: sender ?? "operator",
@@ -1248,6 +1262,44 @@ export class VaultTransport implements Transport {
    */
   async injectInbound(opts: { content: string; sender?: string }): Promise<{ id: string }> {
     return this.writeInbound(opts.content, opts.sender ?? "runner");
+  }
+
+  /**
+   * Write an agent-to-agent CALLBACK as an INBOUND note on THIS channel — the "reply_to"
+   * substrate. A recipient agent's drain, on turn completion, calls this on the SENDER's
+   * channel transport (resolved by the daemon's buildWriteCallback) so the sender is woken
+   * with a completion notification through the NORMAL inbound path: this writes a
+   * `#agent/message/inbound` note (parent + inbound child tags), the vault trigger fires,
+   * webhooks back, and the daemon routes it to the sender's agent — exactly like a human's
+   * chat send. The callback `content` is a brief notification + link; the metadata is the
+   * {@link CallbackMetadata} contract (`source_*` for the orchestrator to PULL the result).
+   *
+   * LOOP GUARD (structural): we stamp the callback metadata but NEVER a `reply_to` — a
+   * callback is terminal, so handling it can't auto-trigger another callback. We defensively
+   * STRIP any `reply_to` from the incoming meta to make that invariant impossible to violate
+   * even if a caller mistakenly supplied one. `sender` is a `callback:<source_channel>`
+   * marker so the transcript shows who/what authored it.
+   *
+   * Reuses {@link writeInbound} (the one inbound-write implementation), passing the callback
+   * fields as its `extraMeta`. Returns the written note id.
+   */
+  async writeCallback(content: string, meta: CallbackMetadata): Promise<{ sent: string[] }> {
+    // Defense-in-depth: never let a `reply_to` ride on a callback note (the terminal-callback
+    // loop guard). The CallbackMetadata type has no reply_to, but we strip explicitly in case
+    // a future caller widens the shape — a callback that carries reply_to would ping-pong.
+    const { reply_to: _stripReplyTo, ...safe } = meta as CallbackMetadata & { reply_to?: string };
+    void _stripReplyTo;
+    const extraMeta: Record<string, string> = {
+      callback: safe.callback,
+      status: safe.status,
+      source_channel: safe.source_channel,
+      source_thread: safe.source_thread,
+      delegation_depth: safe.delegation_depth,
+      ...(safe.source_message ? { source_message: safe.source_message } : {}),
+      ...(safe.correlation_id ? { correlation_id: safe.correlation_id } : {}),
+    };
+    const { id } = await this.writeInbound(content, `callback:${safe.source_channel}`, extraMeta);
+    return { sent: [id] };
   }
 
   // -------------------------------------------------------------------------

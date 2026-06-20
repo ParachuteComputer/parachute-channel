@@ -106,6 +106,25 @@ export interface ThreadRecord {
   sameTurn?: boolean;
 }
 
+/**
+ * The METADATA a callback inbound note carries (the agent-to-agent "reply_to" substrate).
+ * Mirrors `CallbackMeta` in backends/registry.ts; kept local here so the transport layer
+ * doesn't import the backend layer (the registry already keeps a local copy of the thread
+ * note shape for the same reason). All string-valued — the vault stores metadata as strings.
+ *
+ * IMPORTANT: a callback note carries `callback:"true"` + status + the source links, but NEVER
+ * a `reply_to` — a callback is terminal, which is the structural loop guard.
+ */
+export interface CallbackMetadata {
+  callback: "true";
+  status: "ok" | "error";
+  source_channel: string;
+  source_thread: string;
+  source_message?: string;
+  correlation_id?: string;
+  delegation_depth: string;
+}
+
 export interface ReactArgs {
   channel: string;
   message_id: string;
@@ -179,6 +198,16 @@ export interface Transport {
    * one note per channel, multi-threaded writes one per fire. Returns the written note id(s).
    */
   writeThread?(thread: ThreadRecord): Promise<{ sent: string[] }>;
+  /**
+   * Optional: write an agent-to-agent CALLBACK as an INBOUND note on THIS channel (the
+   * "reply_to" substrate). A recipient agent's drain, on turn completion, calls this on the
+   * SENDER's channel transport to wake the sender with a completion notification. The note
+   * carries the inbound tags (so the vault trigger wakes the sender through the normal path)
+   * PLUS the {@link CallbackMetadata} contract — BUT it must NOT carry a `reply_to` (a
+   * callback is terminal; that is the loop guard). Only a durable transport (the
+   * VaultTransport) implements it; others omit it. Returns the written note id(s).
+   */
+  writeCallback?(content: string, meta: CallbackMetadata): Promise<{ sent: string[] }>;
   /**
    * Optional: handle an HTTP request the daemon didn't handle itself. The
    * daemon owns `Bun.serve`; a transport that needs to contribute routes (e.g.

@@ -47,10 +47,18 @@ import {
   contextFor,
   reregisterProgrammaticAgents,
   buildWriteOutbound,
+  buildWriteCallback,
+  callbackFieldsFromMeta,
 } from "./daemon.ts";
 import { ClientRegistry } from "./routing.ts";
 import { DeliveryState } from "./delivery-state.ts";
-import { ProgrammaticAgentRegistry, type WriteOutbound } from "./backends/registry.ts";
+import {
+  ProgrammaticAgentRegistry,
+  MAX_DELEGATION_DEPTH,
+  type WriteOutbound,
+  type WriteCallback,
+  type CallbackMeta,
+} from "./backends/registry.ts";
 import type { AgentBackend, AgentHandle, AgentStatus, DeliverResult } from "./backends/types.ts";
 import type { AgentSpec } from "./sandbox/types.ts";
 import { VaultTransport } from "./transports/vault.ts";
@@ -656,5 +664,143 @@ describe("backend default + interactive rejection", () => {
     } finally {
       srv.stop(true);
     }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────
+// AGENT-TO-AGENT CALLBACK ROUTING ("reply_to") — the DAEMON-side wiring (design
+// 2026-06-20-agent-callbacks.md). The registry unit test owns the drain mechanics; here we
+// verify the WIRING: callbackFieldsFromMeta extraction + coercion, the contextFor.emit fork
+// threading the callback fields off `msg.meta` onto the QueuedMessage end-to-end, and
+// buildWriteCallback's own-it-don't-strand posture for an unknown reply_to channel.
+// ───────────────────────────────────────────────────────────────────────────────
+
+/** A recorder WriteCallback for the wiring tests. */
+function callbackRec(): { calls: { channel: string; content: string; meta: CallbackMeta }[]; fn: WriteCallback } {
+  const calls: { channel: string; content: string; meta: CallbackMeta }[] = [];
+  const fn: WriteCallback = async (channel, content, meta) => {
+    calls.push({ channel, content, meta });
+  };
+  return { calls, fn };
+}
+
+describe("callbackFieldsFromMeta — extraction + string→number coercion", () => {
+  test("present fields are extracted; delegation_depth coerced to an integer", () => {
+    const got = callbackFieldsFromMeta({
+      reply_to: "orchestrator",
+      correlation_id: "corr-1",
+      delegation_depth: "3",
+      // unrelated note metadata must be ignored.
+      channel: "worker",
+      ts: "2026-06-20T00:00:00Z",
+    });
+    expect(got).toEqual({ replyTo: "orchestrator", correlationId: "corr-1", delegationDepth: 3 });
+  });
+
+  test("absent reply_to → empty (a non-delegated turn); a clean spread no-op", () => {
+    expect(callbackFieldsFromMeta({ channel: "worker", ts: "x" })).toEqual({});
+    expect(callbackFieldsFromMeta(undefined)).toEqual({});
+  });
+
+  test("garbage / absent / non-positive delegation_depth reads as 0 (omitted)", () => {
+    expect(callbackFieldsFromMeta({ reply_to: "o", delegation_depth: "abc" })).toEqual({ replyTo: "o" });
+    expect(callbackFieldsFromMeta({ reply_to: "o", delegation_depth: "-5" })).toEqual({ replyTo: "o" });
+    expect(callbackFieldsFromMeta({ reply_to: "o" })).toEqual({ replyTo: "o" });
+  });
+});
+
+describe("contextFor.emit threads reply_to → a callback end-to-end through the real fork", () => {
+  test("an inbound emit carrying reply_to metadata → the drain delivers a callback to that channel", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "reply:" + m });
+    const out = recorder();
+    const cb = callbackRec();
+    const programmatic = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeCallback: cb.fn,
+    });
+    await programmatic.register({ name: "worker", channels: ["worker"], backend: "programmatic" });
+
+    const registry = new ClientRegistry();
+    const deliveryState = new DeliveryState();
+    const ctx = contextFor(registry, "worker", deliveryState, programmatic);
+
+    // Simulate a vault inbound note whose metadata carried the callback fields — the SAME
+    // shape ingestInbound flattens onto `meta` (all string-valued, incl. delegation_depth).
+    ctx.emit({
+      channel: "worker",
+      content: "do the sub-task",
+      meta: {
+        note_id: "inbound-99",
+        reply_to: "orchestrator",
+        correlation_id: "corr-xyz",
+        delegation_depth: "1",
+        source: "vault",
+      },
+      source: "vault",
+    });
+
+    await until(() => cb.calls.length === 1);
+    expect(cb.calls[0]!.channel).toBe("orchestrator");
+    expect(cb.calls[0]!.meta.status).toBe("ok");
+    expect(cb.calls[0]!.meta.source_channel).toBe("worker");
+    expect(cb.calls[0]!.meta.correlation_id).toBe("corr-xyz");
+    expect(cb.calls[0]!.meta.delegation_depth).toBe("2"); // incoming "1" → 1, +1 hop.
+  });
+
+  test("an inbound emit WITHOUT reply_to → no callback (the common path)", async () => {
+    const backend = new FakeBackend();
+    const out = recorder();
+    const cb = callbackRec();
+    const programmatic = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeCallback: cb.fn,
+    });
+    await programmatic.register({ name: "worker", channels: ["worker"], backend: "programmatic" });
+    const ctx = contextFor(new ClientRegistry(), "worker", new DeliveryState(), programmatic);
+
+    ctx.emit({ channel: "worker", content: "plain", meta: { note_id: "n1", source: "vault" }, source: "vault" });
+    await until(() => out.calls.length === 1);
+    await new Promise<void>((r) => setTimeout(r, 5));
+    expect(cb.calls).toHaveLength(0);
+  });
+});
+
+describe("buildWriteCallback — own-it-don't-strand for an unknown reply_to channel", () => {
+  const meta: CallbackMeta = {
+    callback: "true",
+    status: "ok",
+    source_channel: "worker",
+    source_thread: "thread-1",
+    delegation_depth: "1",
+  };
+
+  test("an unknown reply_to channel → LOGS + returns (no throw, so the drain isn't stranded)", async () => {
+    const channels = new Map<string, Channel>(); // empty — the reply_to channel is gone.
+    const write = buildWriteCallback(channels);
+    // Must NOT throw (the registry would otherwise log it as a callback error, but the
+    // own-it posture is to no-op cleanly for a torn-down sender).
+    await expect(write("ghost-orchestrator", "[callback] worker finished (ok)", meta)).resolves.toBeUndefined();
+  });
+
+  test("a live VaultTransport reply_to channel → writeCallback is invoked on it", async () => {
+    const vt = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "x" });
+    // Bind a ctx so `this.channel` resolves, and stub writeCallback so we don't hit the network.
+    (vt as unknown as { ctx: unknown }).ctx = { channel: "orchestrator", emit() {}, emitPermissionVerdict() {} };
+    let captured: { content: string; meta: CallbackMeta } | undefined;
+    (vt as unknown as { writeCallback: unknown }).writeCallback = async (content: string, m: CallbackMeta) => {
+      captured = { content, meta: m };
+      return { sent: ["cb-note-1"] };
+    };
+    const channels = new Map<string, Channel>([
+      ["orchestrator", { name: "orchestrator", transport: vt, entry: { name: "orchestrator", transport: "vault" } }],
+    ]);
+    const write = buildWriteCallback(channels);
+    await write("orchestrator", "[callback] worker finished (ok)", meta);
+    expect(captured).toBeDefined();
+    expect(captured!.meta.source_channel).toBe("worker");
+    expect(captured!.content).toContain("[callback]");
   });
 });

@@ -1110,6 +1110,90 @@ describe("VaultTransport — writeInbound (the chat's send → wakes the session
   });
 });
 
+describe("VaultTransport — writeCallback (agent-to-agent reply_to substrate)", () => {
+  test("writes an INBOUND note carrying the callback metadata contract, NO reply_to, both inbound tags", async () => {
+    let sent: { content: string; tags: string[]; metadata: Record<string, string> } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith("/api/notes") && init?.method === "POST") {
+        sent = JSON.parse(String(init?.body));
+      }
+      return new Response(JSON.stringify({ id: "callback-note-1" }), { status: 201 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("orchestrator")); // the SENDER's channel.
+    const result = await t.writeCallback("[callback] worker finished (ok) — see source_message.", {
+      callback: "true",
+      status: "ok",
+      source_channel: "worker",
+      source_thread: "thread-uuid-1",
+      source_message: "reply-note-7",
+      correlation_id: "corr-abc",
+      delegation_depth: "3",
+    });
+
+    expect(result.sent).toEqual(["callback-note-1"]);
+    // The callback is an INBOUND note (so it wakes the sender via the normal vault trigger).
+    expect(sent!.tags).toEqual(["#agent/message", "#agent/message/inbound"]);
+    expect(sent!.tags).not.toContain("#agent/message/outbound");
+    // The metadata contract — all present fields stamped.
+    expect(sent!.metadata.callback).toBe("true");
+    expect(sent!.metadata.status).toBe("ok");
+    expect(sent!.metadata.source_channel).toBe("worker");
+    expect(sent!.metadata.source_thread).toBe("thread-uuid-1");
+    expect(sent!.metadata.source_message).toBe("reply-note-7");
+    expect(sent!.metadata.correlation_id).toBe("corr-abc");
+    expect(sent!.metadata.delegation_depth).toBe("3");
+    // The channel it's routed to is THIS transport's channel (the sender's), direction inbound.
+    expect(sent!.metadata.channel).toBe("orchestrator");
+    expect(sent!.metadata.direction).toBe("inbound");
+    expect(sent!.metadata.sender).toBe("callback:worker");
+    // LOOP GUARD: the callback note must NEVER carry a reply_to (terminal callback).
+    expect(sent!.metadata.reply_to).toBeUndefined();
+  });
+
+  test("omits source_message + correlation_id when absent (error callback, no reply)", async () => {
+    let sent: { metadata: Record<string, string> } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith("/api/notes") && init?.method === "POST") sent = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ id: "n" }), { status: 201 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("orchestrator"));
+    await t.writeCallback("[callback] worker finished with an error.", {
+      callback: "true",
+      status: "error",
+      source_channel: "worker",
+      source_thread: "thread-2",
+      delegation_depth: "1",
+    });
+    expect(sent!.metadata.status).toBe("error");
+    expect(sent!.metadata.source_message).toBeUndefined();
+    expect(sent!.metadata.correlation_id).toBeUndefined();
+  });
+
+  test("a stray reply_to on the meta is STRIPPED (defense-in-depth loop guard)", async () => {
+    let sent: { metadata: Record<string, string> } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith("/api/notes") && init?.method === "POST") sent = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ id: "n" }), { status: 201 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("orchestrator"));
+    // Simulate a (mistaken) caller widening the shape with a reply_to — it must NOT survive.
+    await t.writeCallback("x", {
+      callback: "true",
+      status: "ok",
+      source_channel: "worker",
+      source_thread: "t",
+      delegation_depth: "1",
+      // @ts-expect-error — intentionally passing an extra field the contract forbids.
+      reply_to: "should-be-stripped",
+    });
+    expect(sent!.metadata.reply_to).toBeUndefined();
+  });
+});
+
 describe("VaultTransport — ingestInbound", () => {
   test("emits the inbound content + meta onto its channel", () => {
     const t = new VaultTransport(baseConfig());
@@ -1174,6 +1258,34 @@ describe("VaultTransport — ingestInbound", () => {
       metadata: { channel: "eng", direction: "outbound" },
     });
     expect(ctx.emitted).toHaveLength(0);
+  });
+
+  test("FLATTENS the agent-to-agent callback fields (reply_to/correlation_id/delegation_depth) into meta", () => {
+    // The READ side of the callback round-trip: a SENDING agent stamps reply_to et al on the
+    // inbound note's metadata; ingestInbound must surface them in `meta` so contextFor.emit's
+    // callbackFieldsFromMeta can pick them up. (ingestInbound already flattens ALL metadata —
+    // this pins the behavior the callback substrate depends on.)
+    const t = new VaultTransport(baseConfig());
+    const ctx = fakeCtx("worker");
+    void t.start(ctx);
+    t.ingestInbound({
+      id: "note-deleg-1",
+      content: "do the sub-task",
+      tags: ["#agent/message", "#agent/message/inbound"],
+      metadata: {
+        channel: "worker",
+        direction: "inbound",
+        sender: "orchestrator",
+        reply_to: "orchestrator",
+        correlation_id: "corr-1",
+        delegation_depth: "2",
+      },
+    });
+    expect(ctx.emitted).toHaveLength(1);
+    const m = ctx.emitted[0]!.meta;
+    expect(m.reply_to).toBe("orchestrator");
+    expect(m.correlation_id).toBe("corr-1");
+    expect(m.delegation_depth).toBe("2"); // string-valued, as the vault stores it.
   });
 });
 

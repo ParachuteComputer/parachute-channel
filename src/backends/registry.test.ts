@@ -14,9 +14,12 @@ import {
   ProgrammaticAgentRegistry,
   OUTBOUND_MAX_RETRIES,
   PENDING_INBOUND_CAP,
+  MAX_DELEGATION_DEPTH,
   isTransientOutboundError,
   type WriteOutbound,
   type WriteThread,
+  type WriteCallback,
+  type CallbackMeta,
   type ThreadNote,
   type TurnEventSink,
   type TurnLifecycleEvent,
@@ -968,5 +971,276 @@ describe("ProgrammaticAgentRegistry — thread-as-container working-ensure (Part
     // per-fire thread note's leaf — the explicit message↔thread link.
     expect(outbound[0]!.threadId).toBeDefined();
     expect(outbound[0]!.threadId).toBe(threads.ends()[0]!.threadId!);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────
+// AGENT-TO-AGENT CALLBACK ROUTING ("reply_to") — design 2026-06-20-agent-callbacks.md.
+// A FAKE WriteCallback recorder captures every callback the drain delivers (its target
+// channel + content + the metadata contract), so we can assert: a reply_to message gets
+// exactly one callback w/ the right metadata; a no-reply_to message gets none; ok AND error
+// both fire; the depth guard suppresses; and N callbacks to one channel drain FIFO + none
+// is lost (the orchestrator-resume concurrency story).
+// ───────────────────────────────────────────────────────────────────────────────
+
+/** A recorder WriteCallback — captures every callback the registry delivers, in order. */
+function callbackRecorder(): {
+  calls: { channel: string; content: string; meta: CallbackMeta }[];
+  fn: WriteCallback;
+} {
+  const calls: { channel: string; content: string; meta: CallbackMeta }[] = [];
+  const fn: WriteCallback = async (channel, content, meta) => {
+    calls.push({ channel, content, meta });
+  };
+  return { calls, fn };
+}
+
+/** A WriteOutbound that returns a deterministic note id, so source_message is assertable. */
+function recorderWithId(noteId = "outbound-note-1"): {
+  calls: { channel: string; reply: string }[];
+  fn: WriteOutbound;
+} {
+  const calls: { channel: string; reply: string }[] = [];
+  const fn: WriteOutbound = async (channel, reply) => {
+    calls.push({ channel, reply });
+    return { id: noteId };
+  };
+  return { calls, fn };
+}
+
+describe("ProgrammaticAgentRegistry — agent-to-agent callbacks (reply_to)", () => {
+  test("an inbound WITH reply_to → exactly ONE callback to the reply_to channel with the full metadata contract (ok)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    const out = recorderWithId("reply-note-42");
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specFor("worker"));
+
+    reg.enqueue("worker", {
+      content: "sub-task",
+      inReplyTo: "inbound-note-7",
+      replyTo: "orchestrator",
+      correlationId: "corr-abc",
+      delegationDepth: 2,
+    });
+    await until(() => cb.calls.length === 1);
+    // Let any erroneous SECOND callback land, then assert there was exactly one.
+    await new Promise<void>((r) => setTimeout(r, 5));
+    expect(cb.calls).toHaveLength(1);
+
+    const { channel, content, meta } = cb.calls[0]!;
+    expect(channel).toBe("orchestrator"); // delivered to the SENDER's channel.
+    expect(content).toContain("[callback]");
+    expect(content).not.toContain("done:sub-task"); // summary + link, NOT the full reply.
+    expect(meta.callback).toBe("true");
+    expect(meta.status).toBe("ok");
+    expect(meta.source_channel).toBe("worker");
+    expect(meta.source_message).toBe("reply-note-42"); // the delivered outbound note id.
+    expect(meta.source_thread).toBeDefined(); // the per-turn thread id (pull link).
+    expect(meta.correlation_id).toBe("corr-abc"); // echoed verbatim.
+    expect(meta.delegation_depth).toBe("3"); // incoming 2 + 1 hop.
+    // The callback note must NOT itself carry a reply_to (terminal — the loop guard).
+    expect((meta as unknown as Record<string, unknown>).reply_to).toBeUndefined();
+  });
+
+  test("an inbound WITHOUT reply_to → NO callback (a normal turn never emits one)", async () => {
+    const backend = new FakeBackend();
+    const out = recorderWithId();
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specFor("worker"));
+
+    reg.enqueue("worker", { content: "plain message" });
+    await until(() => out.calls.length === 1);
+    await new Promise<void>((r) => setTimeout(r, 5));
+    expect(out.calls).toHaveLength(1); // the turn ran + replied normally,
+    expect(cb.calls).toHaveLength(0); // but no callback fired.
+  });
+
+  test("the callback fires on an ERROR turn too (status:error, no source_message)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: false, error: "mint refused" });
+    const out = recorderWithId();
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specFor("worker"));
+
+    reg.enqueue("worker", { content: "do it", replyTo: "orchestrator", delegationDepth: 0 });
+    await until(() => cb.calls.length === 1);
+    await new Promise<void>((r) => setTimeout(r, 5));
+    expect(cb.calls).toHaveLength(1);
+    expect(out.calls).toHaveLength(0); // an error turn writes no outbound,
+    const { meta, content } = cb.calls[0]!;
+    expect(meta.status).toBe("error"); // but the orchestrator still learns it failed.
+    expect(content).toContain("error");
+    expect(meta.source_message).toBeUndefined(); // no delivered reply note.
+    expect(meta.delegation_depth).toBe("1"); // 0 + 1.
+  });
+
+  test("the callback fires when deliver() THROWS (defensive catch → status:error)", async () => {
+    const backend = new FakeBackend();
+    backend.throwOnce = new Error("surprise throw");
+    const out = recorderWithId();
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specFor("worker"));
+
+    reg.enqueue("worker", { content: "boom", replyTo: "orchestrator" });
+    await until(() => cb.calls.length === 1);
+    expect(cb.calls[0]!.meta.status).toBe("error");
+  });
+
+  test("the callback fires status:error when the outbound write FAILS after retries (reply produced but not delivered)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    // Always-fail outbound (a permanent 4xx → no retry); the reply was produced but lost.
+    const alwaysFail: WriteOutbound = async () => {
+      throw new Error("vault transport: write reply failed (400) bad request");
+    };
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: alwaysFail,
+      writeCallback: cb.fn,
+      outboundRetryBaseMs: 1,
+    });
+    await reg.register(specFor("worker"));
+
+    reg.enqueue("worker", { content: "x", replyTo: "orchestrator" });
+    await until(() => cb.calls.length === 1);
+    // The orchestrator learns the turn did NOT truly succeed (the reply never landed).
+    expect(cb.calls[0]!.meta.status).toBe("error");
+    expect(cb.calls[0]!.meta.source_message).toBeUndefined(); // the note never landed.
+  });
+
+  test("delegation_depth >= MAX → NO callback (the depth loop guard), turn still runs", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    const out = recorderWithId();
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specFor("worker"));
+
+    // An incoming message already AT the ceiling: a callback would push it over, so suppress.
+    reg.enqueue("worker", {
+      content: "deep",
+      replyTo: "orchestrator",
+      delegationDepth: MAX_DELEGATION_DEPTH,
+    });
+    await until(() => out.calls.length === 1); // the turn STILL ran + replied,
+    await new Promise<void>((r) => setTimeout(r, 5));
+    expect(out.calls).toHaveLength(1);
+    expect(cb.calls).toHaveLength(0); // but the callback was suppressed by the depth guard.
+  });
+
+  test("a message just UNDER the ceiling still gets a callback (boundary)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    const out = recorderWithId();
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specFor("worker"));
+
+    reg.enqueue("worker", {
+      content: "near-edge",
+      replyTo: "orchestrator",
+      delegationDepth: MAX_DELEGATION_DEPTH - 1,
+    });
+    await until(() => cb.calls.length === 1);
+    expect(cb.calls).toHaveLength(1);
+    expect(cb.calls[0]!.meta.delegation_depth).toBe(String(MAX_DELEGATION_DEPTH)); // the last hop.
+  });
+
+  test("no WriteCallback wired → reply_to is inert (the turn runs normally, no crash)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    const out = recorderWithId();
+    // NOTE: writeCallback intentionally NOT passed.
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: out.fn });
+    await reg.register(specFor("worker"));
+
+    reg.enqueue("worker", { content: "x", replyTo: "orchestrator" });
+    await until(() => out.calls.length === 1);
+    expect(out.calls).toHaveLength(1); // the turn ran fine despite reply_to + no sink.
+  });
+
+  test("a WriteCallback that THROWS does not strand the drain (best-effort, logged)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    const out = recorderWithId();
+    const throwingCb: WriteCallback = async () => {
+      throw new Error("callback delivery boom");
+    };
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeCallback: throwingCb,
+    });
+    await reg.register(specFor("worker"));
+
+    // Two reply_to messages; the first callback throws — the second turn must still drain.
+    reg.enqueue("worker", { content: "first", replyTo: "orchestrator" });
+    reg.enqueue("worker", { content: "second", replyTo: "orchestrator" });
+    await until(() => out.calls.length === 2);
+    expect(out.calls.map((c) => c.reply)).toEqual(["done:first", "done:second"]);
+  });
+
+  test("CONCURRENCY: N callbacks returning to ONE orchestrator channel drain FIFO, none lost or clobbered", async () => {
+    // The orchestrator-resume story: an orchestrator fires N sub-tasks; each worker's turn
+    // completes and delivers a callback BACK to the orchestrator's channel. Those callbacks
+    // arrive as inbound on the orchestrator's channel and are handled by ITS per-channel
+    // serial drain — one at a time, FIFO, never concurrent (its --resume session carries
+    // state across them). We exercise the DRAIN-SIDE FIFO property directly here (enqueue N
+    // callback-shaped inbound messages on one channel + assert they drain in order, none
+    // lost, the backend never ran two concurrently) — NOT the real vault-IPC delivery path
+    // (callback note → trigger → /api/vault/inbound → emit), which the wiring + vault suites
+    // cover. The serial drain is the same machinery either way, so this pins the invariant.
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "ack:" + m });
+    const out = recorderWithId();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: out.fn });
+    await reg.register(specFor("orchestrator"));
+
+    const N = 6;
+    for (let i = 0; i < N; i++) {
+      // A callback inbound carries NO reply_to (terminal) — exactly the shape the daemon
+      // writes. The orchestrator processes each as "a sub-task finished" message.
+      reg.enqueue("orchestrator", { content: `callback-${i}` });
+    }
+    await until(() => backend.calls.length === N);
+    // FIFO: arrival order preserved, NONE lost or duplicated.
+    expect(backend.calls.map((c) => c.message)).toEqual(
+      Array.from({ length: N }, (_, i) => `callback-${i}`),
+    );
+    // The per-channel serial worker never ran two turns at once (the --resume invariant).
+    expect(backend.maxConcurrent).toBe(1);
+    expect(out.calls.map((c) => c.reply)).toEqual(
+      Array.from({ length: N }, (_, i) => `ack:callback-${i}`),
+    );
   });
 });

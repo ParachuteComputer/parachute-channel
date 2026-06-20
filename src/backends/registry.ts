@@ -74,8 +74,15 @@ export type TurnLifecycleEvent =
  * Write an outbound reply for a channel — the seam the registry posts a turn's
  * reply through. The daemon wires this to the channel transport's `reply()` (a
  * VaultTransport writes a `#agent/message/outbound` note). `inReplyTo` threads the
- * reply to the inbound note id when one is known. Returns nothing; a write failure
- * is the implementation's to surface (the registry logs whatever it throws).
+ * reply to the inbound note id when one is known.
+ *
+ * RETURN: optionally the written outbound note's id (`{ id }`) — the agent-to-agent
+ * callback uses it as the `source_message` an orchestrator pulls the full reply from.
+ * Returning `void` (or `{}`) is fine — the callback then just omits `source_message`
+ * (the sender still learns the turn finished; it has the `source_thread` to pull from).
+ * Kept BACK-COMPAT: every existing `async () => {}` recorder still satisfies this (`void`
+ * is a member of the union). A write failure is still surfaced as a throw (the registry's
+ * retry/record logic depends on the throw, not the return).
  */
 export type WriteOutbound = (
   channel: string,
@@ -90,7 +97,7 @@ export type WriteOutbound = (
    * deferred (those notes are externally written; see the PR notes).
    */
   threadId?: string,
-) => Promise<void>;
+) => Promise<{ id?: string } | void>;
 
 /**
  * One turn's input to materializing a `#agent/thread` note (the UNIFIED model
@@ -158,6 +165,82 @@ export interface ThreadNote {
 export type WriteThread = (thread: ThreadNote) => Promise<void>;
 
 /**
+ * A callback delivered back to a SENDER's channel when a turn it requested finishes —
+ * the agent-to-agent request/response substrate ("reply_to"). The daemon wires this to
+ * write a NEW `#agent/message/inbound` note to the `channel` (so it wakes the sender
+ * through the normal inbound path), carrying the {@link CallbackMeta} contract.
+ *
+ * The content is a brief NOTIFICATION + a LINK to the result (NOT the full reply
+ * duplicated) — the orchestrator reads `source_message`/`source_thread` off the metadata
+ * and PULLS the full result if it wants (the user's explicit choice: summary + link,
+ * orchestrator pulls — cleaner + a better security boundary than fan-out duplication).
+ *
+ * LOOP SAFETY (load-bearing): the callback note this writes carries the INBOUND tags so
+ * it routes, but the daemon's wiring MUST NOT put a `reply_to` on it — a callback is
+ * TERMINAL, so handling one can never auto-trigger another callback (no ping-pong).
+ *
+ * A write failure is the implementation's to surface (the registry logs whatever it
+ * throws); a callback NEVER re-runs the turn. Optional on the registry — when unwired (no
+ * vault-backed channels), reply_to is silently inert.
+ */
+export type WriteCallback = (channel: string, content: string, meta: CallbackMeta) => Promise<void>;
+
+/**
+ * The METADATA CONTRACT a callback inbound note carries (design
+ * 2026-06-20-agent-callbacks.md). The daemon's {@link WriteCallback} wiring stamps these
+ * onto the new `#agent/message/inbound` note's `metadata` (the vault stores them as
+ * strings). The orchestrator reads `source_message` / `source_thread` to PULL the full
+ * result. Deliberately a SUMMARY + LINK, never the duplicated reply body.
+ */
+export interface CallbackMeta {
+  /**
+   * `"true"` — the marker that distinguishes a callback inbound from an ordinary one, so
+   * an orchestrator's turn can tell "a sub-task finished" from "a new request arrived".
+   */
+  callback: "true";
+  /** The terminal outcome of the requested turn — `ok` (succeeded) or `error` (failed). */
+  status: "ok" | "error";
+  /** The channel/def whose turn just finished (the recipient) — provenance for the sender. */
+  source_channel: string;
+  /**
+   * The per-turn thread id the drain minted. RESOLVABILITY DIFFERS BY MODE:
+   *  - multi-threaded: this IS the per-fire note's leaf — the orchestrator can pull the
+   *    thread note at `Threads/<channel>/<source_thread>`.
+   *  - single-threaded: this is a per-turn CORRELATION id, NOT the note leaf (the
+   *    single-threaded note lives at the deterministic `Threads/<channel>/<name>`), so it
+   *    is NOT directly resolvable. Use `source_message` as the reliable pull-link for a
+   *    single-threaded recipient. Making this a resolvable thread id for both modes
+   *    (widen the writeThread seam to return the written note id) is tracked as a
+   *    follow-up (parachute-agent#124).
+   */
+  source_thread: string;
+  /**
+   * The recipient's OUTBOUND reply note id, when the turn produced (and delivered) a
+   * reply. The orchestrator pulls the full reply text from here. ABSENT when there was no
+   * reply (an error turn, or an empty/tool-only turn) — the callback still fires so the
+   * orchestrator learns the turn is done; it just has no reply note to pull.
+   */
+  source_message?: string;
+  /** The sender's opaque correlation id, echoed verbatim when one was set. Omitted otherwise. */
+  correlation_id?: string;
+  /**
+   * The depth of THIS callback = the incoming message's depth + 1. The sender's turn,
+   * woken by this callback, inherits it; if that turn delegates onward, the chain's depth
+   * keeps climbing toward {@link MAX_DELEGATION_DEPTH}.
+   */
+  delegation_depth: string;
+}
+
+/**
+ * The hard ceiling on delegation HOPS — the depth loop guard (design
+ * 2026-06-20-agent-callbacks.md §loop-safety). An inbound message arriving at or past this
+ * depth delivers NO callback (logged), which BOUNDS any chain even if the no-`reply_to`-on-
+ * callback rule were somehow circumvented. 8 is generous for real orchestration trees
+ * (an orchestrator → workers → sub-workers fan-out is 2-3 deep) while still finite.
+ */
+export const MAX_DELEGATION_DEPTH = 8;
+
+/**
  * Cap on the per-channel PENDING-INBOUND queue (the agent#121 pre-registration buffer).
  * A buffer that grows without bound is a memory-leak / DoS footgun if a channel's agent
  * never comes up; past the cap the OLDEST pending message is dropped (FIFO eviction) with
@@ -198,11 +281,39 @@ function delay(ms: number): Promise<void> {
 }
 
 /** A queued inbound message awaiting its serial turn. */
-interface QueuedMessage {
+export interface QueuedMessage {
   /** The inbound text handed to the `claude -p` turn as the prompt. */
   content: string;
   /** The inbound note id (if known), threaded into the outbound reply's `in_reply_to`. */
   inReplyTo?: string;
+  // ── AGENT-TO-AGENT CALLBACK ROUTING ("reply_to") ───────────────────────────────
+  // These ride from the inbound note's metadata (a SENDING agent stamps them when it
+  // writes an inbound note to THIS channel via the vault), through `contextFor.emit`
+  // (daemon.ts, which flattens note.metadata into `meta`), onto this queue item, so the
+  // drain can deliver a CALLBACK to the originating channel when this turn finishes.
+  /**
+   * The SENDER's channel name — where to deliver a callback when this turn completes
+   * (BOTH ok and error). A single-threaded agent's channel ↔ thread is 1:1, so an
+   * orchestrator knows its own channel = its def name and stamps it here when it writes
+   * the inbound note to the recipient. Absent → NO callback (a normal, non-orchestrated
+   * turn). A callback note itself NEVER carries `reply_to` (it's terminal — that is the
+   * primary loop guard; see {@link MAX_DELEGATION_DEPTH}).
+   */
+  replyTo?: string;
+  /**
+   * An OPAQUE id the sender uses to match a callback to the request it fired (it may
+   * have N sub-tasks in flight). Echoed verbatim onto the callback metadata; the daemon
+   * never interprets it. Absent → omitted from the callback.
+   */
+  correlationId?: string;
+  /**
+   * How many delegation HOPS deep this message is (0 = a top-level human/runner turn).
+   * Incremented on each callback hop; bounds runaway chains. A message arriving at or
+   * past {@link MAX_DELEGATION_DEPTH} delivers NO callback (the depth loop guard). The
+   * vault stores metadata as STRINGS, so daemon.ts coerces `metadata.delegation_depth`
+   * to a finite integer before it lands here; a missing/garbage value reads as 0.
+   */
+  delegationDepth?: number;
 }
 
 /** A registered programmatic agent's live status (surfaced in /health + the list). */
@@ -266,6 +377,11 @@ export class ProgrammaticAgentRegistry {
   private readonly writeOutbound: WriteOutbound;
   /** Optional thread-note sink — materialize an `#agent/thread` note (BOTH modes). */
   private readonly writeThread?: WriteThread;
+  /**
+   * Optional callback sink — deliver an agent-to-agent callback to a sender's channel on
+   * turn completion (the "reply_to" substrate). Unwired → reply_to is silently inert.
+   */
+  private readonly writeCallback?: WriteCallback;
   /** Optional streaming-view sink — push interim + lifecycle turn events per channel. */
   private readonly onTurnEvent?: TurnEventSink;
   /** Base backoff (ms) between outbound retries (FIX 1). Injectable so tests run fast. */
@@ -275,6 +391,7 @@ export class ProgrammaticAgentRegistry {
     backend: AgentBackend;
     writeOutbound: WriteOutbound;
     writeThread?: WriteThread;
+    writeCallback?: WriteCallback;
     onTurnEvent?: TurnEventSink;
     /** Override the outbound-retry backoff base (ms). Default {@link OUTBOUND_RETRY_BASE_MS}. */
     outboundRetryBaseMs?: number;
@@ -282,6 +399,7 @@ export class ProgrammaticAgentRegistry {
     this.backend = deps.backend;
     this.writeOutbound = deps.writeOutbound;
     if (deps.writeThread) this.writeThread = deps.writeThread;
+    if (deps.writeCallback) this.writeCallback = deps.writeCallback;
     if (deps.onTurnEvent) this.onTurnEvent = deps.onTurnEvent;
     this.outboundRetryBaseMs = deps.outboundRetryBaseMs ?? OUTBOUND_RETRY_BASE_MS;
   }
@@ -648,6 +766,9 @@ export class ProgrammaticAgentRegistry {
           phase: "end",
         });
         this.emitTurnEvent(channel, { kind: "error", error: reason });
+        // CALLBACK on the failure too — an orchestrator MUST learn its sub-task failed, not
+        // hang waiting forever. No outbound note was produced, so no `source_message`.
+        await this.maybeDeliverCallback(handle, msg, turnThreadId, "error");
         continue;
       }
 
@@ -666,6 +787,9 @@ export class ProgrammaticAgentRegistry {
           phase: "end",
         });
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
+        // CALLBACK on the failure-as-value too (status:error) — the orchestrator learns the
+        // sub-task failed and can react. No delivered reply, so no `source_message`.
+        await this.maybeDeliverCallback(handle, msg, turnThreadId, "error");
         continue;
       }
 
@@ -686,6 +810,12 @@ export class ProgrammaticAgentRegistry {
       // ADDITIVE to the primary thread-note record already written above (for BOTH modes).
       // Empty reply → NO note (reviewer contract — `reply` can be ""): a turn that produced
       // no text (e.g. tool-only work) leaves the chat clean.
+      //
+      // `sourceMessage` — the delivered outbound note id, captured for the callback's
+      // `source_message` so an orchestrator can PULL the full reply text. Stays undefined
+      // for an empty/tool-only turn (no note) — the callback still fires (status:ok), it
+      // just has no reply note to point at (the orchestrator pulls from `source_thread`).
+      let sourceMessage: string | undefined;
       if (result.reply && result.reply.length > 0) {
         const delivered = await this.deliverOutboundWithRetry(
           channel,
@@ -693,6 +823,7 @@ export class ProgrammaticAgentRegistry {
           msg.inReplyTo,
           turnThreadId,
         );
+        if (delivered.ok) sourceMessage = delivered.noteId;
         if (!delivered.ok) {
           // FIX 1 (PR #3) — the SCARY one. The reply was PRODUCED but, after the bounded
           // retry, still NOT persisted to the transcript (a persistent vault 5xx / network
@@ -727,6 +858,11 @@ export class ProgrammaticAgentRegistry {
             kind: "error",
             error: `reply produced but not saved: ${delivered.error}`,
           });
+          // CALLBACK as status:error — the reply was produced but NOT delivered, so the
+          // turn did not truly succeed; the orchestrator must learn that. No `source_message`
+          // (the outbound note never landed); the undelivered text lives in the error thread
+          // note for an operator to recover.
+          await this.maybeDeliverCallback(handle, msg, turnThreadId, "error");
           continue;
         }
       }
@@ -737,6 +873,89 @@ export class ProgrammaticAgentRegistry {
       // Reached only when the outbound write SUCCEEDED, or there was no reply to write
       // (empty/tool-only turn → clean resolve, no note expected).
       this.emitTurnEvent(channel, { kind: "done", reply: result.reply ?? "" });
+      // CALLBACK on success — the turn finished cleanly (status:ok). `sourceMessage` is the
+      // delivered reply note (when there was one) the orchestrator pulls the full result from.
+      await this.maybeDeliverCallback(handle, msg, turnThreadId, "ok", sourceMessage);
+    }
+  }
+
+  /**
+   * Deliver an agent-to-agent CALLBACK to the originating channel when a requested turn
+   * finishes — the request/response substrate ("reply_to"). Called at EVERY terminal point
+   * of the drain (success, failure-as-value, defensive-catch throw, AND outbound-delivery
+   * failure), because an orchestrator must learn the outcome whether the sub-task succeeded
+   * OR failed — a hung orchestrator waiting on a dropped failure is the worst outcome.
+   *
+   * GUARDS (in order; each is a hard precondition — failing any one is a clean no-op):
+   *  1. No {@link WriteCallback} wired → reply_to is inert (a daemon with no vault channels).
+   *  2. No `replyTo` on the originating message → an ordinary, non-orchestrated turn. This
+   *     is THE common case + the first loop guard: a CALLBACK note is written WITHOUT a
+   *     `reply_to` (see the daemon's wiring), so handling a callback can NEVER itself emit a
+   *     callback — no ping-pong, structurally.
+   *  3. `delegationDepth >= MAX_DELEGATION_DEPTH` → the DEPTH loop guard. Even if guard 2
+   *     were somehow defeated, this bounds any chain to a finite hop count. We LOG loudly
+   *     (a hit is a real signal — a delegation tree ran away or a cycle formed) and drop the
+   *     callback. The turn itself already ran + recorded; only the onward notification stops.
+   *
+   * The callback CONTENT is a brief NOTIFICATION + a LINK (never the duplicated reply) — the
+   * orchestrator reads `source_thread`/`source_message` off the metadata and PULLS the full
+   * result (the user's explicit choice). METADATA is the {@link CallbackMeta} contract, with
+   * `delegation_depth` = incoming + 1 so the chain's depth climbs each hop.
+   *
+   * Best-effort like the other sinks: a write failure is LOGGED, never thrown — a callback
+   * failure must NOT strand the per-channel drain or re-run the (already-completed) turn.
+   */
+  private async maybeDeliverCallback(
+    handle: ProgrammaticAgentHandle,
+    msg: QueuedMessage,
+    turnThreadId: string,
+    status: "ok" | "error",
+    sourceMessage?: string,
+  ): Promise<void> {
+    // Guard 1 + 2: no sink, or this wasn't a delegated request → nothing to call back.
+    if (!this.writeCallback) return;
+    if (!msg.replyTo) return;
+
+    // Guard 3 (DEPTH): bound the delegation chain. The INCOMING depth (default 0) is how
+    // deep this message already is; the callback we'd write is one hop deeper. If the
+    // incoming message is already at/over the ceiling, stop — do not deliver.
+    const incomingDepth = msg.delegationDepth ?? 0;
+    if (incomingDepth >= MAX_DELEGATION_DEPTH) {
+      console.warn(
+        `parachute-agent: delegation depth ${incomingDepth} >= MAX (${MAX_DELEGATION_DEPTH}) for ` +
+          `channel "${handle.channel}" → NOT delivering a callback to "${msg.replyTo}" (loop guard). ` +
+          `A delegation chain ran away or a cycle formed; the turn ran + recorded normally.`,
+      );
+      return;
+    }
+
+    // The brief notification + link. NOT the full reply (the orchestrator pulls it).
+    const verb = status === "ok" ? "finished (ok)" : "finished with an error";
+    const content =
+      `[callback] ${handle.channel} ${verb} — see source_message / source_thread in this ` +
+      `note's metadata to pull the full result.`;
+
+    // The metadata contract. delegation_depth = incoming + 1 (this hop). correlation_id +
+    // source_message are echoed/included only when present. The daemon's WriteCallback
+    // wiring writes this as a `#agent/message/inbound` note to `msg.replyTo` and — CRUCIALLY
+    // — does NOT stamp a `reply_to` on it (the terminal-callback loop guard).
+    const meta: CallbackMeta = {
+      callback: "true",
+      status,
+      source_channel: handle.channel,
+      source_thread: turnThreadId,
+      ...(sourceMessage ? { source_message: sourceMessage } : {}),
+      ...(msg.correlationId ? { correlation_id: msg.correlationId } : {}),
+      delegation_depth: String(incomingDepth + 1),
+    };
+
+    try {
+      await this.writeCallback(msg.replyTo, content, meta);
+    } catch (err) {
+      console.error(
+        `parachute-agent: delivering callback to channel "${msg.replyTo}" failed ` +
+          `(continuing — the turn already completed + recorded): ${(err as Error).message}`,
+      );
     }
   }
 
@@ -809,12 +1028,15 @@ export class ProgrammaticAgentRegistry {
     reply: string,
     inReplyTo?: string,
     threadId?: string,
-  ): Promise<{ ok: true } | { ok: false; error: string }> {
+  ): Promise<{ ok: true; noteId?: string } | { ok: false; error: string }> {
     let lastError = "";
     for (let attempt = 0; attempt <= OUTBOUND_MAX_RETRIES; attempt++) {
       try {
-        await this.writeOutbound(channel, reply, inReplyTo, threadId);
-        return { ok: true };
+        // Capture the written note id (when the seam returns one) so the caller can
+        // point a callback's `source_message` at the delivered reply. A void return →
+        // no id (the callback then omits source_message — still fires).
+        const written = await this.writeOutbound(channel, reply, inReplyTo, threadId);
+        return { ok: true, ...(written && written.id ? { noteId: written.id } : {}) };
       } catch (err) {
         lastError = (err as Error).message;
         const transient = isTransientOutboundError(err);

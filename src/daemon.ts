@@ -116,6 +116,8 @@ import {
   ProgrammaticAgentRegistry,
   type WriteOutbound,
   type WriteThread,
+  type WriteCallback,
+  type QueuedMessage,
   type TurnEventSink,
 } from "./backends/registry.ts";
 import {
@@ -242,6 +244,41 @@ const START_CMD: string[] = resolveStartCmd(INSTALL_DIR);
 // Registry + routing
 // ---------------------------------------------------------------------------
 
+/**
+ * Extract the agent-to-agent CALLBACK fields ("reply_to") from a flattened inbound `meta`
+ * (the vault transport's ingestInbound copies the note's metadata into `meta`, all string-
+ * valued). A SENDING agent stamps these on the inbound note it writes to the recipient:
+ *   - `reply_to`         — the sender's channel name; where to deliver the completion
+ *                          callback. Absent → no callback (an ordinary turn).
+ *   - `correlation_id`   — an opaque id the sender matches replies to requests with.
+ *   - `delegation_depth` — how many hops deep this message is (the loop guard's counter).
+ *                          The vault stores it as a STRING, so coerce to a finite integer
+ *                          here; a missing/garbage value reads as 0 (a top-level turn).
+ *
+ * Returns ONLY the keys that are present, so spreading it into a {@link QueuedMessage} is a
+ * clean no-op when this isn't a delegated request. NOTE we read `reply_to` from metadata —
+ * NOT to be confused with the Telegram quote-reply `reply_to` on ReplyArgs (a message-id,
+ * a different axis that lives on the outbound side).
+ */
+export function callbackFieldsFromMeta(
+  meta: Record<string, string> | undefined,
+): Pick<QueuedMessage, "replyTo" | "correlationId" | "delegationDepth"> {
+  if (!meta) return {};
+  const out: Pick<QueuedMessage, "replyTo" | "correlationId" | "delegationDepth"> = {};
+  if (typeof meta.reply_to === "string" && meta.reply_to) out.replyTo = meta.reply_to;
+  if (typeof meta.correlation_id === "string" && meta.correlation_id) {
+    out.correlationId = meta.correlation_id;
+  }
+  // Coerce the string-typed depth to a finite positive integer. Anything else — absent, "",
+  // "abc", a negative, OR a literal "0" — is OMITTED here; the drain's `?? 0` fallback
+  // (maybeDeliverCallback) treats an absent `delegationDepth` as 0, so a depth-0 message
+  // still gets to call back (the ceiling, not the floor, is what stops a runaway chain).
+  // We only bother storing a value when it's a meaningful positive depth.
+  const depth = Number(meta.delegation_depth);
+  if (Number.isFinite(depth) && depth > 0) out.delegationDepth = Math.floor(depth);
+  return out;
+}
+
 /** Build the per-channel context a transport routes through. Exported for tests
  *  (the inbound-routing fork lives here). */
 export function contextFor(
@@ -281,6 +318,11 @@ export function contextFor(
         programmatic.enqueue(channel, {
           content: msg.content,
           ...(msg.meta?.note_id ? { inReplyTo: msg.meta.note_id } : {}),
+          // AGENT-TO-AGENT CALLBACK ROUTING ("reply_to") — pull the callback fields a
+          // SENDING agent stamped on this inbound note's metadata (flattened into `meta` by
+          // the vault transport's ingestInbound). When `reply_to` is present, the drain
+          // delivers a callback to that channel on turn completion. See callbackFieldsFromMeta.
+          ...callbackFieldsFromMeta(msg.meta),
         });
         return;
       }
@@ -298,6 +340,10 @@ export function contextFor(
         const outcome = programmatic.queuePending(channel, {
           content: msg.content,
           ...(msg.meta?.note_id ? { inReplyTo: msg.meta.note_id } : {}),
+          // Carry the callback fields through the PENDING buffer too — a delegated request
+          // that arrives before its recipient agent is live must still trigger a callback
+          // once the buffered turn runs on register() (the agent#121 replay path).
+          ...callbackFieldsFromMeta(msg.meta),
         });
         if (outcome === "queued") return;
         // outcome === "unknown" — not an expected programmatic channel. It may still be a
@@ -624,11 +670,16 @@ export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutboun
     const meta: Record<string, string> = {};
     if (inReplyTo) meta.in_reply_to = inReplyTo;
     if (threadId) meta.thread = threadId;
-    await ch.transport.reply({
+    const sent = await ch.transport.reply({
       channel,
       text: reply,
       ...(Object.keys(meta).length > 0 ? { meta } : {}),
     });
+    // Surface the written outbound note id so the agent-to-agent callback can point its
+    // `source_message` at it (the orchestrator pulls the full reply from there). `reply()`
+    // returns `{ sent: [noteId] }`; the first id is the note. Absent/empty → undefined,
+    // and the callback simply omits source_message.
+    return { ...(sent?.sent?.[0] ? { id: sent.sent[0] } : {}) };
   };
 }
 
@@ -674,6 +725,51 @@ export function buildWriteThread(channels: Map<string, Channel>): WriteThread {
       ...(thread.sameTurn ? { sameTurn: true } : {}),
       ...(thread.phase ? { phase: thread.phase } : {}),
     });
+  };
+}
+
+/**
+ * Build the {@link WriteCallback} the programmatic registry delivers an agent-to-agent
+ * completion callback through (the "reply_to" substrate). Resolve the SENDER's (`reply_to`)
+ * channel transport from the live `channels` map and write a CALLBACK inbound note there
+ * (`writeCallback` → a `#agent/message/inbound` note + the {@link CallbackMetadata}
+ * contract). The vault trigger on that note wakes the sender's agent through the normal
+ * inbound path — so an orchestrator is resumed by its own channel exactly as if a human
+ * had messaged it, and the per-channel serial drain handles N returning callbacks FIFO.
+ *
+ * UNKNOWN / not-live reply_to channel (reuses the #122 own-it-don't-strand posture): if the
+ * channel has no live VaultTransport, we LOG and return WITHOUT throwing — a callback that
+ * can't be delivered must not crash the recipient's drain or strand its queue. (We don't
+ * throw — unlike buildWriteOutbound/buildWriteThread, where a missing transport IS an error
+ * worth surfacing — because a callback is best-effort orchestration sugar: the recipient's
+ * turn already ran + recorded; only the onward notification is lost, and the sender can still
+ * poll the recipient's thread/transcript out-of-band.)
+ *
+ * LOOP SAFETY: `writeCallback` writes the inbound WITHOUT a `reply_to` (terminal callback),
+ * so the woken sender's turn cannot auto-emit another callback. Verified end-to-end:
+ * callback note → vault trigger → /api/vault/inbound → contextFor.emit → the sender's drain;
+ * `callbackFieldsFromMeta` finds no `reply_to`, so `maybeDeliverCallback` no-ops there.
+ */
+export function buildWriteCallback(channels: Map<string, Channel>): WriteCallback {
+  return async (channel, content, meta) => {
+    const ch = channels.get(channel);
+    const vt = ch?.transport instanceof VaultTransport ? ch.transport : undefined;
+    if (!vt || !vt.writeCallback) {
+      // Own-it-don't-strand: no live vault transport for the reply_to channel. The sender
+      // may have been torn down, or never been a vault-backed channel. Log + drop — the
+      // recipient turn already completed + recorded; we never throw (which would surface as
+      // an error in the recipient's drain).
+      console.warn(
+        `parachute-agent: callback for source "${meta.source_channel}" could not be delivered ` +
+          `— reply_to channel "${channel}" has no live vault transport (dropping the callback; ` +
+          `the turn itself completed + recorded normally).`,
+      );
+      return;
+    }
+    // `meta` is the registry's CallbackMeta; the transport's CallbackMetadata is the
+    // structurally-identical local mirror (the transport layer doesn't import the backend
+    // layer), so it passes without a cast.
+    await vt.writeCallback(content, meta);
   };
 }
 
@@ -734,6 +830,7 @@ export function createDefaultProgrammaticRegistry(
     backend,
     writeOutbound: buildWriteOutbound(channels),
     writeThread: buildWriteThread(channels),
+    writeCallback: buildWriteCallback(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }

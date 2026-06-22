@@ -14,7 +14,7 @@ An agent is a `#agent/definition` note (body = system prompt, metadata = config)
 - **`programmatic`** (the DEFAULT) — the daemon runs each turn headless via
   `claude -p --resume` (sandboxed, always-on). No resident process; an inbound message
   becomes one on-demand turn, the reply is written as an outbound note.
-- **`channel`** — the turn is delivered over a channel to a Claude Code session **you
+- **`attached`** — the turn is delivered over a channel to a Claude Code session **you
   run yourself** (your machine, your env/creds, unsandboxed) and have connected to the
   channel's MCP endpoint. The daemon runs no turn; the inbound notes accumulate as a
   durable queue and your session **pulls** the next message, works, and **replies** via
@@ -24,7 +24,7 @@ An agent is a `#agent/definition` note (body = system prompt, metadata = config)
 > [`2026-06-19-retire-interactive-backend.md`](./design/2026-06-19-retire-interactive-backend.md)).
 > It puppeted a tmux pane with send-keys and pushed onto an idle MCP stream to fake
 > message injection — and carried the deaf-on-restart / backlog-replay / idle-wake
-> fragility class. `channel` supersedes it. The PTY/tmux spawner is **parked** at
+> fragility class. `attached` supersedes it. The PTY/tmux spawner is **parked** at
 > [`src/_parked/interactive-spawn.ts`](./src/_parked/interactive-spawn.ts) for future
 > terminal/process-management (a general capability, decoupled from the agent backend),
 > not maintained as a live backend.
@@ -35,14 +35,14 @@ The **daemon** (port 1941, long-running, one per machine) is the only process th
 touches a transport's external API (e.g. Telegram's getUpdates long-poll — exclusive,
 no multi-consumer races). It owns the channel registry, routes inbound to the right
 backend (the **daemon routing fork**: `programmatic` → `ProgrammaticAgentRegistry`'s
-serial worker runs `claude -p`; `channel` → `ChannelQueueRegistry`, the durable
+serial worker runs `claude -p`; `attached` → `AttachedQueueRegistry`, the durable
 note-queue a connected session pulls from), and writes outbound notes.
 
 A Claude Code session connects to a channel two ways:
 
 - **HTTP MCP (primary)** — the session adds `<hub>/agent/mcp/<channel>` as a pure HTTP
   MCP server (URL + OAuth), exactly like the vault. The daemon serves a stateful
-  Streamable-HTTP MCP endpoint (`src/mcp-http.ts`): for a `channel`-backend agent it
+  Streamable-HTTP MCP endpoint (`src/mcp-http.ts`): for an `attached`-backend agent it
   exposes the **pull surface** (`pending` / `next-message` / `reply` / `release`); the
   live `pushToChannel` wake streams the programmatic backend's interim "watch it work"
   text + the live inbound wake onto the session's GET stream.
@@ -66,7 +66,7 @@ bun src/daemon.ts
 
 Telegram channels carry a per-channel bot token in `channels.json` config — the daemon does NOT read a global `TELEGRAM_BOT_TOKEN`. Define channels via the admin SPA at `/agent/app/` (or by writing `~/.parachute/agent/channels.json` directly).
 
-### Connecting a `channel`-backend session (the easy path)
+### Connecting an `attached`-backend session (the easy path)
 
 ```bash
 claude mcp add --transport http agent <hub-origin>/agent/mcp/<channel>
@@ -116,8 +116,8 @@ old server-rendered HTML pages — the `/ui` chat, the six-page nav — retired 
 
 ## HTTP MCP endpoint detail (the discovery contract)
 
-The `<hub-origin>/agent/mcp/<channel>` endpoint a session adds (see "Connecting a
-`channel`-backend session" above) is a stateful Streamable-HTTP MCP server
+The `<hub-origin>/agent/mcp/<channel>` endpoint a session adds (see "Connecting an
+`attached`-backend session" above) is a stateful Streamable-HTTP MCP server
 (`src/mcp-http.ts`). Discovery is RFC 9728 + RFC 8414, in the **path-insertion** form a
 Claude Code HTTP-MCP client probes (mirrors vault's `src/oauth-discovery.ts`), served
 PUBLIC (no auth) by the daemon:
@@ -132,8 +132,8 @@ PUBLIC (no auth) by the daemon:
   spec OAuth client follows to start the flow. (Only `/mcp/*` carries the challenge; `/events`
   + `/api/*` stay plain 401.)
 
-For a `channel`-backend agent the endpoint serves the PULL surface
-(`pending` / `next-message` / `reply` / `release`, dispatched to `ChannelQueueRegistry`);
+For an `attached`-backend agent the endpoint serves the PULL surface
+(`pending` / `next-message` / `reply` / `release`, dispatched to `AttachedQueueRegistry`);
 the live `pushToChannel` wake streams the programmatic backend's interim text + the live
 inbound wake onto a session's GET stream. The stdio `bridge.ts` over `/events` + `/api/*`
 still works (Layer 1 below) — the HTTP MCP endpoint is **additive**, and is the path the
@@ -168,7 +168,13 @@ config listing is non-sensitive.
 
 A `vault` transport backs a channel with notes in a Parachute vault, so messages
 are durable, queryable, and a vault surface can render them. Multiple channels per
-vault: the note's `channel` metadata routes it.
+vault: the note's routing-key metadata routes it.
+
+> **Routing-key expand phase (#133).** The routing key is now written under BOTH
+> `metadata.agent` (new, canonical) AND `metadata.channel` (legacy) on every note, and
+> READ as `agent ?? channel` via the `noteAgentKey` helper (`src/transports/vault.ts`) —
+> the expand phase of the data-model `channel → agent` rename. The vault inbound trigger
+> still keys on `channel` until a later cutover, so both keys stay populated for now.
 
 **The `#agent/*` namespace is module-owned** (design
 `design/2026-06-17-vault-native-agents.md`). Every vault object this module manages
@@ -251,9 +257,16 @@ EVERY completed turn materializes a `#agent/thread` note (a "run" was always a t
 one turn — the older `#agent/run` tag retired into this). The note is the durable,
 queryable record of one thread: its BODY is a rolling SUMMARY (`## Summary` /
 `## Latest turn`), and its metadata carries the thread state — `channel`, `definition`,
-`mode`, `status`, `started_at`, `last_turn_at`, `turn_count`, and cumulative `usage`. The
-INDEXED `status`/`definition`/`mode` fields make threads operator-queryable ("all failed
-threads", "all threads of agent X", "all multi-threaded threads").
+`mode`, `status`, `started_at`, `last_turn_at`, `turn_count`, cumulative `usage`, and the
+Claude `session` UUID. The INDEXED `status`/`definition`/`mode` fields make threads
+operator-queryable ("all failed threads", "all threads of agent X", "all multi-threaded
+threads").
+
+> **Thread ≡ session (#131).** The thread's Claude session UUID now lives on the thread
+> note itself as `metadata.session`: the daemon `--session-id`-CREATES the session on the
+> first turn and `--resume`-CONTINUES it on later turns, reading the UUID back off the
+> note. This replaces the retired separate `agent-session-state.json` store — the thread
+> note IS the session record.
 
 **v1 OVERWRITES the `## Summary` section every turn.** The module regenerates the whole
 body from the rolled-up metadata each turn (it never reads the prior note's content), so
@@ -289,7 +302,7 @@ survives an outbound failure.
 | `PARACHUTE_AGENT_PORT` | `1941` | Daemon HTTP port — back-compat override for a daemon run *outside* the supervisor. Used only when `PORT` is unset. |
 | `PARACHUTE_AGENT_URL` | `http://127.0.0.1:1941` | Bridge → daemon URL |
 | `PARACHUTE_AGENT_STATE_DIR` | `~/.parachute/agent` | Token, access config, inbox |
-| `PARACHUTE_AGENT_SWEEP_MS` | `30000` | **Daemon:** cadence of the channel-backend claim-sweep tick (auto-releases `in-flight` inbound claims older than the 15-min TTL back to `pending`, so a crashed/abandoned session can't strand a channel queue). |
+| `PARACHUTE_AGENT_SWEEP_MS` | `30000` | **Daemon:** cadence of the attached-backend claim-sweep tick (auto-releases `in-flight` inbound claims older than the 15-min TTL back to `pending`, so a crashed/abandoned session can't strand a channel queue). |
 | `PARACHUTE_HUB_ORIGIN` | `http://127.0.0.1:1939` | **Daemon:** hub's public origin for JWT `iss` validation. Required on an exposed deployment (the loopback default is dev-only); hub-as-supervisor sets it. |
 | `PARACHUTE_AGENT_TOKEN` | (none) | **Bridge:** hub-issued agent JWT presented as Bearer. The launcher mints + injects it; unset = no auth header (dev only). Default mint TTL is the hub's non-ephemeral default (~90d); re-launch re-mints. |
 
@@ -348,7 +361,7 @@ Private DMs to the bot have `chat.id === user_id` (Telegram convention). To perm
 The channel MCP endpoint serves ONE of two tool surfaces, resolved at connect time by
 the channel's backend (`src/mcp-http.ts`):
 
-**Push surface** (a non-channel channel / the bridge — the session is woken, then replies):
+**Push surface** (a non-`attached` channel / the bridge — the session is woken, then replies):
 
 | Tool | Description |
 |---|---|
@@ -357,8 +370,8 @@ the channel's backend (`src/mcp-http.ts`):
 | `edit_message` | Edit a previously sent message |
 | `download_attachment` | Download a Telegram file by file_id, returns local path |
 
-**Pull surface** (a `channel`-backend agent — the session pulls the durable queue,
-dispatched to `ChannelQueueRegistry`):
+**Pull surface** (an `attached`-backend agent — the session pulls the durable queue,
+dispatched to `AttachedQueueRegistry`):
 
 | Tool | Description |
 |---|---|
@@ -386,7 +399,7 @@ Two orthogonal axes extend cleanly:
 - **New transports** (how a channel reaches the outside world — Telegram, http-ui,
   vault, …): add `src/transports/<name>.ts` implementing the `Transport` contract and
   register it alongside the others. The session-facing MCP contract is unchanged.
-- **The two backends** (`programmatic` | `channel`) are the settled execution axis; the
+- **The two backends** (`programmatic` | `attached`) are the settled execution axis; the
   retired `interactive` (tmux) path is parked, not extended (design
   [`2026-06-19-retire-interactive-backend.md`](./design/2026-06-19-retire-interactive-backend.md)).
   A future revival of the parked PTY code lands as a general terminal/process-management

@@ -138,13 +138,6 @@ code {
   text-underline-offset: 0.3em;
   text-decoration-thickness: 2px;
 }
-.nav .nav-divider {
-  display: inline-block;
-  width: 1px;
-  height: 1.1em;
-  background: var(--border);
-  align-self: center;
-}
 
 /* ---- Headings ---- */
 h1 {

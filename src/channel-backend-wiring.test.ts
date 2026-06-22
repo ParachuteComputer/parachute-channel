@@ -90,13 +90,13 @@ describe("daemon routing fork (contextFor) — attached vs programmatic", () => 
   test("an attached-backend inbound does NOT enqueue to the programmatic worker", async () => {
     const backend = new FakeProgrammaticBackend();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopWriteOutbound() });
-    const channelQueue = new AttachedQueueRegistry();
+    const attachedQueue = new AttachedQueueRegistry();
     const store = new FakeStore();
     // Register an ATTACHED agent for "laptop" (its queue store is the fake).
-    channelQueue.register(channelSpec("laptop"), store);
+    attachedQueue.register(channelSpec("laptop"), store);
 
     const registry = new ClientRegistry();
-    const ctx = contextFor(registry, "laptop", new DeliveryState(), programmatic, channelQueue);
+    const ctx = contextFor(registry, "laptop", new DeliveryState(), programmatic, attachedQueue);
     // Simulate the vault trigger delivering an inbound for the channel.
     ctx.emit({
       channel: "laptop",
@@ -111,7 +111,7 @@ describe("daemon routing fork (contextFor) — attached vs programmatic", () => 
     // status:pending; emit doesn't mutate it). The note already lives in the vault; the
     // channel registry reads it on the next pull.
     store.add({ id: "note-1", text: "handle this when you're around", sender: "operator", ts: "2026-06-18T10:00:00Z", status: "pending" });
-    const view = await channelQueue.pending("laptop");
+    const view = await attachedQueue.pending("laptop");
     expect(view.count).toBe(1);
   });
 
@@ -119,10 +119,10 @@ describe("daemon routing fork (contextFor) — attached vs programmatic", () => 
     const backend = new FakeProgrammaticBackend();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopWriteOutbound() });
     await programmatic.register({ name: "eng", channels: ["eng"], backend: "programmatic" });
-    const channelQueue = new AttachedQueueRegistry(); // no attached agent for "eng".
+    const attachedQueue = new AttachedQueueRegistry(); // no attached agent for "eng".
 
     const registry = new ClientRegistry();
-    const ctx = contextFor(registry, "eng", new DeliveryState(), programmatic, channelQueue);
+    const ctx = contextFor(registry, "eng", new DeliveryState(), programmatic, attachedQueue);
     ctx.emit({ channel: "eng", content: "do a task", meta: { note_id: "n-eng" }, source: "vault" });
 
     // The serial worker drains async — wait for the turn to run.
@@ -138,10 +138,10 @@ describe("daemon routing fork (contextFor) — attached vs programmatic", () => 
     const backend = new FakeProgrammaticBackend();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopWriteOutbound() });
     await programmatic.register({ name: "dual", channels: ["dual"], backend: "programmatic" });
-    const channelQueue = new AttachedQueueRegistry();
-    channelQueue.register(channelSpec("dual"), new FakeStore());
+    const attachedQueue = new AttachedQueueRegistry();
+    attachedQueue.register(channelSpec("dual"), new FakeStore());
 
-    const ctx = contextFor(new ClientRegistry(), "dual", new DeliveryState(), programmatic, channelQueue);
+    const ctx = contextFor(new ClientRegistry(), "dual", new DeliveryState(), programmatic, attachedQueue);
     ctx.emit({ channel: "dual", content: "x", meta: {}, source: "vault" });
     await new Promise<void>((r) => setTimeout(r, 10));
     expect(backend.delivered).toEqual([]); // channel won the fork.

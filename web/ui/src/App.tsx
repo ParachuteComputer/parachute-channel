@@ -43,12 +43,6 @@ export function App() {
         <NavSection to="/" label="Agents" exact />
         <NavSection to="/create" label="New agent" />
         <NavSection to="/chat" label="Chat" />
-        {/* Boundary: everything past here is the older daemon-rendered HTML,
-            kept mounted during the migration so the operator can compare. */}
-        <span className="nav-divider" aria-hidden="true" />
-        <a href="/agent/agents" title="The legacy create/list HTML page">
-          Classic UI
-        </a>
       </nav>
 
       <Routes>

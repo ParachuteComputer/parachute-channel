@@ -48,8 +48,7 @@ A session can also connect as a **pure HTTP MCP server** (by URL + OAuth, exactl
 like adding the vault) — no local config file. See
 [Connecting a session](#connecting-a-session).
 
-Deeper design + operational detail live in [`CLAUDE.md`](./CLAUDE.md) and
-[`PLAN.md`](./PLAN.md).
+Deeper design + operational detail live in [`CLAUDE.md`](./CLAUDE.md).
 
 ## Status & safety
 

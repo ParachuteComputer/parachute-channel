@@ -104,7 +104,7 @@ export interface ClaimedMessage {
 }
 
 /** One registered attached-backend agent: its spec + the store its queue lives in. */
-interface ChannelRecord {
+interface AttachedRecord {
   /** The agent slug (the spec name) == the wake channel (agent ≡ channel). */
   name: string;
   /** The channel the queue + MCP surface key on. */
@@ -128,7 +128,7 @@ const PREVIEW_LEN = 120;
  */
 export class AttachedQueueRegistry {
   /** channel → record. */
-  private readonly byChannel = new Map<string, ChannelRecord>();
+  private readonly byChannel = new Map<string, AttachedRecord>();
   /** name → channel (the lifecycle index; an agent has exactly one channel). */
   private readonly nameToChannel = new Map<string, string>();
   private readonly claimTtlMs: number;

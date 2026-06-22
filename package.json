@@ -1,7 +1,7 @@
 {
   "name": "@openparachute/agent",
   "version": "0.1.0",
-  "description": "Messaging gateway for Claude Code — Telegram today, anything tomorrow",
+  "description": "Vault-native agents for Claude Code — a #agent/definition note + an inbound message becomes a sandboxed claude turn; the reply is written back as a note. Messaging gateway on :1941.",
   "license": "AGPL-3.0",
   "type": "module",
   "bin": {

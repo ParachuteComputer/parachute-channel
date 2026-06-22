@@ -197,7 +197,7 @@ function serverWith(
   channels: Map<string, Channel>,
   o?: {
     agentDefs?: AgentDefRegistry;
-    channelQueue?: AttachedQueueRegistry;
+    attachedQueue?: AttachedQueueRegistry;
     addDefVault?: AddDefVault;
   },
 ) {
@@ -208,7 +208,7 @@ function serverWith(
     idleTimeout: 0,
     fetch: createFetchHandler(channels, registry, {
       ...(o?.agentDefs ? { agentDefs: o.agentDefs } : {}),
-      ...(o?.channelQueue ? { channelQueue: o.channelQueue } : {}),
+      ...(o?.attachedQueue ? { attachedQueue: o.attachedQueue } : {}),
       ...(o?.addDefVault ? { addDefVault: o.addDefVault } : {}),
     }),
   });
@@ -248,9 +248,9 @@ describe("GET /api/agents includes channel-backend agents (#102)", () => {
   }
 
   test("a registered attached agent appears with backend:attached + queued status + channel + vault", async () => {
-    const channelQueue = new AttachedQueueRegistry();
-    channelQueue.register(channelSpec("laptop", "research"), storeWithPending(2));
-    const { srv, base } = serverWith(emptyChannels(), { channelQueue });
+    const attachedQueue = new AttachedQueueRegistry();
+    attachedQueue.register(channelSpec("laptop", "research"), storeWithPending(2));
+    const { srv, base } = serverWith(emptyChannels(), { attachedQueue });
     const res = await fetch(`${base}/api/agents`, { headers: adminAuth });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { agents: Array<Record<string, unknown>> };
@@ -267,9 +267,9 @@ describe("GET /api/agents includes channel-backend agents (#102)", () => {
   });
 
   test("an empty pending queue → status idle", async () => {
-    const channelQueue = new AttachedQueueRegistry();
-    channelQueue.register(channelSpec("idlebot"), storeWithPending(0));
-    const { srv, base } = serverWith(emptyChannels(), { channelQueue });
+    const attachedQueue = new AttachedQueueRegistry();
+    attachedQueue.register(channelSpec("idlebot"), storeWithPending(0));
+    const { srv, base } = serverWith(emptyChannels(), { attachedQueue });
     const res = await fetch(`${base}/api/agents`, { headers: adminAuth });
     const body = (await res.json()) as { agents: Array<Record<string, unknown>> };
     expect(body.agents.find((a) => a.name === "idlebot")!.status).toBe("idle");
@@ -277,7 +277,7 @@ describe("GET /api/agents includes channel-backend agents (#102)", () => {
   });
 
   test("no Authorization → 401 (admin-gated)", async () => {
-    const { srv, base } = serverWith(emptyChannels(), { channelQueue: new AttachedQueueRegistry() });
+    const { srv, base } = serverWith(emptyChannels(), { attachedQueue: new AttachedQueueRegistry() });
     const res = await fetch(`${base}/api/agents`);
     expect(res.status).toBe(401);
     srv.stop();

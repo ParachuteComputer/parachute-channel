@@ -51,7 +51,6 @@ function agentRow(over: Partial<api.AgentRow> = {}): api.AgentRow {
   return {
     name: "alpha",
     session: "alpha-agent",
-    attached: false,
     workspace: "/w/alpha",
     hasWorkspace: true,
     backend: "programmatic",
@@ -129,7 +128,7 @@ describe("mergeAgents (all-backends merge)", () => {
       [
         agentRow({ name: "prog", backend: "programmatic", status: "idle" }),
         agentRow({ name: "chan", backend: "channel", channel: "chan", vault: "default", status: "queued:2" }),
-        agentRow({ name: "tmux", backend: "interactive", attached: true }),
+        agentRow({ name: "tmux", backend: "interactive" }),
       ],
       [],
     );

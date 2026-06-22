@@ -1,5 +1,5 @@
 /**
- * `channelQueueStoreFor` — the PRODUCTION adapter that wires a live `VaultTransport`
+ * `attachedQueueStoreFor` — the PRODUCTION adapter that wires a live `VaultTransport`
  * into the `AttachedQueueStore` the pull-queue worker uses.
  *
  * Regression for the agent#101 CAS single-claim guard (PR #116): the adapter MUST
@@ -11,7 +11,7 @@
  * REAL adapter end-to-end against a `VaultTransport`.
  */
 import { describe, test, expect, afterEach } from "bun:test";
-import { channelQueueStoreFor } from "./daemon.ts";
+import { attachedQueueStoreFor } from "./daemon.ts";
 import { VaultTransport } from "./transports/vault.ts";
 import type { Channel } from "./registry.ts";
 
@@ -41,9 +41,9 @@ function recordPatch(): { bodies: Record<string, unknown>[] } {
   return { bodies };
 }
 
-describe("channelQueueStoreFor — CAS arg forwarding (agent#101 regression)", () => {
+describe("attachedQueueStoreFor — CAS arg forwarding (agent#101 regression)", () => {
   test("setInboundStatus FORWARDS ifUpdatedAt → the vault does a CAS (if_updated_at), not force", async () => {
-    const store = channelQueueStoreFor(vaultChannels(), "eng");
+    const store = attachedQueueStoreFor(vaultChannels(), "eng");
     expect(store).not.toBeNull();
     const { bodies } = recordPatch();
     await store!.setInboundStatus("note-1", "in-flight", "2026-06-22T00:00:00.000Z", "2026-06-22T00:00:00.000Z");
@@ -55,7 +55,7 @@ describe("channelQueueStoreFor — CAS arg forwarding (agent#101 regression)", (
   });
 
   test("setInboundStatus WITHOUT ifUpdatedAt → force:true (release/handled/sweep path, unchanged)", async () => {
-    const store = channelQueueStoreFor(vaultChannels(), "eng");
+    const store = attachedQueueStoreFor(vaultChannels(), "eng");
     const { bodies } = recordPatch();
     await store!.setInboundStatus("note-1", "pending", null);
     expect(bodies).toHaveLength(1);

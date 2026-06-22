@@ -285,7 +285,7 @@ export function contextFor(
   channel: string,
   deliveryState: DeliveryState,
   programmatic?: ProgrammaticAgentRegistry,
-  channelQueue?: AttachedQueueRegistry,
+  attachedQueue?: AttachedQueueRegistry,
 ): TransportContext {
   return {
     channel,
@@ -303,7 +303,7 @@ export function contextFor(
       //     high-water-mark (there's no live subscriber to deliver to; the durable note
       //     queue + claim status is the durability, not replay). Checked FIRST so an
       //     attached agent NEVER falls through to the programmatic enqueue below.
-      if (channelQueue?.hasChannel(channel)) {
+      if (attachedQueue?.hasChannel(channel)) {
         return;
       }
       // PROGRAMMATIC ROUTING (design 2026-06-16 step 3). If a programmatic agent is
@@ -404,7 +404,7 @@ async function addChannelLive(
   entry: ChannelEntry,
   deliveryState: DeliveryState,
   programmatic?: ProgrammaticAgentRegistry,
-  channelQueue?: AttachedQueueRegistry,
+  attachedQueue?: AttachedQueueRegistry,
 ): Promise<Channel> {
   const existing = channels.get(entry.name);
   if (existing) {
@@ -420,7 +420,7 @@ async function addChannelLive(
   const transport = instantiateTransport(entry);
   const channel: Channel = { name: entry.name, transport, entry };
   channels.set(entry.name, channel);
-  await transport.start(contextFor(registry, entry.name, deliveryState, programmatic, channelQueue));
+  await transport.start(contextFor(registry, entry.name, deliveryState, programmatic, attachedQueue));
   return channel;
 }
 
@@ -487,7 +487,7 @@ export function buildInstantiateDeps(
   registry: ClientRegistry,
   deliveryState: DeliveryState,
   programmatic: ProgrammaticAgentRegistry,
-  channelQueue: AttachedQueueRegistry,
+  attachedQueue: AttachedQueueRegistry,
 ): InstantiateDeps {
   return {
     ensureChannel: async (name, binding) => {
@@ -496,7 +496,7 @@ export function buildInstantiateDeps(
       // the channel is live the vault trigger can fire an inbound, but the agent isn't
       // `register()`ed until `setupAndRegister` runs (a later step). An inbound landing in
       // that window now QUEUES PENDING (owned, replayed on register) instead of dropping.
-      // Harmless for a `channel`-backend agent — its inbound is handled by the channelQueue
+      // Harmless for a `channel`-backend agent — its inbound is handled by the attachedQueue
       // routing fork first, so the expected mark is never consulted for it. The mark is
       // cleared on register (the live index takes over) or on teardown (unexpectChannel).
       programmatic.expectChannel(normalizeChannel(name).name);
@@ -506,7 +506,7 @@ export function buildInstantiateDeps(
         defVaultChannelEntry(name, binding),
         deliveryState,
         programmatic,
-        channelQueue,
+        attachedQueue,
       );
     },
     setupAndRegister: async (spec) => {
@@ -520,14 +520,14 @@ export function buildInstantiateDeps(
       // e.g. read straight from an old spec.json) is treated as `"attached"` here too —
       // belt-and-suspenders on top of the parse-path normalization in agent-defs.ts.
       if (spec.backend === "attached" || (spec.backend as string) === "channel") {
-        const store = channelQueueStoreFor(channels, spec.channels[0]);
+        const store = attachedQueueStoreFor(channels, spec.channels[0]);
         if (!store) {
           throw new Error(
             `cannot register attached-backend agent "${spec.name}": its wake channel is not a ` +
               `live vault transport (the queue needs the vault as its durable store)`,
           );
         }
-        channelQueue.register(spec, store);
+        attachedQueue.register(spec, store);
         return;
       }
       // Persist spec.json (so boot re-register + per-turn deliver find the workspace)
@@ -544,7 +544,7 @@ export function buildInstantiateDeps(
       // teardown — a deleted def must not leave its channel marked expected forever).
       const wakeChannel = programmatic.getByName(name)?.channel;
       const fromProgrammatic = await programmatic.deregister(name);
-      const fromChannel = channelQueue.deregister(name);
+      const fromChannel = attachedQueue.deregister(name);
       if (wakeChannel) programmatic.unexpectChannel(wakeChannel);
       return fromProgrammatic || fromChannel;
     },
@@ -621,7 +621,7 @@ function defaultAddDefVault(
  * — the same `reply()` the programmatic worker uses, so the outbound is durable +
  * loop-safe (tagged `#agent/message/outbound`, which the inbound trigger never fires on).
  */
-export function channelQueueStoreFor(
+export function attachedQueueStoreFor(
   channels: Map<string, Channel>,
   channelName: string | { name: string } | undefined,
 ): AttachedQueueStore | null {
@@ -935,7 +935,6 @@ export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry):
       return {
         name: h.name,
         session: `${h.name}-agent`,
-        attached: false,
         workspace,
         hasWorkspace: existsSync(join(workspace, "spec.json")),
         backend: "programmatic" as const,
@@ -959,14 +958,14 @@ export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry):
  * each) — best-effort: a queue read failure degrades that agent's status to `idle`,
  * never failing the whole list. NEVER surfaces a token/secret.
  */
-export async function listChannelAgents(channelQueue: AttachedQueueRegistry): Promise<AgentInfo[]> {
+export async function listAttachedAgents(attachedQueue: AttachedQueueRegistry): Promise<AgentInfo[]> {
   const dir = defaultSessionsDir();
-  const records = channelQueue.list();
+  const records = attachedQueue.list();
   return Promise.all(
     records.map(async (rec) => {
       let status = "idle";
       try {
-        const view = await channelQueue.pending(rec.channel);
+        const view = await attachedQueue.pending(rec.channel);
         status = view.count > 0 ? `queued:${view.count}` : "idle";
       } catch {
         // A queue read failure shouldn't sink the list — show idle, not an error.
@@ -975,7 +974,6 @@ export async function listChannelAgents(channelQueue: AttachedQueueRegistry): Pr
       const info: AgentInfo = {
         name: rec.name,
         session: `${rec.name}-agent`,
-        attached: false,
         workspace,
         hasWorkspace: existsSync(join(workspace, "spec.json")),
         backend: "attached",
@@ -1238,7 +1236,7 @@ export function createFetchHandler(
      * `contextFor` routing fork checks); tests inject a fake-store-backed instance.
      * Optional — when absent, the channel MCP tools no-op (no attached agents).
      */
-    channelQueue?: AttachedQueueRegistry;
+    attachedQueue?: AttachedQueueRegistry;
     /**
      * The per-channel turn-event SSE registry (the streaming view, design build
      * item #1). The `/api/channels/<ch>/turn-events` SSE route registers subscribers
@@ -1303,7 +1301,7 @@ export function createFetchHandler(
   // channel MCP surface dispatches to). Defaulted to a fresh instance so a plain
   // createFetchHandler still serves the channel MCP tools (it just has no channel
   // agents registered until one is instantiated). Tests inject a fake-store-backed one.
-  const channelQueue: AttachedQueueRegistry = opts?.channelQueue ?? new AttachedQueueRegistry();
+  const attachedQueue: AttachedQueueRegistry = opts?.attachedQueue ?? new AttachedQueueRegistry();
 
   // Per-channel delivery high-water-mark store (durable infra). `contextFor.emit`
   // advances it on a real delivery; the daemon's `main` passes the boot-time
@@ -1616,7 +1614,7 @@ export function createFetchHandler(
         return json({ error: `failed to write channels.json: ${(err as Error).message}` }, 500);
       }
       try {
-        await addChannelLive(channels, registry, entry, deliveryState, programmatic, channelQueue);
+        await addChannelLive(channels, registry, entry, deliveryState, programmatic, attachedQueue);
       } catch (err) {
         return json(
           {
@@ -1950,7 +1948,7 @@ export function createFetchHandler(
           // each carries its `backend` + a live `status` (idle|working|queued:N); a
           // channel agent also surfaces its wake `channel` + backing `vault`.
           const programmaticInfos = listProgrammaticAgents(programmatic);
-          const channelInfos = await listChannelAgents(channelQueue);
+          const channelInfos = await listAttachedAgents(attachedQueue);
           return json({ agents: [...programmaticInfos, ...channelInfos] });
         } catch (err) {
           return json({ error: `failed to list agents: ${(err as Error).message}` }, 500);
@@ -2877,7 +2875,7 @@ export function createFetchHandler(
         // Unreachable in practice (requireScope passed); fall back to read-only.
         scopes = [SCOPE_READ];
       }
-      return handleMcp(req, channel, transport, scopes, channelQueue);
+      return handleMcp(req, channel, transport, scopes, attachedQueue);
     }
 
     // Give each transport a chance to handle a route the daemon didn't. Runs
@@ -3009,7 +3007,7 @@ function main(): void {
   // durable queue + claim state lives on the inbound notes in each channel's vault, so
   // this registry holds no per-message state of its own — it's the claim/peek/reply
   // surface over those notes.
-  const channelQueue = new AttachedQueueRegistry();
+  const attachedQueue = new AttachedQueueRegistry();
 
   // The terminal WS handler set (pty↔socket relay + backpressure flow control,
   // src/terminal.ts). One handler object serves every terminal connection;
@@ -3058,10 +3056,10 @@ function main(): void {
   // resolve below (resolveDefVaults → addVault → loadAll) fills it. ADDITIVE to
   // channels.json — both paths coexist.
   const agentDefs = new AgentDefRegistry(
-    buildInstantiateDeps(channels, registry, deliveryState, programmatic, channelQueue),
+    buildInstantiateDeps(channels, registry, deliveryState, programmatic, attachedQueue),
   );
 
-  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, channelQueue, turnEvents, jobStore, runner, agentDefs });
+  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, attachedQueue, turnEvents, jobStore, runner, agentDefs });
   const server = Bun.serve<TerminalWsData, never>({
     port: PORT,
     hostname: "127.0.0.1",
@@ -3146,7 +3144,7 @@ function main(): void {
   // still serve the channels that did come up. Pass the programmatic registry so a
   // channel with a registered programmatic agent routes inbound to its serial queue.
   for (const channel of [...channels.values()]) {
-    addChannelLive(channels, registry, channel.entry, deliveryState, programmatic, channelQueue).catch((err) => {
+    addChannelLive(channels, registry, channel.entry, deliveryState, programmatic, attachedQueue).catch((err) => {
       console.error(`parachute-agent: transport "${channel.name}" start failed:`, err);
     });
   }
@@ -3179,7 +3177,7 @@ function main(): void {
   // process open; runs at the same 30s cadence as the runner tick.
   const sweepIntervalMs = parseInt(process.env.PARACHUTE_AGENT_SWEEP_MS ?? "", 10) || 30_000;
   const channelSweep = setInterval(() => {
-    void channelQueue.sweepExpired().catch((err) => {
+    void attachedQueue.sweepExpired().catch((err) => {
       console.error(`parachute-agent: attached-queue sweep failed (continuing): ${(err as Error).message}`);
     });
   }, sweepIntervalMs);

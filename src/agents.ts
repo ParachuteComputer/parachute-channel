@@ -43,19 +43,16 @@ export const AGENT_NAME_SLUG = /^[a-z0-9_-]+$/i;
 /**
  * One agent as the `/api/agents` list returns it — a PROGRAMMATIC or ATTACHED agent
  * (the only two live backends; interactive was retired 2026-06-19). Neither has a
- * tmux session, so `session` is the conventional `<name>-agent` display label,
- * `attached` is always false (the boolean tmux-attach flag — NOT the backend value),
- * and liveness rides in `status` (`idle` | `working` | `queued:N`) rather than the old
+ * tmux session, so `session` is the conventional `<name>-agent` display label and
+ * liveness rides in `status` (`idle` | `working` | `queued:N`) rather than the old
  * tmux `attached`/`mcp_sessions` flags. Built by `listProgrammaticAgents` /
- * `listChannelAgents` (daemon.ts). NEVER carries a secret.
+ * `listAttachedAgents` (daemon.ts). NEVER carries a secret.
  */
 export interface AgentInfo {
   /** Agent slug. */
   name: string;
   /** Conventional `<name>-agent` display label (no tmux session backs it). */
   session: string;
-  /** Always false (no tmux session to attach to). */
-  attached: boolean;
   /** Per-session workspace dir (where spec.json lives). */
   workspace: string;
   /** Whether the session's workspace (with its spec.json) is present on disk. */

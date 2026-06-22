@@ -157,18 +157,16 @@ export type AgentMode = "single-threaded" | "multi-threaded";
 
 /**
  * One entry from `GET /agent/api/agents` — the merged all-backends list.
- * Mirrors `AgentInfo` in `src/agents.ts`. Interactive agents carry
- * `attached`/`hasWorkspace`; programmatic/channel agents carry a live `status`
- * and (when vault-native) a `channel` + `vault`.
+ * Mirrors `AgentInfo` in `src/agents.ts`. Programmatic/channel agents carry a
+ * live `status` and (when vault-native) a `channel` + `vault`.
  */
 export interface AgentRow {
   name: string;
   session: string;
-  attached: boolean;
   workspace: string;
   hasWorkspace: boolean;
   backend: AgentBackend;
-  /** Live status — `idle` | `working` | `queued:N`. Absent for interactive. */
+  /** Live status — `idle` | `working` | `queued:N`. */
   status?: string;
   /** The wake channel this agent serves (channel-backend; agent == channel). */
   channel?: string;

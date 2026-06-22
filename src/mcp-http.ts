@@ -439,7 +439,7 @@ const CHANNEL_WRITE_TOOLS = new Set(["next-message", "reply", "release"]);
  */
 export async function dispatchChannelTool(
   channel: string,
-  channelQueue: AttachedQueueRegistry,
+  attachedQueue: AttachedQueueRegistry,
   scopes: string[],
   name: string,
   args: Record<string, unknown>,
@@ -448,7 +448,7 @@ export async function dispatchChannelTool(
   // attached-backend agent is registered. (The daemon also only serves CHANNEL_TOOL_DEFS
   // when the agent is registered, so a well-behaved client never reaches here for a
   // non-attached channel — but a hand-crafted call should fail gracefully, not 500.)
-  if (!channelQueue.hasChannel(channel)) {
+  if (!attachedQueue.hasChannel(channel)) {
     return {
       content: [{ type: "text", text: `channel "${channel}" has no attached-backend agent — the pull/reply tools are not available here` }],
       isError: true,
@@ -468,11 +468,11 @@ export async function dispatchChannelTool(
   try {
     switch (name) {
       case "pending": {
-        const view = await channelQueue.pending(channel);
+        const view = await attachedQueue.pending(channel);
         return { content: [{ type: "text", text: JSON.stringify(view) }] };
       }
       case "next-message": {
-        const claimed = await channelQueue.claimNext(channel);
+        const claimed = await attachedQueue.claimNext(channel);
         if (!claimed) {
           return { content: [{ type: "text", text: JSON.stringify({ message: null, note: "no pending messages" }) }] };
         }
@@ -481,7 +481,7 @@ export async function dispatchChannelTool(
       case "reply": {
         const text = typeof args.text === "string" ? args.text : "";
         const inReplyTo = typeof args.inReplyTo === "string" ? args.inReplyTo : undefined;
-        const sent = await channelQueue.reply(channel, { text, ...(inReplyTo ? { inReplyTo } : {}) });
+        const sent = await attachedQueue.reply(channel, { text, ...(inReplyTo ? { inReplyTo } : {}) });
         const ids = sent.sent;
         return {
           content: [{ type: "text", text: `replied + marked handled (outbound id: ${ids.join(", ")})` }],
@@ -492,7 +492,7 @@ export async function dispatchChannelTool(
         if (!id) {
           return { content: [{ type: "text", text: "release requires an id" }], isError: true };
         }
-        await channelQueue.release(channel, id);
+        await attachedQueue.release(channel, id);
         return { content: [{ type: "text", text: `released ${id} back to pending` }] };
       }
       default:
@@ -524,7 +524,7 @@ function buildServer(
   channel: string,
   transport: Transport,
   session: McpSession,
-  channelQueue?: AttachedQueueRegistry,
+  attachedQueue?: AttachedQueueRegistry,
 ): Server {
   // ── ATTACHED-BACKEND FORK (design 2026-06-18). When a `backend:attached` agent is
   // registered for this channel, serve the PULL/REPLY surface (pending / next-message
@@ -532,7 +532,7 @@ function buildServer(
   // AttachedQueueRegistry. Otherwise serve the existing push surface (reply / react /
   // edit / download), dispatched to the transport. Resolved at connect time — a
   // channel doesn't switch backends under a live session.
-  const isAttachedBackend = !!channelQueue?.hasChannel(channel);
+  const isAttachedBackend = !!attachedQueue?.hasChannel(channel);
   const server = new Server(
     // Per-channel name (`agent-<name>`) so it reads clearly in `/mcp` and lines
     // up with the `--dangerously-load-development-channels=server:agent-<name>`
@@ -559,8 +559,8 @@ function buildServer(
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const args = (req.params.arguments ?? {}) as Record<string, unknown>;
     const result =
-      isAttachedBackend && channelQueue
-        ? await dispatchChannelTool(channel, channelQueue, session.scopes, req.params.name, args)
+      isAttachedBackend && attachedQueue
+        ? await dispatchChannelTool(channel, attachedQueue, session.scopes, req.params.name, args)
         : await dispatchTool(channel, transport, session.scopes, req.params.name, args);
     // Our ToolResult is the content/isError subset of the SDK's CallToolResult
     // (which also has a task-variant we never emit); return it as that shape.
@@ -708,7 +708,7 @@ export async function handleMcp(
   channel: string,
   transport: Transport,
   scopes: string[],
-  channelQueue?: AttachedQueueRegistry,
+  attachedQueue?: AttachedQueueRegistry,
 ): Promise<Response> {
   const sid = req.headers.get("mcp-session-id");
 
@@ -756,7 +756,7 @@ export async function handleMcp(
     },
   });
 
-  const server = buildServer(channel, transport, session, channelQueue);
+  const server = buildServer(channel, transport, session, attachedQueue);
   session.server = server;
   session.transport = httpTransport;
 

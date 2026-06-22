@@ -386,7 +386,7 @@ export const AGENT_DEFINITION_TAG = "#agent/definition";
  * `#agent/message`. Introduced in Phase 2 as the flat `#agent-job`; moved into the
  * `#agent/*` namespace (`#agent/job`) by the vault-native-agents work (Phase 4a).
  */
-const AGENT_JOB_TAG = "#agent/job";
+export const AGENT_JOB_TAG = "#agent/job";
 /** Default path prefix under which job notes are written: `Channels/<ch>/jobs/<id>`. */
 const JOB_PATH_PREFIX = "Channels";
 
@@ -489,6 +489,20 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     name: AGENT_JOB_TAG,
     parent_names: [AGENT_ROOT_TAG],
     description: "A scheduled job — the runner injects this note's message on its cron schedule.",
+    // Indexed query axes so an operator/agent can find jobs by target + state (mirrors
+    // the #agent/thread axes). All stored as strings (the vault stores metadata as
+    // strings; `enabled` is "true"/"false"):
+    //  - channel    → "all jobs targeting agent X"
+    //  - enabled    → "active jobs" (enabled:"true") vs paused ("false")
+    //  - lastStatus → "jobs whose last run errored"
+    // The full field set is `JobNoteMetadata` in src/jobs.ts (design
+    // 2026-06-17-runner-scheduled-agent-turns); the schema is permissive, so the other
+    // job fields (jobId/cron/tz/createdAt/lastRunAt) ride as undeclared metadata.
+    fields: {
+      channel: { type: "string", indexed: true },
+      enabled: { type: "string", indexed: true },
+      lastStatus: { type: "string", indexed: true },
+    },
   },
   {
     name: AGENT_THREAD_TAG,

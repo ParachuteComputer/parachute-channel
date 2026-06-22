@@ -26,7 +26,7 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, InboundClaimConflictError } from "./vault.ts";
+import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError } from "./vault.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
 
@@ -1455,6 +1455,24 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
       status: { type: "string", indexed: true },
       definition: { type: "string", indexed: true },
       mode: { type: "string", indexed: true },
+    });
+  });
+
+  test("ensureSchema sends the indexed `fields` body for #agent/job (query by channel/enabled/lastStatus)", async () => {
+    let jobBody: { fields?: Record<string, unknown> } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const name = decodeURIComponent(String(url).split("/api/tags/")[1]!);
+      if (name === AGENT_JOB_TAG) jobBody = JSON.parse(String(init?.body));
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.ensureSchema();
+
+    expect(jobBody?.fields).toEqual({
+      channel: { type: "string", indexed: true },
+      enabled: { type: "string", indexed: true },
+      lastStatus: { type: "string", indexed: true },
     });
   });
 

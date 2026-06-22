@@ -13,6 +13,7 @@ import type {
   AgentStatus,
   DeliverResult,
   InterimSink,
+  TurnSession,
 } from "./backends/types.ts";
 import type { AgentSpec } from "./sandbox/types.ts";
 
@@ -376,30 +377,35 @@ describe("Runner — driver wiring (start/stop)", () => {
 // just the runner-in-isolation contract.
 // ---------------------------------------------------------------------------
 
-/** A fake backend that records whether each turn resumed, keyed off the spec's mode. */
+/**
+ * A fake backend that records whether each turn RESUMED — read off the {@link TurnSession}
+ * the REGISTRY hands it (the daemon now owns the session uuid; the backend reads no store).
+ * The registry resolves resume-vs-create from the thread note's persisted session (the
+ * test wires `readSession` to simulate a prior session), so a faithful assertion is "what
+ * did the registry decide?", surfaced via `session.resume`.
+ */
 class ModeFakeBackend implements AgentBackend {
   readonly kind = "programmatic";
   readonly resumed = new Map<string, boolean>(); // channel → did this turn resume?
-  private readonly sessionId = new Map<string, string>(); // channel → persisted id
 
   async start(spec: AgentSpec): Promise<AgentHandle> {
     return { backend: this.kind, channel: spec.channels[0] as string, name: spec.name, spec };
   }
-  async deliver(handle: AgentHandle, message: string, _onInterim?: InterimSink): Promise<DeliverResult> {
-    // Mirror the real backend's mode semantics so the runner-path assertion is faithful.
-    const multiThreaded = handle.spec?.mode === "multi-threaded";
-    const prior = multiThreaded ? undefined : this.sessionId.get(handle.channel);
-    this.resumed.set(handle.channel, prior !== undefined);
-    if (!multiThreaded) this.sessionId.set(handle.channel, "sess-" + handle.channel);
-    return { ok: true, reply: "did: " + message };
+  async deliver(
+    handle: AgentHandle,
+    message: string,
+    session: TurnSession,
+    _onInterim?: InterimSink,
+  ): Promise<DeliverResult> {
+    // The registry resolved the session (resume an existing one vs create a fresh uuid);
+    // the backend just records what it was handed. Echo the id back so the registry persists
+    // it onto the thread note.
+    this.resumed.set(handle.channel, session.resume);
+    return { ok: true, reply: "did: " + message, sessionId: session.id };
   }
   async stop(_handle: AgentHandle): Promise<void> {}
   async status(_handle: AgentHandle): Promise<AgentStatus> {
     return { live: true };
-  }
-  /** Seed a prior session id (as if a previous turn established one). */
-  seed(channel: string, id: string): void {
-    this.sessionId.set(channel, id);
   }
 }
 
@@ -442,10 +448,16 @@ describe("Runner — a scheduled fire honors the def's mode", () => {
   test("a MULTI-THREADED def's scheduled fire is fresh (no resume) + materializes a thread note", async () => {
     const backend = new ModeFakeBackend();
     const threads = threadRec();
-    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopOutbound, writeThread: threads.fn });
+    // Even with a prior session AVAILABLE on the note, a multi-threaded fire must NOT
+    // consult readSession (each fire is a fresh thread) — wire one that WOULD return a
+    // prior to prove it's ignored.
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: noopOutbound,
+      writeThread: threads.fn,
+      readSession: async () => "sess-OLD",
+    });
     await reg.register({ name: "digest", channels: ["digest"], mode: "multi-threaded", definition: "Agents/digest" });
-    // Even with a prior session id seeded, a multi-threaded fire must NOT resume.
-    backend.seed("digest", "sess-OLD");
 
     const r = wireRunner(reg);
     // runNow needs the job in the store; drive `fire` directly (the runner's fire is
@@ -467,10 +479,16 @@ describe("Runner — a scheduled fire honors the def's mode", () => {
   test("REGRESSION: a SINGLE-THREADED def's scheduled fire RESUMES the thread + materializes ONE thread note", async () => {
     const backend = new ModeFakeBackend();
     const threads = threadRec();
-    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopOutbound, writeThread: threads.fn });
+    // A prior turn established the thread → its session lives on the thread note; the
+    // registry reads it back (readSession) and resumes. Wire a reader returning a prior.
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: noopOutbound,
+      writeThread: threads.fn,
+      readSession: async () => "sess-EXISTING",
+    });
     // No mode → single-threaded (the default = today's behavior).
     await reg.register({ name: "uni-dev", channels: ["uni-dev"] });
-    backend.seed("uni-dev", "sess-EXISTING"); // a prior turn established the thread.
 
     const r = wireRunner(reg);
     await r["fire"](job({ id: "uni-job", channel: "uni-dev", message: "daily check-in" }));

@@ -24,7 +24,14 @@ import {
   type TurnEventSink,
   type TurnLifecycleEvent,
 } from "./registry.ts";
-import type { AgentBackend, AgentHandle, AgentStatus, DeliverResult, InterimSink } from "./types.ts";
+import type {
+  AgentBackend,
+  AgentHandle,
+  AgentStatus,
+  DeliverResult,
+  InterimSink,
+  TurnSession,
+} from "./types.ts";
 import type { AgentSpec } from "../sandbox/types.ts";
 
 /** A deferred promise — resolve it externally to release a gated turn. */
@@ -43,8 +50,8 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
  */
 class FakeBackend implements AgentBackend {
   readonly kind = "programmatic";
-  /** Per-call records, in arrival order. */
-  readonly calls: { channel: string; message: string }[] = [];
+  /** Per-call records, in arrival order — including the caller-resolved {@link TurnSession}. */
+  readonly calls: { channel: string; message: string; session: TurnSession }[] = [];
   /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial). */
   maxConcurrent = 0;
   private inFlight = 0;
@@ -52,8 +59,18 @@ class FakeBackend implements AgentBackend {
   readonly stopped = new Set<string>();
   /** A gate the next turn waits on (release to let it finish). Reset per use. */
   gate: { promise: Promise<void>; resolve: () => void } | null = null;
-  /** The result function — given the message, returns the DeliverResult to resolve. */
-  resultFor: (message: string) => DeliverResult = (m) => ({ ok: true, reply: "reply:" + m });
+  /**
+   * The result function — given the message + the turn's session id, returns the
+   * DeliverResult to resolve. The DEFAULT ECHOES `sessionId` (mirroring real claude, which
+   * always echoes the `--session-id`/`--resume` id it was handed on a successful turn) so a
+   * successful turn's thread note carries the established session — the FIX-2 invariant.
+   * An override that omits `sessionId` models a turn that failed BEFORE establishing one.
+   */
+  resultFor: (message: string, sessionId: string) => DeliverResult = (m, sid) => ({
+    ok: true,
+    reply: "reply:" + m,
+    sessionId: sid,
+  });
   /** If set, `deliver` THROWS this (to test the defensive catch). */
   throwOnce: Error | null = null;
   /** Interim events to emit (via `onInterim`) during the next turn — set per test. */
@@ -63,8 +80,13 @@ class FakeBackend implements AgentBackend {
     return { backend: this.kind, channel: spec.channels[0] as string, name: spec.name, spec };
   }
 
-  async deliver(handle: AgentHandle, message: string, onInterim?: InterimSink): Promise<DeliverResult> {
-    this.calls.push({ channel: handle.channel, message });
+  async deliver(
+    handle: AgentHandle,
+    message: string,
+    session: TurnSession,
+    onInterim?: InterimSink,
+  ): Promise<DeliverResult> {
+    this.calls.push({ channel: handle.channel, message, session });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);
     try {
@@ -77,7 +99,7 @@ class FakeBackend implements AgentBackend {
         this.throwOnce = null;
         throw e;
       }
-      return this.resultFor(message);
+      return this.resultFor(message, session.id);
     } finally {
       this.inFlight--;
     }
@@ -173,7 +195,7 @@ describe("ProgrammaticAgentRegistry — registration + indexes", () => {
     expect(reg.list().map((x) => x.name)).toEqual(["eng"]);
   });
 
-  test("deregister drops the indexes + clears the backend session", async () => {
+  test("deregister drops the indexes + tears down the backend handle (stop)", async () => {
     const backend = new FakeBackend();
     const { fn } = recorder();
     const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: fn });
@@ -181,20 +203,53 @@ describe("ProgrammaticAgentRegistry — registration + indexes", () => {
     expect(await reg.deregister("eng")).toBe(true);
     expect(reg.hasChannel("eng")).toBe(false);
     expect(reg.hasName("eng")).toBe(false);
+    // deregister calls backend.stop (a no-op for programmatic) — it does NOT clear the
+    // thread-note session; re-registering should resume. Wiping continuity is resetSession.
     expect(backend.stopped.has("eng")).toBe(true);
     // A second deregister is a no-op false.
     expect(await reg.deregister("eng")).toBe(false);
   });
 
-  test("resetSession clears the session WITHOUT deregistering", async () => {
+  test("resetSession CLEARS the thread-note session (via clearSession) WITHOUT deregistering", async () => {
     const backend = new FakeBackend();
     const { fn } = recorder();
-    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: fn });
+    // Track the clearSession invocations + simulate the note's session being wiped: after a
+    // clear, readSession returns undefined for that (channel, name).
+    const cleared: { channel: string; name: string }[] = [];
+    let priorSession: string | undefined = "sess-OLD";
+    const clearSession = async (channel: string, name: string) => {
+      cleared.push({ channel, name });
+      priorSession = undefined; // the note's session is now empty.
+    };
+    const reader: { calls: { channel: string; name: string }[] } = { calls: [] };
+    const readSession = async (channel: string, name: string) => {
+      reader.calls.push({ channel, name });
+      return priorSession;
+    };
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: fn,
+      writeThread: threads.fn,
+      readSession,
+      clearSession,
+    });
     await reg.register(specFor("eng"));
+
+    // RESET → invokes clearSession with the right (channel, name); does NOT deregister.
     expect(await reg.resetSession("eng")).toBe(true);
-    expect(backend.stopped.has("eng")).toBe(true);
-    // Still registered.
-    expect(reg.hasName("eng")).toBe(true);
+    expect(cleared).toEqual([{ channel: "eng", name: "eng" }]);
+    expect(reg.hasName("eng")).toBe(true); // still registered.
+    // reset() does NOT route through backend.stop anymore (the session lives on the note).
+    expect(backend.stopped.has("eng")).toBe(false);
+
+    // BONUS — after the reset, the next drain finds NO prior session → a fresh {resume:false}
+    // create (self-heal), proving reset actually wiped continuity (not a dead no-op).
+    reg.enqueue("eng", { content: "after reset" });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+
     expect(await reg.resetSession("nope")).toBe(false);
   });
 });
@@ -209,7 +264,12 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
     expect(reg.enqueue("eng", { content: "hello", inReplyTo: "note-1" })).toBe(true);
     await until(() => rec.calls.length === 1);
 
-    expect(backend.calls).toEqual([{ channel: "eng", message: "hello" }]);
+    expect(backend.calls).toHaveLength(1);
+    expect(backend.calls[0]!.channel).toBe("eng");
+    expect(backend.calls[0]!.message).toBe("hello");
+    // No readSession wired → a single-threaded turn CREATES a fresh session (resume:false).
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
     expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:hello", inReplyTo: "note-1" }]);
   });
 
@@ -498,6 +558,183 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(threads.ends()[1]!.sameTurn).toBe(true);
     // Transient → the outbound was retried the full budget (1 initial + OUTBOUND_MAX_RETRIES).
     expect(outboundAttempts).toBe(1 + OUTBOUND_MAX_RETRIES);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — thread≡session (the daemon owns the uuid)", () => {
+  /** A recorder readSession — captures every (channel, name) consulted; returns `prior`. */
+  function sessionReader(prior?: string): {
+    calls: { channel: string; name: string }[];
+    fn: (channel: string, name: string) => Promise<string | undefined>;
+  } {
+    const calls: { channel: string; name: string }[] = [];
+    const fn = async (channel: string, name: string) => {
+      calls.push({ channel, name });
+      return prior;
+    };
+    return { calls, fn };
+  }
+
+  test("single-threaded with a PRIOR session: consults readSession + passes {resume:true} to deliver", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reader = sessionReader("11111111-1111-4111-8111-111111111111");
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specFor("eng")); // single-threaded (default).
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => backend.calls.length === 1);
+
+    // readSession was consulted with the channel + the def name (the deterministic key).
+    expect(reader.calls).toEqual([{ channel: "eng", name: "eng" }]);
+    // A prior session → RESUME it (continue the conversation), with that exact id.
+    expect(backend.calls[0]!.session).toEqual({
+      id: "11111111-1111-4111-8111-111111111111",
+      resume: true,
+    });
+    // The END record carries the session claude echoed (the persisted thread≡session record).
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.session).toBe("11111111-1111-4111-8111-111111111111");
+    // The START-ensure carries NO session (FIX 2) — it runs before claude, so no session is
+    // established yet; persisting one there would brick the next turn if claude never inited.
+    // (Continuity for a single-threaded resume is preserved by the transport's prior-read.)
+    expect(threads.starts()[0]!.session).toBeUndefined();
+  });
+
+  test("single-threaded with NO prior session: consults readSession + passes {resume:false} + a fresh uuid", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reader = sessionReader(undefined); // no prior — first turn.
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => backend.calls.length === 1);
+
+    expect(reader.calls).toEqual([{ channel: "eng", name: "eng" }]);
+    // No prior → CREATE a fresh session with a generated uuid (--session-id, not --resume).
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+    // The fresh uuid is the one persisted onto the thread note (so turn 2 can resume it).
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.session).toBe(backend.calls[0]!.session.id);
+  });
+
+  test("multi-threaded NEVER consults readSession + ALWAYS passes {resume:false} with a fresh uuid", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reader = sessionReader("should-never-be-used");
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specMultiThreaded("digest", "digest"));
+
+    // Two fires — each must mint its OWN fresh session, never resume.
+    reg.enqueue("digest", { content: "fire one" });
+    await until(() => backend.calls.length === 1);
+    reg.enqueue("digest", { content: "fire two" });
+    await until(() => backend.calls.length === 2);
+
+    // readSession is NEVER consulted for a multi-threaded agent (each fire is a fresh thread).
+    expect(reader.calls).toHaveLength(0);
+    // Both fires CREATE fresh sessions (resume:false), with DISTINCT uuids.
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[1]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(backend.calls[1]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(backend.calls[0]!.session.id).not.toBe(backend.calls[1]!.session.id);
+    // Each per-fire thread note carries its own fire's session.
+    await until(() => threads.ends().length === 2);
+    expect(threads.ends()[0]!.session).toBe(backend.calls[0]!.session.id);
+    expect(threads.ends()[1]!.session).toBe(backend.calls[1]!.session.id);
+  });
+
+  test("no readSession wired: a single-threaded turn still CREATES a fresh session", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => backend.calls.length === 1);
+
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.session).toBe(backend.calls[0]!.session.id);
+  });
+
+  test("the captured backend sessionId (Claude's echoed id) is what lands on the thread note", async () => {
+    const backend = new FakeBackend();
+    // The backend echoes a DIFFERENT id than the one we passed (Claude's authoritative id).
+    backend.resultFor = (m) => ({ ok: true, reply: "reply:" + m, sessionId: "echoed-by-claude-id" });
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => threads.ends().length === 1);
+
+    // The END record prefers Claude's echoed id (result.sessionId) over the uuid we passed.
+    expect(threads.ends()[0]!.session).toBe("echoed-by-claude-id");
+  });
+
+  test("FIX 2 — a failed turn that established NO session persists NONE → next turn self-heals (no brick)", async () => {
+    const backend = new FakeBackend();
+    // A turn that FAILS before claude ever creates a session: { ok:false } with NO sessionId
+    // (claude exited before emitting an init/result session_id). The OLD code persisted the
+    // passed uuid here → next turn `--resume`d a phantom id → "No conversation found" →
+    // permanent brick. FIX 2: persist NOTHING when claude echoed no session.
+    backend.resultFor = () => ({ ok: false, error: "claude exited 1 before init" });
+    const rec = recorder();
+    const threads = threadRecorder();
+    // Simulate the note: readSession returns whatever the last persisted end-record carried.
+    let stored: string | undefined; // no prior session.
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: async (t) => {
+        threads.threads.push(t);
+        // Mirror the transport's persistence: an end record with a session sets it; a start
+        // or a sessionless end leaves the prior value (the transport preserves single-threaded).
+        if (t.phase !== "start" && t.session) stored = t.session;
+      },
+      readSession: async () => stored,
+    });
+    await reg.register(specFor("eng")); // single-threaded (default).
+
+    // Turn 1 — fails before establishing a session.
+    reg.enqueue("eng", { content: "boom" });
+    await until(() => threads.ends().length === 1);
+    // The error end-record carries NO session (claude echoed none) — so the note stays clean.
+    expect(threads.ends()[0]!.status).toBe("error");
+    expect(threads.ends()[0]!.session).toBeUndefined();
+    expect(stored).toBeUndefined(); // nothing persisted → no phantom to --resume.
+
+    // Turn 2 — readSession finds no session → a FRESH {resume:false} create (self-heal,
+    // NOT a brick). The next turn is a clean new conversation, not a doomed --resume.
+    reg.enqueue("eng", { content: "again" });
+    await until(() => backend.calls.length === 2);
+    expect(backend.calls[1]!.session.resume).toBe(false);
+    expect(backend.calls[1]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
   });
 });
 

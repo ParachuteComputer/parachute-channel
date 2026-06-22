@@ -62,6 +62,26 @@ export type { InterimTurnEvent } from "./stream-json.ts";
 export type InterimSink = (event: InterimTurnEvent) => void;
 
 /**
+ * The Claude session UUID for ONE turn, RESOLVED BY THE CALLER (the registry) and
+ * handed to the backend. The daemon owns the session UUID — it lives on the durable
+ * `#agent/thread` note (`metadata.session`), NOT in a backend-private store — so the
+ * caller decides, per turn, whether to CONTINUE a prior conversation or CREATE a new
+ * one, and the backend just runs the turn it's handed:
+ *  - `resume: true`  → `claude --resume <id> -p "…"` — continue a prior conversation
+ *    (single-threaded turn 2+: the thread note already carries a session).
+ *  - `resume: false` → `claude --session-id <id> -p "…"` — CREATE a session with this
+ *    uuid (single-threaded first turn, or every multi-threaded fresh-per-fire turn).
+ * `id` MUST be a valid UUID (the caller mints it via `crypto.randomUUID()` when there
+ * is no prior session to resume).
+ */
+export interface TurnSession {
+  /** The Claude session UUID for this turn. */
+  id: string;
+  /** true → --resume <id> (continue a prior conversation); false → --session-id <id> (create a new one). */
+  resume: boolean;
+}
+
+/**
  * An opaque handle to a started agent, returned by {@link AgentBackend.start} and
  * passed back to `deliver`/`stop`/`status`. The only field the seam itself depends
  * on is `channel` (the wake channel a turn/push targets) + the backend's own
@@ -145,8 +165,9 @@ export interface AgentBackend {
 
   /**
    * Bring an agent up for a channel from its spec. For the programmatic backend
-   * this is lightweight (there is no resident process to launch — a "session" is
-   * just the persisted resume id); for the interactive backend it is the tmux
+   * this is lightweight (there is no resident process to launch — and no session to
+   * pre-establish: the session uuid is resolved per turn by the caller and lives on
+   * the durable `#agent/thread` note); for the interactive backend it is the tmux
    * spawn. Returns an opaque handle the other methods take.
    */
   start(spec: AgentSpec): Promise<AgentHandle>;
@@ -157,6 +178,14 @@ export interface AgentBackend {
    * throw, so the caller always learns the outcome inline (the asymmetric-guarantee
    * fix). The daemon serializes deliveries per channel (one turn at a time).
    *
+   * `session` is the {@link TurnSession} the CALLER resolved for this turn — the
+   * daemon owns the session UUID (it lives on the durable `#agent/thread` note, not a
+   * backend store), so the caller decides resume-existing (`resume: true` →
+   * `--resume <id>`) vs create-new (`resume: false` → `--session-id <id>`). The
+   * backend just runs the turn with that uuid; it no longer reads or writes any
+   * session store. The captured/echoed id still comes back on the
+   * {@link DeliverResult} (`sessionId`) so the caller can persist it onto the note.
+   *
    * `onInterim` (optional) is the streaming-view sink: the backend calls it with
    * interim progress (assistant text chunks + tool_use) AS the turn runs, so the
    * daemon can render "watch it work" live in the chat UI. ADDITIVE — when omitted,
@@ -164,12 +193,13 @@ export interface AgentBackend {
    * durable record either way. (Only the programmatic backend streams today; an
    * interactive retrofit may ignore it.)
    */
-  deliver(handle: AgentHandle, message: string, onInterim?: InterimSink): Promise<DeliverResult>;
+  deliver(handle: AgentHandle, message: string, session: TurnSession, onInterim?: InterimSink): Promise<DeliverResult>;
 
   /**
-   * Tear the agent down. For the programmatic backend this clears the persisted
-   * resume id (the next message starts a fresh conversation); for the interactive
-   * backend it kills the tmux session.
+   * Tear the agent down. For the programmatic backend this is a NO-OP — there is no
+   * resident process to kill and no session store to clear (the session lives on the
+   * durable `#agent/thread` note), so stop does NOT reset conversation continuity; the
+   * interactive backend kills the tmux session.
    */
   stop(handle: AgentHandle): Promise<void>;
 

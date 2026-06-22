@@ -92,6 +92,15 @@ export interface ThreadRecord {
   /** Optional token/cost usage for this turn (single-threaded accumulates into the note). */
   usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
   /**
+   * The Claude session UUID to persist on this thread note (`metadata.session`) — the
+   * UNIFIED thread≡session record (the daemon owns the uuid; the note is its single
+   * source of truth). The registry passes the turn's session id here so the NEXT turn
+   * can `--resume` it (read back via {@link VaultTransport.readThreadSession}). Absent
+   * on a write that carries no session (e.g. a start-phase working-ensure) — a
+   * single-threaded upsert PRESERVES the prior note's session in that case.
+   */
+  session?: string;
+  /**
    * MULTI-threaded only: a stable per-TURN thread id (the note's path leaf). Passing the
    * SAME id on a re-record (e.g. flipping `ok`→`error` after an outbound-delivery failure)
    * makes both writes hit the SAME per-fire note instead of minting a duplicate. Absent →
@@ -198,6 +207,21 @@ export interface Transport {
    * one note per channel, multi-threaded writes one per fire. Returns the written note id(s).
    */
   writeThread?(thread: ThreadRecord): Promise<{ sent: string[] }>;
+  /**
+   * Optional: read the persisted Claude session UUID for a single-threaded agent's
+   * deterministic `#agent/thread` note (the thread≡session record), or undefined when
+   * none yet (the first turn). The daemon reads this BEFORE a turn so it can `--resume`
+   * the prior conversation. Only a durable transport (the VaultTransport) implements it;
+   * transports without a durable thread store (telegram) omit it.
+   */
+  readThreadSession?(channel: string, name: string): Promise<string | undefined>;
+  /**
+   * Optional: CLEAR the persisted session on a single-threaded agent's `#agent/thread`
+   * note so its next turn starts a fresh Claude conversation (the per-agent restart /
+   * reset). Only a durable transport (the VaultTransport) implements it; transports
+   * without a durable thread store (telegram) omit it.
+   */
+  clearThreadSession?(channel: string, name: string): Promise<void>;
   /**
    * Optional: write an agent-to-agent CALLBACK as an INBOUND note on THIS channel (the
    * "reply_to" substrate). A recipient agent's drain, on turn completion, calls this on the

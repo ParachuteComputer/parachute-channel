@@ -44,7 +44,7 @@
 
 import type { AgentSpec, AgentMode } from "../sandbox/types.ts";
 import { normalizeChannel } from "../sandbox/types.ts";
-import type { AgentBackend, AgentHandle, InterimTurnEvent } from "./types.ts";
+import type { AgentBackend, AgentHandle, InterimTurnEvent, TurnSession } from "./types.ts";
 
 /**
  * The streaming-view sink (design 2026-06-16 build item #1): the daemon wires this
@@ -128,6 +128,18 @@ export interface ThreadNote {
   input: string;
   /** The reply on success, the failure reason on error, or "" while `working`. */
   output: string;
+  /**
+   * The Claude session UUID for this turn — the transport persists it to the thread
+   * note's `metadata.session` (the thread≡session record), so the NEXT turn can
+   * `--resume` it. Set ONLY on the `end` record, and ONLY from the session claude
+   * actually ECHOED (`result.sessionId`, captured from the init/result event). A turn
+   * that never established a session (claude exited before creating one) persists NONE
+   * — and a single-threaded prior session is preserved by the transport — so the next
+   * turn resolves a fresh create and SELF-HEALS rather than `--resume`ing a phantom id
+   * (which would brick the channel: "No conversation found" is non-transient → no retry).
+   * NOT set on the `start`-ensure (it runs before claude, so no session exists yet).
+   */
+  session?: string;
   /** ISO start/end of the turn (a start-ensure does not advance the thread's last_turn_at). */
   started_at: string;
   ended_at: string;
@@ -384,6 +396,21 @@ export class ProgrammaticAgentRegistry {
   private readonly writeCallback?: WriteCallback;
   /** Optional streaming-view sink — push interim + lifecycle turn events per channel. */
   private readonly onTurnEvent?: TurnEventSink;
+  /**
+   * Optional pre-turn session read — the persisted Claude session UUID for a
+   * single-threaded agent's thread note (the daemon wires this to the channel
+   * transport's `readThreadSession`). Read in {@link drain} so a single-threaded turn
+   * 2+ `--resume`s its prior conversation. Unwired (or no prior) → every turn creates a
+   * fresh session. Multi-threaded NEVER consults it (each fire is a fresh thread).
+   */
+  private readonly readSession?: (channel: string, name: string) => Promise<string | undefined>;
+  /**
+   * Optional session CLEAR — wipe a single-threaded agent's persisted thread-note session
+   * so its next turn starts a FRESH claude conversation (the per-agent restart). The daemon
+   * wires this to the channel transport's `clearThreadSession`. Called by {@link resetSession}.
+   * Unwired → reset is a clean no-op beyond returning that the agent exists.
+   */
+  private readonly clearSession?: (channel: string, name: string) => Promise<void>;
   /** Base backoff (ms) between outbound retries (FIX 1). Injectable so tests run fast. */
   private readonly outboundRetryBaseMs: number;
 
@@ -393,6 +420,10 @@ export class ProgrammaticAgentRegistry {
     writeThread?: WriteThread;
     writeCallback?: WriteCallback;
     onTurnEvent?: TurnEventSink;
+    /** Read the persisted thread-note session UUID (single-threaded resume). */
+    readSession?: (channel: string, name: string) => Promise<string | undefined>;
+    /** Clear the persisted thread-note session (the per-agent restart / reset). */
+    clearSession?: (channel: string, name: string) => Promise<void>;
     /** Override the outbound-retry backoff base (ms). Default {@link OUTBOUND_RETRY_BASE_MS}. */
     outboundRetryBaseMs?: number;
   }) {
@@ -401,6 +432,8 @@ export class ProgrammaticAgentRegistry {
     if (deps.writeThread) this.writeThread = deps.writeThread;
     if (deps.writeCallback) this.writeCallback = deps.writeCallback;
     if (deps.onTurnEvent) this.onTurnEvent = deps.onTurnEvent;
+    if (deps.readSession) this.readSession = deps.readSession;
+    if (deps.clearSession) this.clearSession = deps.clearSession;
     this.outboundRetryBaseMs = deps.outboundRetryBaseMs ?? OUTBOUND_RETRY_BASE_MS;
   }
 
@@ -624,8 +657,11 @@ export class ProgrammaticAgentRegistry {
     // registry callers safe too (the reviewer's latent-footgun nit).
     this.expectedChannels.delete(channel);
     this.pending.delete(channel);
-    // Clear the persisted resume id so a re-spawn starts fresh (the backend's
-    // `stop` is a no-op beyond that — there's no process to kill).
+    // Tear down the backend handle (the programmatic `stop` is a no-op — there's no
+    // process to kill, and the session now lives on the durable thread note, not a
+    // backend store). Deregister deliberately does NOT clear the thread-note session:
+    // re-registering the same agent should resume its conversation. Wiping continuity is
+    // an explicit RESET (`resetSession`), not a side effect of teardown.
     if (handle) {
       try {
         await this.backend.stop(handle.backendHandle);
@@ -639,17 +675,21 @@ export class ProgrammaticAgentRegistry {
   }
 
   /**
-   * Reset a programmatic agent's conversation — clear its persisted session id so
-   * the next message starts fresh, WITHOUT deregistering it. This is what the
-   * per-session restart endpoint maps to for a programmatic agent (the interactive
-   * restart's "kill + re-spawn" has no analog — there's no process). Returns whether
-   * an agent was registered under that name.
+   * Reset a programmatic agent's conversation — clear the persisted session on its
+   * `#agent/thread` note (via the wired `clearSession` → the transport's
+   * `clearThreadSession`) so the next message starts a FRESH claude conversation, WITHOUT
+   * deregistering it. This is what the per-session restart endpoint maps to for a
+   * programmatic agent (the interactive restart's "kill + re-spawn" has no analog — there's
+   * no process; continuity is the thread-note session, not a backend store). With the next
+   * turn's `readSession` finding no session, it resolves a fresh `--session-id` create.
+   * Best-effort: a clear failure is logged, never thrown. Returns whether an agent was
+   * registered under that name.
    */
   async resetSession(name: string): Promise<boolean> {
     const handle = this.getByName(name);
     if (!handle) return false;
     try {
-      await this.backend.stop(handle.backendHandle);
+      await this.clearSession?.(handle.channel, handle.spec.name);
     } catch (err) {
       console.error(
         `parachute-agent: programmatic session reset for "${name}" failed: ${(err as Error).message}`,
@@ -721,6 +761,20 @@ export class ProgrammaticAgentRegistry {
       // threaded ignores it (deterministic name leaf). One uuid per turn.
       const turnThreadId = crypto.randomUUID();
 
+      // RESOLVE THE SESSION (the thread≡session record — the daemon owns the uuid). A
+      // single-threaded agent RESUMES the session persisted on its deterministic thread
+      // note (when one exists); the first turn (no prior) and EVERY multi-threaded fire
+      // CREATE a fresh session with a new uuid (`--session-id`). The backend just runs the
+      // turn with this {@link TurnSession}; it reads no session store.
+      const multiThreaded = (handle.spec.mode ?? "single-threaded") === "multi-threaded";
+      let resumeId: string | undefined;
+      if (!multiThreaded && this.readSession) {
+        resumeId = await this.readSession(handle.channel, handle.spec.name);
+      }
+      const turnSession: TurnSession = resumeId
+        ? { id: resumeId, resume: true }
+        : { id: crypto.randomUUID(), resume: false };
+
       // ── THREAD-AS-CONTAINER (the user's model: definition -> thread -> message). ENSURE
       // the thread note in a `working` state BEFORE the turn runs, so the thread is visible
       // the moment processing starts (status `working` → `ok`/`error`), not only as a
@@ -738,6 +792,12 @@ export class ProgrammaticAgentRegistry {
       await this.recordThread(handle, msg, "working", "", startedAt, undefined, {
         threadId: turnThreadId,
         phase: "start",
+        // NO session on the start-ensure: it runs BEFORE claude, so claude may never
+        // establish a session this turn. Persisting `turnSession.id` here would brick the
+        // next turn (it'd `--resume` an id for a conversation that never existed →
+        // non-transient "No conversation found" → no retry). We persist a session ONLY on
+        // the `end` record, and ONLY the id claude actually echoed (FIX 2). For a
+        // single-threaded resume turn the prior session is preserved by writeThread anyway.
       });
 
       let result;
@@ -745,7 +805,7 @@ export class ProgrammaticAgentRegistry {
         // Forward each interim event to the streaming-view sink (keyed by channel)
         // as the turn runs — the "watch it work" live progress. The sink swallows
         // its own throws (emitTurnEvent), so a dead live stream can't break the turn.
-        result = await this.backend.deliver(handle.backendHandle, msg.content, (e) =>
+        result = await this.backend.deliver(handle.backendHandle, msg.content, turnSession, (e) =>
           this.emitTurnEvent(channel, e),
         );
       } catch (err) {
@@ -764,6 +824,10 @@ export class ProgrammaticAgentRegistry {
         await this.recordThread(handle, msg, "error", reason, startedAt, undefined, {
           threadId: turnThreadId,
           phase: "end",
+          // No `result` (the backend threw) → NO session to persist. We never write a
+          // session claude didn't echo (FIX 2): persisting an unestablished uuid would
+          // brick the next turn's `--resume`. A single-threaded prior session is preserved
+          // by writeThread; otherwise the next turn self-heals with a fresh create.
         });
         this.emitTurnEvent(channel, { kind: "error", error: reason });
         // Post a user-facing failure note so the channel shows SOMETHING (not a silent
@@ -788,6 +852,12 @@ export class ProgrammaticAgentRegistry {
         await this.recordThread(handle, msg, "error", result.error, startedAt, undefined, {
           threadId: turnThreadId,
           phase: "end",
+          // Persist ONLY the session claude ECHOED (FIX 2). A turn can fail AFTER
+          // establishing a session (claude emitted it in the init/result event) → resume
+          // it next turn. A turn that failed BEFORE establishing one echoes none →
+          // `result.sessionId` is undefined → we persist nothing → the next turn
+          // self-heals with a fresh create (no brick). NEVER fall back to `turnSession.id`.
+          ...(result.sessionId ? { session: result.sessionId } : {}),
         });
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
         // Post a user-facing failure note so the channel shows SOMETHING (not a silent
@@ -810,6 +880,10 @@ export class ProgrammaticAgentRegistry {
       await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage, {
         threadId: turnThreadId,
         phase: "end",
+        // Persist the session claude ECHOED (FIX 2) so the next turn `--resume`s this
+        // conversation — the thread≡session record. A successful turn always echoes an id;
+        // the guard keeps the "only an established session" invariant uniform.
+        ...(result.sessionId ? { session: result.sessionId } : {}),
       });
 
       // The outbound reply — the channel-transcript delivery (the chat bubble). It is
@@ -858,7 +932,15 @@ export class ProgrammaticAgentRegistry {
               `Undelivered reply text: ${result.reply}`,
             startedAt,
             result.usage,
-            { threadId: turnThreadId, sameTurn: true, phase: "end" },
+            {
+              threadId: turnThreadId,
+              sameTurn: true,
+              phase: "end",
+              // The turn DID establish a session (it produced a reply) — keep the ECHOED id
+              // on the note so the next turn resumes, even though the outbound transcript
+              // write failed. Only claude's echoed id (FIX 2), never the passed uuid.
+              ...(result.sessionId ? { session: result.sessionId } : {}),
+            },
           );
           this.emitTurnEvent(channel, {
             kind: "error",
@@ -983,7 +1065,7 @@ export class ProgrammaticAgentRegistry {
     output: string,
     startedAt: string,
     usage: ThreadNote["usage"],
-    opts: { threadId?: string; sameTurn?: boolean; phase?: "start" | "end" } = {},
+    opts: { threadId?: string; sameTurn?: boolean; phase?: "start" | "end"; session?: string } = {},
   ): Promise<void> {
     if (!this.writeThread) return;
     const thread: ThreadNote = {
@@ -997,6 +1079,10 @@ export class ProgrammaticAgentRegistry {
       started_at: startedAt,
       ended_at: new Date().toISOString(),
       ...(usage ? { usage } : {}),
+      // The Claude session UUID for this turn — persisted to the thread note so the next
+      // turn `--resume`s it (the thread≡session record). The transport preserves a prior
+      // single-threaded session when a write carries none.
+      ...(opts.session ? { session: opts.session } : {}),
       // The per-turn thread id (stable across an ok→error re-record) + the same-turn flag,
       // so a re-record updates the SAME note without minting a duplicate (multi) or
       // double-counting turn_count (single).

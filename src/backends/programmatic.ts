@@ -12,15 +12,18 @@
  *     --output-format stream-json --verbose \
  *     --strict-mcp-config --mcp-config <path> \
  *     --dangerously-skip-permissions \
- *     [--resume <session_id>]
+ *     [--session-id <uuid> | --resume <uuid>]
  *
  *   - Runs on the SUBSCRIPTION (`apiKeySource: "none"` in the init event; the
  *     rate_limit_event shows the `five_hour` subscription pool) — NOT metered API,
  *     as long as no `ANTHROPIC_API_KEY`/`CLAUDE_API_KEY` is in the env. The
  *     `total_cost_usd` in the result is an equivalent-cost figure, not a charge.
- *   - `--resume <session_id>` restores full conversation continuity. FIRST turn:
- *     omit `--resume`, capture `session_id` from the init/result event, persist it
- *     (AgentSessionState); subsequent turns pass `--resume <stored id>`.
+ *   - The DAEMON owns the session uuid (it lives on the `#agent/thread` note's
+ *     `metadata.session`), NOT a backend-private store. The caller resolves the turn's
+ *     {@link TurnSession} and hands it in: `--session-id <uuid>` CREATES a session with
+ *     that uuid (first turn) and `--resume <uuid>` CONTINUES it (subsequent turns) —
+ *     both restore/establish full conversation continuity. The captured id still comes
+ *     back on the result so the caller (the registry) can persist it onto the note.
  *   - `-p` has NO TUI → no consent gates at all (this backend avoids the #70/#71
  *     class by construction). Hence NO `--dangerously-load-development-channels`.
  *
@@ -72,7 +75,6 @@ import {
 import { buildAgentMcpConfigJson, vaultEntryKey } from "../agent-mcp-config.ts";
 import { resolveClaudeCredential, resolveChannelEnv } from "../credentials.ts";
 import { resolveInjectedGrants, type GrantsClient } from "../grants.ts";
-import { AgentSessionState } from "../agent-session-state.ts";
 import { parseStreamJsonStream } from "./stream-json.ts";
 import type {
   AgentBackend,
@@ -81,6 +83,7 @@ import type {
   DeliverResult,
   DeliverUsage,
   InterimSink,
+  TurnSession,
 } from "./types.ts";
 
 /** Same slug shape `spawnAgent` enforces — a name lands in a path segment. */
@@ -114,11 +117,6 @@ export interface ProgrammaticBackendDeps {
   sessionsDir: string;
   /** Read-only runtime/config binds the sandbox always grants (the claude config dir, …). */
   runtimeReadOnly: string[];
-  /**
-   * The per-channel session-id store (resume continuity). Injected so tests point
-   * it at a throwaway dir; the daemon constructs one at boot.
-   */
-  sessionState: AgentSessionState;
   /** Resolve the Claude OAuth token (channel override ?? default ?? throw). Stub in tests. */
   resolveClaudeToken?: (channel: string) => string;
   /** Resolve the per-channel env injection (GH_TOKEN, CLOUDFLARE_API_TOKEN, …). Stub in tests. */
@@ -203,9 +201,11 @@ const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTim
  *
  * The verified shape (claude 2.1.179): headless `-p` with the message as the
  * prompt, stream-json output, the strict multi-entry MCP config, and
- * skip-permissions (the turn is autonomous; the sandbox is the containment). When a
- * `resumeSessionId` is present, `--resume <id>` continues the prior conversation;
- * the FIRST turn omits it.
+ * skip-permissions (the turn is autonomous; the sandbox is the containment). The
+ * caller resolves the turn's session (the daemon owns the uuid — it lives on the
+ * `#agent/thread` note): when `sessionId` is present, `--resume <id>` CONTINUES the
+ * prior conversation (`resumeSession: true`) or `--session-id <id>` CREATES a session
+ * with that uuid (`resumeSession: false`).
  *
  * DELIBERATELY ABSENT: `--dangerously-load-development-channels` (no channel MCP in
  * this backend — the daemon mediates messaging), and any TUI flag (`-p` has none).
@@ -222,7 +222,10 @@ const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTim
 export function buildProgrammaticClaudeArgs(opts: {
   message: string;
   mcpConfigPath: string;
-  resumeSessionId?: string;
+  /** The Claude session UUID for this turn (caller-resolved). Omitted → no session flag. */
+  sessionId?: string;
+  /** true → `--resume <sessionId>` (continue); false (default) → `--session-id <sessionId>` (create). */
+  resumeSession?: boolean;
   claudeBin?: string;
   /** Path to the per-session system-prompt file (omitted = no system-prompt flag). */
   systemPromptFile?: string;
@@ -259,8 +262,8 @@ export function buildProgrammaticClaudeArgs(opts: {
     const flag = opts.systemPromptMode === "replace" ? "--system-prompt-file" : "--append-system-prompt-file";
     argv.push(flag, opts.systemPromptFile);
   }
-  if (opts.resumeSessionId) {
-    argv.push("--resume", opts.resumeSessionId);
+  if (opts.sessionId) {
+    argv.push(opts.resumeSession ? "--resume" : "--session-id", opts.sessionId);
   }
   return argv;
 }
@@ -278,10 +281,12 @@ async function drainStream(stream: ReadableStream<Uint8Array> | null): Promise<s
 /**
  * The programmatic backend — one sandboxed `claude -p` turn per message.
  *
- * `start` is lightweight (no resident process; a "session" is just the persisted
- * resume id). `deliver` runs the turn and returns a {@link DeliverResult} — a
- * failure is a VALUE (`{ ok: false, error }`), never a throw. `stop` clears the
- * resume id. `status` is always live (there is nothing to keep alive).
+ * `start` is lightweight (no resident process; a "session" is just the uuid the
+ * caller resolves per turn, persisted on the thread note — not here). `deliver` runs
+ * the turn with the caller-supplied {@link TurnSession} and returns a
+ * {@link DeliverResult} — a failure is a VALUE (`{ ok: false, error }`), never a
+ * throw. `stop` is a no-op (no process to kill, no store to clear — the session lives
+ * on the durable thread note). `status` is always live (there is nothing to keep alive).
  */
 export class ProgrammaticBackend implements AgentBackend {
   readonly kind = PROGRAMMATIC_BACKEND_KIND;
@@ -292,9 +297,11 @@ export class ProgrammaticBackend implements AgentBackend {
   }
 
   /**
-   * Bring an agent up for a channel. There is no resident process — this validates
-   * the spec and returns a handle keyed on the wake channel (the first channel).
-   * The actual `claude -p` invocation happens per-message in {@link deliver}.
+   * Bring an agent up for a channel. There is no resident process (and no session to
+   * pre-establish — the session uuid is resolved per turn by the caller and lives on
+   * the thread note) — this validates the spec and returns a handle keyed on the wake
+   * channel (the first channel). The actual `claude -p` invocation happens per-message
+   * in {@link deliver}.
    */
   async start(spec: AgentSpec): Promise<AgentHandle> {
     if (!AGENT_NAME_SLUG.test(spec.name)) {
@@ -315,9 +322,10 @@ export class ProgrammaticBackend implements AgentBackend {
    *
    * Order: resolve the Claude credential (throws → the daemon surfaces it) → mint
    * the VAULT token (if the spec binds a vault) → write the vault-only `.mcp.json`
-   * → build the `-p` argv (with `--resume <sid>` when a session id is stored) →
-   * sandbox-wrap via the shared seam → spawn → STREAM + parse the stream-json →
-   * persist the captured session id → return the DeliverResult.
+   * → build the `-p` argv (with the caller's {@link TurnSession}: `--resume <id>` to
+   * continue, `--session-id <id>` to create) → sandbox-wrap via the shared seam →
+   * spawn → STREAM + parse the stream-json → return the DeliverResult (carrying the
+   * captured session id so the caller can persist it onto the thread note).
    *
    * STREAMING (design build item #1): the stdout stream-json is read INCREMENTALLY
    * via {@link parseStreamJsonStream}. When `onInterim` is given, interim events
@@ -330,7 +338,7 @@ export class ProgrammaticBackend implements AgentBackend {
    * empty output) returns `{ ok: false, error }` — it does NOT throw, so the daemon
    * always learns the outcome inline.
    */
-  async deliver(handle: AgentHandle, message: string, onInterim?: InterimSink): Promise<DeliverResult> {
+  async deliver(handle: AgentHandle, message: string, session: TurnSession, onInterim?: InterimSink): Promise<DeliverResult> {
     const spec = handle.spec;
     if (!spec) {
       return { ok: false, error: `ProgrammaticBackend.deliver: handle for "${handle.name}" carries no spec` };
@@ -456,25 +464,16 @@ export class ProgrammaticBackend implements AgentBackend {
       writeFileSync(systemPromptFile, spec.systemPrompt, { mode: 0o600 });
     }
 
-    // Mode-aware session handling (the architecture-synthesis chokepoint). A
-    // `multi-threaded` agent is thread-keyed; TODAY (no inbound thread id yet) every
-    // fire mints a FRESH thread: do NOT read a prior session id (no `--resume`) and do
-    // NOT persist the returned id below — each fire is a clean, independent invocation
-    // with no conversation continuity. (The per-thread persist+resume — keying the
-    // session store by thread id so a specific prior thread can be resumed — is the
-    // DEFERRED increment of this mode; until then multi-threaded ships in its degenerate
-    // fresh-per-fire form.) `single-threaded` (the default, = today) reads + persists
-    // exactly as before. Branch ONCE here on `spec.mode`.
-    const multiThreaded = spec.mode === "multi-threaded";
-
-    // Build the -p argv with --resume when a session id is stored for this channel —
-    // skipped entirely for multi-threaded (no continuity to restore in its fresh-per-
-    // fire form).
-    const resumeSessionId = multiThreaded ? undefined : this.deps.sessionState.get(channel);
+    // The DAEMON owns the session uuid (the caller resolved it from the durable
+    // `#agent/thread` note — single-threaded resumes its persisted session, multi-
+    // threaded gets a fresh uuid every fire). The backend reads no session store: it
+    // just runs the turn with the supplied {@link TurnSession} — `--resume <id>` to
+    // continue, `--session-id <id>` to create.
     const argv = buildProgrammaticClaudeArgs({
       message,
       mcpConfigPath,
-      ...(resumeSessionId ? { resumeSessionId } : {}),
+      sessionId: session.id,
+      resumeSession: session.resume,
       ...(this.deps.claudeBin ? { claudeBin: this.deps.claudeBin } : {}),
       ...(systemPromptFile
         ? { systemPromptFile, systemPromptMode: spec.systemPromptMode ?? "append" }
@@ -567,9 +566,10 @@ export class ProgrammaticBackend implements AgentBackend {
       }
 
       if (parsed.success === true) {
-        // Persist the captured session id so the NEXT turn resumes it. SKIPPED for
-        // multi-threaded (each fire starts fresh — no resume, no persist). Blank id = no-op.
-        if (!multiThreaded && parsed.sessionId) this.deps.sessionState.set(channel, parsed.sessionId);
+        // The captured session id is RETURNED (below) for the caller to persist onto
+        // the thread note — the backend no longer owns a session store. The id we
+        // passed in (session.id) and Claude's echoed parsed.sessionId are normally the
+        // same; the registry prefers the echoed one and falls back to session.id.
 
         const usage: DeliverUsage | undefined = parsed.usage
           ? {
@@ -609,11 +609,10 @@ export class ProgrammaticBackend implements AgentBackend {
         await sleepFn(backoff);
         continue;
       }
-      // Persist the session id even on a FINAL failure — a turn can fail AFTER
+      // RETURN the session id even on a FINAL failure — a turn can fail AFTER
       // establishing a session; the id is still the continuation handle for the next
-      // turn (matches the pre-retry behavior). SKIPPED for multi-threaded. NOT persisted
-      // on a retried attempt (the fixed argv re-resumes the turn-start sid each time).
-      if (!multiThreaded && parsed.sessionId) this.deps.sessionState.set(channel, parsed.sessionId);
+      // turn. The registry persists it onto the thread note (`result.sessionId ??
+      // turnSession.id`), so the next turn resumes the conversation.
       // Non-transient, or out of attempts → return the failure (the daemon records
       // status:error AND posts a user-facing failure note to the channel).
       return {
@@ -627,11 +626,15 @@ export class ProgrammaticBackend implements AgentBackend {
   }
 
   /**
-   * Tear the agent down — clear the persisted resume id so the channel's next
-   * message starts a FRESH conversation. There is no process to kill.
+   * Tear the agent down. A NO-OP for the programmatic backend: there is no resident
+   * process to kill, and no session store to clear — the session now lives on the
+   * durable `#agent/thread` note (`metadata.session`). So `stop` no longer resets
+   * conversation continuity; a single-threaded agent's next turn still resumes its
+   * persisted session. Starting a genuinely FRESH conversation is a separate operation
+   * (deleting the thread note), not a side effect of stop/deregister.
    */
-  async stop(handle: AgentHandle): Promise<void> {
-    this.deps.sessionState.clear(handle.channel);
+  async stop(_handle: AgentHandle): Promise<void> {
+    // Intentionally empty — see the doc comment.
   }
 
   /**

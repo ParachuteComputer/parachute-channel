@@ -502,7 +502,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
     }
   });
 
-  test("missing note.metadata.channel → 400", async () => {
+  test("missing routing key (neither agent nor channel) → 400", async () => {
     const { srv, base } = buildVaultServer();
     try {
       const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
@@ -531,6 +531,56 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
       expect(emitted[0]!.content).toBe("wake up session");
       expect(emitted[0]!.meta.note_id).toBe("n-ok");
       expect(emitted[0]!.meta.source).toBe("vault");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("EXPAND-PHASE dual-read: a note carrying ONLY metadata.agent (no channel) routes + emits", async () => {
+    const { srv, base, emitted } = buildVaultServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          note: {
+            id: "agent-only-1",
+            content: "wake up via agent key",
+            tags: ["#agent/message", "#agent/message/inbound"],
+            // NO `channel` field — the routing key is carried ONLY under the new `agent` alias.
+            metadata: { agent: "eng", direction: "inbound", sender: "aaron" },
+          },
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.channel).toBe("eng");
+      expect(emitted[0]!.content).toBe("wake up via agent key");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("BACK-COMPAT dual-read: a note carrying ONLY legacy metadata.channel (no agent) still routes + emits", async () => {
+    const { srv, base, emitted } = buildVaultServer();
+    try {
+      const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          note: {
+            id: "channel-only-1",
+            content: "wake up via legacy channel key",
+            tags: ["#agent/message", "#agent/message/inbound"],
+            // ONLY the legacy `channel` field — a pre-expand writer; must still route.
+            metadata: { channel: "eng", direction: "inbound", sender: "aaron" },
+          },
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.channel).toBe("eng");
+      expect(emitted[0]!.content).toBe("wake up via legacy channel key");
     } finally {
       srv.stop(true);
     }

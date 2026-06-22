@@ -140,6 +140,8 @@ export interface JobNote {
 export interface JobNoteMetadata {
   /** The operator-facing slug (so the displayed id survives the vault's note-id assignment). */
   jobId: string;
+  /** The routing key under the NEW `agent` alias (dual-write, same value as `channel`). */
+  agent: string;
   channel: string;
   cron: string;
   tz?: string;
@@ -254,6 +256,16 @@ const AGENT_MESSAGE_OUTBOUND_TAG = "#agent/message/outbound";
 const STATUS_META_KEY = "status";
 /** Metadata key carrying the ISO timestamp an inbound was claimed (for the TTL sweep). */
 const CLAIMED_AT_META_KEY = "claimedAt";
+
+/** The agent (routing) key carried on a vault note's metadata. Reads the NEW `agent`
+ *  field, falling back to the legacy `channel` field (the expand-phase dual-read), so a
+ *  note written by either an agent-speaking or a legacy channel-speaking writer routes. */
+export function noteAgentKey(meta: Record<string, unknown> | undefined | null): string | undefined {
+  const a = meta?.agent;
+  if (typeof a === "string" && a) return a;
+  const c = meta?.channel;
+  return typeof c === "string" && c ? c : undefined;
+}
 
 /**
  * Coerce a raw `status` metadata value to an {@link InboundStatus}. The vault stores
@@ -474,6 +486,12 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     name: AGENT_MESSAGE_TAG,
     parent_names: [AGENT_ROOT_TAG],
     description: "A message in a Parachute channel (parent of /inbound + /outbound).",
+    // Expand phase: declare the NEW `agent` routing key indexed so agent-keyed queries
+    // are indexed. The legacy `channel` field was never declared indexed here (transcript
+    // filtering is client-side, index-free); we add only the new alias, additively.
+    fields: {
+      agent: { type: "string", indexed: true },
+    },
   },
   {
     name: AGENT_MESSAGE_INBOUND_TAG,
@@ -499,6 +517,9 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     // 2026-06-17-runner-scheduled-agent-turns); the schema is permissive, so the other
     // job fields (jobId/cron/tz/createdAt/lastRunAt) ride as undeclared metadata.
     fields: {
+      // Expand phase: dual-index the routing key — the new `agent` alias alongside the
+      // existing legacy `channel` field (additive; both indexed).
+      agent: { type: "string", indexed: true },
       channel: { type: "string", indexed: true },
       enabled: { type: "string", indexed: true },
       lastStatus: { type: "string", indexed: true },
@@ -515,6 +536,9 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     //  - definition → "all threads of agent X" (the def note id)
     //  - mode       → "all multi-threaded threads"
     fields: {
+      // Expand phase: declare the new `agent` routing key indexed (additive — the legacy
+      // `channel` field was never declared indexed here; we add only the new alias).
+      agent: { type: "string", indexed: true },
       status: { type: "string", indexed: true },
       definition: { type: "string", indexed: true },
       mode: { type: "string", indexed: true },
@@ -754,6 +778,11 @@ export class VaultTransport implements Transport {
     const path = `${this.pathPrefix}/${safeChannel}/${id}`;
 
     const metadata: Record<string, string> = {
+      // Dual-write the routing key under BOTH the new `agent` alias and the legacy
+      // `channel` field (same value) — the expand phase. Keeps the existing
+      // `has_metadata:["channel"]` trigger + any channel-speaking reader working
+      // while the data model starts speaking `agent`.
+      agent: channel,
       channel,
       // `direction` stays as a human/UI convenience field. The loop-avoidance
       // source of truth is now the `#agent/message/outbound` TAG below — the
@@ -945,6 +974,8 @@ export class VaultTransport implements Transport {
     // Indexed string fields (queryable) + the thread-state observability fields. The
     // vault stores metadata as strings; numbers are stringified.
     const metadata: Record<string, string> = {
+      // Dual-write the routing key (expand phase): new `agent` alias + legacy `channel`.
+      agent: thread.channel,
       channel: thread.channel,
       mode: thread.mode,
       status: thread.status,
@@ -1209,8 +1240,8 @@ export class VaultTransport implements Transport {
       if (typeof note.id !== "string" || !note.id) continue;
       const meta = note.metadata ?? {};
       // Client-side channel filter (see the index-free note above): keep only
-      // notes whose metadata.channel matches this channel.
-      if (meta.channel !== channel) continue;
+      // notes whose routing key matches this channel. Dual-read `agent ?? channel`.
+      if (noteAgentKey(meta) !== channel) continue;
       const tags = note.tags ?? [];
       // Direction: prefer the explicit metadata field; fall back to the child tag
       // (new OR legacy outbound — dual-read).
@@ -1272,6 +1303,10 @@ export class VaultTransport implements Transport {
     const metadata: Record<string, string> = {
       // Caller-supplied extra fields first, so the invariants below cannot be clobbered.
       ...(extraMeta ?? {}),
+      // Dual-write the routing key (expand phase): new `agent` alias + legacy `channel`.
+      // BOTH must be present here — this is the inbound path the vault trigger fires on
+      // (`has_metadata:["channel"]`), so dropping `channel` would break the trigger.
+      agent: channel,
       channel,
       direction: "inbound",
       sender: sender ?? "operator",
@@ -1450,7 +1485,7 @@ export class VaultTransport implements Transport {
     for (const note of notes) {
       if (typeof note.id !== "string" || !note.id) continue;
       const meta = note.metadata ?? {};
-      if (meta.channel !== channel) continue; // client-side channel filter (index-free).
+      if (noteAgentKey(meta) !== channel) continue; // client-side filter (index-free); dual-read agent ?? channel.
       const status = coerceInboundStatus(meta[STATUS_META_KEY]);
       // Drop `handled` notes — they are not queue items (#103). Only pending + in-flight
       // make up the actionable queue; counting/returning handled would let them crowd
@@ -1574,7 +1609,7 @@ export class VaultTransport implements Transport {
     for (const note of notes) {
       if (typeof note.id !== "string" || !note.id) continue;
       const m = note.metadata ?? {};
-      const channel = typeof m.channel === "string" ? m.channel : "";
+      const channel = noteAgentKey(m) ?? ""; // dual-read the routing key: agent ?? channel.
       const cron = typeof m.cron === "string" ? m.cron : "";
       if (!channel || !cron) continue; // not a well-formed job note; skip.
       // The operator-facing id is the slug in `metadata.jobId`; fall back to the
@@ -1620,6 +1655,8 @@ export class VaultTransport implements Transport {
     const path = `${JOB_PATH_PREFIX}/${safeChannel}/jobs/${safeId}`;
     const metadata: JobNoteMetadata = {
       jobId: job.id, // the operator-facing slug, so it survives the vault's note-id assignment.
+      // Dual-write the routing key (expand phase): new `agent` alias + legacy `channel`.
+      agent: job.channel,
       channel: job.channel,
       cron: job.cron,
       enabled: job.enabled ? "true" : "false",
@@ -1722,10 +1759,16 @@ export class VaultTransport implements Transport {
       flatMeta[k] = typeof v === "string" ? v : String(v);
     }
     this.ctx.emit({
+      // `channel` here is the in-memory InboundMessage.channel TS field (NOT serialized
+      // note metadata) — left as the channel name. The routing key alias rides in `meta`.
       channel: this.ctx.channel,
       content: note.content ?? "",
       meta: {
         ...flatMeta,
+        // Dual-write the routing key onto the in-memory event meta (expand phase):
+        // new `agent` alias + legacy `channel`, same value.
+        agent: this.ctx.channel,
+        channel: this.ctx.channel,
         source: "vault",
         note_id: note.id,
         sender: typeof meta.sender === "string" ? meta.sender : "",

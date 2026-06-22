@@ -26,7 +26,7 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError } from "./vault.ts";
+import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError, noteAgentKey } from "./vault.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
 
@@ -56,6 +56,30 @@ function baseConfig() {
     webhookSecret: "s3cret",
   };
 }
+
+describe("noteAgentKey — the expand-phase dual-read routing key", () => {
+  test("returns `agent` when present", () => {
+    expect(noteAgentKey({ agent: "eng" })).toBe("eng");
+  });
+  test("falls back to legacy `channel` when `agent` is absent", () => {
+    expect(noteAgentKey({ channel: "ops" })).toBe("ops");
+  });
+  test("prefers `agent` over `channel` when BOTH are present", () => {
+    expect(noteAgentKey({ agent: "eng", channel: "legacy" })).toBe("eng");
+  });
+  test("returns undefined when neither is present", () => {
+    expect(noteAgentKey({})).toBeUndefined();
+    expect(noteAgentKey(undefined)).toBeUndefined();
+    expect(noteAgentKey(null)).toBeUndefined();
+  });
+  test("ignores empty-string / non-string values (falls through)", () => {
+    // An empty `agent` is not a usable routing key → fall back to channel.
+    expect(noteAgentKey({ agent: "", channel: "ops" })).toBe("ops");
+    // Non-string values are ignored entirely.
+    expect(noteAgentKey({ agent: 123 as unknown as string, channel: "ops" })).toBe("ops");
+    expect(noteAgentKey({ agent: "", channel: "" })).toBeUndefined();
+  });
+});
 
 describe("VaultTransport — reply (outbound note write)", () => {
   test("reply() POSTs .../api/notes tagged #agent/message + #agent/message/outbound + direction + channel + Bearer", async () => {
@@ -107,6 +131,10 @@ describe("VaultTransport — reply (outbound note write)", () => {
     // The note PATH prefix is DOMAIN (`channel/<name>/`) — unchanged by the rename.
     expect(sent.path.startsWith("channel/eng/")).toBe(true);
     expect(sent.metadata.channel).toBe("eng");
+    // EXPAND PHASE dual-write: the routing key is written under BOTH the new `agent`
+    // alias AND the legacy `channel` field, with the SAME value.
+    expect(sent.metadata.agent).toBe("eng");
+    expect(sent.metadata.agent).toBe(sent.metadata.channel);
     expect(sent.metadata.direction).toBe("outbound");
     expect(sent.metadata.sender).toBe("session");
     // The old `outbound:"1"` presence marker is gone — no such metadata key.
@@ -230,6 +258,9 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(sent.metadata.mode).toBe("multi-threaded");
     // Thread-state + channel + usage (stringified for the vault).
     expect(sent.metadata.channel).toBe("eng");
+    // EXPAND PHASE dual-write: routing key under BOTH `agent` and legacy `channel`.
+    expect(sent.metadata.agent).toBe("eng");
+    expect(sent.metadata.agent).toBe(sent.metadata.channel);
     expect(sent.metadata.started_at).toBe("2026-06-18T07:00:00.000Z");
     expect(sent.metadata.last_turn_at).toBe("2026-06-18T07:00:12.000Z");
     expect(sent.metadata.turn_count).toBe("1");
@@ -1246,6 +1277,11 @@ describe("VaultTransport — writeInbound (the chat's send → wakes the session
     // Write-discipline: never write the legacy tag family going forward.
     expect(sent.tags).not.toContain("#channel-message");
     expect(sent.metadata.channel).toBe("eng");
+    // EXPAND PHASE dual-write: routing key under BOTH `agent` and legacy `channel`.
+    // BOTH must be present on the inbound note — the trigger fires on
+    // `has_metadata:["channel"]`, so `channel` must stay; `agent` is the new alias.
+    expect(sent.metadata.agent).toBe("eng");
+    expect(sent.metadata.agent).toBe(sent.metadata.channel);
     expect(sent.metadata.direction).toBe("inbound");
     expect(sent.metadata.sender).toBe("operator");
     expect(typeof sent.metadata.ts).toBe("string");
@@ -1392,6 +1428,11 @@ describe("VaultTransport — ingestInbound", () => {
     expect(m.meta.note_id).toBe("note-in-1");
     expect(m.meta.sender).toBe("aaron");
     expect(m.meta.direction).toBe("inbound");
+    // EXPAND PHASE dual-write onto the in-memory event meta: the routing key rides
+    // under BOTH `agent` and legacy `channel` (same value).
+    expect(m.meta.agent).toBe("eng");
+    expect(m.meta.channel).toBe("eng");
+    expect(m.meta.agent).toBe(m.meta.channel);
   });
 
   test("IGNORES a #agent/message/outbound-tagged note (loop avoidance)", () => {
@@ -1598,9 +1639,22 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     // "all failed threads" (status), "all threads of agent X" (definition), "all
     // multi-threaded threads" (mode). The three axes carry over from the run record VERBATIM.
     expect(byName("#agent/thread").fields).toEqual({
+      // Expand phase: the new `agent` routing-key alias is declared indexed (additive).
+      agent: { type: "string", indexed: true },
       status: { type: "string", indexed: true },
       definition: { type: "string", indexed: true },
       mode: { type: "string", indexed: true },
+    });
+    // Expand phase: `#agent/message` newly declares the indexed `agent` alias.
+    expect(byName("#agent/message").fields).toEqual({
+      agent: { type: "string", indexed: true },
+    });
+    // Expand phase: `#agent/job` dual-indexes the routing key — new `agent` + legacy `channel`.
+    expect(byName("#agent/job").fields).toEqual({
+      agent: { type: "string", indexed: true },
+      channel: { type: "string", indexed: true },
+      enabled: { type: "string", indexed: true },
+      lastStatus: { type: "string", indexed: true },
     });
   });
 
@@ -1629,13 +1683,15 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     await t.ensureSchema();
 
     expect(threadBody?.fields).toEqual({
+      // Expand phase: the new `agent` routing-key alias is declared indexed (additive).
+      agent: { type: "string", indexed: true },
       status: { type: "string", indexed: true },
       definition: { type: "string", indexed: true },
       mode: { type: "string", indexed: true },
     });
   });
 
-  test("ensureSchema sends the indexed `fields` body for #agent/job (query by channel/enabled/lastStatus)", async () => {
+  test("ensureSchema sends the indexed `fields` body for #agent/job (query by agent/channel/enabled/lastStatus)", async () => {
     let jobBody: { fields?: Record<string, unknown> } | undefined;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const name = decodeURIComponent(String(url).split("/api/tags/")[1]!);
@@ -1647,6 +1703,8 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     await t.ensureSchema();
 
     expect(jobBody?.fields).toEqual({
+      // Expand phase: dual-index the routing key — new `agent` alias + legacy `channel`.
+      agent: { type: "string", indexed: true },
       channel: { type: "string", indexed: true },
       enabled: { type: "string", indexed: true },
       lastStatus: { type: "string", indexed: true },
@@ -1824,6 +1882,10 @@ describe("VaultTransport — scheduled-job notes (vault-native store)", () => {
     expect(body.tags).toEqual(["#agent/job"]);
     expect(body.metadata.enabled).toBe("true");
     expect(body.metadata.jobId).toBe("m"); // slug persisted for stable display
+    // EXPAND PHASE dual-write: routing key under BOTH `agent` and legacy `channel`.
+    expect(body.metadata.channel).toBe("eng");
+    expect(body.metadata.agent).toBe("eng");
+    expect(body.metadata.agent).toBe(body.metadata.channel);
   });
 
   test("patchJobNote sends a PATCH with only the changed metadata", async () => {

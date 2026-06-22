@@ -51,7 +51,7 @@ import {
   type Channel,
   type ChannelEntry,
 } from "./registry.ts";
-import { VaultTransport, AGENT_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
+import { VaultTransport, AGENT_VAULT_TRIGGER_TEMPLATE, noteAgentKey } from "./transports/vault.ts";
 import {
   AgentDefRegistry,
   AgentDefWriteError,
@@ -2556,10 +2556,15 @@ export function createFetchHandler(
       if (!note || typeof note.id !== "string" || !note.id) {
         return json({ error: "body must include note.id" }, 400);
       }
-      const channelName =
-        typeof note.metadata?.channel === "string" ? note.metadata.channel : undefined;
+      // Dual-read the routing key: the NEW `agent` field, falling back to the legacy
+      // `channel` field (the expand-phase dual-read) — a note written by either an
+      // agent-speaking or a legacy channel-speaking writer routes.
+      const channelName = noteAgentKey(note.metadata);
       if (!channelName) {
-        return json({ error: "note.metadata.channel is required to route the message" }, 400);
+        return json(
+          { error: "note.metadata.agent (or legacy channel) is required to route the message" },
+          400,
+        );
       }
       const ch = channels.get(channelName);
       const vt = ch?.transport instanceof VaultTransport ? ch.transport : undefined;

@@ -6,23 +6,22 @@
  * delivery. They cover:
  *   - reply(): writes the right POST .../api/notes tagged BOTH the queryable parent
  *     `#agent/message` AND the directional child `#agent/message/outbound` (no
- *     `outbound` metadata key), with direction, channel, Bearer token; returns the id;
+ *     `outbound` metadata key), with direction, `metadata.agent`, Bearer token; returns the id;
  *   - reply(): threads in_reply_to when the bridge passes it;
- *   - loadTranscript(): DUAL-READS — a note tagged only the LEGACY `#channel-message`
- *     (or the interim `#agent-message`) still appears (the impl unions a
- *     `#agent/message`, an `#agent-message`, and a `#channel-message` query by note id);
+ *   - loadTranscript(): queries the single `#agent/message` parent tag, filters by
+ *     `noteAgentKey(meta)` (the routing key) client-side;
  *   - ingestInbound(): emits the inbound content + meta onto its channel;
- *   - ingestInbound(): IGNORES a `#agent/message/outbound`-tagged note AND a LEGACY
- *     `#channel-message/outbound`-tagged note (loop avoidance, dual-read);
- *   - schema: `AGENT_VAULT_TAG_SCHEMA` declares the `#agent/*` namespace rollup PLUS
- *     the interim + legacy tag families so pre-namespace history keeps its inheritance;
+ *   - ingestInbound(): IGNORES a `#agent/message/outbound`-tagged note (loop avoidance);
+ *   - schema: `AGENT_VAULT_TAG_SCHEMA` declares the `#agent/*` namespace rollup;
  *   - registry: a vault channel instantiates from config.
  *
- * TAG NAMESPACE — `#agent/*` (design 2026-06-17-vault-native-agents). WRITE
- * assertions expect the NEW `#agent/message*` tags; READ assertions ALSO exercise
- * the interim `#agent-message*` and legacy `#channel-message*` families (dual-read).
- * The `metadata.channel` routing key, the channel-name slugs, `?channel=`, the
- * `Channel*` types, and the `channel/<name>/` note path prefix are DOMAIN — unchanged.
+ * TAG NAMESPACE — `#agent/*` (design 2026-06-17-vault-native-agents). WRITE + READ
+ * are the `#agent/message*` tags only — the channel→agent data-model rename CONTRACT
+ * dropped the legacy `#channel-message*` / interim `#agent-message*` dual-read. The
+ * routing key is written under `metadata.agent` ONLY (the `channel` dual-write is
+ * dropped); `noteAgentKey` keeps an `agent ?? channel` read fallback for stragglers.
+ * The channel-name slugs, `?channel=`, the `Channel*` types, and the `channel/<name>/`
+ * note path prefix are DOMAIN — unchanged.
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
@@ -117,24 +116,21 @@ describe("VaultTransport — reply (outbound note write)", () => {
     // the note is queryable under it (a slash is namespace, NOT query inheritance —
     // a child-only-tagged note is invisible to a `tag:#agent/message` query), and
     // the directional child `#agent/message/outbound` is the trigger discriminator.
-    // We WRITE only the NEW namespaced tags; dual-read recognizes the interim +
-    // legacy families on READ.
+    // We WRITE only the `#agent/message*` tags.
     expect(sent.tags).toEqual(["#agent/message", "#agent/message/outbound"]);
     // Regression guard: the queryable parent tag MUST be present literally.
     expect(sent.tags).toContain("#agent/message");
     expect(sent.tags).toContain("#agent/message/outbound");
-    // Loop-avoidance / write-discipline: we NEVER write the interim/legacy tags going forward.
+    // Write-discipline: the interim/legacy tags are gone (CONTRACT dropped them).
     expect(sent.tags).not.toContain("#agent-message");
     expect(sent.tags).not.toContain("#agent-message/outbound");
     expect(sent.tags).not.toContain("#channel-message");
     expect(sent.tags).not.toContain("#channel-message/outbound");
     // The note PATH prefix is DOMAIN (`channel/<name>/`) — unchanged by the rename.
     expect(sent.path.startsWith("channel/eng/")).toBe(true);
-    expect(sent.metadata.channel).toBe("eng");
-    // EXPAND PHASE dual-write: the routing key is written under BOTH the new `agent`
-    // alias AND the legacy `channel` field, with the SAME value.
+    // CONTRACT: the routing key is written under `metadata.agent` ONLY — no `channel`.
     expect(sent.metadata.agent).toBe("eng");
-    expect(sent.metadata.agent).toBe(sent.metadata.channel);
+    expect(sent.metadata.channel).toBeUndefined();
     expect(sent.metadata.direction).toBe("outbound");
     expect(sent.metadata.sender).toBe("session");
     // The old `outbound:"1"` presence marker is gone — no such metadata key.
@@ -256,11 +252,10 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(sent.metadata.status).toBe("ok");
     expect(sent.metadata.definition).toBe("Agents/digest");
     expect(sent.metadata.mode).toBe("multi-threaded");
-    // Thread-state + channel + usage (stringified for the vault).
-    expect(sent.metadata.channel).toBe("eng");
-    // EXPAND PHASE dual-write: routing key under BOTH `agent` and legacy `channel`.
+    // Thread-state + routing key + usage (stringified for the vault).
+    // CONTRACT: routing key under `metadata.agent` ONLY — no `channel`.
     expect(sent.metadata.agent).toBe("eng");
-    expect(sent.metadata.agent).toBe(sent.metadata.channel);
+    expect(sent.metadata.channel).toBeUndefined();
     expect(sent.metadata.started_at).toBe("2026-06-18T07:00:00.000Z");
     expect(sent.metadata.last_turn_at).toBe("2026-06-18T07:00:12.000Z");
     expect(sent.metadata.turn_count).toBe("1");
@@ -1011,10 +1006,7 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
       if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
         getUrls.push(u);
         capturedAuth = (init?.headers as Record<string, string> | undefined)?.authorization ?? "";
-        // The dual-read fires THREE queries (#agent/message + interim
-        // #agent-message + legacy #channel-message). Serve the NEW-tagged notes on
-        // the #agent/message query; an empty array on the interim + legacy queries
-        // (those dual-read paths have their own dedicated tests).
+        // CONTRACT: a SINGLE `#agent/message` query (no interim/legacy union).
         if (u.includes("tag=%23agent%2Fmessage")) {
           // Return notes OUT of ts order (prove the ascending sort) + a note from a
           // DIFFERENT channel (prove the client-side channel filter excludes it).
@@ -1024,25 +1016,24 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
                 id: "n-out",
                 content: "session reply",
                 tags: ["#agent/message", "#agent/message/outbound"],
-                metadata: { channel: "eng", direction: "outbound", sender: "session", ts: "2026-06-08T00:00:02Z", in_reply_to: "n-in" },
+                metadata: { agent: "eng", direction: "outbound", sender: "session", ts: "2026-06-08T00:00:02Z", in_reply_to: "n-in" },
               },
               {
                 id: "n-other",
                 content: "different channel — must be excluded",
                 tags: ["#agent/message", "#agent/message/inbound"],
-                metadata: { channel: "other", direction: "inbound", sender: "x", ts: "2026-06-08T00:00:03Z" },
+                metadata: { agent: "other", direction: "inbound", sender: "x", ts: "2026-06-08T00:00:03Z" },
               },
               {
                 id: "n-in",
                 content: "hi session",
                 tags: ["#agent/message", "#agent/message/inbound"],
-                metadata: { channel: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:01Z" },
+                metadata: { agent: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:01Z" },
               },
             ]),
             { status: 200, headers: { "content-type": "application/json" } },
           );
         }
-        // interim #agent-message + legacy #channel-message queries → nothing here.
         return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
       }
       // ensureSchema PUTs
@@ -1053,20 +1044,20 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
     await t.start(fakeCtx("eng"));
     const msgs = await t.loadTranscript();
 
-    // DUAL-READ: the new + interim + legacy parent tags are queried (unioned by id).
-    // Each query carries the encoded parent tag + include_content, and DELIBERATELY
-    // no `metadata=` operator filter (the channel field isn't indexed on a bare
+    // CONTRACT: exactly ONE `#agent/message` query — the interim/legacy union is gone.
+    // It carries the encoded parent tag + include_content, and DELIBERATELY no
+    // `metadata=` operator filter (the routing-key field isn't indexed on a bare
     // vault; we filter client-side). Overfetches the tag so other channels don't
     // crowd us out.
-    const agentGet = getUrls.find((u) => u.includes("tag=%23agent%2Fmessage"));
-    const interimGet = getUrls.find((u) => u.includes("tag=%23agent-message"));
-    const legacyGet = getUrls.find((u) => u.includes("tag=%23channel-message"));
-    expect(agentGet).toBeDefined();
-    expect(interimGet).toBeDefined(); // proves the interim flat tag is also queried (dual-read)
-    expect(legacyGet).toBeDefined(); // proves the legacy tag is also queried (dual-read)
-    expect(agentGet!.startsWith("http://127.0.0.1:1940/vault/default/api/notes?")).toBe(true);
-    expect(agentGet!).toContain("include_content=true");
-    expect(agentGet!).not.toContain("metadata=");
+    const agentGets = getUrls.filter((u) => u.includes("tag=%23agent%2Fmessage"));
+    expect(agentGets).toHaveLength(1);
+    // No interim/legacy queries are issued.
+    expect(getUrls.some((u) => u.includes("tag=%23agent-message"))).toBe(false);
+    expect(getUrls.some((u) => u.includes("tag=%23channel-message"))).toBe(false);
+    const agentGet = agentGets[0]!;
+    expect(agentGet.startsWith("http://127.0.0.1:1940/vault/default/api/notes?")).toBe(true);
+    expect(agentGet).toContain("include_content=true");
+    expect(agentGet).not.toContain("metadata=");
     expect(capturedAuth).toBe("Bearer write-token-xyz");
 
     // The "other" channel note is filtered OUT; the two "eng" notes remain, sorted
@@ -1081,98 +1072,17 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
     expect(msgs[1]!.inReplyTo).toBe("n-in");
   });
 
-  test("DUAL-READ: a note tagged ONLY the LEGACY #channel-message still appears in the transcript", async () => {
-    // The dual-read proof (rule 2). The impl issues TWO tag queries — one for the
-    // NEW `#agent/message`, one for the legacy `#channel-message` — and unions the
-    // results by note id. A pre-rename note carrying ONLY the legacy tags (and the
-    // matching `metadata.channel`) must STILL load, so existing history survives the
-    // rename until the one-time re-tag run lands.
-    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      const u = String(url);
-      if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
-        if (u.includes("tag=%23agent%2Fmessage")) {
-          // A NEW-tagged note (post-rename) on this channel.
-          return new Response(
-            JSON.stringify([
-              {
-                id: "n-new",
-                content: "post-rename message",
-                tags: ["#agent/message", "#agent/message/inbound"],
-                metadata: { channel: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:02Z" },
-              },
-            ]),
-            { status: 200, headers: { "content-type": "application/json" } },
-          );
-        }
-        if (u.includes("tag=%23channel-message")) {
-          // A LEGACY-only note (pre-rename) — carries ONLY the old tag family.
-          return new Response(
-            JSON.stringify([
-              {
-                id: "n-legacy",
-                content: "pre-rename message",
-                tags: ["#channel-message", "#channel-message/inbound"],
-                metadata: { channel: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:01Z" },
-              },
-            ]),
-            { status: 200, headers: { "content-type": "application/json" } },
-          );
-        }
-        return new Response("[]", { status: 200 });
-      }
-      return new Response("{}", { status: 200 });
-    }) as typeof fetch;
-
-    const t = new VaultTransport(baseConfig());
-    await t.start(fakeCtx("eng"));
-    const msgs = await t.loadTranscript();
-
-    // Union of both queries: the legacy-only note is present alongside the new one,
-    // sorted ascending by ts (legacy ts is earlier → first).
-    expect(msgs.map((m) => m.id)).toEqual(["n-legacy", "n-new"]);
-    const legacy = msgs.find((m) => m.id === "n-legacy")!;
-    expect(legacy.text).toBe("pre-rename message");
-    expect(legacy.direction).toBe("inbound");
-  });
-
-  test("DUAL-READ: a note carried by BOTH queries (re-tagged) is NOT duplicated (union by id)", async () => {
-    // A note re-tagged to carry both families appears on each query; the union
-    // dedups by note id so it shows exactly once.
-    const dual = {
-      id: "n-both",
-      content: "re-tagged message",
-      tags: ["#agent/message", "#channel-message", "#agent/message/inbound", "#channel-message/inbound"],
-      metadata: { channel: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:01Z" },
-    };
-    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      const u = String(url);
-      if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
-        // Both queries return the same note.
-        return new Response(JSON.stringify([dual]), { status: 200, headers: { "content-type": "application/json" } });
-      }
-      return new Response("{}", { status: 200 });
-    }) as typeof fetch;
-
-    const t = new VaultTransport(baseConfig());
-    await t.start(fakeCtx("eng"));
-    const msgs = await t.loadTranscript();
-    expect(msgs).toHaveLength(1);
-    expect(msgs[0]!.id).toBe("n-both");
-  });
-
   test("caps the returned transcript to the requested limit (most-recent by ts)", async () => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
-        // Only the #agent/message query returns notes; the legacy query is empty
-        // (so the union doesn't double-count by id under dual-read).
         if (u.includes("tag=%23agent%2Fmessage")) {
           return new Response(
             JSON.stringify([1, 2, 3, 4].map((i) => ({
               id: "n" + i,
               content: "m" + i,
               tags: ["#agent/message", "#agent/message/inbound"],
-              metadata: { channel: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:0" + i + "Z" },
+              metadata: { agent: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:0" + i + "Z" },
             }))),
             { status: 200 },
           );
@@ -1188,26 +1098,17 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
     expect(msgs.map((m) => m.id)).toEqual(["n3", "n4"]);
   });
 
-  test("falls back to the child tag for direction when metadata.direction is absent (new + legacy outbound tags)", async () => {
+  test("falls back to the outbound child tag for direction when metadata.direction is absent", async () => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
         if (u.includes("tag=%23agent%2Fmessage")) {
           return new Response(
             JSON.stringify([
-              // NEW outbound child → direction inferred "outbound".
-              { id: "a", content: "x", tags: ["#agent/message", "#agent/message/outbound"], metadata: { channel: "eng", ts: "2026-06-08T00:00:01Z" } },
+              // Outbound child → direction inferred "outbound".
+              { id: "a", content: "x", tags: ["#agent/message", "#agent/message/outbound"], metadata: { agent: "eng", ts: "2026-06-08T00:00:01Z" } },
               // No direction signal at all → defaults to "inbound".
-              { id: "b", content: "y", tags: ["#agent/message", "#agent/message/inbound"], metadata: { channel: "eng", ts: "2026-06-08T00:00:02Z" } },
-            ]),
-            { status: 200 },
-          );
-        }
-        if (u.includes("tag=%23channel-message")) {
-          // LEGACY outbound child → dual-read recognizes it too → "outbound".
-          return new Response(
-            JSON.stringify([
-              { id: "c", content: "z", tags: ["#channel-message", "#channel-message/outbound"], metadata: { channel: "eng", ts: "2026-06-08T00:00:03Z" } },
+              { id: "b", content: "y", tags: ["#agent/message", "#agent/message/inbound"], metadata: { agent: "eng", ts: "2026-06-08T00:00:02Z" } },
             ]),
             { status: 200 },
           );
@@ -1221,8 +1122,6 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
     const msgs = await t.loadTranscript();
     expect(msgs.find((m) => m.id === "a")!.direction).toBe("outbound");
     expect(msgs.find((m) => m.id === "b")!.direction).toBe("inbound");
-    // Dual-read: the legacy outbound child tag is recognized for direction too.
-    expect(msgs.find((m) => m.id === "c")!.direction).toBe("outbound");
   });
 
   test("throws a clear error on a non-ok vault response", async () => {
@@ -1274,14 +1173,12 @@ describe("VaultTransport — writeInbound (the chat's send → wakes the session
     expect(sent.tags).toContain("#agent/message/inbound");
     // It must NOT carry the outbound tag (that would be a reply, never wake).
     expect(sent.tags).not.toContain("#agent/message/outbound");
-    // Write-discipline: never write the legacy tag family going forward.
+    // Write-discipline: the legacy tag family is gone (CONTRACT dropped it).
     expect(sent.tags).not.toContain("#channel-message");
-    expect(sent.metadata.channel).toBe("eng");
-    // EXPAND PHASE dual-write: routing key under BOTH `agent` and legacy `channel`.
-    // BOTH must be present on the inbound note — the trigger fires on
-    // `has_metadata:["channel"]`, so `channel` must stay; `agent` is the new alias.
+    // CONTRACT: the routing key under `metadata.agent` ONLY — no `channel`. The vault
+    // trigger keys on `has_metadata:["agent"]` to fire on this inbound note.
     expect(sent.metadata.agent).toBe("eng");
-    expect(sent.metadata.agent).toBe(sent.metadata.channel);
+    expect(sent.metadata.channel).toBeUndefined();
     expect(sent.metadata.direction).toBe("inbound");
     expect(sent.metadata.sender).toBe("operator");
     expect(typeof sent.metadata.ts).toBe("string");
@@ -1358,7 +1255,9 @@ describe("VaultTransport — writeCallback (agent-to-agent reply_to substrate)",
     expect(sent!.metadata.correlation_id).toBe("corr-abc");
     expect(sent!.metadata.delegation_depth).toBe("3");
     // The channel it's routed to is THIS transport's channel (the sender's), direction inbound.
-    expect(sent!.metadata.channel).toBe("orchestrator");
+    // CONTRACT: routing key under `metadata.agent` ONLY — no `channel`.
+    expect(sent!.metadata.agent).toBe("orchestrator");
+    expect(sent!.metadata.channel).toBeUndefined();
     expect(sent!.metadata.direction).toBe("inbound");
     expect(sent!.metadata.sender).toBe("callback:worker");
     // LOOP GUARD: the callback note must NEVER carry a reply_to (terminal callback).
@@ -1417,7 +1316,7 @@ describe("VaultTransport — ingestInbound", () => {
       id: "note-in-1",
       content: "hello session",
       tags: ["#agent/message", "#agent/message/inbound"],
-      metadata: { channel: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:00Z" },
+      metadata: { agent: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:00Z" },
     });
     expect(ctx.emitted).toHaveLength(1);
     const m = ctx.emitted[0]!;
@@ -1428,11 +1327,11 @@ describe("VaultTransport — ingestInbound", () => {
     expect(m.meta.note_id).toBe("note-in-1");
     expect(m.meta.sender).toBe("aaron");
     expect(m.meta.direction).toBe("inbound");
-    // EXPAND PHASE dual-write onto the in-memory event meta: the routing key rides
-    // under BOTH `agent` and legacy `channel` (same value).
+    // CONTRACT: the routing key on the in-memory event meta is stamped under `agent`
+    // ONLY (the `channel` dual-write is dropped). The top-level InboundMessage.channel
+    // TS field stays the channel name.
     expect(m.meta.agent).toBe("eng");
-    expect(m.meta.channel).toBe("eng");
-    expect(m.meta.agent).toBe(m.meta.channel);
+    expect(m.meta.channel).toBeUndefined();
   });
 
   test("IGNORES a #agent/message/outbound-tagged note (loop avoidance)", () => {
@@ -1444,24 +1343,6 @@ describe("VaultTransport — ingestInbound", () => {
       content: "I am awake",
       tags: ["#agent/message", "#agent/message/outbound"],
       metadata: { channel: "eng", direction: "outbound", sender: "session" },
-    });
-    expect(ctx.emitted).toHaveLength(0);
-  });
-
-  test("DUAL-READ loop avoidance: IGNORES a LEGACY #channel-message/outbound-tagged note", () => {
-    // Belt-and-suspenders dual-read (rule 2): even a pre-rename reply note —
-    // carrying only the legacy outbound child tag, and WITHOUT a direction
-    // metadata field — must be dropped, so a still-live legacy trigger that
-    // mis-delivers our own old reply can never wake the session on it.
-    const t = new VaultTransport(baseConfig());
-    const ctx = fakeCtx("eng");
-    void t.start(ctx);
-    t.ingestInbound({
-      id: "our-own-legacy-reply",
-      content: "I am awake (legacy)",
-      tags: ["#channel-message", "#channel-message/outbound"],
-      // No direction field — the drop must come from the legacy outbound TAG alone.
-      metadata: { channel: "eng", sender: "session" },
     });
     expect(ctx.emitted).toHaveLength(0);
   });
@@ -1599,13 +1480,11 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(jobBody.parent_names).toEqual(["#agent"]);
   });
 
-  test("schema declares the #agent/* namespace rollup PLUS the interim + legacy families (dual-read, 13 entries)", async () => {
+  test("schema declares ONLY the #agent/* namespace rollup (CONTRACT dropped interim + legacy, 7 entries)", async () => {
     // The `#agent/*` namespace (design 2026-06-17-vault-native-agents) rolls up
-    // definitions, messages, jobs, AND threads to the `#agent` root. DUAL-READ: the schema
-    // ALSO keeps declaring the interim flat `#agent-message*` AND legacy
-    // `#channel-message*` inheritance so pre-namespace history keeps its parent/child
-    // expansion until the one-time re-tag run lands. Exactly 13 entries (12 + the
-    // execution-lifecycle `#agent/thread` record tag).
+    // definitions, messages, jobs, AND threads to the `#agent` root. The channel→agent
+    // CONTRACT dropped the interim flat `#agent-message*` AND legacy `#channel-message*`
+    // schema entries — exactly 7 entries, all under `#agent/*`.
     const names = AGENT_VAULT_TAG_SCHEMA.map((e) => e.name);
     expect(names).toEqual([
       "#agent",
@@ -1615,13 +1494,10 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
       "#agent/message/outbound",
       "#agent/job",
       "#agent/thread",
-      "#agent-message",
-      "#agent-message/inbound",
-      "#agent-message/outbound",
-      "#channel-message",
-      "#channel-message/inbound",
-      "#channel-message/outbound",
     ]);
+    // The interim/legacy families are gone entirely.
+    expect(names).not.toContain("#agent-message");
+    expect(names).not.toContain("#channel-message");
     // The namespace children all roll up to the `#agent` root (the human rollup).
     const byName = (n: string) => AGENT_VAULT_TAG_SCHEMA.find((e) => e.name === n)!;
     expect(byName("#agent/definition").parent_names).toEqual(["#agent"]);
@@ -1630,29 +1506,23 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(byName("#agent/thread").parent_names).toEqual(["#agent"]);
     expect(byName("#agent/message/inbound").parent_names).toEqual(["#agent/message"]);
     expect(byName("#agent/message/outbound").parent_names).toEqual(["#agent/message"]);
-    // The interim + legacy children still declare their own parents (inheritance preserved).
-    expect(byName("#agent-message/inbound").parent_names).toEqual(["#agent-message"]);
-    expect(byName("#agent-message/outbound").parent_names).toEqual(["#agent-message"]);
-    expect(byName("#channel-message/inbound").parent_names).toEqual(["#channel-message"]);
-    expect(byName("#channel-message/outbound").parent_names).toEqual(["#channel-message"]);
     // `#agent/thread` declares INDEXED string fields so threads are operator-queryable —
     // "all failed threads" (status), "all threads of agent X" (definition), "all
     // multi-threaded threads" (mode). The three axes carry over from the run record VERBATIM.
     expect(byName("#agent/thread").fields).toEqual({
-      // Expand phase: the new `agent` routing-key alias is declared indexed (additive).
+      // The canonical `agent` routing-key alias is declared indexed.
       agent: { type: "string", indexed: true },
       status: { type: "string", indexed: true },
       definition: { type: "string", indexed: true },
       mode: { type: "string", indexed: true },
     });
-    // Expand phase: `#agent/message` newly declares the indexed `agent` alias.
+    // `#agent/message` declares the indexed `agent` routing key.
     expect(byName("#agent/message").fields).toEqual({
       agent: { type: "string", indexed: true },
     });
-    // Expand phase: `#agent/job` dual-indexes the routing key — new `agent` + legacy `channel`.
+    // CONTRACT: `#agent/job` indexes the routing key under `agent` ONLY — no `channel`.
     expect(byName("#agent/job").fields).toEqual({
       agent: { type: "string", indexed: true },
-      channel: { type: "string", indexed: true },
       enabled: { type: "string", indexed: true },
       lastStatus: { type: "string", indexed: true },
     });
@@ -1691,7 +1561,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     });
   });
 
-  test("ensureSchema sends the indexed `fields` body for #agent/job (query by agent/channel/enabled/lastStatus)", async () => {
+  test("ensureSchema sends the indexed `fields` body for #agent/job (query by agent/enabled/lastStatus)", async () => {
     let jobBody: { fields?: Record<string, unknown> } | undefined;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const name = decodeURIComponent(String(url).split("/api/tags/")[1]!);
@@ -1703,9 +1573,8 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     await t.ensureSchema();
 
     expect(jobBody?.fields).toEqual({
-      // Expand phase: dual-index the routing key — new `agent` alias + legacy `channel`.
+      // CONTRACT: index the routing key under `agent` ONLY — no `channel`.
       agent: { type: "string", indexed: true },
-      channel: { type: "string", indexed: true },
       enabled: { type: "string", indexed: true },
       lastStatus: { type: "string", indexed: true },
     });
@@ -1882,10 +1751,9 @@ describe("VaultTransport — scheduled-job notes (vault-native store)", () => {
     expect(body.tags).toEqual(["#agent/job"]);
     expect(body.metadata.enabled).toBe("true");
     expect(body.metadata.jobId).toBe("m"); // slug persisted for stable display
-    // EXPAND PHASE dual-write: routing key under BOTH `agent` and legacy `channel`.
-    expect(body.metadata.channel).toBe("eng");
+    // CONTRACT: routing key under `metadata.agent` ONLY — no `channel`.
     expect(body.metadata.agent).toBe("eng");
-    expect(body.metadata.agent).toBe(body.metadata.channel);
+    expect(body.metadata.channel).toBeUndefined();
   });
 
   test("patchJobNote sends a PATCH with only the changed metadata", async () => {

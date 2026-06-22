@@ -170,11 +170,18 @@ A `vault` transport backs a channel with notes in a Parachute vault, so messages
 are durable, queryable, and a vault surface can render them. Multiple channels per
 vault: the note's routing-key metadata routes it.
 
-> **Routing-key expand phase (#133).** The routing key is now written under BOTH
-> `metadata.agent` (new, canonical) AND `metadata.channel` (legacy) on every note, and
-> READ as `agent ?? channel` via the `noteAgentKey` helper (`src/transports/vault.ts`) —
-> the expand phase of the data-model `channel → agent` rename. The vault inbound trigger
-> still keys on `channel` until a later cutover, so both keys stay populated for now.
+> **Routing-key CONTRACT landed (#133).** The data-model `channel → agent` rename's
+> CONTRACT phase is in: every note now writes the routing key under `metadata.agent`
+> ONLY (the `metadata.channel` dual-write is dropped), and the vault inbound trigger
+> keys on `has_metadata:["agent"]`. The `noteAgentKey` helper (`src/transports/vault.ts`)
+> still READS `agent ?? channel` as a read-only tolerance for any in-flight straggler
+> during the live cutover. The legacy `#channel-message*` / interim `#agent-message*`
+> tag dual-read + dual-schema were dropped too (we only ever wrote `#agent/message*`).
+> **Live cutover is a SEPARATE step:** merging this code has no live effect until the
+> vault trigger is re-registered to `has_metadata:["agent"]` and the daemon restarts.
+> Note the TRANSPORT/ENDPOINT "channel" concept is untouched — `channels.json`, the
+> `Channel` type, `/mcp/<channel>`, `InboundMessage.channel`, and the note path prefixes
+> all stay.
 
 **The `#agent/*` namespace is module-owned** (design
 `design/2026-06-17-vault-native-agents.md`). Every vault object this module manages
@@ -185,14 +192,15 @@ record of one thread — see the `#agent/thread` subsection below). The tag sche
 `parent_names` so a human `tag:#agent` query rolls up to everything the module owns.
 The module always queries the EXACT leaf tag (never relies on prefix magic), and
 keeps the "tag both queryable parent + directional child literally" floor so loop
-avoidance + transcript listing work with zero per-vault schema dependency. DUAL-READ
-recognizes the prior flat `#agent-message*` and legacy `#channel-message*` tags on
-READ (pre-namespace history) but only ever WRITES the namespaced tags.
+avoidance + transcript listing work with zero per-vault schema dependency. The
+channel→agent CONTRACT dropped the prior flat `#agent-message*` / legacy
+`#channel-message*` tag dual-read — the module both WRITES and READS only the
+`#agent/message*` tags now.
 
 **Note shape** — TWO tags per note, carried literally (two orthogonal axes):
 - the parent `#agent/message` — the QUERYABLE membership tag. A UI lists a channel's
-  whole transcript (both directions) with one `tag: "#agent/message"` + `metadata.channel`
-  query, because the parent is literally on every note.
+  whole transcript (both directions) with one `tag: "#agent/message"` + `metadata.agent`
+  (the routing key) query, because the parent is literally on every note.
 - a directional child — the trigger DISCRIMINATOR: `#agent/message/inbound` (human→session)
   or `#agent/message/outbound` (session reply).
 
@@ -203,17 +211,19 @@ A note tagged ONLY `#agent/message/inbound` is INVISIBLE to a `tag: "#agent/mess
 query unless that inheritance was separately declared — so we tag BOTH the parent and the
 child and don't depend on per-vault schema setup.
 
-Content = the message text; metadata: `{ channel, direction: "inbound"|"outbound", sender,
-in_reply_to (outbound), ts }`. Loop avoidance lives in the TAG, not metadata: the trigger
-fires on the inbound child tag only (exact match), which an outbound note never carries, so a
-reply never wakes its own session. **Inbound notes MUST carry BOTH `#agent/message` (parent,
-makes it queryable) AND `#agent/message/inbound` (child, fires the trigger), with the channel
-name in `metadata.channel`.** Outbound notes carry `#agent/message` + `#agent/message/outbound`.
+Content = the message text; metadata: `{ agent, direction: "inbound"|"outbound", sender,
+in_reply_to (outbound), ts }` — `agent` is the routing key (the channel→agent CONTRACT moved
+it off the dropped `channel` field; `noteAgentKey` keeps an `agent ?? channel` read fallback
+for stragglers). Loop avoidance lives in the TAG, not metadata: the trigger fires on the inbound
+child tag only (exact match), which an outbound note never carries, so a reply never wakes its own
+session. **Inbound notes MUST carry BOTH `#agent/message` (parent, makes it queryable) AND
+`#agent/message/inbound` (child, fires the trigger), with the routing key in `metadata.agent`.**
+Outbound notes carry `#agent/message` + `#agent/message/outbound`.
 
 **Flow.** INBOUND (human→session): a new `#agent/message` + `#agent/message/inbound` note →
 a vault **trigger** POSTs a webhook → the agent daemon's `POST /api/vault/inbound` → routes by
-`note.metadata.channel` → `ctx.emit` wakes the session (fans to SSE bridges + HTTP-MCP sessions
-alike). OUTBOUND (session→human): the session's `reply` writes a `#agent/message` +
+`noteAgentKey(note.metadata)` (reads `metadata.agent`) → `ctx.emit` wakes the session (fans to
+SSE bridges + HTTP-MCP sessions alike). OUTBOUND (session→human): the session's `reply` writes a `#agent/message` +
 `#agent/message/outbound` note via the vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`,
 Bearer `vault:<name>:write`).
 
@@ -226,7 +236,7 @@ Bearer `vault:<name>:write`).
 
 **Vault side** (operator config — activates the inbound trigger):
 1. (Optional, for indexed queries) declare the `#agent/message` tag schema with
-   indexed `channel`/`direction`/`sender` fields (`update-tag`).
+   indexed `agent`/`direction`/`sender` fields (`update-tag`).
 2. Add a trigger to the vault's `config.yaml` that fires on new inbound notes and
    webhooks the agent daemon. Loop avoidance is by tag: the vault predicate does
    EXACT tag membership, so firing on the inbound CHILD tag (`#agent/message/inbound`)
@@ -239,7 +249,7 @@ Bearer `vault:<name>:write`).
        events: ["created"]
        when:
          tags: ["#agent/message/inbound"]
-         has_metadata: ["channel"]
+         has_metadata: ["agent"]
          missing_metadata: ["channel_inbound_rendered_at"]
        action:
          webhook: "http://127.0.0.1:1941/api/vault/inbound?secret=<shared secret>"
@@ -256,8 +266,8 @@ The unified model is `definition -> thread -> message`: **everything is a thread
 EVERY completed turn materializes a `#agent/thread` note (a "run" was always a thread with
 one turn — the older `#agent/run` tag retired into this). The note is the durable,
 queryable record of one thread: its BODY is a rolling SUMMARY (`## Summary` /
-`## Latest turn`), and its metadata carries the thread state — `channel`, `definition`,
-`mode`, `status`, `started_at`, `last_turn_at`, `turn_count`, cumulative `usage`, and the
+`## Latest turn`), and its metadata carries the thread state — `agent` (the routing key),
+`definition`, `mode`, `status`, `started_at`, `last_turn_at`, `turn_count`, cumulative `usage`, and the
 Claude `session` UUID. The INDEXED `status`/`definition`/`mode` fields make threads
 operator-queryable ("all failed threads", "all threads of agent X", "all multi-threaded
 threads").

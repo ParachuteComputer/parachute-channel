@@ -195,12 +195,14 @@ describe("VaultJobStore — vault-native CRUD", () => {
     expect(body.metadata.jobId).toBe("morning"); // slug persisted for stable display
     expect(body.content).toBe("Run the morning weave");
     expect(body.metadata).toMatchObject({
-      channel: "uni-dev",
+      // CONTRACT: routing key under `metadata.agent` ONLY — no `channel`.
+      agent: "uni-dev",
       cron: "53 7 * * *",
       tz: "America/Los_Angeles",
       enabled: "true",
       createdAt: "2026-06-17T00:00:00.000Z",
     });
+    expect(body.metadata.channel).toBeUndefined();
     // nextRunAt is NEVER persisted.
     expect(body.metadata.nextRunAt).toBeUndefined();
     const headers = calls[0]!.init.headers as Record<string, string>;

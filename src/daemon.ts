@@ -628,7 +628,12 @@ export function channelQueueStoreFor(
   if (!(vt instanceof VaultTransport)) return null;
   return {
     listInboundQueue: (opts) => vt.listInboundQueue(opts),
-    setInboundStatus: (id, status, claimedAt) => vt.setInboundStatus(id, status, claimedAt),
+    // Forward ALL FOUR args — the 4th `ifUpdatedAt` is the CAS precondition the
+    // single-claim guard (agent#101) depends on. A 3-arg arrow silently dropped it,
+    // collapsing every claim to `force:true` (last-write-wins) and DISABLING the CAS in
+    // production (the double-claim race PR #116 closed was re-opened for channel agents).
+    setInboundStatus: (id, status, claimedAt, ifUpdatedAt) =>
+      vt.setInboundStatus(id, status, claimedAt, ifUpdatedAt),
     reply: async (args) => {
       return vt.reply({
         channel: name,

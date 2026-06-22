@@ -1,20 +1,23 @@
 /**
- * The CHANNEL-backend queue registry (design 2026-06-18-channel-backend.md, phase 1).
+ * The ATTACHED-backend queue registry (design 2026-06-18-channel-backend.md, phase 1).
+ * (The backend VALUE was named `"channel"` before the rename; the ROUTING KEY `channel`
+ * — the agent's address / the `/mcp/<channel>` segment — is a separate concept and KEEPS
+ * its name, so `channel` still appears throughout as the routing-key identifier.)
  *
  * The PARALLEL to {@link ProgrammaticAgentRegistry}, NOT a reuse of it. A
- * `backend: "channel"` agent runs NO `claude -p` and has NO drain worker: the turn
- * is handled by a Claude Code session the OPERATOR runs and connects to the channel's
- * MCP endpoint. The inbound `#agent/message/inbound` notes themselves ARE the queue
- * (the vault is the queue + the source of truth), and their claim `status`
+ * `backend: "attached"` agent runs NO `claude -p` and has NO drain worker: the turn
+ * is handled by a Claude Code session the OPERATOR runs and connects ("attaches") to the
+ * channel's MCP endpoint. The inbound `#agent/message/inbound` notes themselves ARE the
+ * queue (the vault is the queue + the source of truth), and their claim `status`
  * (`pending | in-flight | handled`) lives on the note, so a claim survives a daemon
  * restart and a handled message is never re-presented.
  *
  * ── Why a separate registry (the daemon routing fork) ────────────────────────────
  * The programmatic registry's drain worker reads `deliver()`'s `reply` synchronously
- * and OWNS the outbound write. A channel agent has no synchronous turn and its
+ * and OWNS the outbound write. An attached agent has no synchronous turn and its
  * outbound is written by the MCP `reply` tool — reusing that worker would double-write
  * (worker + tool) or drop the reply (worker sees an empty `deliver`). So the fork is
- * at the daemon ROUTER: inbound for a `channel` agent routes HERE and is NOT enqueued
+ * at the daemon ROUTER: inbound for an `attached` agent routes HERE and is NOT enqueued
  * to the programmatic worker. This registry exposes only queue operations the MCP
  * surface calls — there is no in-process `deliver`-produces-reply.
  *
@@ -47,7 +50,7 @@ import type { InboundQueueNote, InboundStatus } from "../transports/vault.ts";
  * inbound-note store (the daemon wires this to the channel's VaultTransport; tests
  * inject a fake). Mirrors the vault-transport methods 1:1 so the seam is thin.
  */
-export interface ChannelQueueStore {
+export interface AttachedQueueStore {
   /** List this channel's inbound queue notes, ascending by ts (oldest first). */
   listInboundQueue(opts?: { limit?: number }): Promise<InboundQueueNote[]>;
   /**
@@ -67,7 +70,7 @@ export interface ChannelQueueStore {
   reply(args: { text: string; inReplyTo?: string }): Promise<{ sent: string[] }>;
 }
 
-/** Bound on the CAS re-list retries in {@link ChannelQueueRegistry.claimNext} — a
+/** Bound on the CAS re-list retries in {@link AttachedQueueRegistry.claimNext} — a
  *  safety net against a pathological all-contended queue (each pass claims/eliminates
  *  one note, so the loop is naturally bounded by the pending count anyway). */
 const MAX_CLAIM_ATTEMPTS = 25;
@@ -100,7 +103,7 @@ export interface ClaimedMessage {
   systemPrompt: string;
 }
 
-/** One registered channel-backend agent: its spec + the store its queue lives in. */
+/** One registered attached-backend agent: its spec + the store its queue lives in. */
 interface ChannelRecord {
   /** The agent slug (the spec name) == the wake channel (agent ≡ channel). */
   name: string;
@@ -109,7 +112,7 @@ interface ChannelRecord {
   /** The spec — carries the systemPrompt the session adopts on `next-message`. */
   spec: AgentSpec;
   /** The durable inbound-note store (the channel's VaultTransport, in production). */
-  store: ChannelQueueStore;
+  store: AttachedQueueStore;
 }
 
 /** How many pending items the `pending` peek returns at most (a nudge, not a dump). */
@@ -118,12 +121,12 @@ const PENDING_PEEK_CAP = 20;
 const PREVIEW_LEN = 120;
 
 /**
- * The daemon's registry of CHANNEL-backend agents + their durable queues. Keyed by
+ * The daemon's registry of ATTACHED-backend agents + their durable queues. Keyed by
  * CHANNEL (the inbound-routing index + the MCP-surface lookup are both O(1)). One
  * instance per daemon, constructed at boot; the store is injected per-agent so tests
  * drive it with a fake store, no real vault.
  */
-export class ChannelQueueRegistry {
+export class AttachedQueueRegistry {
   /** channel → record. */
   private readonly byChannel = new Map<string, ChannelRecord>();
   /** name → channel (the lifecycle index; an agent has exactly one channel). */
@@ -135,13 +138,13 @@ export class ChannelQueueRegistry {
   }
 
   /**
-   * Register (or replace) a channel-backend agent. Lightweight: index the record by
+   * Register (or replace) a attached-backend agent. Lightweight: index the record by
    * channel + name. Idempotent-replace by name (a reload / boot re-register swaps the
    * spec + store in place). Throws if the spec declares no channel.
    */
-  register(spec: AgentSpec, store: ChannelQueueStore): void {
+  register(spec: AgentSpec, store: AttachedQueueStore): void {
     if (spec.channels.length === 0) {
-      throw new Error(`channel-queue registry: spec "${spec.name}" declares no channels`);
+      throw new Error(`attached-queue registry: spec "${spec.name}" declares no channels`);
     }
     const channel = channelOf(spec);
     // If the name moved channels (rare), drop the stale channel index.
@@ -153,7 +156,7 @@ export class ChannelQueueRegistry {
     this.nameToChannel.set(spec.name, channel);
   }
 
-  /** Deregister a channel-backend agent by NAME — drop its indexes. The durable queue
+  /** Deregister a attached-backend agent by NAME — drop its indexes. The durable queue
    *  notes stay in the vault (deregistering an agent doesn't delete its history). */
   deregister(name: string): boolean {
     const channel = this.nameToChannel.get(name);
@@ -163,12 +166,12 @@ export class ChannelQueueRegistry {
     return true;
   }
 
-  /** Is a channel-backend agent registered for this channel? (the routing-fork check) */
+  /** Is a attached-backend agent registered for this channel? (the routing-fork check) */
   hasChannel(channel: string): boolean {
     return this.byChannel.has(channel);
   }
 
-  /** Is a channel-backend agent registered under this name? (the mutual-exclusion check) */
+  /** Is a attached-backend agent registered under this name? (the mutual-exclusion check) */
   hasName(name: string): boolean {
     return this.nameToChannel.has(name);
   }
@@ -179,7 +182,7 @@ export class ChannelQueueRegistry {
   }
 
   /**
-   * The registered channel-backend agents as plain records (name + channel + the
+   * The registered attached-backend agents as plain records (name + channel + the
    * spec's surfaceable, non-secret fields). The `GET /api/agents` list (#102) maps
    * these into {@link AgentInfo}; tests assert the shape. Sorted by name for a stable
    * list. NEVER carries a token/secret — the spec's vault binding is a name + access
@@ -285,7 +288,7 @@ export class ChannelQueueRegistry {
    */
   async reply(channel: string, args: { inReplyTo?: string; text: string }): Promise<{ sent: string[] }> {
     const rec = this.byChannel.get(channel);
-    if (!rec) throw new Error(`channel-queue registry: no channel-backend agent for "${channel}"`);
+    if (!rec) throw new Error(`attached-queue registry: no attached-backend agent for "${channel}"`);
     const sent = await rec.store.reply({
       text: args.text,
       ...(args.inReplyTo ? { inReplyTo: args.inReplyTo } : {}),
@@ -305,7 +308,7 @@ export class ChannelQueueRegistry {
    */
   async release(channel: string, id: string): Promise<void> {
     const rec = this.byChannel.get(channel);
-    if (!rec) throw new Error(`channel-queue registry: no channel-backend agent for "${channel}"`);
+    if (!rec) throw new Error(`attached-queue registry: no attached-backend agent for "${channel}"`);
     await rec.store.setInboundStatus(id, "pending", null);
   }
 
@@ -328,7 +331,7 @@ export class ChannelQueueRegistry {
         notes = await rec.store.listInboundQueue();
       } catch (err) {
         console.warn(
-          `channel-queue: sweep list for "${rec.channel}" failed (continuing): ${(err as Error).message}`,
+          `attached-queue: sweep list for "${rec.channel}" failed (continuing): ${(err as Error).message}`,
         );
         continue;
       }
@@ -341,12 +344,12 @@ export class ChannelQueueRegistry {
           await rec.store.setInboundStatus(n.id, "pending", null);
           released++;
           console.log(
-            `channel-queue: auto-released stale in-flight note ${n.id} on "${rec.channel}" ` +
+            `attached-queue: auto-released stale in-flight note ${n.id} on "${rec.channel}" ` +
               `(claimed ${n.claimedAt}, TTL ${this.claimTtlMs}ms).`,
           );
         } catch (err) {
           console.warn(
-            `channel-queue: sweep release of ${n.id} on "${rec.channel}" failed (continuing): ` +
+            `attached-queue: sweep release of ${n.id} on "${rec.channel}" failed (continuing): ` +
               `${(err as Error).message}`,
           );
         }

@@ -1,13 +1,13 @@
 /**
- * Tests for the CHANNEL-backend daemon wiring (design 2026-06-18-channel-backend.md,
+ * Tests for the ATTACHED-backend daemon wiring (design 2026-06-18-attached-backend.md,
  * phases 1-2) — the two load-bearing seams:
  *
- *   1. The DAEMON ROUTING FORK (`contextFor`): an inbound for a `backend:channel`
+ *   1. The DAEMON ROUTING FORK (`contextFor`): an inbound for a `backend:attached`
  *      agent must NOT enqueue to the ProgrammaticAgentRegistry (no `claude -p`) and
  *      lands as a durable queue note; an inbound for a programmatic agent still
  *      enqueues as before (no regression).
  *   2. The CHANNEL MCP SURFACE (`dispatchChannelTool`): pending / next-message /
- *      reply / release dispatch to the ChannelQueueRegistry; the outbound from `reply`
+ *      reply / release dispatch to the AttachedQueueRegistry; the outbound from `reply`
  *      goes through the channel transport's reply (the `#agent/message/outbound` path —
  *      loop-safe).
  *
@@ -23,9 +23,9 @@ import {
   type WriteOutbound,
 } from "./backends/registry.ts";
 import {
-  ChannelQueueRegistry,
-  type ChannelQueueStore,
-} from "./backends/channel-queue.ts";
+  AttachedQueueRegistry,
+  type AttachedQueueStore,
+} from "./backends/attached-queue.ts";
 import { dispatchChannelTool } from "./mcp-http.ts";
 import { SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
 import type { AgentBackend, AgentHandle, AgentStatus, DeliverResult } from "./backends/types.ts";
@@ -55,8 +55,8 @@ function noopWriteOutbound(): WriteOutbound {
   return async () => {};
 }
 
-/** A fake channel-queue store: in-memory notes + recorded outbound. */
-class FakeStore implements ChannelQueueStore {
+/** A fake attached-queue store: in-memory notes + recorded outbound. */
+class FakeStore implements AttachedQueueStore {
   readonly notes = new Map<string, InboundQueueNote>();
   readonly outbound: Array<{ text: string; inReplyTo?: string }> = [];
   add(n: InboundQueueNote): void {
@@ -80,19 +80,19 @@ class FakeStore implements ChannelQueueStore {
 const channelSpec = (name: string, systemPrompt?: string): AgentSpec => ({
   name,
   channels: [name],
-  backend: "channel",
+  backend: "attached",
   ...(systemPrompt ? { systemPrompt } : {}),
 });
 
 // --- 1. the daemon routing fork --------------------------------------------
 
-describe("daemon routing fork (contextFor) — channel vs programmatic", () => {
-  test("a channel-backend inbound does NOT enqueue to the programmatic worker", async () => {
+describe("daemon routing fork (contextFor) — attached vs programmatic", () => {
+  test("an attached-backend inbound does NOT enqueue to the programmatic worker", async () => {
     const backend = new FakeProgrammaticBackend();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopWriteOutbound() });
-    const channelQueue = new ChannelQueueRegistry();
+    const channelQueue = new AttachedQueueRegistry();
     const store = new FakeStore();
-    // Register a CHANNEL agent for "laptop" (its queue store is the fake).
+    // Register an ATTACHED agent for "laptop" (its queue store is the fake).
     channelQueue.register(channelSpec("laptop"), store);
 
     const registry = new ClientRegistry();
@@ -119,7 +119,7 @@ describe("daemon routing fork (contextFor) — channel vs programmatic", () => {
     const backend = new FakeProgrammaticBackend();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopWriteOutbound() });
     await programmatic.register({ name: "eng", channels: ["eng"], backend: "programmatic" });
-    const channelQueue = new ChannelQueueRegistry(); // no channel agent for "eng".
+    const channelQueue = new AttachedQueueRegistry(); // no attached agent for "eng".
 
     const registry = new ClientRegistry();
     const ctx = contextFor(registry, "eng", new DeliveryState(), programmatic, channelQueue);
@@ -138,7 +138,7 @@ describe("daemon routing fork (contextFor) — channel vs programmatic", () => {
     const backend = new FakeProgrammaticBackend();
     const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopWriteOutbound() });
     await programmatic.register({ name: "dual", channels: ["dual"], backend: "programmatic" });
-    const channelQueue = new ChannelQueueRegistry();
+    const channelQueue = new AttachedQueueRegistry();
     channelQueue.register(channelSpec("dual"), new FakeStore());
 
     const ctx = contextFor(new ClientRegistry(), "dual", new DeliveryState(), programmatic, channelQueue);
@@ -158,7 +158,7 @@ function parse(result: { content: Array<{ type: "text"; text: string }> }): unkn
 
 describe("channel MCP surface (dispatchChannelTool)", () => {
   test("pending → { count, items }", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add({ id: "a", text: "hi", sender: "operator", ts: "2026-06-18T10:00:00Z", status: "pending" });
     reg.register(channelSpec("laptop"), store);
@@ -169,7 +169,7 @@ describe("channel MCP surface (dispatchChannelTool)", () => {
   });
 
   test("next-message claims + returns id/text/inReplyTo/systemPrompt", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add({ id: "a", text: "the question", sender: "operator", ts: "2026-06-18T10:00:00Z", status: "pending" });
     reg.register(channelSpec("laptop", "You are laptop."), store);
@@ -184,14 +184,14 @@ describe("channel MCP surface (dispatchChannelTool)", () => {
   });
 
   test("next-message returns a null-message sentinel when the queue is empty", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     reg.register(channelSpec("laptop"), new FakeStore());
     const r = await dispatchChannelTool("laptop", reg, RW, "next-message", {});
     expect(parse(r)).toEqual({ message: null, note: "no pending messages" });
   });
 
   test("reply writes the outbound (loop-safe path) + marks handled", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add({ id: "a", text: "q", sender: "operator", ts: "2026-06-18T10:00:00Z", status: "in-flight", claimedAt: "2026-06-18T10:01:00Z" });
     reg.register(channelSpec("laptop"), store);
@@ -205,7 +205,7 @@ describe("channel MCP surface (dispatchChannelTool)", () => {
   });
 
   test("release un-claims back to pending", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add({ id: "a", text: "q", sender: "operator", ts: "t", status: "in-flight", claimedAt: "2026-06-18T10:00:00Z" });
     reg.register(channelSpec("laptop"), store);
@@ -216,7 +216,7 @@ describe("channel MCP surface (dispatchChannelTool)", () => {
   });
 
   test("write tools require agent:write; a read-only token is refused", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     reg.register(channelSpec("laptop"), new FakeStore());
     for (const tool of ["next-message", "reply", "release"]) {
       const r = await dispatchChannelTool("laptop", reg, [SCOPE_READ], tool, { id: "a", text: "x" });
@@ -228,10 +228,10 @@ describe("channel MCP surface (dispatchChannelTool)", () => {
     expect(ok.isError).toBeUndefined();
   });
 
-  test("a non-channel channel gates cleanly (tool error, not a crash)", async () => {
-    const reg = new ChannelQueueRegistry(); // nothing registered.
+  test("a non-attached channel gates cleanly (tool error, not a crash)", async () => {
+    const reg = new AttachedQueueRegistry(); // nothing registered.
     const r = await dispatchChannelTool("nope", reg, RW, "pending", {});
     expect(r.isError).toBe(true);
-    expect(r.content[0]!.text).toContain("no channel-backend agent");
+    expect(r.content[0]!.text).toContain("no attached-backend agent");
   });
 });

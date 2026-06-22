@@ -121,9 +121,9 @@ import {
   type TurnEventSink,
 } from "./backends/registry.ts";
 import {
-  ChannelQueueRegistry,
-  type ChannelQueueStore,
-} from "./backends/channel-queue.ts";
+  AttachedQueueRegistry,
+  type AttachedQueueStore,
+} from "./backends/attached-queue.ts";
 import { AgentSessionState } from "./agent-session-state.ts";
 import { readPersistedSpec, sessionWorkspace } from "./spawn-agent.ts";
 import { normalizeChannel } from "./sandbox/types.ts";
@@ -286,7 +286,7 @@ export function contextFor(
   channel: string,
   deliveryState: DeliveryState,
   programmatic?: ProgrammaticAgentRegistry,
-  channelQueue?: ChannelQueueRegistry,
+  channelQueue?: AttachedQueueRegistry,
 ): TransportContext {
   return {
     channel,
@@ -294,16 +294,16 @@ export function contextFor(
       // ── DAEMON ROUTING FORK (design 2026-06-18-channel-backend.md, the load-bearing
       // change). Route inbound by the agent's BACKEND:
       //
-      //   backend: channel → the ChannelQueueRegistry path. The inbound
+      //   backend: attached → the AttachedQueueRegistry path. The inbound
       //     `#agent/message/inbound` note IS the queue item (durable in the vault,
       //     status:pending by default). There is NO `claude -p`, NO serial worker, and
       //     NO live push — a connected Claude Code session PULLS it via the channel MCP
-      //     surface. So a channel inbound is a NO-OP here beyond its own durability:
+      //     surface. So an attached inbound is a NO-OP here beyond its own durability:
       //     we MUST NOT enqueue to the programmatic worker (that would run a turn the
-      //     channel model deliberately doesn't), and we don't advance the delivery
+      //     attached model deliberately doesn't), and we don't advance the delivery
       //     high-water-mark (there's no live subscriber to deliver to; the durable note
-      //     queue + claim status is the durability, not replay). Checked FIRST so a
-      //     channel agent NEVER falls through to the programmatic enqueue below.
+      //     queue + claim status is the durability, not replay). Checked FIRST so an
+      //     attached agent NEVER falls through to the programmatic enqueue below.
       if (channelQueue?.hasChannel(channel)) {
         return;
       }
@@ -405,7 +405,7 @@ async function addChannelLive(
   entry: ChannelEntry,
   deliveryState: DeliveryState,
   programmatic?: ProgrammaticAgentRegistry,
-  channelQueue?: ChannelQueueRegistry,
+  channelQueue?: AttachedQueueRegistry,
 ): Promise<Channel> {
   const existing = channels.get(entry.name);
   if (existing) {
@@ -488,7 +488,7 @@ export function buildInstantiateDeps(
   registry: ClientRegistry,
   deliveryState: DeliveryState,
   programmatic: ProgrammaticAgentRegistry,
-  channelQueue: ChannelQueueRegistry,
+  channelQueue: AttachedQueueRegistry,
 ): InstantiateDeps {
   return {
     ensureChannel: async (name, binding) => {
@@ -511,16 +511,20 @@ export function buildInstantiateDeps(
       );
     },
     setupAndRegister: async (spec) => {
-      // ── BACKEND FORK (design 2026-06-18-channel-backend.md). A `channel` agent
+      // ── BACKEND FORK (design 2026-06-18-channel-backend.md). An `attached` agent
       // does NOT register with the programmatic registry (no `claude -p`, no serial
-      // worker) — it registers with the ChannelQueueRegistry, whose store is the
+      // worker) — it registers with the AttachedQueueRegistry, whose store is the
       // agent's live VaultTransport (the durable inbound-note queue). A `programmatic`
       // agent takes the existing path (persist spec.json + register the serial worker).
-      if (spec.backend === "channel") {
+      //
+      // DUAL-READ: a spec carrying the legacy backend value `"channel"` (un-normalized,
+      // e.g. read straight from an old spec.json) is treated as `"attached"` here too —
+      // belt-and-suspenders on top of the parse-path normalization in agent-defs.ts.
+      if (spec.backend === "attached" || (spec.backend as string) === "channel") {
         const store = channelQueueStoreFor(channels, spec.channels[0]);
         if (!store) {
           throw new Error(
-            `cannot register channel-backend agent "${spec.name}": its wake channel is not a ` +
+            `cannot register attached-backend agent "${spec.name}": its wake channel is not a ` +
               `live vault transport (the queue needs the vault as its durable store)`,
           );
         }
@@ -610,10 +614,10 @@ function defaultAddDefVault(
 }
 
 /**
- * Build a {@link ChannelQueueStore} for a channel name from its live VaultTransport —
- * the durable inbound-note queue a CHANNEL-backend agent's connected session pulls
+ * Build a {@link AttachedQueueStore} for a channel name from its live VaultTransport —
+ * the durable inbound-note queue an ATTACHED-backend agent's connected session pulls
  * from (design 2026-06-18). Returns null when the channel isn't a live vault transport
- * (a channel agent's queue REQUIRES the vault as its source of truth). The store is a
+ * (an attached agent's queue REQUIRES the vault as its source of truth). The store is a
  * thin adapter over the transport's `listInboundQueue` / `setInboundStatus` / `reply`
  * — the same `reply()` the programmatic worker uses, so the outbound is durable +
  * loop-safe (tagged `#agent/message/outbound`, which the inbound trigger never fires on).
@@ -621,7 +625,7 @@ function defaultAddDefVault(
 export function channelQueueStoreFor(
   channels: Map<string, Channel>,
   channelName: string | { name: string } | undefined,
-): ChannelQueueStore | null {
+): AttachedQueueStore | null {
   const name = typeof channelName === "string" ? channelName : channelName?.name;
   if (!name) return null;
   const vt = channels.get(name)?.transport;
@@ -631,7 +635,7 @@ export function channelQueueStoreFor(
     // Forward ALL FOUR args — the 4th `ifUpdatedAt` is the CAS precondition the
     // single-claim guard (agent#101) depends on. A 3-arg arrow silently dropped it,
     // collapsing every claim to `force:true` (last-write-wins) and DISABLING the CAS in
-    // production (the double-claim race PR #116 closed was re-opened for channel agents).
+    // production (the double-claim race PR #116 closed was re-opened for attached agents).
     setInboundStatus: (id, status, claimedAt, ifUpdatedAt) =>
       vt.setInboundStatus(id, status, claimedAt, ifUpdatedAt),
     reply: async (args) => {
@@ -916,7 +920,7 @@ export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry):
  * each) — best-effort: a queue read failure degrades that agent's status to `idle`,
  * never failing the whole list. NEVER surfaces a token/secret.
  */
-export async function listChannelAgents(channelQueue: ChannelQueueRegistry): Promise<AgentInfo[]> {
+export async function listChannelAgents(channelQueue: AttachedQueueRegistry): Promise<AgentInfo[]> {
   const dir = defaultSessionsDir();
   const records = channelQueue.list();
   return Promise.all(
@@ -935,7 +939,7 @@ export async function listChannelAgents(channelQueue: ChannelQueueRegistry): Pro
         attached: false,
         workspace,
         hasWorkspace: existsSync(join(workspace, "spec.json")),
-        backend: "channel",
+        backend: "attached",
         status,
         channel: rec.channel,
         ...(rec.systemPrompt ? { systemPromptMode: "append" as const } : {}),
@@ -1187,14 +1191,14 @@ export function createFetchHandler(
     deliveryState?: DeliveryState;
     programmatic?: ProgrammaticAgentRegistry;
     /**
-     * The CHANNEL-backend queue registry (design 2026-06-18-channel-backend.md) — the
+     * The ATTACHED-backend queue registry (design 2026-06-18-channel-backend.md) — the
      * durable inbound-note queue + claim tracker a connected Claude Code session pulls
      * from via the channel MCP surface (`next-message` / `pending` / `reply` /
      * `release`). `main` passes the boot instance (the SAME one the transports'
      * `contextFor` routing fork checks); tests inject a fake-store-backed instance.
-     * Optional — when absent, the channel MCP tools no-op (no channel agents).
+     * Optional — when absent, the channel MCP tools no-op (no attached agents).
      */
-    channelQueue?: ChannelQueueRegistry;
+    channelQueue?: AttachedQueueRegistry;
     /**
      * The per-channel turn-event SSE registry (the streaming view, design build
      * item #1). The `/api/channels/<ch>/turn-events` SSE route registers subscribers
@@ -1259,7 +1263,7 @@ export function createFetchHandler(
   // channel MCP surface dispatches to). Defaulted to a fresh instance so a plain
   // createFetchHandler still serves the channel MCP tools (it just has no channel
   // agents registered until one is instantiated). Tests inject a fake-store-backed one.
-  const channelQueue: ChannelQueueRegistry = opts?.channelQueue ?? new ChannelQueueRegistry();
+  const channelQueue: AttachedQueueRegistry = opts?.channelQueue ?? new AttachedQueueRegistry();
 
   // Per-channel delivery high-water-mark store (durable infra). `contextFor.emit`
   // advances it on a real delivery; the daemon's `main` passes the boot-time
@@ -2058,9 +2062,13 @@ export function createFetchHandler(
       if (typeof body.name !== "string" || body.name.length === 0) {
         return json({ error: "body.name (string) is required" }, 400);
       }
-      const backend = body.backend === undefined ? "programmatic" : body.backend;
-      if (backend !== "programmatic" && backend !== "channel") {
-        return json({ error: 'body.backend must be "programmatic" or "channel"' }, 400);
+      // DUAL-READ the legacy backend value `"channel"` → canonical `"attached"`, so an
+      // API client still passing the pre-rename value is accepted (and persisted as the
+      // canonical value by createDef). The routing key `channel` is a separate concept.
+      const rawBackend = body.backend === undefined ? "programmatic" : body.backend;
+      const backend = rawBackend === "channel" ? "attached" : rawBackend;
+      if (backend !== "programmatic" && backend !== "attached") {
+        return json({ error: 'body.backend must be "programmatic" or "attached"' }, 400);
       }
       if (body.systemPrompt !== undefined && typeof body.systemPrompt !== "string") {
         return json({ error: "body.systemPrompt must be a string" }, 400);
@@ -2948,15 +2956,15 @@ function main(): void {
   // its interim progress to `turnEvents` (the chat's live view).
   const programmatic = createDefaultProgrammaticRegistry(channels, buildTurnEventSink(turnEvents));
 
-  // The CHANNEL-backend queue registry (design 2026-06-18-channel-backend.md),
+  // The ATTACHED-backend queue registry (design 2026-06-18-channel-backend.md),
   // constructed ONCE at boot and shared by the fetch handler (the channel MCP surface),
-  // the transports' `contextFor` (the routing fork — a channel inbound is NOT enqueued
-  // to the programmatic worker), the agent-def instantiate path (a `backend:channel`
+  // the transports' `contextFor` (the routing fork — an attached inbound is NOT enqueued
+  // to the programmatic worker), the agent-def instantiate path (a `backend:attached`
   // def registers here, not with programmatic), and the periodic sweep below. The
   // durable queue + claim state lives on the inbound notes in each channel's vault, so
   // this registry holds no per-message state of its own — it's the claim/peek/reply
   // surface over those notes.
-  const channelQueue = new ChannelQueueRegistry();
+  const channelQueue = new AttachedQueueRegistry();
 
   // The terminal WS handler set (pty↔socket relay + backpressure flow control,
   // src/terminal.ts). One handler object serves every terminal connection;
@@ -3117,16 +3125,16 @@ function main(): void {
   runner.start();
   console.log(`parachute-agent: runner started (scheduled-job tick)`);
 
-  // CHANNEL-BACKEND CLAIM TTL SWEEP (design 2026-06-18-channel-backend.md). A periodic
-  // tick scans every channel-backend agent's in-flight inbound notes and resets any
+  // ATTACHED-BACKEND CLAIM TTL SWEEP (design 2026-06-18-channel-backend.md). A periodic
+  // tick scans every attached-backend agent's in-flight inbound notes and resets any
   // claimed longer than the claim TTL (15 min) back to `pending` — so a crashed /
   // abandoned connected session can't strand the queue. Cheap + idempotent (a
-  // channel with no channel agents lists nothing). `unref` so it never holds the
+  // channel with no attached agents lists nothing). `unref` so it never holds the
   // process open; runs at the same 30s cadence as the runner tick.
   const sweepIntervalMs = parseInt(process.env.PARACHUTE_AGENT_SWEEP_MS ?? "", 10) || 30_000;
   const channelSweep = setInterval(() => {
     void channelQueue.sweepExpired().catch((err) => {
-      console.error(`parachute-agent: channel-queue sweep failed (continuing): ${(err as Error).message}`);
+      console.error(`parachute-agent: attached-queue sweep failed (continuing): ${(err as Error).message}`);
     });
   }, sweepIntervalMs);
   channelSweep.unref?.();

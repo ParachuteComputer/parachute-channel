@@ -1,6 +1,6 @@
 /**
  * `channelQueueStoreFor` — the PRODUCTION adapter that wires a live `VaultTransport`
- * into the `ChannelQueueStore` the pull-queue worker uses.
+ * into the `AttachedQueueStore` the pull-queue worker uses.
  *
  * Regression for the agent#101 CAS single-claim guard (PR #116): the adapter MUST
  * forward the 4th `ifUpdatedAt` arg to `vt.setInboundStatus`, or the compare-and-set

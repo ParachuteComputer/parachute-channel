@@ -109,24 +109,33 @@ export type AgentChannel = string | AgentChannelSpec;
  *    is posted back as an outbound `#agent/message/outbound` note. No idle session →
  *    nothing to go deaf, no reconnect, no replay, no consent gate. The reliable
  *    primary path; best for clean per-message "do a task, report back" turns.
- *  - `"channel"` (design 2026-06-18-channel-backend.md): the turn is delivered over
- *    a channel to a Claude Code session the OPERATOR runs themselves (their machine,
- *    their env/creds, unsandboxed) and has connected to the channel's MCP endpoint.
- *    The daemon runs NO `claude -p`; the inbound `#agent/message/inbound` notes
- *    accumulate as a durable queue (the vault IS the queue). The connected session
- *    PULLs the next message (an MCP tool), works, and REPLYs (an MCP tool) — the
- *    daemon writes the outbound note + marks the inbound handled. Routed to the
- *    {@link ChannelQueueRegistry}, entirely bypassing the programmatic serial worker
- *    (the daemon routing fork). Claim state lives on the inbound note's `status`
- *    (`pending | in-flight | handled`), so it's restart-safe.
+ *  - `"attached"` (design 2026-06-18-channel-backend.md; the backend value was named
+ *    `"channel"` before this rename — see the BACK-COMPAT note below): the turn is
+ *    delivered over a channel to a Claude Code session the OPERATOR runs themselves
+ *    (their machine, their env/creds, unsandboxed) and has connected (is "attached") to
+ *    the channel's MCP endpoint. The daemon runs NO `claude -p`; the inbound
+ *    `#agent/message/inbound` notes accumulate as a durable queue (the vault IS the
+ *    queue). The connected session PULLs the next message (an MCP tool), works, and
+ *    REPLYs (an MCP tool) — the daemon writes the outbound note + marks the inbound
+ *    handled. Routed to the {@link AttachedQueueRegistry}, entirely bypassing the
+ *    programmatic serial worker (the daemon routing fork). Claim state lives on the
+ *    inbound note's `status` (`pending | in-flight | handled`), so it's restart-safe.
  *
- * BACK-COMPAT: a persisted `spec.json` that carries the retired `backend:"interactive"`
- * value (or omits `backend` entirely — pre-field specs were interactive) is no longer
- * re-registered on boot (the boot re-register reads `spec.backend === "programmatic"`
- * exactly; anything else is skipped — see daemon.ts), so a stale interactive spec on
- * disk is inert, never migrated and never launched.
+ * BACK-COMPAT (backend VALUE rename `"channel"` → `"attached"`): an already-persisted
+ * def (or `spec.json`) whose `backend` is the legacy `"channel"` is DUAL-READ —
+ * normalized to `"attached"` on read (`parseAgentDef` in agent-defs.ts; the daemon
+ * routing fork also accepts a legacy un-normalized value defensively). Only the new
+ * `"attached"` value is ever WRITTEN. (Note: the ROUTING KEY `channel` — the agent's
+ * address, the `/mcp/<channel>` URL segment, `metadata.channel` on notes — is a
+ * SEPARATE concept and is deliberately unchanged.)
+ *
+ * BACK-COMPAT (retired `interactive`): a persisted `spec.json` that carries the retired
+ * `backend:"interactive"` value (or omits `backend` entirely — pre-field specs were
+ * interactive) is no longer re-registered on boot (the boot re-register reads
+ * `spec.backend === "programmatic"` exactly; anything else is skipped — see daemon.ts),
+ * so a stale interactive spec on disk is inert, never migrated and never launched.
  */
-export type AgentBackendKind = "programmatic" | "channel";
+export type AgentBackendKind = "programmatic" | "attached";
 
 /**
  * How a channel's {@link AgentSpec.systemPrompt} composes with Claude Code's own
@@ -283,8 +292,9 @@ export interface AgentSpec {
   /**
    * Which backend drives the agent (design 2026-06-16-pluggable-agent-backend.md +
    * 2026-06-18-channel-backend.md) — `"programmatic"` (the default; on-demand
-   * `claude -p` turns, no resident process) or `"channel"` (handled by a Claude Code
-   * session the operator connects to the channel's MCP endpoint). The `interactive`
+   * `claude -p` turns, no resident process) or `"attached"` (handled by a Claude Code
+   * session the operator connects — "attaches" — to the channel's MCP endpoint; the
+   * value was named `"channel"` before the rename, dual-read on load). The `interactive`
    * (tmux) backend was retired 2026-06-19. See {@link AgentBackendKind}. Persisted in
    * spec.json so a daemon restart re-registers a programmatic agent on boot.
    */

@@ -1,9 +1,9 @@
 /**
- * Tests for the CHANNEL-backend queue registry (`src/backends/channel-queue.ts`) —
- * the parallel-to-ProgrammaticAgentRegistry registry a `backend:channel` agent's
+ * Tests for the ATTACHED-backend queue registry (`src/backends/attached-queue.ts`) —
+ * the parallel-to-ProgrammaticAgentRegistry registry a `backend:attached` agent's
  * connected Claude Code session pulls from (design 2026-06-18-channel-backend.md).
  *
- * A FAKE store (implements {@link ChannelQueueStore}) stands in for the channel's
+ * A FAKE store (implements {@link AttachedQueueStore}) stands in for the channel's
  * VaultTransport: it holds inbound notes in memory with a mutable `status`/`claimedAt`
  * (the vault IS the queue + source of truth), and records outbound replies. So the
  * claim/reply/release/sweep semantics + the restart-safety (re-read from the store)
@@ -12,9 +12,9 @@
 
 import { describe, test, expect } from "bun:test";
 import {
-  ChannelQueueRegistry,
-  type ChannelQueueStore,
-} from "./channel-queue.ts";
+  AttachedQueueRegistry,
+  type AttachedQueueStore,
+} from "./attached-queue.ts";
 import type { AgentSpec } from "../sandbox/types.ts";
 import { InboundClaimConflictError } from "../transports/vault.ts";
 import type { InboundQueueNote, InboundStatus } from "../transports/vault.ts";
@@ -24,7 +24,7 @@ import type { InboundQueueNote, InboundStatus } from "../transports/vault.ts";
  * outbound writes. Mirrors the VaultTransport methods the registry calls. The status
  * mutations persist in the Map, so re-reading models the vault's restart-safety.
  */
-class FakeStore implements ChannelQueueStore {
+class FakeStore implements AttachedQueueStore {
   readonly notes = new Map<string, InboundQueueNote>();
   readonly outbound: Array<{ text: string; inReplyTo?: string }> = [];
   /** If set, the NEXT `setInboundStatus` throws this (to test claim-fail safety). */
@@ -84,7 +84,7 @@ class FakeStore implements ChannelQueueStore {
 const specFor = (name: string, systemPrompt?: string): AgentSpec => ({
   name,
   channels: [name],
-  backend: "channel",
+  backend: "attached",
   ...(systemPrompt ? { systemPrompt } : {}),
 });
 
@@ -96,9 +96,9 @@ const inbound = (id: string, text: string, ts: string, status: InboundStatus = "
   status,
 });
 
-describe("ChannelQueueRegistry — registration", () => {
+describe("AttachedQueueRegistry — registration", () => {
   test("register indexes by channel + name; deregister drops it", () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     expect(reg.hasChannel("laptop")).toBe(false);
     reg.register(specFor("laptop"), store);
@@ -111,14 +111,14 @@ describe("ChannelQueueRegistry — registration", () => {
   });
 
   test("register throws for a spec with no channel", () => {
-    const reg = new ChannelQueueRegistry();
-    expect(() => reg.register({ name: "x", channels: [], backend: "channel" }, new FakeStore())).toThrow(/no channel/);
+    const reg = new AttachedQueueRegistry();
+    expect(() => reg.register({ name: "x", channels: [], backend: "attached" }, new FakeStore())).toThrow(/no channel/);
   });
 });
 
-describe("ChannelQueueRegistry — pending peek", () => {
+describe("AttachedQueueRegistry — pending peek", () => {
   test("counts only pending; previews the oldest-first", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add(inbound("a", "first message", "2026-06-18T10:00:00Z"));
     store.add(inbound("b", "second message", "2026-06-18T10:01:00Z"));
@@ -131,16 +131,16 @@ describe("ChannelQueueRegistry — pending peek", () => {
     expect(view.items[0]!.preview).toBe("first message");
   });
 
-  test("a non-channel channel yields an empty no-op view", async () => {
-    const reg = new ChannelQueueRegistry();
+  test("a non-attached channel yields an empty no-op view", async () => {
+    const reg = new AttachedQueueRegistry();
     const view = await reg.pending("unknown");
     expect(view).toEqual({ count: 0, items: [] });
   });
 });
 
-describe("ChannelQueueRegistry — claimNext (single-claim)", () => {
+describe("AttachedQueueRegistry — claimNext (single-claim)", () => {
   test("claims the OLDEST pending, sets in-flight + claimedAt, returns text + systemPrompt", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add(inbound("b", "newer", "2026-06-18T10:05:00Z"));
     store.add(inbound("a", "older", "2026-06-18T10:00:00Z"));
@@ -158,7 +158,7 @@ describe("ChannelQueueRegistry — claimNext (single-claim)", () => {
   });
 
   test("a SECOND claimNext does not return the same message (single-claim)", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add(inbound("a", "older", "2026-06-18T10:00:00Z"));
     store.add(inbound("b", "newer", "2026-06-18T10:05:00Z"));
@@ -173,7 +173,7 @@ describe("ChannelQueueRegistry — claimNext (single-claim)", () => {
   });
 
   test("returns null when none pending", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add(inbound("a", "done", "2026-06-18T10:00:00Z", "handled"));
     reg.register(specFor("laptop"), store);
@@ -181,7 +181,7 @@ describe("ChannelQueueRegistry — claimNext (single-claim)", () => {
   });
 
   test("a claim PATCH failure surfaces + leaves the note pending (no hand-out)", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add(inbound("a", "older", "2026-06-18T10:00:00Z"));
     reg.register(specFor("laptop"), store);
@@ -191,7 +191,7 @@ describe("ChannelQueueRegistry — claimNext (single-claim)", () => {
   });
 
   test("FIX 3: a passed-through updatedAt is used as the CAS precondition on the claim", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add({ ...inbound("a", "older", "2026-06-18T10:00:00Z"), updatedAt: "rev-1" });
     reg.register(specFor("laptop"), store);
@@ -203,7 +203,7 @@ describe("ChannelQueueRegistry — claimNext (single-claim)", () => {
   });
 
   test("FIX 3: a 428/409 conflict on the claim PATCH makes claimNext skip to the NEXT pending (no double-claim)", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     // Two pending notes, each with a known revision for the CAS precondition.
     store.add({ ...inbound("a", "older", "2026-06-18T10:00:00Z"), updatedAt: "rev-a" });
@@ -232,7 +232,7 @@ describe("ChannelQueueRegistry — claimNext (single-claim)", () => {
   });
 
   test("FIX 3: a conflict with NO other pending returns null (nothing claimable right now)", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add({ ...inbound("a", "only", "2026-06-18T10:00:00Z"), updatedAt: "rev-a" });
     reg.register(specFor("laptop"), store);
@@ -248,9 +248,9 @@ describe("ChannelQueueRegistry — claimNext (single-claim)", () => {
   });
 });
 
-describe("ChannelQueueRegistry — reply (outbound + mark handled)", () => {
+describe("AttachedQueueRegistry — reply (outbound + mark handled)", () => {
   test("writes the outbound via the store reply, THEN marks the inbound handled", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add(inbound("a", "question", "2026-06-18T10:00:00Z", "in-flight"));
     store.notes.get("a")!.claimedAt = "2026-06-18T10:01:00Z";
@@ -266,7 +266,7 @@ describe("ChannelQueueRegistry — reply (outbound + mark handled)", () => {
   });
 
   test("if the outbound write fails, the inbound is NOT marked handled (retryable)", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add(inbound("a", "question", "2026-06-18T10:00:00Z", "in-flight"));
     reg.register(specFor("laptop"), store);
@@ -278,14 +278,14 @@ describe("ChannelQueueRegistry — reply (outbound + mark handled)", () => {
   });
 
   test("reply for an unregistered channel throws", async () => {
-    const reg = new ChannelQueueRegistry();
-    await expect(reg.reply("nope", { text: "x" })).rejects.toThrow(/no channel-backend agent/);
+    const reg = new AttachedQueueRegistry();
+    await expect(reg.reply("nope", { text: "x" })).rejects.toThrow(/no attached-backend agent/);
   });
 });
 
-describe("ChannelQueueRegistry — release", () => {
+describe("AttachedQueueRegistry — release", () => {
   test("returns an in-flight note to pending + clears claimedAt", async () => {
-    const reg = new ChannelQueueRegistry();
+    const reg = new AttachedQueueRegistry();
     const store = new FakeStore();
     store.add(inbound("a", "q", "2026-06-18T10:00:00Z", "in-flight"));
     store.notes.get("a")!.claimedAt = "2026-06-18T10:01:00Z";
@@ -300,10 +300,10 @@ describe("ChannelQueueRegistry — release", () => {
   });
 });
 
-describe("ChannelQueueRegistry — sweepExpired (TTL auto-release)", () => {
+describe("AttachedQueueRegistry — sweepExpired (TTL auto-release)", () => {
   test("resets a STALE in-flight note to pending; leaves a fresh one alone", async () => {
     const ttl = 15 * 60 * 1000; // 15 min.
-    const reg = new ChannelQueueRegistry({ claimTtlMs: ttl });
+    const reg = new AttachedQueueRegistry({ claimTtlMs: ttl });
     const store = new FakeStore();
     const now = new Date("2026-06-18T12:00:00Z");
     // 'stale' claimed 20 min ago (> TTL) → released; 'fresh' claimed 5 min ago → kept.
@@ -321,7 +321,7 @@ describe("ChannelQueueRegistry — sweepExpired (TTL auto-release)", () => {
   });
 
   test("an in-flight note with no claimedAt is left alone (can't judge its age)", async () => {
-    const reg = new ChannelQueueRegistry({ claimTtlMs: 1000 });
+    const reg = new AttachedQueueRegistry({ claimTtlMs: 1000 });
     const store = new FakeStore();
     store.add(inbound("a", "q", "2026-06-18T10:00:00Z", "in-flight")); // no claimedAt.
     reg.register(specFor("laptop"), store);
@@ -331,7 +331,7 @@ describe("ChannelQueueRegistry — sweepExpired (TTL auto-release)", () => {
   });
 
   test("one channel's store error doesn't abort the sweep of the others", async () => {
-    const reg = new ChannelQueueRegistry({ claimTtlMs: 1000 });
+    const reg = new AttachedQueueRegistry({ claimTtlMs: 1000 });
     const bad = new FakeStore();
     bad.listInboundQueue = async () => {
       throw new Error("vault down");
@@ -346,14 +346,14 @@ describe("ChannelQueueRegistry — sweepExpired (TTL auto-release)", () => {
   });
 });
 
-describe("ChannelQueueRegistry — restart safety (vault is the source of truth)", () => {
+describe("AttachedQueueRegistry — restart safety (vault is the source of truth)", () => {
   test("a claim survives a 'restart' (a fresh registry reading the same store)", async () => {
     const store = new FakeStore();
     store.add(inbound("a", "q1", "2026-06-18T10:00:00Z"));
     store.add(inbound("b", "q2", "2026-06-18T10:05:00Z"));
 
     // Registry instance #1 claims 'a'.
-    const reg1 = new ChannelQueueRegistry();
+    const reg1 = new AttachedQueueRegistry();
     reg1.register(specFor("laptop"), store);
     const claimed = await reg1.claimNext("laptop");
     expect(claimed!.id).toBe("a");
@@ -362,7 +362,7 @@ describe("ChannelQueueRegistry — restart safety (vault is the source of truth)
     // (status:in-flight on note 'a') persisted — so the new registry's first claim is
     // 'b' (a is still in-flight, not re-presented), and a handled message would not
     // reappear either. The vault is the source of truth, not in-memory state.
-    const reg2 = new ChannelQueueRegistry();
+    const reg2 = new AttachedQueueRegistry();
     reg2.register(specFor("laptop"), store);
     const afterRestart = await reg2.claimNext("laptop");
     expect(afterRestart!.id).toBe("b");

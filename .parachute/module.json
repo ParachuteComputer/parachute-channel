@@ -2,7 +2,7 @@
   "name": "agent",
   "manifestName": "parachute-agent",
   "displayName": "Agent",
-  "tagline": "Chat with your Claude Code sessions — a channel per session.",
+  "tagline": "Chat with your Claude Code sessions — a session per agent.",
   "port": 1941,
   "paths": ["/agent"],
   "health": "/health",
@@ -17,8 +17,8 @@
     "defines": ["agent:read", "agent:write", "agent:send", "agent:admin"]
   },
   "events": [
-    { "key": "message.received", "title": "A message arrived on a channel" },
-    { "key": "message.sent", "title": "A session replied on a channel" }
+    { "key": "message.received", "title": "A message arrived for an agent" },
+    { "key": "message.sent", "title": "An agent replied" }
   ],
   "actions": [
     {
@@ -45,8 +45,8 @@
   "connectionTemplates": [
     {
       "key": "link-to-vault",
-      "title": "Link a channel to a vault",
-      "description": "Back a channel with a Parachute vault: inbound notes wake the session, replies are written back as notes. The operator picks WHICH vault (the parameter) and names the channel; the channel's config UI creates the connection with the operator's approval (the click is the approval).",
+      "title": "Link an agent to a vault",
+      "description": "Back an agent with a Parachute vault: inbound notes wake the agent, replies are written back as notes. The operator picks WHICH vault (the parameter) and names the agent's channel; the agent's config UI creates the connection with the operator's approval (the click is the approval).",
       "requestedBy": "agent",
       "source": {
         "module": "vault",

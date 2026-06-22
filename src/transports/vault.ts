@@ -192,8 +192,8 @@ export interface ChannelMessage {
 export type InboundStatus = "pending" | "in-flight" | "handled";
 
 /**
- * One inbound queue item for a CHANNEL-backend agent — an `#agent/message/inbound`
- * note as the {@link ChannelQueueRegistry} reads it. Carries the claim `status` +
+ * One inbound queue item for an ATTACHED-backend agent — an `#agent/message/inbound`
+ * note as the {@link AttachedQueueRegistry} reads it. Carries the claim `status` +
  * `claimedAt` (for the TTL sweep) alongside the message text + threading id.
  */
 export interface InboundQueueNote {
@@ -1322,7 +1322,7 @@ export class VaultTransport implements Transport {
   // inbound `#agent/message/inbound` notes themselves ARE the queue; the claim
   // `status` (pending | in-flight | handled) lives on each note so the vault is
   // the source of truth (restart-safe). These methods own the vault I/O (URL +
-  // token + encoding) so the ChannelQueueRegistry stays storage-agnostic — the
+  // token + encoding) so the AttachedQueueRegistry stays storage-agnostic — the
   // same separation jobs.ts has from the job-note I/O. The channel's existing
   // `vault:<name>:write` token covers GET + the status PATCH; no new mint.
   // -------------------------------------------------------------------------

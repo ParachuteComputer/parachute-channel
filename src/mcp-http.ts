@@ -13,7 +13,7 @@
  * Stateful Streamable HTTP (a `sessionIdGenerator` + `enableJsonResponse:false`)
  * gives each session an SSE GET stream the server can push onto. This file is the
  * productionized form: per-channel session registry, the push surface, the
- * CHANNEL-backend pull surface (`pending`/`next-message`/`reply`/`release` —
+ * ATTACHED-backend pull surface (`pending`/`next-message`/`reply`/`release` —
  * design 2026-06-18), and read-vs-write scope enforcement.
  *
  * NOTE — the deaf-on-restart BACKLOG REPLAY (the connect-hook that replayed
@@ -52,7 +52,7 @@ import type {
   DownloadArgs,
 } from "./transport.ts";
 import { SCOPE_WRITE, grantsScope } from "./auth.ts";
-import type { ChannelQueueRegistry } from "./backends/channel-queue.ts";
+import type { AttachedQueueRegistry } from "./backends/attached-queue.ts";
 
 // ---------------------------------------------------------------------------
 // Per-channel session registry
@@ -356,11 +356,11 @@ const TOOL_DEFS = [
 const WRITE_TOOLS = new Set(["reply", "react", "edit_message"]);
 
 // ---------------------------------------------------------------------------
-// CHANNEL-BACKEND tool surface — the MCP pull/reply protocol (design
-// 2026-06-18-channel-backend.md, phase 2). When the channel has a `backend:channel`
+// ATTACHED-BACKEND tool surface — the MCP pull/reply protocol (design
+// 2026-06-18-channel-backend.md, phase 2). When the channel has a `backend:attached`
 // agent registered, the session connects + PULLs the durable queue instead of being
 // pushed to: `pending` / `next-message` / `reply` / `release`, dispatched to the
-// {@link ChannelQueueRegistry}. The session "is" the agent by adopting the
+// {@link AttachedQueueRegistry}. The session "is" the agent by adopting the
 // systemPrompt `next-message` returns (the def body) — reinforced by INSTRUCTIONS
 // below, since MCP can't force a system prompt on the caller.
 // ---------------------------------------------------------------------------
@@ -380,7 +380,7 @@ const CHANNEL_INSTRUCTIONS = [
   "The human reads ONLY what you send via `reply`. Your transcript text is invisible to them — always finish a handled message with a `reply`.",
 ].join("\n");
 
-/** The channel-backend pull/reply tool list (design 2026-06-18, phase 2). */
+/** The attached-backend pull/reply tool list (design 2026-06-18, phase 2). */
 const CHANNEL_TOOL_DEFS = [
   {
     name: "pending",
@@ -424,33 +424,33 @@ const CHANNEL_TOOL_DEFS = [
   },
 ];
 
-/** Channel-backend tools that mutate the queue/write outbound require agent:write
+/** Attached-backend tools that mutate the queue/write outbound require agent:write
  *  (`pending` + `next-message`... next-message claims, so it mutates → write; pending
  *  is read-only). reply + release + next-message mutate; pending is read. */
 const CHANNEL_WRITE_TOOLS = new Set(["next-message", "reply", "release"]);
 
 /**
- * Dispatch one CHANNEL-backend tool call to the {@link ChannelQueueRegistry},
+ * Dispatch one ATTACHED-backend tool call to the {@link AttachedQueueRegistry},
  * enforcing write scope on the mutating tools. Returns a tool-error result (not a
- * throw) when no channel-backend agent is registered for `channel` — so a session that
- * connected to a non-channel channel and called these tools gets a clean "not a channel
+ * throw) when no attached-backend agent is registered for `channel` — so a session that
+ * connected to a non-attached channel and called these tools gets a clean "not an attached
  * agent" message rather than a crash. Pure over its inputs (the daemon's per-session
  * handler + the unit tests both call it).
  */
 export async function dispatchChannelTool(
   channel: string,
-  channelQueue: ChannelQueueRegistry,
+  channelQueue: AttachedQueueRegistry,
   scopes: string[],
   name: string,
   args: Record<string, unknown>,
 ): Promise<ToolResult> {
-  // Gate cleanly for a non-channel channel — these tools are meaningful only when a
-  // backend:channel agent is registered. (The daemon also only serves CHANNEL_TOOL_DEFS
+  // Gate cleanly for a non-attached channel — these tools are meaningful only when an
+  // attached-backend agent is registered. (The daemon also only serves CHANNEL_TOOL_DEFS
   // when the agent is registered, so a well-behaved client never reaches here for a
-  // non-channel channel — but a hand-crafted call should fail gracefully, not 500.)
+  // non-attached channel — but a hand-crafted call should fail gracefully, not 500.)
   if (!channelQueue.hasChannel(channel)) {
     return {
-      content: [{ type: "text", text: `channel "${channel}" has no channel-backend agent — the pull/reply tools are not available here` }],
+      content: [{ type: "text", text: `channel "${channel}" has no attached-backend agent — the pull/reply tools are not available here` }],
       isError: true,
     };
   }
@@ -524,15 +524,15 @@ function buildServer(
   channel: string,
   transport: Transport,
   session: McpSession,
-  channelQueue?: ChannelQueueRegistry,
+  channelQueue?: AttachedQueueRegistry,
 ): Server {
-  // ── CHANNEL-BACKEND FORK (design 2026-06-18). When a `backend:channel` agent is
+  // ── ATTACHED-BACKEND FORK (design 2026-06-18). When a `backend:attached` agent is
   // registered for this channel, serve the PULL/REPLY surface (pending / next-message
   // / reply / release) + its reinforcing INSTRUCTIONS, dispatched to the
-  // ChannelQueueRegistry. Otherwise serve the existing push surface (reply / react /
+  // AttachedQueueRegistry. Otherwise serve the existing push surface (reply / react /
   // edit / download), dispatched to the transport. Resolved at connect time — a
   // channel doesn't switch backends under a live session.
-  const isChannelBackend = !!channelQueue?.hasChannel(channel);
+  const isAttachedBackend = !!channelQueue?.hasChannel(channel);
   const server = new Server(
     // Per-channel name (`agent-<name>`) so it reads clearly in `/mcp` and lines
     // up with the `--dangerously-load-development-channels=server:agent-<name>`
@@ -546,12 +546,12 @@ function buildServer(
         },
         tools: {},
       },
-      instructions: isChannelBackend ? CHANNEL_INSTRUCTIONS : INSTRUCTIONS,
+      instructions: isAttachedBackend ? CHANNEL_INSTRUCTIONS : INSTRUCTIONS,
     },
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: isChannelBackend ? CHANNEL_TOOL_DEFS : TOOL_DEFS,
+    tools: isAttachedBackend ? CHANNEL_TOOL_DEFS : TOOL_DEFS,
   }));
 
   // Dispatch reads `session.scopes` live (the daemon refreshes it per request),
@@ -559,7 +559,7 @@ function buildServer(
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const args = (req.params.arguments ?? {}) as Record<string, unknown>;
     const result =
-      isChannelBackend && channelQueue
+      isAttachedBackend && channelQueue
         ? await dispatchChannelTool(channel, channelQueue, session.scopes, req.params.name, args)
         : await dispatchTool(channel, transport, session.scopes, req.params.name, args);
     // Our ToolResult is the content/isError subset of the SDK's CallToolResult
@@ -708,7 +708,7 @@ export async function handleMcp(
   channel: string,
   transport: Transport,
   scopes: string[],
-  channelQueue?: ChannelQueueRegistry,
+  channelQueue?: AttachedQueueRegistry,
 ): Promise<Response> {
   const sid = req.headers.get("mcp-session-id");
 

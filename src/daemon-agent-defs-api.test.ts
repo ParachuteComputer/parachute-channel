@@ -65,7 +65,7 @@ import { createFetchHandler } from "./daemon.ts";
 import { MintError } from "./mint-token.ts";
 import { ClientRegistry } from "./routing.ts";
 import { AgentDefRegistry, type InstantiateDeps } from "./agent-defs.ts";
-import { ChannelQueueRegistry, type ChannelQueueStore } from "./backends/channel-queue.ts";
+import { AttachedQueueRegistry, type AttachedQueueStore } from "./backends/attached-queue.ts";
 import type { Channel } from "./registry.ts";
 import type { AgentSpec } from "./sandbox/types.ts";
 import type { InboundQueueNote, InboundStatus } from "./transports/vault.ts";
@@ -197,7 +197,7 @@ function serverWith(
   channels: Map<string, Channel>,
   o?: {
     agentDefs?: AgentDefRegistry;
-    channelQueue?: ChannelQueueRegistry;
+    channelQueue?: AttachedQueueRegistry;
     addDefVault?: AddDefVault;
   },
 ) {
@@ -221,8 +221,8 @@ const emptyChannels = () => new Map<string, Channel>();
 // GET /api/agents — includes channel-backend agents (#102)
 // ===========================================================================
 describe("GET /api/agents includes channel-backend agents (#102)", () => {
-  /** A minimal channel-queue store with a pending count we control. */
-  function storeWithPending(count: number): ChannelQueueStore {
+  /** A minimal attached-queue store with a pending count we control. */
+  function storeWithPending(count: number): AttachedQueueStore {
     const notes: InboundQueueNote[] = Array.from({ length: count }, (_, i) => ({
       id: `in-${i}`,
       text: `m${i}`,
@@ -241,14 +241,14 @@ describe("GET /api/agents includes channel-backend agents (#102)", () => {
     return {
       name,
       channels: [name],
-      backend: "channel",
+      backend: "attached",
       ...(vault ? { vault: { name: vault, access: "write" } } : {}),
       systemPrompt: "You are the laptop agent.",
     };
   }
 
-  test("a registered channel agent appears with backend:channel + queued status + channel + vault", async () => {
-    const channelQueue = new ChannelQueueRegistry();
+  test("a registered attached agent appears with backend:attached + queued status + channel + vault", async () => {
+    const channelQueue = new AttachedQueueRegistry();
     channelQueue.register(channelSpec("laptop", "research"), storeWithPending(2));
     const { srv, base } = serverWith(emptyChannels(), { channelQueue });
     const res = await fetch(`${base}/api/agents`, { headers: adminAuth });
@@ -256,7 +256,7 @@ describe("GET /api/agents includes channel-backend agents (#102)", () => {
     const body = (await res.json()) as { agents: Array<Record<string, unknown>> };
     const laptop = body.agents.find((a) => a.name === "laptop");
     expect(laptop).toBeDefined();
-    expect(laptop!.backend).toBe("channel");
+    expect(laptop!.backend).toBe("attached");
     expect(laptop!.status).toBe("queued:2");
     expect(laptop!.channel).toBe("laptop");
     expect(laptop!.vault).toBe("research");
@@ -267,7 +267,7 @@ describe("GET /api/agents includes channel-backend agents (#102)", () => {
   });
 
   test("an empty pending queue → status idle", async () => {
-    const channelQueue = new ChannelQueueRegistry();
+    const channelQueue = new AttachedQueueRegistry();
     channelQueue.register(channelSpec("idlebot"), storeWithPending(0));
     const { srv, base } = serverWith(emptyChannels(), { channelQueue });
     const res = await fetch(`${base}/api/agents`, { headers: adminAuth });
@@ -277,7 +277,7 @@ describe("GET /api/agents includes channel-backend agents (#102)", () => {
   });
 
   test("no Authorization → 401 (admin-gated)", async () => {
-    const { srv, base } = serverWith(emptyChannels(), { channelQueue: new ChannelQueueRegistry() });
+    const { srv, base } = serverWith(emptyChannels(), { channelQueue: new AttachedQueueRegistry() });
     const res = await fetch(`${base}/api/agents`);
     expect(res.status).toBe(401);
     srv.stop();
@@ -310,7 +310,7 @@ describe("GET /api/agent-defs", () => {
       id: "Agents/uni-dev",
       content: "a".repeat(500), // long prompt → preview truncates to 200.
       tags: ["#agent/definition"],
-      metadata: { name: "uni-dev", backend: "channel", mode: "multi-threaded" },
+      metadata: { name: "uni-dev", backend: "attached", mode: "multi-threaded" },
     });
     const { reg } = registryWithFakeVault({ fake });
     await reg.loadAll(); // instantiate the seeded def.
@@ -322,7 +322,7 @@ describe("GET /api/agent-defs", () => {
     const d = body.defs[0]!;
     expect(d.noteId).toBe("Agents/uni-dev");
     expect(d.name).toBe("uni-dev");
-    expect(d.backend).toBe("channel");
+    expect(d.backend).toBe("attached");
     expect(d.mode).toBe("multi-threaded"); // the list carries the mode (edit form pre-fill).
     expect(d.vault).toBe("default");
     expect(d.status).toBe("enabled");
@@ -352,7 +352,7 @@ describe("GET /api/agent-defs/:noteId (full def)", () => {
       id: "Agents/uni-dev",
       content: "F".repeat(500), // long body → list preview truncates; full returns all.
       tags: ["#agent/definition"],
-      metadata: { name: "uni-dev", backend: "channel", mode: "multi-threaded", wants: "vault:research:read" },
+      metadata: { name: "uni-dev", backend: "attached", mode: "multi-threaded", wants: "vault:research:read" },
     });
     const { reg } = registryWithFakeVault({ fake });
     await reg.loadAll();
@@ -386,7 +386,7 @@ describe("GET /api/agent-defs/:noteId (full def)", () => {
     const d = body.def;
     expect(d.noteId).toBe("Agents/uni-dev");
     expect(d.name).toBe("uni-dev");
-    expect(d.backend).toBe("channel");
+    expect(d.backend).toBe("attached");
     expect(d.mode).toBe("multi-threaded");
     expect(d.vault).toBe("default");
     expect(d.wants).toEqual(["vault:research:read"]);
@@ -498,6 +498,32 @@ describe("POST /api/agent-defs", () => {
     srv.stop();
   });
 
+  test("dual-read: the legacy backend value \"channel\" is accepted + persisted as \"attached\"", async () => {
+    // The backend VALUE was renamed `channel` → `attached`. An API client still sending
+    // the pre-rename value must be ACCEPTED (not 400) and the def must be WRITTEN +
+    // returned with the canonical `attached`. (The routing key `channel` is untouched.)
+    const { reg, fake } = registryWithFakeVault();
+    const { srv, base } = serverWith(emptyChannels(), { agentDefs: reg });
+    const res = await fetch(`${base}/api/agent-defs`, {
+      method: "POST",
+      headers: adminAuth,
+      body: JSON.stringify({
+        vault: "default",
+        name: "legacybot",
+        backend: "channel", // the legacy value.
+        systemPrompt: "You are legacybot.",
+      }),
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { ok: boolean; def: Record<string, unknown> };
+    expect(body.def.backend).toBe("attached"); // normalized on the way out.
+    // And the persisted note metadata is the canonical value, never the legacy one.
+    const written = [...fake.notes.values()].find((n) => n.metadata.name === "legacybot");
+    expect(written).toBeDefined();
+    expect(written!.metadata.backend).toBe("attached");
+    srv.stop();
+  });
+
   test("validation: bad name slug → 400", async () => {
     const { reg } = registryWithFakeVault();
     const { srv, base } = serverWith(emptyChannels(), { agentDefs: reg });
@@ -539,7 +565,7 @@ describe("POST /api/agent-defs", () => {
     const res = await fetch(`${base}/api/agent-defs`, {
       method: "POST",
       headers: adminAuth,
-      body: JSON.stringify({ vault: "default", name: "uni-dev", backend: "channel" }),
+      body: JSON.stringify({ vault: "default", name: "uni-dev", backend: "attached" }),
     });
     expect(res.status).toBe(409);
     expect((await res.json()) as { error: string }).toMatchObject({

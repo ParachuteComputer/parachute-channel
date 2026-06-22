@@ -234,28 +234,38 @@ export function parseAgentDef(note: {
   }
 
   // Backend — default programmatic (the reliable primary path). A vault-native def
-  // may select EITHER `programmatic` (the daemon runs `claude -p` turns) OR `channel`
+  // may select EITHER `programmatic` (the daemon runs `claude -p` turns) OR `attached`
   // (the design 2026-06-18-channel-backend path — the turn is handled by a Claude Code
-  // session the operator connects to the channel's MCP endpoint; the daemon runs no
-  // turn, the inbound notes accumulate as a durable queue). `interactive` (the retired
-  // tmux path) is REJECTED with a clear message (→ status:error on the note) rather
-  // than silently demoting — `channel` is what it was reaching for, done right.
+  // session the operator connects — "attaches" — to the channel's MCP endpoint; the
+  // daemon runs no turn, the inbound notes accumulate as a durable queue). `interactive`
+  // (the retired tmux path) is REJECTED with a clear message (→ status:error on the
+  // note) rather than silently demoting — `attached` is what it was reaching for, done right.
+  //
+  // DUAL-READ the legacy backend VALUE, mapping silently (no operator-facing break, no
+  // migration of already-authored def notes / spec.json):
+  //   legacy value → canonical value
+  //   ──────────────────────────────
+  //   channel      → attached   (the backend value was renamed `channel` → `attached`;
+  //                              the ROUTING KEY `channel` — metadata.channel, the
+  //                              `/mcp/<channel>` segment — is a SEPARATE concept, untouched)
   let backend: AgentBackendKind = "programmatic";
   const rawBackend = metaStr(meta.backend);
   if (rawBackend !== undefined) {
     if (rawBackend === "interactive") {
       throw new AgentDefParseError(
         `#agent/definition note ${noteId}: the "interactive" backend is retired — use ` +
-          `"programmatic" (daemon-run turns, the default) or "channel" (handled by a Claude ` +
+          `"programmatic" (daemon-run turns, the default) or "attached" (handled by a Claude ` +
           `Code session you connect to the channel).`,
       );
     }
-    if (rawBackend !== "programmatic" && rawBackend !== "channel") {
+    // DUAL-READ: the legacy backend value `"channel"` normalizes to `"attached"`.
+    const normalizedBackend = rawBackend === "channel" ? "attached" : rawBackend;
+    if (normalizedBackend !== "programmatic" && normalizedBackend !== "attached") {
       throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: backend must be "programmatic" or "channel"`,
+        `#agent/definition note ${noteId}: backend must be "programmatic" or "attached"`,
       );
     }
-    backend = rawBackend;
+    backend = normalizedBackend;
   }
 
   // Execution-lifecycle mode (the Phase-3 prerequisite). An agent is SINGLE-THREADED
@@ -707,7 +717,7 @@ interface LiveDef {
   name: string;
   /** The resolved status (for /health + observability). */
   status: AgentDefStatus;
-  /** The agent backend the def selected (`programmatic` | `channel`). */
+  /** The agent backend the def selected (`programmatic` | `attached`). */
   backend: AgentBackendKind;
   /** The execution-lifecycle mode the def selected (`single-threaded` | `multi-threaded`). */
   mode: AgentMode;
@@ -731,7 +741,7 @@ export interface AgentDefDetail {
   noteId: string;
   /** The agent name (= wake channel + spec name). */
   name: string;
-  /** The agent backend (`programmatic` | `channel`). */
+  /** The agent backend (`programmatic` | `attached`). */
   backend: AgentBackendKind;
   /** The execution-lifecycle mode (`single-threaded` | `multi-threaded`). */
   mode: AgentMode;
@@ -767,7 +777,7 @@ export interface AgentDefFull {
   noteId: string;
   /** The agent name (= wake channel + spec name). */
   name: string;
-  /** The agent backend (`programmatic` | `channel`). */
+  /** The agent backend (`programmatic` | `attached`). */
   backend: AgentBackendKind;
   /** The def-vault this agent is defined in. */
   vault: string;
@@ -1259,8 +1269,13 @@ export class AgentDefRegistry {
         400,
       );
     }
-    if (args.backend !== "programmatic" && args.backend !== "channel") {
-      throw new AgentDefWriteError(`backend must be "programmatic" or "channel"`, 400);
+    // DUAL-READ the legacy backend value `"channel"` → canonical `"attached"`, so a
+    // caller (or a hand-driven API client) passing the pre-rename value still WRITES the
+    // canonical value. The routing key `channel` is a separate concept, unchanged.
+    const backend: AgentBackendKind =
+      (args.backend as string) === "channel" ? "attached" : args.backend;
+    if (backend !== "programmatic" && backend !== "attached") {
+      throw new AgentDefWriteError(`backend must be "programmatic" or "attached"`, 400);
     }
     // A name collision with a live def (in ANY vault — the wake channel is shared) would
     // resurrect last-writer-wins on the channel; reject up front for a clean error.
@@ -1272,7 +1287,7 @@ export class AgentDefRegistry {
         );
       }
     }
-    const metadata = this.buildDefMetadata(args);
+    const metadata = this.buildDefMetadata({ ...args, backend });
     const created = await client.createNote({
       content: args.systemPrompt,
       metadata,

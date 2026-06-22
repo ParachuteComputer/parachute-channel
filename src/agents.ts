@@ -41,12 +41,13 @@ import { resolveClaudeCredential } from "./credentials.ts";
 export const AGENT_NAME_SLUG = /^[a-z0-9_-]+$/i;
 
 /**
- * One agent as the `/api/agents` list returns it — a PROGRAMMATIC or CHANNEL agent
+ * One agent as the `/api/agents` list returns it — a PROGRAMMATIC or ATTACHED agent
  * (the only two live backends; interactive was retired 2026-06-19). Neither has a
  * tmux session, so `session` is the conventional `<name>-agent` display label,
- * `attached` is always false, and liveness rides in `status` (`idle` | `working` |
- * `queued:N`) rather than the old tmux `attached`/`mcp_sessions` flags. Built by
- * `listProgrammaticAgents` / `listChannelAgents` (daemon.ts). NEVER carries a secret.
+ * `attached` is always false (the boolean tmux-attach flag — NOT the backend value),
+ * and liveness rides in `status` (`idle` | `working` | `queued:N`) rather than the old
+ * tmux `attached`/`mcp_sessions` flags. Built by `listProgrammaticAgents` /
+ * `listChannelAgents` (daemon.ts). NEVER carries a secret.
  */
 export interface AgentInfo {
   /** Agent slug. */
@@ -60,7 +61,7 @@ export interface AgentInfo {
   /** Whether the session's workspace (with its spec.json) is present on disk. */
   hasWorkspace: boolean;
   /** Which backend drives this agent. */
-  backend: "programmatic" | "channel";
+  backend: "programmatic" | "attached";
   /** Live status — `idle` | `working` | `queued:N`. */
   status?: string;
   /** The wake channel this agent serves (present for channel agents). */
@@ -185,17 +186,19 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
   }
 
   // Backend selector. Only `"programmatic"` is accepted via this web spawn POST
-  // (the default when omitted). `"channel"` is VAULT-NATIVE — define a channel agent
-  // as a #agent/definition note (the create-agent UX for channel is phase 5), not via
-  // this endpoint. `"interactive"` was RETIRED (design 2026-06-19-retire-interactive-
-  // backend.md) — it is no longer a selectable backend anywhere.
+  // (the default when omitted). `"attached"` (the backend value formerly named
+  // `"channel"`) is VAULT-NATIVE — define an attached agent as a #agent/definition note,
+  // not via this endpoint. `"interactive"` was RETIRED (design 2026-06-19-retire-
+  // interactive-backend.md) — it is no longer a selectable backend anywhere.
   if (b.backend !== undefined && b.backend !== null) {
     if (b.backend !== "programmatic") {
       throw new SpawnRequestError(
-        b.backend === "channel"
-          ? "channel-backend agents are vault-native — define them as an #agent/definition note, not via this endpoint"
+        // Accept the legacy `"channel"` value in the diagnostic branch (dual-read of the
+        // renamed backend value) — both map to the same vault-native guidance.
+        b.backend === "attached" || b.backend === "channel"
+          ? "attached-backend agents are vault-native — define them as an #agent/definition note, not via this endpoint"
           : b.backend === "interactive"
-            ? 'the "interactive" backend is retired — use "programmatic" (the default) or define a "channel" agent as a #agent/definition note'
+            ? 'the "interactive" backend is retired — use "programmatic" (the default) or define an "attached" agent as a #agent/definition note'
             : 'body.backend must be "programmatic"',
       );
     }

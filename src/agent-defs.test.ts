@@ -246,17 +246,32 @@ describe("parseAgentDef", () => {
     ).toThrow(/interactive/);
   });
 
-  test("accepts backend:channel (design 2026-06-18-channel-backend), threads it onto the spec", () => {
+  test("accepts backend:attached (design 2026-06-18-channel-backend), threads it onto the spec", () => {
     const def = parseAgentDef(
-      { id: "Agents/laptop", content: "You are the laptop agent.", metadata: { name: "laptop", backend: "channel" } },
+      { id: "Agents/laptop", content: "You are the laptop agent.", metadata: { name: "laptop", backend: "attached" } },
       { vault: "default" },
     );
-    expect(def.spec.backend).toBe("channel");
+    expect(def.spec.backend).toBe("attached");
     expect(def.name).toBe("laptop");
     // The body is still the system prompt (the session adopts it on next-message).
     expect(def.spec.systemPrompt).toBe("You are the laptop agent.");
     // Wake channel = the agent name (agent ≡ channel) — same collapse as programmatic.
     expect(def.spec.channels).toEqual(["laptop"]);
+  });
+
+  test("DUAL-READ: a persisted def with the legacy backend value \"channel\" normalizes to \"attached\"", () => {
+    // The backend VALUE was renamed `channel` → `attached`. An already-authored def note
+    // (or spec.json) carrying the legacy `metadata.backend: "channel"` must still LOAD —
+    // normalized to the canonical `attached` on read, no operator-facing break, no
+    // migration. (The routing key `channel` — metadata.channel / the `/mcp/<channel>`
+    // segment — is a SEPARATE concept and is deliberately unchanged.)
+    const def = parseAgentDef(
+      { id: "Agents/laptop", content: "You are the laptop agent.", metadata: { name: "laptop", backend: "channel" } },
+      { vault: "default" },
+    );
+    expect(def.spec.backend).toBe("attached"); // normalized, NOT the legacy "channel".
+    expect(def.name).toBe("laptop");
+    expect(def.spec.channels).toEqual(["laptop"]); // routing key unchanged.
   });
 
   // --- execution-lifecycle mode (the Phase-3 prerequisite) ---
@@ -813,14 +828,14 @@ describe("AgentDefRegistry — lifecycle", () => {
         {
           id: "Agents/uni-dev",
           content: longPrompt,
-          metadata: { name: "uni-dev", backend: "channel", mode: "multi-threaded", wants: "vault:research:read" },
+          metadata: { name: "uni-dev", backend: "attached", mode: "multi-threaded", wants: "vault:research:read" },
         },
       ],
       byId: {
         "Agents/uni-dev": {
           id: "Agents/uni-dev",
           content: longPrompt,
-          metadata: { name: "uni-dev", backend: "channel", mode: "multi-threaded", wants: "vault:research:read" },
+          metadata: { name: "uni-dev", backend: "attached", mode: "multi-threaded", wants: "vault:research:read" },
         },
       },
     });
@@ -830,7 +845,7 @@ describe("AgentDefRegistry — lifecycle", () => {
     expect(full).not.toBeNull();
     expect(full!.noteId).toBe("Agents/uni-dev");
     expect(full!.name).toBe("uni-dev");
-    expect(full!.backend).toBe("channel");
+    expect(full!.backend).toBe("attached");
     expect(full!.mode).toBe("multi-threaded");
     expect(full!.vault).toBe("default");
     expect(full!.wants).toEqual(["vault:research:read"]);

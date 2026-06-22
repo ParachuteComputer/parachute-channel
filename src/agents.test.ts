@@ -91,9 +91,9 @@ describe("buildSpecFromBody", () => {
     expect(() => buildSpecFromBody({ name: "a", channels: ["c"], workspace: 42 })).toThrow(/workspace must be a string/);
   });
 
-  // Backend selection post-retire: omitted → programmatic; "channel" is vault-native
-  // (rejected with the deflect message); "interactive" is retired (rejected); any
-  // other value is rejected.
+  // Backend selection post-retire: omitted → programmatic; "attached" (and the legacy
+  // value "channel") is vault-native (rejected with the deflect message); "interactive"
+  // is retired (rejected); any other value is rejected.
   test("omitted backend → programmatic (the new-request default)", () => {
     expect(buildSpecFromBody({ name: "a", channels: ["c"] }).backend).toBe("programmatic");
     expect(buildSpecFromBody({ name: "a", channels: ["c"], backend: null }).backend).toBe("programmatic");
@@ -104,7 +104,10 @@ describe("buildSpecFromBody", () => {
   test("backend:\"interactive\" is REJECTED (retired)", () => {
     expect(() => buildSpecFromBody({ name: "a", channels: ["c"], backend: "interactive" })).toThrow(/retired/);
   });
-  test("backend:\"channel\" is REJECTED via this endpoint (vault-native)", () => {
+  test("backend:\"attached\" is REJECTED via this endpoint (vault-native)", () => {
+    expect(() => buildSpecFromBody({ name: "a", channels: ["c"], backend: "attached" })).toThrow(/vault-native/);
+  });
+  test("the legacy backend:\"channel\" is ALSO deflected as vault-native (dual-read)", () => {
     expect(() => buildSpecFromBody({ name: "a", channels: ["c"], backend: "channel" })).toThrow(/vault-native/);
   });
   test("rejects an invalid backend value", () => {

@@ -1,0 +1,43 @@
+name: CI
+
+# The gate the project already runs locally (`bun run test` = typecheck + bun test ./src/),
+# now enforced on every PR + push to main — closing the "no CI / nothing gates PRs" gap.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# One in-flight run per ref; a new push cancels the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: typecheck + tests (src)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - name: typecheck
+        run: bun run typecheck
+      - name: tests
+        run: bun test ./src/
+
+  spa:
+    name: web/ui (vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: install (web/ui)
+        run: bun install --frozen-lockfile
+        working-directory: web/ui
+      - name: test (vitest)
+        run: bun run test
+        working-directory: web/ui

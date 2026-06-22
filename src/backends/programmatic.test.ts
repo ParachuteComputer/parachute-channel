@@ -33,7 +33,7 @@ import {
   type ProgrammaticBackendDeps,
   type ProgrammaticSpawnFn,
 } from "./programmatic.ts";
-import { AgentSessionState } from "../agent-session-state.ts";
+import type { TurnSession } from "./types.ts";
 import type { SandboxEngine } from "../sandbox/index.ts";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { AgentSpec } from "../sandbox/types.ts";
@@ -161,7 +161,6 @@ function baseDeps(
     vaultUrl: "http://127.0.0.1:1940",
     sessionsDir,
     runtimeReadOnly: ["/cfg/.claude"],
-    sessionState: new AgentSessionState({ stateDir }),
     resolveClaudeToken: () => "OAUTH-CRED-PLACEHOLDER",
     sandboxEngine: fakeEngine(),
     fetchFn: fakeMintFetch(),
@@ -215,10 +214,26 @@ function mkDirs(tag: string): void {
   stateDir = mkdtempSync(join(tmpdir(), `prog-state-${tag}-`));
 }
 
+// ---- TurnSession helpers ---------------------------------------------------
+// The daemon (registry) now OWNS the session uuid + the resume-vs-create decision and
+// hands it to `deliver` as a {@link TurnSession}. These build the two shapes:
+//  - createSession(id) → `--session-id <id>` (CREATE: first turn / every multi-threaded fire)
+//  - resumeSession(id) → `--resume <id>` (CONTINUE: single-threaded turn 2+)
+function createSession(id: string): TurnSession {
+  return { id, resume: false };
+}
+function resumeSession(id: string): TurnSession {
+  return { id, resume: true };
+}
+/** A fresh-create session with a generated uuid (the default when a test doesn't care). */
+function freshSession(): TurnSession {
+  return { id: crypto.randomUUID(), resume: false };
+}
+
 // ---- pure-helper tests -----------------------------------------------------
 
 describe("buildProgrammaticClaudeArgs", () => {
-  test("FIRST turn (no resume): -p + stream-json + strict MCP; NO --resume, NO dev-channels", () => {
+  test("no session: -p + stream-json + strict MCP; NEITHER session flag, NO dev-channels", () => {
     const argv = buildProgrammaticClaudeArgs({ message: "hello", mcpConfigPath: "/ws/.mcp.json" });
     expect(argv).toContain("-p");
     expect(argv).toContain("hello");
@@ -230,18 +245,44 @@ describe("buildProgrammaticClaudeArgs", () => {
     expect(argv).toContain("--dangerously-skip-permissions");
     // The daemon mediates messaging — NO channel dev-channels flag here.
     expect(argv.some((a) => a.includes("dangerously-load-development-channels"))).toBe(false);
-    // First turn → no --resume.
+    // No sessionId → neither session flag.
+    expect(argv).not.toContain("--resume");
+    expect(argv).not.toContain("--session-id");
+  });
+
+  test("CREATE (resumeSession=false): --session-id <id> appended (NOT --resume)", () => {
+    const argv = buildProgrammaticClaudeArgs({
+      message: "first",
+      mcpConfigPath: "/ws/.mcp.json",
+      sessionId: "sess-new",
+      resumeSession: false,
+    });
+    expect(argv).toContain("--session-id");
+    expect(argv[argv.indexOf("--session-id") + 1]).toBe("sess-new");
     expect(argv).not.toContain("--resume");
   });
 
-  test("SECOND turn (resume): --resume <sid> appended", () => {
+  test("CREATE (resumeSession omitted defaults to create): --session-id <id>", () => {
+    const argv = buildProgrammaticClaudeArgs({
+      message: "first",
+      mcpConfigPath: "/ws/.mcp.json",
+      sessionId: "sess-new",
+    });
+    expect(argv).toContain("--session-id");
+    expect(argv[argv.indexOf("--session-id") + 1]).toBe("sess-new");
+    expect(argv).not.toContain("--resume");
+  });
+
+  test("CONTINUE (resumeSession=true): --resume <id> appended (NOT --session-id)", () => {
     const argv = buildProgrammaticClaudeArgs({
       message: "next",
       mcpConfigPath: "/ws/.mcp.json",
-      resumeSessionId: "sess-xyz",
+      sessionId: "sess-xyz",
+      resumeSession: true,
     });
     expect(argv).toContain("--resume");
     expect(argv[argv.indexOf("--resume") + 1]).toBe("sess-xyz");
+    expect(argv).not.toContain("--session-id");
   });
 
   test("system prompt (append, default): --append-system-prompt-file <path>", () => {
@@ -318,146 +359,134 @@ describe("buildProgrammaticClaudeArgs", () => {
 
 // ---- single-turn runner tests ----------------------------------------------
 
-describe("ProgrammaticBackend.deliver — first turn (no stored sid)", () => {
-  test("argv has NO --resume; session_id captured + persisted; reply from the result event", async () => {
+describe("ProgrammaticBackend.deliver — CREATE turn (--session-id)", () => {
+  test("a create session → argv has --session-id <id> (NOT --resume); reply + sessionId returned", async () => {
     mkDirs("first");
     const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-FIRST", "the reply text") });
     const engine = fakeEngine();
-    const state = new AgentSessionState({ stateDir });
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sandboxEngine: engine, sessionState: state }));
+    const backend = new ProgrammaticBackend(baseDeps(fn, { sandboxEngine: engine }));
 
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "hi agent");
+    const result = await backend.deliver(handle, "hi agent", createSession("sess-FIRST"));
 
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.reply).toBe("the reply text");
+      // Claude echoes the session id (matches the uuid we passed) — RETURNED so the
+      // registry persists it onto the thread note (the backend keeps no store).
       expect(result.sessionId).toBe("sess-FIRST");
       expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5, totalCostUsd: 0.001 });
     }
 
-    // The wrapped argv (engine echoes the claude command in argv[2]) has NO --resume.
+    // The wrapped argv (engine echoes the claude command in argv[2]) CREATES the session.
     expect(calls).toHaveLength(1);
     const cmd = calls[0]!.argv[2]!;
     expect(cmd).toContain("SBX claude -p");
+    expect(cmd).toContain("--session-id sess-FIRST");
     expect(cmd).not.toContain("--resume");
-
-    // session_id PERSISTED to the state store (so the next turn resumes it).
-    expect(state.get("eng")).toBe("sess-FIRST");
-    // …and it survives a "restart" (a fresh store instance reads the file).
-    expect(new AgentSessionState({ stateDir }).get("eng")).toBe("sess-FIRST");
   });
 });
 
-describe("ProgrammaticBackend.deliver — second turn (sid stored)", () => {
-  test("argv includes --resume <sid>; reply extracted; sid stable across turns", async () => {
+describe("ProgrammaticBackend.deliver — CONTINUE turn (--resume)", () => {
+  test("a resume session → argv has --resume <id> (NOT --session-id); reply extracted", async () => {
     mkDirs("second");
-    const state = new AgentSessionState({ stateDir });
-    // Turn 1 establishes the session; turn 2 must resume it.
     const { fn, calls } = sequencedSpawn([
       successTurn("sess-RESUME", "first reply"),
       successTurn("sess-RESUME", "second reply"),
     ]);
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
 
-    const r1 = await backend.deliver(handle, "turn one");
+    // Turn 1 CREATES the session (the registry would mint a fresh uuid); turn 2 RESUMES it
+    // (the registry read it back off the thread note).
+    const r1 = await backend.deliver(handle, "turn one", createSession("sess-RESUME"));
     expect(r1.ok).toBe(true);
-    expect(state.get("eng")).toBe("sess-RESUME");
+    if (r1.ok) expect(r1.sessionId).toBe("sess-RESUME");
 
-    const r2 = await backend.deliver(handle, "turn two");
+    const r2 = await backend.deliver(handle, "turn two", resumeSession("sess-RESUME"));
     expect(r2.ok).toBe(true);
     if (r2.ok) expect(r2.reply).toBe("second reply");
 
-    // Turn 1 argv: no --resume. Turn 2 argv: --resume sess-RESUME.
+    // Turn 1 argv: --session-id (create). Turn 2 argv: --resume (continue) — same id.
     const cmd1 = calls[0]!.argv[2]!;
     const cmd2 = calls[1]!.argv[2]!;
+    expect(cmd1).toContain("--session-id sess-RESUME");
     expect(cmd1).not.toContain("--resume");
     expect(cmd2).toContain("--resume sess-RESUME");
-    // The sid is stable (same conversation continued, not forked).
-    expect(state.get("eng")).toBe("sess-RESUME");
+    expect(cmd2).not.toContain("--session-id");
   });
 });
 
-describe("ProgrammaticBackend.deliver — mode: multi-threaded (fresh-per-fire, no resume/persist)", () => {
-  test("multi-threaded turn does NOT --resume even with a stored sid, and does NOT persist the returned id", async () => {
+describe("ProgrammaticBackend.deliver — the backend is a pure function of the TurnSession", () => {
+  test("the backend reads no store: it just runs the turn it's handed (create) and returns the id", async () => {
+    // A multi-threaded fire is just a CREATE turn at this layer — the registry decides the
+    // mode + the fresh uuid; the backend behaves identically to any create turn.
     mkDirs("multithreaded");
-    const state = new AgentSessionState({ stateDir });
-    // Plant a prior session id for the channel — a single-threaded turn WOULD resume it; a
-    // multi-threaded turn must IGNORE it (no --resume) and must NOT overwrite it.
-    state.set("eng", "sess-PRIOR");
-
     const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-NEW", "ephemeral reply") });
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specMultiThreaded("eng"));
 
-    const result = await backend.deliver(handle, "fire the turn");
+    const result = await backend.deliver(handle, "fire the turn", createSession("sess-NEW"));
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.reply).toBe("ephemeral reply");
+    if (result.ok) {
+      expect(result.reply).toBe("ephemeral reply");
+      expect(result.sessionId).toBe("sess-NEW");
+    }
 
-    // The argv carries NO --resume (the prior id was deliberately not read).
     const cmd = calls[0]!.argv[2]!;
     expect(cmd).toContain("SBX claude -p");
+    expect(cmd).toContain("--session-id sess-NEW");
     expect(cmd).not.toContain("--resume");
-
-    // The returned id is NOT persisted: the store still holds the PRIOR id, untouched
-    // (a multi-threaded fire leaves no continuity handle behind in its fresh-per-fire form).
-    expect(state.get("eng")).toBe("sess-PRIOR");
-    // …and a fresh store instance ("restart") confirms it was never written.
-    expect(new AgentSessionState({ stateDir }).get("eng")).toBe("sess-PRIOR");
   });
 
-  test("a multi-threaded turn with NO prior id still omits --resume and persists nothing", async () => {
+  test("a create turn with a fresh uuid → --session-id <uuid>, NO --resume", async () => {
     mkDirs("multithreaded-fresh");
-    const state = new AgentSessionState({ stateDir });
     const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-X", "reply") });
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specMultiThreaded("eng"));
 
-    await backend.deliver(handle, "go");
-    expect(calls[0]!.argv[2]!).not.toContain("--resume");
-    // Nothing persisted — the channel has no stored id after a multi-threaded fire.
-    expect(state.get("eng")).toBeUndefined();
+    const session = freshSession();
+    await backend.deliver(handle, "go", session);
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain(`--session-id ${session.id}`);
+    expect(cmd).not.toContain("--resume");
   });
 
-  test("REGRESSION: single-threaded (default mode) still resumes + persists exactly as before", async () => {
+  test("a resume turn → --resume <id>, NO --session-id (single-threaded turn 2+ path)", async () => {
     mkDirs("single-threaded-regress");
-    const state = new AgentSessionState({ stateDir });
-    state.set("eng", "sess-PRIOR");
     const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-PRIOR", "continued") });
-    // specWithVault has NO mode → single-threaded (the default).
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    // specWithVault has NO mode → single-threaded (the default); the registry resumes it.
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
 
-    const result = await backend.deliver(handle, "continue the thread");
+    const result = await backend.deliver(handle, "continue the thread", resumeSession("sess-PRIOR"));
     expect(result.ok).toBe(true);
-    // A single-threaded turn DOES resume the stored id…
-    expect(calls[0]!.argv[2]!).toContain("--resume sess-PRIOR");
-    // …and persists the (same, stable) id.
-    expect(state.get("eng")).toBe("sess-PRIOR");
+    if (result.ok) expect(result.sessionId).toBe("sess-PRIOR");
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain("--resume sess-PRIOR");
+    expect(cmd).not.toContain("--session-id");
   });
 });
 
 describe("ProgrammaticBackend.deliver — error turn", () => {
   test("is_error:true → returns { ok:false, error }, no throw; sid still captured", async () => {
     mkDirs("err");
-    const state = new AgentSessionState({ stateDir });
     const errBlob = ndjson(
       { type: "system", subtype: "init", session_id: "sess-ERR", apiKeySource: "none" },
       { type: "result", subtype: "error_during_execution", is_error: true, result: "boom in the agent", session_id: "sess-ERR" },
     );
     const { fn } = recordingSpawn({ stdout: errBlob });
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
 
-    const result = await backend.deliver(handle, "do a thing");
+    const result = await backend.deliver(handle, "do a thing", createSession("sess-ERR"));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toContain("boom in the agent");
+      // The id is still RETURNED (a turn can fail AFTER establishing a session) — the
+      // registry persists it so the next turn resumes the conversation.
       expect(result.sessionId).toBe("sess-ERR");
     }
-    // The id is still persisted (a turn can fail AFTER establishing a session).
-    expect(state.get("eng")).toBe("sess-ERR");
   });
 
   test("a non-success subtype → { ok:false } (no throw)", async () => {
@@ -469,27 +498,27 @@ describe("ProgrammaticBackend.deliver — error turn", () => {
     const { fn } = recordingSpawn({ stdout: blob });
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault());
-    const result = await backend.deliver(handle, "x");
+    const result = await backend.deliver(handle, "x", freshSession());
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("error_max_turns");
   });
 
   test("a turn that fails BEFORE any session is established has no sessionId on the result", async () => {
     mkDirs("err-presession");
-    const state = new AgentSessionState({ stateDir });
-    // No init event, no session_id anywhere — an immediate non-success result.
+    // No init event, no session_id anywhere — an immediate non-success result. Claude
+    // echoed no id, so the backend reports none (the registry then falls back to the
+    // turn uuid it passed when persisting).
     const blob = ndjson({ type: "result", subtype: "error_during_execution", is_error: true, result: "died early" });
     const { fn } = recordingSpawn({ stdout: blob });
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "x");
+    const result = await backend.deliver(handle, "x", createSession("sess-IGNORED-NO-ECHO"));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toContain("died early");
+      // No echoed id from claude → none on the result (the registry uses turnSession.id).
       expect(result.sessionId).toBeUndefined();
     }
-    // Nothing persisted (no id to resume).
-    expect(state.get("eng")).toBeUndefined();
   });
 
   test("no result event (truncated/crashed turn) + non-zero exit → { ok:false }", async () => {
@@ -498,7 +527,7 @@ describe("ProgrammaticBackend.deliver — error turn", () => {
     const { fn } = recordingSpawn({ stdout: blob, stderr: "claude crashed", code: 1 });
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault());
-    const result = await backend.deliver(handle, "x");
+    const result = await backend.deliver(handle, "x", freshSession());
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toMatch(/no success result|exited 1|crashed/);
   });
@@ -510,7 +539,7 @@ describe("ProgrammaticBackend.deliver — argv + env shape", () => {
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault());
-    await backend.deliver(handle, "hello");
+    await backend.deliver(handle, "hello", freshSession());
 
     const cmd = calls[0]!.argv[2]!; // the engine echoes the claude command here
     expect(cmd).toContain(" -p ");
@@ -526,7 +555,7 @@ describe("ProgrammaticBackend.deliver — argv + env shape", () => {
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault());
-    await backend.deliver(handle, "hello");
+    await backend.deliver(handle, "hello", freshSession());
 
     const env = calls[0]!.env;
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("OAUTH-CRED-PLACEHOLDER");
@@ -545,7 +574,7 @@ describe("ProgrammaticBackend.deliver — argv + env shape", () => {
       }),
     );
     const handle = await backend.start(specWithVault());
-    await backend.deliver(handle, "hello");
+    await backend.deliver(handle, "hello", freshSession());
 
     const env = calls[0]!.env;
     expect(env.GH_TOKEN).toBe("ghp_INJECTED");
@@ -559,7 +588,7 @@ describe("ProgrammaticBackend.deliver — system prompt (file-backed, per-turn)"
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithSystemPrompt("You are the eng release bot.", "append", "eng"));
-    await backend.deliver(handle, "hello");
+    await backend.deliver(handle, "hello", freshSession());
 
     const promptPath = join(sessionsDir, "eng", "system-prompt.txt");
     // The file exists, is 0600, and carries the EXACT prompt text.
@@ -580,7 +609,7 @@ describe("ProgrammaticBackend.deliver — system prompt (file-backed, per-turn)"
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithSystemPrompt("Full custom persona.", "replace", "eng"));
-    await backend.deliver(handle, "hello");
+    await backend.deliver(handle, "hello", freshSession());
 
     const promptPath = join(sessionsDir, "eng", "system-prompt.txt");
     expect(readFileSync(promptPath, "utf8")).toBe("Full custom persona.");
@@ -594,7 +623,7 @@ describe("ProgrammaticBackend.deliver — system prompt (file-backed, per-turn)"
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "hello");
+    await backend.deliver(handle, "hello", freshSession());
 
     expect(existsSync(join(sessionsDir, "eng", "system-prompt.txt"))).toBe(false);
     const cmd = calls[0]!.argv[2]!;
@@ -603,24 +632,25 @@ describe("ProgrammaticBackend.deliver — system prompt (file-backed, per-turn)"
 
   test("the prompt file is (re)written + the flag re-passed on EVERY turn — incl. a resume turn", async () => {
     mkDirs("sysprompt-perturn");
-    const state = new AgentSessionState({ stateDir });
     const { fn, calls } = sequencedSpawn([
       successTurn("sess-SP", "turn one reply"),
       successTurn("sess-SP", "turn two reply"),
     ]);
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithSystemPrompt("Per-turn role.", "append", "eng"));
 
-    await backend.deliver(handle, "turn one");
-    await backend.deliver(handle, "turn two");
+    // Turn 1 CREATES the session; turn 2 RESUMES it (the registry's mode decision).
+    await backend.deliver(handle, "turn one", createSession("sess-SP"));
+    await backend.deliver(handle, "turn two", resumeSession("sess-SP"));
 
     const promptPath = join(sessionsDir, "eng", "system-prompt.txt");
     // The file is present after the resume turn too (re-written each deliver).
     expect(readFileSync(promptPath, "utf8")).toBe("Per-turn role.");
-    // Turn 1: -file flag, NO --resume. Turn 2 (resume): -file flag AND --resume.
+    // Turn 1: -file flag + --session-id. Turn 2 (resume): -file flag AND --resume.
     const cmd1 = calls[0]!.argv[2]!;
     const cmd2 = calls[1]!.argv[2]!;
     expect(cmd1).toContain("--append-system-prompt-file");
+    expect(cmd1).toContain("--session-id sess-SP");
     expect(cmd1).not.toContain("--resume");
     expect(cmd2).toContain("--append-system-prompt-file"); // re-passed on the resume turn
     expect(cmd2).toContain("--resume sess-SP");
@@ -650,7 +680,7 @@ describe("ProgrammaticBackend.deliver — workspace seam: cwd = workspace, secre
       const engine = fakeEngine();
       const backend = new ProgrammaticBackend(baseDeps(fn, { sandboxEngine: engine }));
       const handle = await backend.start(specWithWorkspace(workspaceDir, "eng"));
-      await backend.deliver(handle, "hello");
+      await backend.deliver(handle, "hello", freshSession());
 
       const privateDir = join(sessionsDir, "eng");
       // The spawned turn's cwd is the SHARED workspace, NOT the private dir.
@@ -679,7 +709,7 @@ describe("ProgrammaticBackend.deliver — workspace seam: cwd = workspace, secre
         systemPrompt: "Work in the repo.",
       };
       const handle = await backend.start(spec);
-      await backend.deliver(handle, "hello");
+      await backend.deliver(handle, "hello", freshSession());
 
       const privateDir = join(sessionsDir, "eng");
       // Private artifacts are under the per-agent dir…
@@ -703,7 +733,7 @@ describe("ProgrammaticBackend.deliver — workspace seam: cwd = workspace, secre
     const engine = fakeEngine();
     const backend = new ProgrammaticBackend(baseDeps(fn, { sandboxEngine: engine }));
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "hello");
+    await backend.deliver(handle, "hello", freshSession());
 
     const privateDir = join(sessionsDir, "eng");
     expect(calls[0]!.cwd).toBe(privateDir);
@@ -717,7 +747,7 @@ describe("ProgrammaticBackend.deliver — MCP config (vault only, no channel)", 
     const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "hello");
+    await backend.deliver(handle, "hello", freshSession());
 
     const mcpPath = join(sessionsDir, "eng", ".mcp.json");
     expect(statSync(mcpPath).mode & 0o777).toBe(0o600);
@@ -734,7 +764,7 @@ describe("ProgrammaticBackend.deliver — MCP config (vault only, no channel)", 
     const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start({ name: "bare", channels: ["bare"] });
-    const result = await backend.deliver(handle, "hello");
+    const result = await backend.deliver(handle, "hello", freshSession());
     expect(result.ok).toBe(true);
     const parsed = JSON.parse(readFileSync(join(sessionsDir, "bare", ".mcp.json"), "utf8")) as {
       mcpServers: Record<string, unknown>;
@@ -754,16 +784,15 @@ describe("ProgrammaticBackend.deliver — robustness", () => {
       JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "robust reply", session_id: "sess-R" }) + "\n" +
       '{"type":"system","subtype":"in'; // a cut-off trailing partial line
     const { fn } = recordingSpawn({ stdout: messyStdout });
-    const state = new AgentSessionState({ stateDir });
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "hello");
+    const result = await backend.deliver(handle, "hello", createSession("sess-R"));
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.reply).toBe("robust reply");
+      // The captured id is RETURNED for the registry to persist (the backend keeps no store).
       expect(result.sessionId).toBe("sess-R");
     }
-    expect(state.get("eng")).toBe("sess-R");
   });
 });
 
@@ -793,14 +822,14 @@ describe("ProgrammaticBackend.deliver — streaming interim events (the watch-it
     // Split into two chunks at a mid-line boundary to exercise incremental decoding.
     const cut = Math.floor(blob.length / 2);
     const backend = new ProgrammaticBackend(
-      baseDeps(chunkedSpawn([blob.slice(0, cut), blob.slice(cut)]), {
-        sessionState: new AgentSessionState({ stateDir }),
-      }),
+      baseDeps(chunkedSpawn([blob.slice(0, cut), blob.slice(cut)])),
     );
     const handle = await backend.start(specWithVault("eng"));
 
     const events: unknown[] = [];
-    const result = await backend.deliver(handle, "where is X", (e) => events.push(e));
+    const result = await backend.deliver(handle, "where is X", createSession("sess-STREAM"), (e) =>
+      events.push(e),
+    );
 
     expect(events).toEqual([
       { kind: "init", sessionId: "sess-STREAM" },
@@ -818,9 +847,9 @@ describe("ProgrammaticBackend.deliver — streaming interim events (the watch-it
   test("a turn with NO onInterim runs identically (durable reply intact, no throw)", async () => {
     mkDirs("nostream");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-NS", "plain reply") });
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: new AgentSessionState({ stateDir }) }));
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "hi"); // no sink
+    const result = await backend.deliver(handle, "hi", freshSession()); // no sink
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.reply).toBe("plain reply");
   });
@@ -828,9 +857,9 @@ describe("ProgrammaticBackend.deliver — streaming interim events (the watch-it
   test("a THROWING onInterim sink cannot break the turn (durable result still returned)", async () => {
     mkDirs("sinkthrow");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-THROW", "survives") });
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: new AgentSessionState({ stateDir }) }));
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "hi", () => {
+    const result = await backend.deliver(handle, "hi", freshSession(), () => {
       throw new Error("dead SSE stream");
     });
     expect(result.ok).toBe(true);
@@ -842,12 +871,12 @@ describe("ProgrammaticBackend.deliver — streaming interim events (the watch-it
     const blob =
       JSON.stringify({ type: "system", subtype: "init", session_id: "sess-ERR" }) + "\n" +
       JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, result: "boom", session_id: "sess-ERR" }) + "\n";
-    const backend = new ProgrammaticBackend(
-      baseDeps(chunkedSpawn([blob]), { sessionState: new AgentSessionState({ stateDir }) }),
-    );
+    const backend = new ProgrammaticBackend(baseDeps(chunkedSpawn([blob])));
     const handle = await backend.start(specWithVault("eng"));
     const events: unknown[] = [];
-    const result = await backend.deliver(handle, "go", (e) => events.push(e));
+    const result = await backend.deliver(handle, "go", createSession("sess-ERR"), (e) =>
+      events.push(e),
+    );
     expect(events).toEqual([{ kind: "init", sessionId: "sess-ERR" }]);
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -869,7 +898,7 @@ describe("ProgrammaticBackend.deliver — credential / mint failures (value, not
       }),
     );
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "hello");
+    const result = await backend.deliver(handle, "hello", freshSession());
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("no Claude credential");
     expect(calls).toHaveLength(0); // never spawned
@@ -885,7 +914,7 @@ describe("ProgrammaticBackend.deliver — credential / mint failures (value, not
       )) as unknown as typeof fetch;
     const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn: refusingFetch }));
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "hello");
+    const result = await backend.deliver(handle, "hello", freshSession());
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toMatch(/mint refused/);
     expect(calls).toHaveLength(0); // mint failed before any spawn
@@ -908,16 +937,23 @@ describe("ProgrammaticBackend — start / stop / status", () => {
     await expect(backend.start({ name: "ok", channels: [] })).rejects.toThrow(/no channels/);
   });
 
-  test("stop() clears the persisted resume id (next turn starts fresh)", async () => {
+  test("stop() is a NO-OP (no store to clear; the session lives on the thread note)", async () => {
     mkDirs("stop");
-    const state = new AgentSessionState({ stateDir });
-    const { fn } = recordingSpawn({ stdout: successTurn("sess-STOP", "ok") });
-    const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-STOP", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "hello");
-    expect(state.get("eng")).toBe("sess-STOP");
+    // A turn establishes a session; the id is RETURNED (the registry persists it on the note).
+    const r = await backend.deliver(handle, "hello", createSession("sess-STOP"));
+    expect(r.ok).toBe(true);
+    // stop() does not throw and runs no side effect — the backend keeps no session store, so
+    // there is nothing to clear (continuity now lives on the durable #agent/thread note).
     await backend.stop(handle);
-    expect(state.get("eng")).toBeUndefined();
+    // It does not spawn anything or otherwise touch the turn machinery.
+    expect(calls).toHaveLength(1);
+    // A subsequent RESUME turn still works (the registry would supply the same id off the note).
+    const r2 = await backend.deliver(handle, "again", resumeSession("sess-STOP"));
+    expect(r2.ok).toBe(true);
+    expect(calls[1]!.argv[2]!).toContain("--resume sess-STOP");
   });
 
   test("status() is live (no resident process to keep alive)", async () => {
@@ -981,7 +1017,7 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
     const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "hi");
+    await backend.deliver(handle, "hi", freshSession());
 
     const servers = readMcpServers("eng");
     // Own def-vault entry still present…
@@ -1003,7 +1039,7 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "hi");
+    await backend.deliver(handle, "hi", freshSession());
 
     expect(calls[0]!.env.GITHUB_TOKEN).toBe("ghp_GRANTED");
     // The granted env var never clobbers the managed Claude auth.
@@ -1022,7 +1058,7 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "hi");
+    await backend.deliver(handle, "hi", freshSession());
 
     const svc = readMcpServers("eng")[grantServiceEntryKey("github")]!;
     expect(svc.type).toBe("http");
@@ -1040,7 +1076,7 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
     const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "hi");
+    await backend.deliver(handle, "hi", freshSession());
 
     const servers = readMcpServers("eng");
     // Only the own def-vault entry — the mcp-kind grant added nothing.
@@ -1059,8 +1095,8 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
     const { fn } = sequencedSpawn([successTurn("s", "one"), successTurn("s", "two")]);
     const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "turn one");
-    await backend.deliver(handle, "turn two");
+    await backend.deliver(handle, "turn one", createSession("s"));
+    await backend.deliver(handle, "turn two", resumeSession("s"));
     // Two turns → two material fetches (no caching).
     expect(called).toEqual(["g1", "g1"]);
   });
@@ -1077,7 +1113,7 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
     // Use the same fetch for the mint path so the vault token still mints.
     const backend = new ProgrammaticBackend(baseDeps(fn, { grants, fetchFn }));
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "hi");
+    const result = await backend.deliver(handle, "hi", freshSession());
     expect(result.ok).toBe(true); // own-vault turn unaffected by the grant blip
     const servers = readMcpServers("eng");
     expect(servers[vaultEntryKey("default")]).toBeDefined();
@@ -1089,7 +1125,7 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
     const { fn } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn)); // no grants in deps
     const handle = await backend.start(specWithVault("eng"));
-    await backend.deliver(handle, "hi");
+    await backend.deliver(handle, "hi", freshSession());
     expect(Object.keys(readMcpServers("eng"))).toEqual([vaultEntryKey("default")]);
   });
 });
@@ -1104,28 +1140,28 @@ describe("ProgrammaticBackend.deliver — transient-error retry with incremental
   test("retries a TRANSIENT turn error (backoff), then succeeds", async () => {
     mkDirs("retry-ok");
     const sleeps: number[] = [];
-    const state = new AgentSessionState({ stateDir });
     const { fn, calls } = sequencedSpawn([
       transientResult("s1", "API Error: 529 Overloaded. Try again."),
       successTurn("s2", "recovered"),
     ]);
     const backend = new ProgrammaticBackend(
       baseDeps(fn, {
-        sessionState: state,
         sleepFn: async (ms) => {
           sleeps.push(ms);
         },
       }),
     );
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "go");
+    const result = await backend.deliver(handle, "go", createSession("s1"));
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.reply).toBe("recovered");
+    if (result.ok) {
+      expect(result.reply).toBe("recovered");
+      // The SUCCESSFUL attempt's sid is RETURNED (not the failed attempt's "s1").
+      expect(result.sessionId).toBe("s2");
+    }
     expect(calls.length).toBe(2); // one retry
     expect(sleeps).toHaveLength(1); // one backoff
     expect(sleeps[0]).toBe(TURN_RETRY_BACKOFF_MS[0]); // the first (incremental) interval
-    // The SUCCESSFUL attempt's sid is persisted (not the failed attempt's "s1").
-    expect(state.get("eng")).toBe("s2");
   });
 
   test("does NOT retry a non-transient turn error (fails fast, no sleep)", async () => {
@@ -1142,7 +1178,7 @@ describe("ProgrammaticBackend.deliver — transient-error retry with incremental
       }),
     );
     const handle = await backend.start(specWithVault());
-    const result = await backend.deliver(handle, "go");
+    const result = await backend.deliver(handle, "go", freshSession());
     expect(result.ok).toBe(false);
     expect(calls.length).toBe(1); // no retry
     expect(sleeps.length).toBe(0);
@@ -1151,26 +1187,26 @@ describe("ProgrammaticBackend.deliver — transient-error retry with incremental
   test("a persistently TRANSIENT error exhausts the retries → { ok:false }", async () => {
     mkDirs("retry-exhaust");
     const sleeps: number[] = [];
-    const state = new AgentSessionState({ stateDir });
     const { fn, calls } = recordingSpawn({
       stdout: transientResult("s", "API Error: 503 Service Unavailable"),
     });
     const backend = new ProgrammaticBackend(
       baseDeps(fn, {
-        sessionState: state,
         sleepFn: async (ms) => {
           sleeps.push(ms);
         },
       }),
     );
     const handle = await backend.start(specWithVault("eng"));
-    const result = await backend.deliver(handle, "go");
+    const result = await backend.deliver(handle, "go", createSession("s"));
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toContain("503");
+    if (!result.ok) {
+      expect(result.error).toContain("503");
+      // The session id is still RETURNED even on a FINAL failure (continuation handle).
+      expect(result.sessionId).toBe("s");
+    }
     expect(calls.length).toBe(TURN_MAX_ATTEMPTS); // all attempts used
     expect(sleeps.length).toBe(TURN_MAX_ATTEMPTS - 1); // one backoff before each retry
-    // The session id is still persisted even on a FINAL failure (continuation handle).
-    expect(state.get("eng")).toBe("s");
   });
 });
 

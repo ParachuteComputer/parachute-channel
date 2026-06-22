@@ -791,6 +791,110 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(patches[0]!.content).not.toContain("**Reply:**");
     expect(patches[1]!.content).toContain("a");
   });
+
+  // ── thread ≡ session (metadata.session — the unified record) ──────────────────────────
+
+  test("writeThread() persists metadata.session when thread.session is set", async () => {
+    const posts: { metadata: Record<string, string> }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
+        posts.push({ metadata: (JSON.parse(String(init?.body)) as { metadata: Record<string, string> }).metadata });
+        return new Response(JSON.stringify({ id: "x" }), { status: 200 });
+      }
+      // multi-threaded → no GET read-back; serve ensureSchema PUTs + anything else 200.
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.writeThread({
+      channel: "eng",
+      mode: "multi-threaded",
+      status: "ok",
+      input: "q",
+      output: "a",
+      started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z",
+      session: "11111111-1111-4111-8111-111111111111",
+    });
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.metadata.session).toBe("11111111-1111-4111-8111-111111111111");
+  });
+
+  test("SINGLE-THREADED upsert PRESERVES a prior metadata.session when the new write carries none", async () => {
+    // The start-phase working-ensure carries NO session; it must not drop the prior one.
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    // Turn 1 END establishes the session on the note.
+    await t.writeThread({
+      channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
+      input: "one", output: "reply one", started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z", phase: "end",
+      session: "sess-ESTABLISHED",
+    });
+    expect(stored!.metadata.session).toBe("sess-ESTABLISHED");
+
+    // Turn 2 START-ENSURE carries NO session — the upsert must PRESERVE the prior one.
+    await t.writeThread({
+      channel: "eng", name: "eng", mode: "single-threaded", status: "working",
+      input: "two", output: "", started_at: "2026-06-18T08:00:00.000Z",
+      ended_at: "2026-06-18T08:00:00.000Z", phase: "start",
+    });
+    expect(stored!.metadata.session).toBe("sess-ESTABLISHED"); // preserved, not dropped.
+  });
+
+  test("readThreadSession() round-trips the stored session (the pre-turn resume read)", async () => {
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    const gets: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        gets.push(decodeURIComponent(u));
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    // Before any turn: no note → undefined (the first-turn create path).
+    expect(await t.readThreadSession("eng", "eng")).toBeUndefined();
+
+    // Write a thread note carrying a session…
+    await t.writeThread({
+      channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
+      input: "x", output: "y", started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z", phase: "end",
+      session: "sess-ROUNDTRIP",
+    });
+
+    // …readThreadSession reads it back off the DETERMINISTIC single-threaded path.
+    expect(await t.readThreadSession("eng", "eng")).toBe("sess-ROUNDTRIP");
+    expect(gets.some((g) => g.includes("/api/notes/Threads/eng/eng"))).toBe(true);
+  });
 });
 
 describe("VaultTransport — loadTranscript (read the durable store)", () => {

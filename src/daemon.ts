@@ -124,7 +124,6 @@ import {
   AttachedQueueRegistry,
   type AttachedQueueStore,
 } from "./backends/attached-queue.ts";
-import { AgentSessionState } from "./agent-session-state.ts";
 import { readPersistedSpec, sessionWorkspace } from "./spawn-agent.ts";
 import { normalizeChannel } from "./sandbox/types.ts";
 import { CredentialNotConfiguredError } from "./credentials.ts";
@@ -724,6 +723,9 @@ export function buildWriteThread(channels: Map<string, Channel>): WriteThread {
       started_at: thread.started_at,
       ended_at: thread.ended_at,
       ...(thread.usage ? { usage: thread.usage } : {}),
+      // The Claude session UUID — persisted to the note's `metadata.session` (thread≡session
+      // record) so the next turn `--resume`s it (read back via `readThreadSession`).
+      ...(thread.session ? { session: thread.session } : {}),
       // Forward the per-turn thread id + same-turn flag + lifecycle phase to the transport.
       // These are LOAD-BEARING (not optional decoration):
       //  - threadId — multi-threaded targets the SAME per-fire note across the start-ensure,
@@ -783,11 +785,32 @@ export function buildWriteCallback(channels: Map<string, Channel>): WriteCallbac
 }
 
 /**
+ * Build the {@link ProgrammaticAgentRegistry}'s pre-turn session read — the thread≡session
+ * record. Resolve the channel's transport from the live `channels` map and read the
+ * persisted Claude session UUID off its deterministic `#agent/thread` note (only the
+ * VaultTransport implements `readThreadSession`; telegram/http-ui omit it → undefined →
+ * the turn creates a fresh session). The registry calls this BEFORE a single-threaded turn
+ * so the turn `--resume`s its prior conversation. Mirrors {@link buildWriteThread}.
+ */
+export function buildReadSession(
+  channels: Map<string, Channel>,
+): (channel: string, name: string) => Promise<string | undefined> {
+  return async (channel, name) => {
+    const ch = channels.get(channel);
+    if (!ch?.transport.readThreadSession) return undefined;
+    return ch.transport.readThreadSession(channel, name);
+  };
+}
+
+/**
  * Build the REAL programmatic-agent registry — the {@link ProgrammaticBackend}
- * wired to the env-resolved spawn deps + the per-channel session-id store, plus the
- * outbound-write callback over the live `channels`. Lazily defaulted by
- * `createFetchHandler` and constructed explicitly by `main` (so the same instance
- * the routes use is the one the transports' `contextFor` enqueues onto).
+ * wired to the env-resolved spawn deps, plus the outbound-write + thread-note +
+ * session-read seams over the live `channels`. The session UUID lives on the durable
+ * `#agent/thread` note (`metadata.session`) — read pre-turn via `readSession`
+ * ({@link buildReadSession}) and persisted post-turn via `writeThread` — there is no
+ * separate session store. Lazily defaulted by `createFetchHandler` and constructed
+ * explicitly by `main` (so the same instance the routes use is the one the transports'
+ * `contextFor` enqueues onto).
  *
  * Best-effort on the backend deps: if the operator token / hub origin can't be
  * resolved yet, the backend still constructs (its mint happens per-turn and will
@@ -798,8 +821,6 @@ export function createDefaultProgrammaticRegistry(
   channels: Map<string, Channel>,
   onTurnEvent?: TurnEventSink,
 ): ProgrammaticAgentRegistry {
-  const stateDir = defaultStateDir();
-  const sessionState = new AgentSessionState({ stateDir });
   // Resolve the spawn deps lazily/defensively — a missing operator token must not
   // crash boot (the interactive path resolves per-spawn too). We read what we can
   // and let the per-turn mint surface any gap as a failure-value.
@@ -812,7 +833,6 @@ export function createDefaultProgrammaticRegistry(
       ...(deps.vaultUrl ? { vaultUrl: deps.vaultUrl } : {}),
       sessionsDir: deps.sessionsDir,
       runtimeReadOnly: deps.runtimeReadOnly,
-      sessionState,
       spawnFn: realProgrammaticSpawn(),
       ...(deps.claudeBin ? { claudeBin: deps.claudeBin } : {}),
       // 4b: the hub grants client — reuses the manager bearer (same operator token
@@ -830,7 +850,6 @@ export function createDefaultProgrammaticRegistry(
       managerBearer: "",
       sessionsDir: defaultSessionsDir(),
       runtimeReadOnly: [],
-      sessionState,
       spawnFn: realProgrammaticSpawn(),
     };
   }
@@ -840,6 +859,7 @@ export function createDefaultProgrammaticRegistry(
     writeOutbound: buildWriteOutbound(channels),
     writeThread: buildWriteThread(channels),
     writeCallback: buildWriteCallback(channels),
+    readSession: buildReadSession(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }
@@ -955,9 +975,10 @@ export async function listChannelAgents(channelQueue: AttachedQueueRegistry): Pr
  * the sessions dir, read each `spec.json`, and re-register every spec whose
  * `backend === "programmatic"` into the live registry — so a programmatic agent,
  * which has no resident process to survive a restart, resumes routing inbound to an
- * on-demand turn after a daemon restart. The persisted session_id (a separate store)
- * makes that next turn `--resume` the prior conversation, so no message is lost in
- * the restart window beyond the normal inbound-trigger durability.
+ * on-demand turn after a daemon restart. The session UUID lives on the `#agent/thread`
+ * note (`metadata.session`), so that next turn reads it back + `--resume`s the prior
+ * conversation, so no message is lost in the restart window beyond the normal
+ * inbound-trigger durability.
  *
  * INTERACTIVE specs are SKIPPED — their tmux sessions survive a daemon restart on
  * their own (or are restarted via the supervisor), and re-registering them here
@@ -3110,8 +3131,9 @@ function main(): void {
   // resident process, so it doesn't survive a daemon restart as a tmux session
   // would — but its spec.json (carrying `backend: "programmatic"`) persists. Scan
   // the per-session workspaces and re-register every programmatic spec so inbound
-  // for its channel resumes routing to an on-demand turn (the persisted session_id
-  // makes the next turn `--resume` the prior conversation — no deaf problem). Best-
+  // for its channel resumes routing to an on-demand turn (the session UUID on the
+  // `#agent/thread` note makes the next turn `--resume` the prior conversation — no
+  // deaf problem). Best-
   // effort: a single bad spec is logged and skipped. The live `channels` map gates
   // it: only a spec whose wake channel is a configured channel is re-registered, so
   // a leaked/orphaned spec dir can't resurrect a phantom agent (agent#75).

@@ -24,7 +24,14 @@ import {
   type TurnEventSink,
   type TurnLifecycleEvent,
 } from "./registry.ts";
-import type { AgentBackend, AgentHandle, AgentStatus, DeliverResult, InterimSink } from "./types.ts";
+import type {
+  AgentBackend,
+  AgentHandle,
+  AgentStatus,
+  DeliverResult,
+  InterimSink,
+  TurnSession,
+} from "./types.ts";
 import type { AgentSpec } from "../sandbox/types.ts";
 
 /** A deferred promise — resolve it externally to release a gated turn. */
@@ -43,8 +50,8 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
  */
 class FakeBackend implements AgentBackend {
   readonly kind = "programmatic";
-  /** Per-call records, in arrival order. */
-  readonly calls: { channel: string; message: string }[] = [];
+  /** Per-call records, in arrival order — including the caller-resolved {@link TurnSession}. */
+  readonly calls: { channel: string; message: string; session: TurnSession }[] = [];
   /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial). */
   maxConcurrent = 0;
   private inFlight = 0;
@@ -63,8 +70,13 @@ class FakeBackend implements AgentBackend {
     return { backend: this.kind, channel: spec.channels[0] as string, name: spec.name, spec };
   }
 
-  async deliver(handle: AgentHandle, message: string, onInterim?: InterimSink): Promise<DeliverResult> {
-    this.calls.push({ channel: handle.channel, message });
+  async deliver(
+    handle: AgentHandle,
+    message: string,
+    session: TurnSession,
+    onInterim?: InterimSink,
+  ): Promise<DeliverResult> {
+    this.calls.push({ channel: handle.channel, message, session });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);
     try {
@@ -209,7 +221,12 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
     expect(reg.enqueue("eng", { content: "hello", inReplyTo: "note-1" })).toBe(true);
     await until(() => rec.calls.length === 1);
 
-    expect(backend.calls).toEqual([{ channel: "eng", message: "hello" }]);
+    expect(backend.calls).toHaveLength(1);
+    expect(backend.calls[0]!.channel).toBe("eng");
+    expect(backend.calls[0]!.message).toBe("hello");
+    // No readSession wired → a single-threaded turn CREATES a fresh session (resume:false).
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
     expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:hello", inReplyTo: "note-1" }]);
   });
 
@@ -498,6 +515,141 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(threads.ends()[1]!.sameTurn).toBe(true);
     // Transient → the outbound was retried the full budget (1 initial + OUTBOUND_MAX_RETRIES).
     expect(outboundAttempts).toBe(1 + OUTBOUND_MAX_RETRIES);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — thread≡session (the daemon owns the uuid)", () => {
+  /** A recorder readSession — captures every (channel, name) consulted; returns `prior`. */
+  function sessionReader(prior?: string): {
+    calls: { channel: string; name: string }[];
+    fn: (channel: string, name: string) => Promise<string | undefined>;
+  } {
+    const calls: { channel: string; name: string }[] = [];
+    const fn = async (channel: string, name: string) => {
+      calls.push({ channel, name });
+      return prior;
+    };
+    return { calls, fn };
+  }
+
+  test("single-threaded with a PRIOR session: consults readSession + passes {resume:true} to deliver", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reader = sessionReader("11111111-1111-4111-8111-111111111111");
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specFor("eng")); // single-threaded (default).
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => backend.calls.length === 1);
+
+    // readSession was consulted with the channel + the def name (the deterministic key).
+    expect(reader.calls).toEqual([{ channel: "eng", name: "eng" }]);
+    // A prior session → RESUME it (continue the conversation), with that exact id.
+    expect(backend.calls[0]!.session).toEqual({
+      id: "11111111-1111-4111-8111-111111111111",
+      resume: true,
+    });
+    // The thread note carries the session (the persisted thread≡session record).
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.session).toBe("11111111-1111-4111-8111-111111111111");
+    // The start-ensure also carried it (so a turn that never completes is still resumable).
+    expect(threads.starts()[0]!.session).toBe("11111111-1111-4111-8111-111111111111");
+  });
+
+  test("single-threaded with NO prior session: consults readSession + passes {resume:false} + a fresh uuid", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reader = sessionReader(undefined); // no prior — first turn.
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => backend.calls.length === 1);
+
+    expect(reader.calls).toEqual([{ channel: "eng", name: "eng" }]);
+    // No prior → CREATE a fresh session with a generated uuid (--session-id, not --resume).
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+    // The fresh uuid is the one persisted onto the thread note (so turn 2 can resume it).
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.session).toBe(backend.calls[0]!.session.id);
+  });
+
+  test("multi-threaded NEVER consults readSession + ALWAYS passes {resume:false} with a fresh uuid", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reader = sessionReader("should-never-be-used");
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specMultiThreaded("digest", "digest"));
+
+    // Two fires — each must mint its OWN fresh session, never resume.
+    reg.enqueue("digest", { content: "fire one" });
+    await until(() => backend.calls.length === 1);
+    reg.enqueue("digest", { content: "fire two" });
+    await until(() => backend.calls.length === 2);
+
+    // readSession is NEVER consulted for a multi-threaded agent (each fire is a fresh thread).
+    expect(reader.calls).toHaveLength(0);
+    // Both fires CREATE fresh sessions (resume:false), with DISTINCT uuids.
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[1]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(backend.calls[1]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(backend.calls[0]!.session.id).not.toBe(backend.calls[1]!.session.id);
+    // Each per-fire thread note carries its own fire's session.
+    await until(() => threads.ends().length === 2);
+    expect(threads.ends()[0]!.session).toBe(backend.calls[0]!.session.id);
+    expect(threads.ends()[1]!.session).toBe(backend.calls[1]!.session.id);
+  });
+
+  test("no readSession wired: a single-threaded turn still CREATES a fresh session", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => backend.calls.length === 1);
+
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.session).toBe(backend.calls[0]!.session.id);
+  });
+
+  test("the captured backend sessionId (Claude's echoed id) is what lands on the thread note", async () => {
+    const backend = new FakeBackend();
+    // The backend echoes a DIFFERENT id than the one we passed (Claude's authoritative id).
+    backend.resultFor = (m) => ({ ok: true, reply: "reply:" + m, sessionId: "echoed-by-claude-id" });
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hello" });
+    await until(() => threads.ends().length === 1);
+
+    // The END record prefers Claude's echoed id (result.sessionId) over the uuid we passed.
+    expect(threads.ends()[0]!.session).toBe("echoed-by-claude-id");
   });
 });
 

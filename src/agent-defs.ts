@@ -58,6 +58,15 @@ import {
 
 const DEFAULT_DEF_VAULT_URL = "http://127.0.0.1:1940";
 
+/**
+ * Page cap for a def-vault list. The poll's removed-def diff now DEREGISTERS (a
+ * destructive teardown), so a list that hits this cap is treated as possibly-
+ * truncated — NOT a confident set — and the removal diff is skipped that pass (see
+ * {@link AgentDefRegistry.loadAll}'s truncation guard). 500 comfortably exceeds any
+ * realistic agent count; it exists so the teardown is safe by construction.
+ */
+const DEF_LIST_LIMIT = 500;
+
 /** A slug: alphanumeric, dash, underscore — the agent name + wake-channel key. */
 const NAME_SLUG_RE = /^[a-zA-Z0-9_-]+$/;
 
@@ -488,7 +497,7 @@ export class DefVaultClient {
   async listDefNotes(opts?: { limit?: number }): Promise<
     Array<{ id: string; content?: string; metadata?: Record<string, unknown> }>
   > {
-    const limit = opts?.limit ?? 500;
+    const limit = opts?.limit ?? DEF_LIST_LIMIT;
     const params = new URLSearchParams();
     params.set("tag", AGENT_DEFINITION_TAG); // URLSearchParams encodes `#`→`%23`, `/`→`%2F`
     params.set("include_content", "true");
@@ -1035,32 +1044,53 @@ export class AgentDefRegistry {
    * failure) is logged and never aborts the others, so one bad def can't sink the set.
    * Returns the count successfully instantiated.
    *
-   * Grant-GC (#96): after a SUCCESSFUL list (a confident read of the vault's whole def
-   * set), diff the prior-known def set against it — any note that was present and is now
-   * GONE has had its `#agent/definition` note deleted, so its grants are pruned ALL
-   * (`reconcileGrants(agent, [])`). A list FAILURE deliberately skips the diff (we
-   * `continue` BEFORE touching the prior set) so a transient vault outage never presents
-   * an empty current set that would nuke every agent's grants (safety guard).
+   * Removed-def convergence: after a CONFIDENT read (a successful, non-truncated list of
+   * the vault's whole def set), diff the prior-known def set against it — any note that
+   * was present and is now GONE has had its `#agent/definition` note deleted, so the agent
+   * is TORN DOWN (deregistered + wake channel removed) and its grants pruned ALL
+   * (`reconcileGrants(agent, [])`). This is the ONLY automatic path for a deletion — there
+   * is no vault `deleted` trigger (see {@link pruneRemovedDefs}). Two guards keep the
+   * teardown safe: a list FAILURE skips the diff (we `continue` BEFORE touching the prior
+   * set) and a TRUNCATED list (>= the page cap) skips it too, so neither a transient vault
+   * outage nor a partial page presents an under-set that wrongly tears down live agents.
    */
   async loadAll(): Promise<number> {
     let count = 0;
     for (const [vault, client] of this.clients) {
       let notes: Awaited<ReturnType<DefVaultClient["listDefNotes"]>>;
       try {
-        notes = await client.listDefNotes();
+        notes = await client.listDefNotes({ limit: DEF_LIST_LIMIT });
       } catch (err) {
         console.error(`agent-defs: listing defs from vault "${vault}" failed (continuing): ${(err as Error).message}`);
         // CONFIDENT-SET GUARD: a failed list is NOT a confident read — leave the prior
         // seen set untouched (no removed-def diff) so a hub/vault blip can't prune grants.
         continue;
       }
-      // The list succeeded → this IS a confident read. Detect removed defs by diffing
-      // the prior seen set (noteId→name) against the ids present now, BEFORE we mutate it.
-      const presentIds = new Set(notes.map((n) => n.id));
-      await this.pruneRemovedDefs(vault, presentIds);
-      // Rebuild the seen set from this confident read (carry-forward last-known names for
-      // notes that fail to parse, so a transient parse error doesn't drop them).
-      this.rebuildSeenDefs(vault, notes);
+      // TRUNCATION GUARD (the second way a read is non-confident): a list at the page cap
+      // may be partial. The removed-def diff now performs a DESTRUCTIVE teardown
+      // (pruneRemovedDefs deregisters), so a truncated read that omits the tail must NOT be
+      // mistaken for deletions. Skip the diff + the seen-set rebuild (rebuilding from a
+      // truncated list would drop the omitted tail and mis-flag it removed next pass); still
+      // (re)instantiate what we got — instantiate only adds/updates, never tears down.
+      // Practically unreachable at today's agent counts; the guard makes the teardown safe
+      // by construction.
+      // `< cap` ⇒ the result fit on one page → it cannot be truncated; `>= cap` is the
+      // (possibly-)truncated case the `else` defers.
+      const confident = notes.length < DEF_LIST_LIMIT;
+      if (confident) {
+        // Detect removed defs by diffing the prior seen set (noteId→name) against the ids
+        // present now, BEFORE we mutate it.
+        const presentIds = new Set(notes.map((n) => n.id));
+        await this.pruneRemovedDefs(vault, presentIds);
+        // Rebuild the seen set from this confident read (carry-forward last-known names for
+        // notes that fail to parse, so a transient parse error doesn't drop them).
+        this.rebuildSeenDefs(vault, notes);
+      } else {
+        console.warn(
+          `agent-defs: def list for "${vault}" returned ${notes.length} notes (>= the ${DEF_LIST_LIMIT} ` +
+            `page cap) — skipping the removed-def reconcile this pass to avoid a truncated-read teardown.`,
+        );
+      }
       for (const note of notes) {
         if (await this.instantiate(vault, note)) count++;
       }
@@ -1070,17 +1100,29 @@ export class AgentDefRegistry {
 
   /**
    * Reconcile every def that was in the prior seen set for `vault` but is NOT in
-   * `presentIds` (its note was deleted) — `reconcileGrants(agent, [])` prunes ALL its
-   * grants so a deleted def doesn't orphan live approved rows. Best-effort + no-op
-   * without a grants client. Called ONLY with a confident current id set (a successful
-   * list); never on a list failure (see {@link loadAll}).
+   * `presentIds` (its note was deleted) — tear the agent DOWN (drop the live
+   * programmatic registration + the wake channel) AND `reconcileGrants(agent, [])`
+   * prune ALL its grants. Best-effort throughout; grant cleanup is a no-op without a
+   * grants client. Called ONLY with a confident current id set (a successful,
+   * non-truncated list); never on a list failure or a truncated read (see {@link loadAll}).
+   *
+   * Why the poll MUST deregister (not just prune grants): there is NO vault `deleted`
+   * trigger — the hub's connection engine maps only `note.created`/`note.updated` to
+   * vault-trigger verbs (parachute-hub `admin-connections` `eventToVaultEvents`), so a
+   * def deleted out-of-band NEVER fires the reactive `reload(...,"deleted")` teardown.
+   * This poll is the ONLY automatic convergence path for a deletion, so it must do the
+   * SAME full teardown {@link confirmedRemoval} does, or a deleted agent stays live (an
+   * orphan: gone from the vault, still answering messages) until the daemon restarts.
    */
   private async pruneRemovedDefs(vault: string, presentIds: Set<string>): Promise<void> {
     const prior = this.seenDefs.get(vault);
     if (!prior) return; // first confident read of this vault — nothing to compare against.
     for (const [noteId, name] of prior) {
       if (presentIds.has(noteId)) continue; // still present — not a removal.
-      // Confirmed removal: the def note is gone from a confident vault read.
+      // Confirmed removal: the def note is gone from a confident vault read. Tear the
+      // agent + wake channel down, then prune its grants. (The seen-set entry is cleared
+      // by the `rebuildSeenDefs` that runs right after this in `loadAll`.)
+      await this.deregisterByNote(vault, noteId);
       await this.reconcileForRemovedAgent(name);
     }
   }

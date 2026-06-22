@@ -3159,9 +3159,11 @@ function main(): void {
     console.log(
       `parachute-agent: vault-native agent defs — ${n} instantiated from ${bindings.length} def-vault(s).`,
     );
-    // Poll fallback (every 60s) for vaults without trigger support: re-load all defs
-    // so a created/updated/deleted note converges even with no webhook. The reload
-    // webhook is the fast path; this is the safety net. `unref` so it never holds the
+    // Poll fallback (every 60s): re-load all defs so a created/updated/deleted note
+    // converges even with no webhook. The created/updated reload webhook is the fast path;
+    // this is the safety net — AND the ONLY automatic path for a DELETE (there is no vault
+    // `deleted` trigger, so a def removed out-of-band converges only here; loadAll's
+    // removed-def diff deregisters the orphaned agent). `unref` so it never holds the
     // process open. Cheap + idempotent (re-instantiate replaces in place).
     const interval = parseInt(process.env.PARACHUTE_AGENT_DEF_POLL_MS ?? "", 10) || 60_000;
     agentDefPoll = setInterval(() => {

@@ -803,6 +803,24 @@ export function buildReadSession(
 }
 
 /**
+ * Build the {@link ProgrammaticAgentRegistry}'s session CLEAR — the per-agent restart /
+ * reset. Resolve the channel's transport and wipe the persisted session on its
+ * deterministic `#agent/thread` note (only the VaultTransport implements
+ * `clearThreadSession`; telegram/http-ui omit it → a clean no-op). `resetSession` calls
+ * this so the agent's NEXT turn finds no session and starts a fresh claude conversation.
+ * Mirrors {@link buildReadSession}.
+ */
+export function buildClearSession(
+  channels: Map<string, Channel>,
+): (channel: string, name: string) => Promise<void> {
+  return async (channel, name) => {
+    const ch = channels.get(channel);
+    if (!ch?.transport.clearThreadSession) return;
+    await ch.transport.clearThreadSession(channel, name);
+  };
+}
+
+/**
  * Build the REAL programmatic-agent registry — the {@link ProgrammaticBackend}
  * wired to the env-resolved spawn deps, plus the outbound-write + thread-note +
  * session-read seams over the live `channels`. The session UUID lives on the durable
@@ -860,6 +878,7 @@ export function createDefaultProgrammaticRegistry(
     writeThread: buildWriteThread(channels),
     writeCallback: buildWriteCallback(channels),
     readSession: buildReadSession(channels),
+    clearSession: buildClearSession(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }

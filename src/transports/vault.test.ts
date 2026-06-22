@@ -895,6 +895,79 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(await t.readThreadSession("eng", "eng")).toBe("sess-ROUNDTRIP");
     expect(gets.some((g) => g.includes("/api/notes/Threads/eng/eng"))).toBe(true);
   });
+
+  test("clearThreadSession() wipes the session (PATCH session:\"\", force) → readThreadSession undefined (the per-agent reset)", async () => {
+    // The vault: a stateful note whose metadata is replaced by each PATCH (mirrors the real
+    // PATCH-merge for the fields we send). readThreadSession's truthy guard treats "" as none.
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    const patches: { metadata: Record<string, unknown>; force?: boolean }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as {
+          metadata: Record<string, string>;
+          content?: string;
+          force?: boolean;
+        };
+        patches.push({ metadata: body.metadata, force: body.force });
+        // Merge the PATCHed metadata over the prior (the vault upserts field-by-field).
+        stored = { metadata: { ...(stored?.metadata ?? {}), ...body.metadata }, content: body.content ?? stored?.content ?? "" };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    // Establish a session, then RESET it.
+    await t.writeThread({
+      channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
+      input: "x", output: "y", started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z", phase: "end", session: "sess-TO-CLEAR",
+    });
+    expect(await t.readThreadSession("eng", "eng")).toBe("sess-TO-CLEAR");
+
+    await t.clearThreadSession("eng", "eng");
+    // The clear PATCH wrote session:"" with force (the vault mutation precondition).
+    const clearPatch = patches[patches.length - 1]!;
+    expect(clearPatch.metadata.session).toBe("");
+    expect(clearPatch.force).toBe(true);
+    // …and readThreadSession now reports NO session (the "" guard) → next turn starts fresh.
+    expect(await t.readThreadSession("eng", "eng")).toBeUndefined();
+  });
+
+  test("clearThreadSession() is a no-op when no thread note exists yet (404)", async () => {
+    let patched = false;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
+        patched = true;
+        return new Response("not found", { status: 404 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    // Must NOT throw on a 404 (no thread yet = already fresh).
+    await t.clearThreadSession("eng", "eng");
+    expect(patched).toBe(true); // it tried (and tolerated the 404).
+  });
+
+  test("clearThreadSession() throws on a non-ok, non-404 vault response", async () => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
+        return new Response("boom", { status: 500 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await expect(t.clearThreadSession("eng", "eng")).rejects.toThrow(/clear thread session failed/);
+  });
 });
 
 describe("VaultTransport — loadTranscript (read the durable store)", () => {

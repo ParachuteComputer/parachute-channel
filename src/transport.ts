@@ -216,6 +216,13 @@ export interface Transport {
    */
   readThreadSession?(channel: string, name: string): Promise<string | undefined>;
   /**
+   * Optional: CLEAR the persisted session on a single-threaded agent's `#agent/thread`
+   * note so its next turn starts a fresh Claude conversation (the per-agent restart /
+   * reset). Only a durable transport (the VaultTransport) implements it; transports
+   * without a durable thread store (telegram) omit it.
+   */
+  clearThreadSession?(channel: string, name: string): Promise<void>;
+  /**
    * Optional: write an agent-to-agent CALLBACK as an INBOUND note on THIS channel (the
    * "reply_to" substrate). A recipient agent's drain, on turn completion, calls this on the
    * SENDER's channel transport to wake the sender with a completion notification. The note

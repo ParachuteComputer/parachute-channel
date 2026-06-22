@@ -1086,6 +1086,23 @@ export class VaultTransport implements Transport {
     return typeof s === "string" && s ? s : undefined;
   }
 
+  /** Clear a single-threaded agent's persisted session so its next turn starts a
+   *  fresh Claude conversation (the per-agent restart). No-op if no thread note yet. */
+  async clearThreadSession(channel: string, name: string): Promise<void> {
+    const path = this.singleThreadedPath(channel, name);
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(path)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
+      body: JSON.stringify({ metadata: { session: "" }, force: true }),
+    });
+    if (res.status === 404) return; // no thread yet = already fresh
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`vault transport: clear thread session failed (${res.status}) ${detail}`.trim());
+    }
+  }
+
   // react / edit / download: vault has no reactions; v1 is reply-only. Omitted.
 
   // -------------------------------------------------------------------------

@@ -313,7 +313,7 @@ describe("inbound for a programmatic channel → deliver → outbound note", () 
     }
   });
 
-  test("ok:false → no outbound note + no crash/loop", async () => {
+  test("ok:false → user-facing failure note + no crash/loop", async () => {
     const backend = new FakeBackend();
     backend.resultFor = () => ({ ok: false, error: "mint refused" });
     const rec = recorder();
@@ -328,10 +328,12 @@ describe("inbound for a programmatic channel → deliver → outbound note", () 
     const { srv, base } = buildServer({ channels, programmatic, deliveryState });
     try {
       await inbound(base, "eng", "note-1", "do it");
-      await until(() => backend.calls.length === 1);
+      await until(() => rec.calls.length === 1);
       await new Promise<void>((r) => setTimeout(r, 5));
       expect(backend.calls).toHaveLength(1);
-      expect(rec.calls).toHaveLength(0);
+      // A failed turn now posts a single user-facing failure note (carrying the reason).
+      expect(rec.calls).toHaveLength(1);
+      expect(rec.calls[0]!.reply).toContain("mint refused");
     } finally {
       srv.stop(true);
     }

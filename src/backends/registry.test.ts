@@ -236,7 +236,7 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
     expect(rec.calls).toHaveLength(0);
   });
 
-  test("an ok:false turn writes NO note + does not crash/loop", async () => {
+  test("an ok:false turn writes a user-facing FAILURE note + does not crash/loop", async () => {
     const backend = new FakeBackend();
     backend.resultFor = () => ({ ok: false, error: "mint refused" });
     const rec = recorder();
@@ -244,11 +244,13 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
     await reg.register(specFor("eng"));
 
     reg.enqueue("eng", { content: "do it" });
-    await until(() => backend.calls.length === 1);
+    await until(() => rec.calls.length === 1);
     await new Promise<void>((r) => setTimeout(r, 5));
-    // Exactly ONE turn ran (no retry loop), and no note was written.
+    // Exactly ONE turn ran (the backend owns turn-retry, not the drain), and the drain
+    // posted a SINGLE user-facing failure note carrying the reason (no silent no-reply).
     expect(backend.calls).toHaveLength(1);
-    expect(rec.calls).toHaveLength(0);
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.reply).toContain("mint refused");
   });
 
   test("a deliver() that THROWS is caught — the worker survives + drains the rest", async () => {
@@ -260,10 +262,13 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
 
     reg.enqueue("eng", { content: "first (throws)" });
     reg.enqueue("eng", { content: "second (ok)" });
-    await until(() => rec.calls.length === 1);
-    // Both turns ran; the throw on the first didn't strand the second.
+    await until(() => rec.calls.length === 2);
+    // Both turns ran; the throw on the first didn't strand the second. The caught throw
+    // posts a user-facing failure note (carrying the reason); the second succeeds normally.
     expect(backend.calls.map((c) => c.message)).toEqual(["first (throws)", "second (ok)"]);
-    expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:second (ok)" }]);
+    expect(rec.calls).toHaveLength(2);
+    expect(rec.calls[0]!.reply).toContain("surprise throw");
+    expect(rec.calls[1]!).toEqual({ channel: "eng", reply: "reply:second (ok)" });
   });
 });
 
@@ -401,8 +406,9 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(threads.ends()[0]!.mode).toBe("multi-threaded");
     expect(threads.ends()[0]!.status).toBe("error");
     expect(threads.ends()[0]!.output).toBe("mint refused");
-    // No outbound note for a failed turn (unchanged behavior).
-    expect(rec.calls).toHaveLength(0);
+    // A user-facing failure note IS now written for a failed turn (carries the reason).
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.reply).toContain("mint refused");
   });
 
   test("a FAILED SINGLE-THREADED turn ALSO materializes an #agent/thread note with status:error (substantiates BOTH modes)", async () => {
@@ -424,8 +430,9 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(threads.ends()[0]!.name).toBe("eng");
     expect(threads.ends()[0]!.status).toBe("error");
     expect(threads.ends()[0]!.output).toBe("mint refused");
-    // No outbound note for a failed turn (unchanged behavior).
-    expect(rec.calls).toHaveLength(0);
+    // A user-facing failure note IS now written for a failed turn (carries the reason).
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.reply).toContain("mint refused");
   });
 
   test("a turn with an empty reply STILL materializes a thread note (status ok, empty output)", async () => {
@@ -698,11 +705,12 @@ describe("ProgrammaticAgentRegistry — streaming turn view (onTurnEvent)", () =
     await reg.register(specFor("eng"));
 
     reg.enqueue("eng", { content: "x" });
-    await until(() => turns.events.some((e) => e.event.kind === "error"));
+    await until(() => rec.calls.length === 1);
 
     expect(turns.events).toEqual([{ channel: "eng", event: { kind: "error", error: "mint refused" } }]);
-    // No outbound note for a failed turn.
-    expect(rec.calls).toHaveLength(0);
+    // The failed turn ALSO posts a user-facing failure note (carrying the reason).
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.reply).toContain("mint refused");
   });
 
   test("a backend THROW also emits 'error' (the defensive catch resolves the live view)", async () => {
@@ -1082,7 +1090,10 @@ describe("ProgrammaticAgentRegistry — agent-to-agent callbacks (reply_to)", ()
     await until(() => cb.calls.length === 1);
     await new Promise<void>((r) => setTimeout(r, 5));
     expect(cb.calls).toHaveLength(1);
-    expect(out.calls).toHaveLength(0); // an error turn writes no outbound,
+    // An error turn now posts a user-facing failure note to the worker's own channel
+    // (in addition to the orchestrator callback) — carrying the reason.
+    expect(out.calls).toHaveLength(1);
+    expect(out.calls[0]!.reply).toContain("mint refused");
     const { meta, content } = cb.calls[0]!;
     expect(meta.status).toBe("error"); // but the orchestrator still learns it failed.
     expect(content).toContain("error");

@@ -27,6 +27,9 @@ import {
   ProgrammaticBackend,
   buildProgrammaticClaudeArgs,
   PROGRAMMATIC_BACKEND_KIND,
+  isTransientTurnError,
+  TURN_MAX_ATTEMPTS,
+  TURN_RETRY_BACKOFF_MS,
   type ProgrammaticBackendDeps,
   type ProgrammaticSpawnFn,
 } from "./programmatic.ts";
@@ -1088,5 +1091,105 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
     const handle = await backend.start(specWithVault("eng"));
     await backend.deliver(handle, "hi");
     expect(Object.keys(readMcpServers("eng"))).toEqual([vaultEntryKey("default")]);
+  });
+});
+
+describe("ProgrammaticBackend.deliver — transient-error retry with incremental backoff", () => {
+  const transientResult = (sid: string, msg: string) =>
+    ndjson(
+      { type: "system", subtype: "init", session_id: sid, apiKeySource: "none" },
+      { type: "result", subtype: "error_during_execution", is_error: true, result: msg, session_id: sid },
+    );
+
+  test("retries a TRANSIENT turn error (backoff), then succeeds", async () => {
+    mkDirs("retry-ok");
+    const sleeps: number[] = [];
+    const { fn, calls } = sequencedSpawn([
+      transientResult("s1", "API Error: 529 Overloaded. Try again."),
+      successTurn("s2", "recovered"),
+    ]);
+    const backend = new ProgrammaticBackend(
+      baseDeps(fn, {
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+        },
+      }),
+    );
+    const handle = await backend.start(specWithVault());
+    const result = await backend.deliver(handle, "go");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.reply).toBe("recovered");
+    expect(calls.length).toBe(2); // one retry
+    expect(sleeps).toHaveLength(1); // one backoff
+    expect(sleeps[0]).toBe(TURN_RETRY_BACKOFF_MS[0]); // the first (incremental) interval
+  });
+
+  test("does NOT retry a non-transient turn error (fails fast, no sleep)", async () => {
+    mkDirs("retry-no");
+    const sleeps: number[] = [];
+    const { fn, calls } = recordingSpawn({
+      stdout: transientResult("s", "401 unauthorized: invalid token"),
+    });
+    const backend = new ProgrammaticBackend(
+      baseDeps(fn, {
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+        },
+      }),
+    );
+    const handle = await backend.start(specWithVault());
+    const result = await backend.deliver(handle, "go");
+    expect(result.ok).toBe(false);
+    expect(calls.length).toBe(1); // no retry
+    expect(sleeps.length).toBe(0);
+  });
+
+  test("a persistently TRANSIENT error exhausts the retries → { ok:false }", async () => {
+    mkDirs("retry-exhaust");
+    const sleeps: number[] = [];
+    const { fn, calls } = recordingSpawn({
+      stdout: transientResult("s", "API Error: 503 Service Unavailable"),
+    });
+    const backend = new ProgrammaticBackend(
+      baseDeps(fn, {
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+        },
+      }),
+    );
+    const handle = await backend.start(specWithVault());
+    const result = await backend.deliver(handle, "go");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("503");
+    expect(calls.length).toBe(TURN_MAX_ATTEMPTS); // all attempts used
+    expect(sleeps.length).toBe(TURN_MAX_ATTEMPTS - 1); // one backoff before each retry
+  });
+});
+
+describe("isTransientTurnError", () => {
+  test("transient upstream/network signals → true", () => {
+    for (const s of [
+      "API Error: 529 Overloaded",
+      "503 Service Unavailable",
+      "429 rate limit exceeded",
+      "Internal Server Error",
+      "Bad Gateway",
+      "ETIMEDOUT",
+      "socket hang up (ECONNRESET)",
+    ]) {
+      expect(isTransientTurnError(s)).toBe(true);
+    }
+  });
+
+  test("permanent/deterministic signals → false (no pointless retry)", () => {
+    for (const s of [
+      "401 unauthorized",
+      "400 bad request",
+      'no Claude credential for channel "x"',
+      "claude -p turn failed (subtype: error_max_turns)",
+      "tag_scope_violation",
+    ]) {
+      expect(isTransientTurnError(s)).toBe(false);
+    }
   });
 });

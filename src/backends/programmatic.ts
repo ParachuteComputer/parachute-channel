@@ -157,7 +157,46 @@ export interface ProgrammaticBackendDeps {
   claudeBin?: string;
   /** Optional ripgrep override threaded to the sandbox (macOS deny-path scan). */
   ripgrep?: { command: string; args?: string[] };
+  /**
+   * Sleep used by the turn-level transient-retry backoff. Injected so tests don't
+   * actually wait the backoff. Defaults to a real `setTimeout`-backed sleep.
+   */
+  sleepFn?: (ms: number) => Promise<void>;
 }
+
+/**
+ * Turn-level retry on TRANSIENT upstream errors (API 529/overload, 5xx, rate-limit,
+ * network). A 529 with no retry is exactly the "silent no-reply" a user hits under
+ * load; incremental backoff turns most of those into a delivered reply. The detector
+ * ({@link isTransientTurnError}) is conservative — a 4xx (auth/validation), a missing
+ * credential, or a deterministic subtype failure is NOT retried (it'd only burn time).
+ */
+export const TURN_MAX_ATTEMPTS = 3;
+/** Incremental backoff before each retry (ms); length = TURN_MAX_ATTEMPTS - 1. */
+export const TURN_RETRY_BACKOFF_MS: readonly number[] = [2_000, 5_000];
+
+/** Does this turn-failure reason look like a transient upstream error worth retrying? */
+export function isTransientTurnError(reason: string): boolean {
+  const r = reason.toLowerCase();
+  return (
+    /\b(429|500|502|503|504|529)\b/.test(reason) ||
+    r.includes("overloaded") ||
+    r.includes("rate limit") ||
+    r.includes("rate_limit") ||
+    r.includes("service unavailable") ||
+    r.includes("bad gateway") ||
+    r.includes("gateway time") ||
+    r.includes("internal server error") ||
+    r.includes("temporarily") ||
+    r.includes("timed out") ||
+    r.includes("timeout") ||
+    r.includes("etimedout") ||
+    r.includes("econnreset")
+  );
+}
+
+/** Default real sleep for the retry backoff (overridable via `deps.sleepFn` in tests). */
+const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Build the `claude -p` invocation argv (PRE-sandbox-wrap) for one turn.
@@ -496,16 +535,12 @@ export class ProgrammaticBackend implements AgentBackend {
       ...homeEnv,
     };
 
-    // Run the turn. A spawn/IO fault is a value (not a throw) — the daemon learns it.
-    // STREAM stdout incrementally (interim events for the live view) while draining
-    // stderr in parallel. The interim sink is best-effort + must not throw: wrap the
-    // caller's `onInterim` so a dead-stream error from the daemon's push can't abort
-    // the drain (which would strand the durable final-result parse). A no-sink turn
-    // passes a no-op, so the stream is still parsed incrementally with zero overhead
-    // beyond the (cheap) per-line dispatch.
-    let parsed;
-    let stderr: string;
-    let code: number;
+    // Run the turn, with a bounded retry on TRANSIENT upstream errors (API 529/overload,
+    // 5xx, rate-limit, network). The argv is fixed (built above with the turn-start
+    // `--resume` sid), so each attempt re-runs the SAME turn. STREAM stdout incrementally
+    // (interim events for the live view) while draining stderr in parallel; the interim
+    // sink is best-effort + must not throw. A spawn/IO fault is a value (not a throw); a
+    // non-transient failure or exhausted retries returns the failure for the daemon to learn.
     const safeInterim: InterimSink = (e) => {
       if (!onInterim) return;
       try {
@@ -514,59 +549,81 @@ export class ProgrammaticBackend implements AgentBackend {
         // A push to a closed SSE stream / a sink fault must never break the turn.
       }
     };
-    try {
-      const proc = this.deps.spawnFn(wrapped.argv, { env: launchEnv, cwd });
-      [parsed, stderr] = await Promise.all([
-        parseStreamJsonStream(proc.stdout, safeInterim),
-        drainStream(proc.stderr),
-      ]);
-      code = await proc.exited;
-    } catch (err) {
-      return { ok: false, error: `claude -p spawn failed: ${(err as Error).message}` };
-    }
+    const sleepFn = this.deps.sleepFn ?? realSleep;
+    for (let attempt = 1; attempt <= TURN_MAX_ATTEMPTS; attempt++) {
+      let parsed;
+      let stderr: string;
+      let code: number;
+      try {
+        const proc = this.deps.spawnFn(wrapped.argv, { env: launchEnv, cwd });
+        [parsed, stderr] = await Promise.all([
+          parseStreamJsonStream(proc.stdout, safeInterim),
+          drainStream(proc.stderr),
+        ]);
+        code = await proc.exited;
+      } catch (err) {
+        // A spawn/IO fault (ENOENT, resource) is a config/permanent class — not retried.
+        return { ok: false, error: `claude -p spawn failed: ${(err as Error).message}` };
+      }
 
-    // Persist the captured session id so the NEXT turn resumes it — even on a
-    // failed turn (a turn can fail AFTER establishing a session; the id is still
-    // the continuation handle). A blank id is a no-op in the store. SKIPPED for
-    // multi-threaded: in its fresh-per-fire form the returned session id is never
-    // persisted to the channel store (the next fire must start fresh — no resume, no
-    // persist; recording the minted id per thread is the deferred continuation increment).
-    if (!multiThreaded && parsed.sessionId) this.deps.sessionState.set(channel, parsed.sessionId);
+      if (parsed.success === true) {
+        // Persist the captured session id so the NEXT turn resumes it. SKIPPED for
+        // multi-threaded (each fire starts fresh — no resume, no persist). Blank id = no-op.
+        if (!multiThreaded && parsed.sessionId) this.deps.sessionState.set(channel, parsed.sessionId);
 
-    const usage: DeliverUsage | undefined = parsed.usage
-      ? {
-          ...(typeof parsed.usage.input_tokens === "number" ? { inputTokens: parsed.usage.input_tokens } : {}),
-          ...(typeof parsed.usage.output_tokens === "number" ? { outputTokens: parsed.usage.output_tokens } : {}),
-          ...(typeof parsed.totalCostUsd === "number" ? { totalCostUsd: parsed.totalCostUsd } : {}),
-        }
-      : typeof parsed.totalCostUsd === "number"
-        ? { totalCostUsd: parsed.totalCostUsd }
-        : undefined;
+        const usage: DeliverUsage | undefined = parsed.usage
+          ? {
+              ...(typeof parsed.usage.input_tokens === "number" ? { inputTokens: parsed.usage.input_tokens } : {}),
+              ...(typeof parsed.usage.output_tokens === "number" ? { outputTokens: parsed.usage.output_tokens } : {}),
+              ...(typeof parsed.totalCostUsd === "number" ? { totalCostUsd: parsed.totalCostUsd } : {}),
+            }
+          : typeof parsed.totalCostUsd === "number"
+            ? { totalCostUsd: parsed.totalCostUsd }
+            : undefined;
 
-    // FAILURE paths — all return a value, never throw:
-    //   - non-zero exit with no parseable success result;
-    //   - a result event with is_error / a non-success subtype;
-    //   - no result event at all (crashed/truncated turn).
-    if (parsed.success !== true) {
+        return {
+          ok: true,
+          reply: parsed.reply ?? "",
+          ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
+          ...(usage ? { usage } : {}),
+        };
+      }
+
+      // FAILURE — compute the reason (non-zero exit / is_error / non-success subtype /
+      // no result event), same precedence as before.
       const reason =
         parsed.errorMessage ??
         (parsed.subtype ? `claude -p turn failed (subtype: ${parsed.subtype})` : undefined) ??
         (code !== 0
           ? `claude -p exited ${code}${stderr.trim() ? `: ${stderr.trim().slice(0, 500)}` : ""}`
           : "claude -p produced no success result (no result event in output)");
+
+      // Retry ONLY a transient error, and only while attempts remain (incremental backoff).
+      if (attempt < TURN_MAX_ATTEMPTS && isTransientTurnError(reason)) {
+        const backoff =
+          TURN_RETRY_BACKOFF_MS[attempt - 1] ?? TURN_RETRY_BACKOFF_MS[TURN_RETRY_BACKOFF_MS.length - 1] ?? 5_000;
+        console.warn(
+          `parachute-agent: transient turn error for channel "${channel}" ` +
+            `(attempt ${attempt}/${TURN_MAX_ATTEMPTS}, retrying in ${backoff}ms): ${reason}`,
+        );
+        await sleepFn(backoff);
+        continue;
+      }
+      // Persist the session id even on a FINAL failure — a turn can fail AFTER
+      // establishing a session; the id is still the continuation handle for the next
+      // turn (matches the pre-retry behavior). SKIPPED for multi-threaded. NOT persisted
+      // on a retried attempt (the fixed argv re-resumes the turn-start sid each time).
+      if (!multiThreaded && parsed.sessionId) this.deps.sessionState.set(channel, parsed.sessionId);
+      // Non-transient, or out of attempts → return the failure (the daemon records
+      // status:error AND posts a user-facing failure note to the channel).
       return {
         ok: false,
         error: reason,
         ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
       };
     }
-
-    return {
-      ok: true,
-      reply: parsed.reply ?? "",
-      ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
-      ...(usage ? { usage } : {}),
-    };
+    // Unreachable — every loop path returns — but satisfies the type checker.
+    return { ok: false, error: "claude -p: retries exhausted" };
   }
 
   /**

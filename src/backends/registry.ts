@@ -766,6 +766,9 @@ export class ProgrammaticAgentRegistry {
           phase: "end",
         });
         this.emitTurnEvent(channel, { kind: "error", error: reason });
+        // Post a user-facing failure note so the channel shows SOMETHING (not a silent
+        // no-reply) — best-effort.
+        await this.postFailureNote(channel, msg.inReplyTo, turnThreadId, reason);
         // CALLBACK on the failure too — an orchestrator MUST learn its sub-task failed, not
         // hang waiting forever. No outbound note was produced, so no `source_message`.
         await this.maybeDeliverCallback(handle, msg, turnThreadId, "error");
@@ -787,6 +790,9 @@ export class ProgrammaticAgentRegistry {
           phase: "end",
         });
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
+        // Post a user-facing failure note so the channel shows SOMETHING (not a silent
+        // no-reply) — best-effort.
+        await this.postFailureNote(channel, msg.inReplyTo, turnThreadId, result.error);
         // CALLBACK on the failure-as-value too (status:error) — the orchestrator learns the
         // sub-task failed and can react. No delivered reply, so no `source_message`.
         await this.maybeDeliverCallback(handle, msg, turnThreadId, "error");
@@ -1061,5 +1067,36 @@ export class ProgrammaticAgentRegistry {
       }
     }
     return { ok: false, error: lastError };
+  }
+
+  /**
+   * Post a brief, user-facing FAILURE note to the channel when a turn doesn't complete
+   * (the backend's transient-retry is exhausted, or a non-transient error). A silent
+   * no-reply reads as "nothing came through" — this makes the failure visible in the
+   * transcript, with the reason. Best-effort: a failed failure-note write is logged,
+   * never thrown (it must not break the drain). Reuses the bounded outbound-write retry.
+   */
+  private async postFailureNote(
+    channel: string,
+    inReplyTo: string | undefined,
+    threadId: string,
+    reason: string,
+  ): Promise<void> {
+    const short = reason.length > 240 ? `${reason.slice(0, 240)}…` : reason;
+    const text =
+      `⚠️ I couldn't complete that — the turn failed: ${short}\n\n` +
+      `This is often temporary; please try again in a moment.`;
+    try {
+      const delivered = await this.deliverOutboundWithRetry(channel, text, inReplyTo, threadId);
+      if (!delivered.ok) {
+        console.error(
+          `parachute-agent: failure note for channel "${channel}" not delivered: ${delivered.error}`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `parachute-agent: posting failure note for channel "${channel}" threw (continuing): ${(err as Error).message}`,
+      );
+    }
   }
 }

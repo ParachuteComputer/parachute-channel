@@ -592,11 +592,15 @@ describe("C — AGENT_VAULT_TRIGGER_TEMPLATE exposed via /.parachute/config", ()
       const body = (await res.json()) as { channels: unknown[]; triggerTemplate: typeof AGENT_VAULT_TRIGGER_TEMPLATE };
       expect(body.triggerTemplate).toEqual(AGENT_VAULT_TRIGGER_TEMPLATE);
       // Sanity on the shape the hub depends on (placeholders + webhook path).
-      // The trigger NAME stays `channel_inbound_<channel>` — `channel` is the
-      // domain routing key, not the module identity. The TAG moved to
-      // #agent/message and the webhook moved to the /agent mount.
+      // The trigger NAME stays `channel_inbound_<channel>` — kept STABLE so
+      // re-registration updates the existing trigger in place. The TAG is
+      // #agent/message and the webhook is on the /agent mount.
       expect(body.triggerTemplate.name).toBe("channel_inbound_<channel>");
       expect(body.triggerTemplate.when.tags).toEqual(["#agent/message/inbound"]);
+      // CONTRACT: the predicate keys on the `agent` routing key (was `channel`).
+      expect(body.triggerTemplate.when.has_metadata).toEqual(["agent"]);
+      // The rendered-at marker NAME is unchanged (cosmetic/internal).
+      expect(body.triggerTemplate.when.missing_metadata).toEqual(["channel_inbound_rendered_at"]);
       expect(body.triggerTemplate.action.webhook).toBe("<hub-origin>/agent/api/vault/inbound");
     } finally {
       srv.stop(true);

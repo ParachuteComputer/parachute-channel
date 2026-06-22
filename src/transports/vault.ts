@@ -10,26 +10,25 @@
  * `2026-06-17-vault-native-agents.md`). The `#agent` prefix is owned entirely by
  * the agent module: every vault object the module manages hangs off it —
  * `#agent/definition` (the agent def), `#agent/message{,/inbound,/outbound}` (a
- * conversation turn), `#agent/job` (a scheduled trigger). Vault-native agents
- * (Phase 4a) moved the flat `#agent-message*` / `#agent-job` tags into this
- * namespace (`#agent/message*` / `#agent/job`).
+ * conversation turn), `#agent/job` (a scheduled trigger). We WRITE and READ only
+ * the `#agent/message*` tags — the channel→agent data-model rename CONTRACT phase
+ * dropped the legacy `#channel-message*` and interim `#agent-message*` dual-read
+ * (no surviving old-tagged data to recognize).
  *
- * TAG RENAME — DUAL-READ (the EARLIER channel→agent rename,
- * `parachute-patterns/migrations/2026-06-17-channel-to-agent.md` rule 2). The
- * message tag first moved `#channel-message*` → `#agent-message*`, and now
- * `#agent-message*` → `#agent/message*`. We WRITE only the NEWEST `#agent/message*`
- * tags going forward, but on READ we recognize BOTH the legacy `#channel-message*`
- * AND the interim `#agent-message*` tags — so all pre-namespace history still loads
- * in the transcript and a still-live legacy trigger (delivering an old-tagged note)
- * still routes. A one-time re-tag run + the legacy trigger's re-registration are
- * Aaron's-hand cutover steps; dual-read keeps everything working until then.
+ * ROUTING KEY (`metadata.agent`). Every note this module writes carries the routing
+ * key under `metadata.agent` ONLY — the CONTRACT phase of the channel→agent rename
+ * dropped the `metadata.channel` dual-write. The vault inbound trigger keys on
+ * `has_metadata:["agent"]`. The `noteAgentKey` helper still READS `agent ?? channel`
+ * as a tolerance fallback so a stray in-flight note written by an older build during
+ * the live cutover still routes — read-only, no longer written.
  *
  * How it differs from telegram / http-ui — the "external party" is the vault:
  *  - Inbound (human → session): a vault trigger POSTs the daemon's
  *    `/api/vault/inbound` webhook when a new `#agent/message/inbound` note
- *    appears; the daemon resolves the channel from `note.metadata.channel` and
- *    calls this transport's `ingestInbound(note)`, which `ctx.emit(...)`s →
- *    routes to the bridge / MCP session subscribed to that channel and wakes it.
+ *    appears; the daemon resolves the channel from `note.metadata.agent` (via
+ *    `noteAgentKey`) and calls this transport's `ingestInbound(note)`, which
+ *    `ctx.emit(...)`s → routes to the bridge / MCP session subscribed to that
+ *    channel and wakes it.
  *  - Outbound (session → human): when the session calls the `reply` tool, the
  *    bridge POSTs `/api/reply {channel,...}`; the daemon dispatches to this
  *    transport's `reply()`, which writes a `#agent/message/outbound` note via
@@ -55,8 +54,7 @@
  * inbound child only — `tags: ["#agent/message/inbound"]` — which an outbound
  * note (parent + `/outbound`) never carries, so a reply can't wake its own session.
  * As belt-and-suspenders, `ingestInbound` also drops any note tagged
- * `#agent/message/outbound` / the interim `#agent-message/outbound` / the legacy
- * `#channel-message/outbound` (or `direction: "outbound"`) — so even a mis-wired
+ * `#agent/message/outbound` (or `direction: "outbound"`) — so even a mis-wired
  * trigger can never wake us on our own reply.
  */
 
@@ -93,8 +91,7 @@ export interface VaultTransportConfig {
 export interface InboundNote {
   id: string;
   content?: string;
-  /** The note's tags — carries `#agent/message/{inbound,outbound}` (or the prior
-   *  `#agent-message/*` / `#channel-message/*` on pre-namespace notes) for loop avoidance. */
+  /** The note's tags — carries `#agent/message/{inbound,outbound}` for loop avoidance. */
   tags?: string[];
   metadata?: Record<string, unknown>;
 }
@@ -140,9 +137,8 @@ export interface JobNote {
 export interface JobNoteMetadata {
   /** The operator-facing slug (so the displayed id survives the vault's note-id assignment). */
   jobId: string;
-  /** The routing key under the NEW `agent` alias (dual-write, same value as `channel`). */
+  /** The routing key — written under `metadata.agent` only (the channel→agent CONTRACT). */
   agent: string;
-  channel: string;
   cron: string;
   tz?: string;
   /** "true" | "false" — the vault stores metadata as strings. */
@@ -257,9 +253,10 @@ const STATUS_META_KEY = "status";
 /** Metadata key carrying the ISO timestamp an inbound was claimed (for the TTL sweep). */
 const CLAIMED_AT_META_KEY = "claimedAt";
 
-/** The agent (routing) key carried on a vault note's metadata. Reads the NEW `agent`
- *  field, falling back to the legacy `channel` field (the expand-phase dual-read), so a
- *  note written by either an agent-speaking or a legacy channel-speaking writer routes. */
+/** The agent (routing) key carried on a vault note's metadata. Reads the canonical
+ *  `agent` field, falling back to the legacy `channel` field as a read-only TOLERANCE
+ *  for any in-flight note written by an older build during the live cutover. New writes
+ *  carry `agent` only (the channel→agent CONTRACT dropped the `channel` dual-write). */
 export function noteAgentKey(meta: Record<string, unknown> | undefined | null): string | undefined {
   const a = meta?.agent;
   if (typeof a === "string" && a) return a;
@@ -346,34 +343,6 @@ function buildThreadSummaryBody(t: {
   );
 }
 
-// ---------------------------------------------------------------------------
-// PRIOR tags (pre-namespace) — DUAL-READ only. We never WRITE these going forward,
-// but we recognize them on READ so pre-namespace history loads + a still-live prior
-// trigger keeps routing. See the file header (dual-read).
-//
-//  - LEGACY  `#channel-message*` — the original channel-era tag (the earliest
-//    rename's prior layer).
-//  - INTERIM `#agent-message*`    — the flat agent tag that preceded the `#agent/*`
-//    namespace (the namespace migration's prior layer).
-// ---------------------------------------------------------------------------
-const LEGACY_MESSAGE_TAG = "#channel-message";
-const LEGACY_MESSAGE_INBOUND_TAG = "#channel-message/inbound";
-const LEGACY_MESSAGE_OUTBOUND_TAG = "#channel-message/outbound";
-const INTERIM_MESSAGE_TAG = "#agent-message";
-const INTERIM_MESSAGE_INBOUND_TAG = "#agent-message/inbound";
-const INTERIM_MESSAGE_OUTBOUND_TAG = "#agent-message/outbound";
-
-/** The message parent tags we recognize on READ (new + interim + legacy) — the
- *  transcript query unions all so pre-namespace history still appears. */
-const READ_MESSAGE_TAGS = [AGENT_MESSAGE_TAG, INTERIM_MESSAGE_TAG, LEGACY_MESSAGE_TAG] as const;
-/** The outbound child tags we recognize on READ (new + interim + legacy) for
- *  direction / loop-avoidance detection. */
-const READ_OUTBOUND_TAGS = [
-  AGENT_MESSAGE_OUTBOUND_TAG,
-  INTERIM_MESSAGE_OUTBOUND_TAG,
-  LEGACY_MESSAGE_OUTBOUND_TAG,
-] as const;
-
 /**
  * The module-owned root namespace tag. Declared (with the three children rolling up
  * to it via `parent_names`) so a human `tag:#agent` query expands to EVERYTHING the
@@ -408,8 +377,9 @@ const JOB_PATH_PREFIX = "Channels";
  * thread, written for BOTH execution-lifecycle modes (the structural unification —
  * "a run was always a thread with one turn"). The note BODY is a rolling SUMMARY of the
  * thread (a future summarizer agent may own/enrich the `## Summary` slot — module-owned
- * in v1); metadata = `{ channel, definition, mode, status, started_at, last_turn_at,
- * turn_count, usage }`. The INDEXED string fields (`status`, `definition`, `mode`) make
+ * in v1); metadata = `{ agent, definition, mode, status, started_at, last_turn_at,
+ * turn_count, usage }` (`agent` is the routing key — the channel→agent CONTRACT).
+ * The INDEXED string fields (`status`, `definition`, `mode`) make
  * "all failed threads" / "all threads of agent X" / "all multi-threaded threads"
  * operator-queryable. `definition` is a plain note-id string for now (interim — typed
  * link fields are a future vault feature).
@@ -445,11 +415,9 @@ const THREAD_PATH_PREFIX = "Threads";
  * `tag:#agent/message` rolls up to both directions — without the module's own
  * exact-leaf queries depending on per-vault schema.
  *
- * DUAL-READ: we ALSO keep declaring the prior `#agent-message*` (interim) and
- * `#channel-message*` (legacy) schema. Their parent/children inheritance must stay
- * declared so a UI querying an old parent still expands to pre-namespace children
- * until the one-time re-tag run completes. New writes use the namespaced tags; the
- * prior entries are read-side scaffolding, retired in a later contract cycle.
+ * The channel→agent rename CONTRACT dropped the prior `#agent-message*` (interim) and
+ * `#channel-message*` (legacy) schema entries — there's no surviving old-tagged data
+ * to keep their inheritance declared for.
  *
  * This matches the vault's "clients bring their own tag schema" principle: the
  * WRITING module provisions its own tag schema at connect-time. It's MODULE-OWNED
@@ -486,9 +454,8 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     name: AGENT_MESSAGE_TAG,
     parent_names: [AGENT_ROOT_TAG],
     description: "A message in a Parachute channel (parent of /inbound + /outbound).",
-    // Expand phase: declare the NEW `agent` routing key indexed so agent-keyed queries
-    // are indexed. The legacy `channel` field was never declared indexed here (transcript
-    // filtering is client-side, index-free); we add only the new alias, additively.
+    // Declare the canonical `agent` routing key indexed so agent-keyed queries are
+    // indexed. (Transcript filtering itself stays client-side / index-free.)
     fields: {
       agent: { type: "string", indexed: true },
     },
@@ -510,17 +477,15 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     // Indexed query axes so an operator/agent can find jobs by target + state (mirrors
     // the #agent/thread axes). All stored as strings (the vault stores metadata as
     // strings; `enabled` is "true"/"false"):
-    //  - channel    → "all jobs targeting agent X"
+    //  - agent      → "all jobs targeting agent X"
     //  - enabled    → "active jobs" (enabled:"true") vs paused ("false")
     //  - lastStatus → "jobs whose last run errored"
     // The full field set is `JobNoteMetadata` in src/jobs.ts (design
     // 2026-06-17-runner-scheduled-agent-turns); the schema is permissive, so the other
     // job fields (jobId/cron/tz/createdAt/lastRunAt) ride as undeclared metadata.
     fields: {
-      // Expand phase: dual-index the routing key — the new `agent` alias alongside the
-      // existing legacy `channel` field (additive; both indexed).
+      // The canonical `agent` routing key, indexed for "all jobs targeting agent X".
       agent: { type: "string", indexed: true },
-      channel: { type: "string", indexed: true },
       enabled: { type: "string", indexed: true },
       lastStatus: { type: "string", indexed: true },
     },
@@ -536,46 +501,12 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     //  - definition → "all threads of agent X" (the def note id)
     //  - mode       → "all multi-threaded threads"
     fields: {
-      // Expand phase: declare the new `agent` routing key indexed (additive — the legacy
-      // `channel` field was never declared indexed here; we add only the new alias).
+      // The canonical `agent` routing key, indexed (mirrors #agent/message + #agent/job).
       agent: { type: "string", indexed: true },
       status: { type: "string", indexed: true },
       definition: { type: "string", indexed: true },
       mode: { type: "string", indexed: true },
     },
-  },
-  // --- Interim (dual-read) — the flat `#agent-message*` tags that preceded the
-  //     `#agent/*` namespace. Declared so pre-namespace history keeps its
-  //     inheritance until the one-time re-tag run lands. Never written going forward. ---
-  {
-    name: INTERIM_MESSAGE_TAG,
-    description: "Interim flat message tag (pre #agent/* namespace); read-only — see #agent/message.",
-  },
-  {
-    name: INTERIM_MESSAGE_INBOUND_TAG,
-    parent_names: [INTERIM_MESSAGE_TAG],
-    description: "Interim inbound message tag (pre-namespace); read-only.",
-  },
-  {
-    name: INTERIM_MESSAGE_OUTBOUND_TAG,
-    parent_names: [INTERIM_MESSAGE_TAG],
-    description: "Interim outbound message tag (pre-namespace); read-only.",
-  },
-  // --- Legacy (dual-read) — declared so pre-rename history keeps its inheritance
-  //     until the one-time re-tag run lands. Never written going forward. ---
-  {
-    name: LEGACY_MESSAGE_TAG,
-    description: "Legacy message tag (pre channel→agent rename); read-only — see #agent/message.",
-  },
-  {
-    name: LEGACY_MESSAGE_INBOUND_TAG,
-    parent_names: [LEGACY_MESSAGE_TAG],
-    description: "Legacy inbound message tag (pre-rename); read-only.",
-  },
-  {
-    name: LEGACY_MESSAGE_OUTBOUND_TAG,
-    parent_names: [LEGACY_MESSAGE_TAG],
-    description: "Legacy outbound message tag (pre-rename); read-only.",
   },
 ];
 
@@ -596,18 +527,19 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
  * the hub mints).
  *
  * The predicate matches a NEW inbound note (`#agent/message/inbound`) that
- * carries a `channel` metadata field and hasn't been rendered yet. Loop avoidance
- * is by the inbound CHILD tag: an outbound (reply) note carries
- * `#agent/message/outbound`, never the inbound child, so it never fires this.
- * (The `channel` metadata field + `channel_inbound_rendered_at` marker are the
- * internal routing plumbing — UNCHANGED by the rename; only the TAG moved.)
+ * carries an `agent` metadata field (the routing key, post channel→agent CONTRACT)
+ * and hasn't been rendered yet. Loop avoidance is by the inbound CHILD tag: an
+ * outbound (reply) note carries `#agent/message/outbound`, never the inbound child,
+ * so it never fires this. (The trigger `name` and the `channel_inbound_rendered_at`
+ * marker are internal plumbing — kept STABLE so re-registration updates the existing
+ * trigger in place rather than orphaning one.)
  */
 export const AGENT_VAULT_TRIGGER_TEMPLATE = {
   name: "channel_inbound_<channel>", // hub substitutes the channel name
   events: ["created"],
   when: {
     tags: ["#agent/message/inbound"],
-    has_metadata: ["channel"],
+    has_metadata: ["agent"],
     missing_metadata: ["channel_inbound_rendered_at"],
   },
   action: {
@@ -778,12 +710,10 @@ export class VaultTransport implements Transport {
     const path = `${this.pathPrefix}/${safeChannel}/${id}`;
 
     const metadata: Record<string, string> = {
-      // Dual-write the routing key under BOTH the new `agent` alias and the legacy
-      // `channel` field (same value) — the expand phase. Keeps the existing
-      // `has_metadata:["channel"]` trigger + any channel-speaking reader working
-      // while the data model starts speaking `agent`.
+      // The routing key — written under `metadata.agent` ONLY (the channel→agent
+      // CONTRACT dropped the `channel` dual-write). `noteAgentKey` still reads
+      // `agent ?? channel` as a tolerance fallback for any in-flight straggler.
       agent: channel,
-      channel,
       // `direction` stays as a human/UI convenience field. The loop-avoidance
       // source of truth is now the `#agent/message/outbound` TAG below — the
       // trigger fires on the inbound child tag only, so this note never wakes us.
@@ -813,7 +743,6 @@ export class VaultTransport implements Transport {
         path,
         // Parent (queryable membership) + directional child (trigger discriminator).
         // Both literal — the slash child is NOT queryable under the parent on its own.
-        // We WRITE only the NEW tags; dual-read recognizes legacy on read.
         tags: [AGENT_MESSAGE_TAG, AGENT_MESSAGE_OUTBOUND_TAG],
         metadata,
       }),
@@ -974,9 +903,8 @@ export class VaultTransport implements Transport {
     // Indexed string fields (queryable) + the thread-state observability fields. The
     // vault stores metadata as strings; numbers are stringified.
     const metadata: Record<string, string> = {
-      // Dual-write the routing key (expand phase): new `agent` alias + legacy `channel`.
+      // The routing key — `metadata.agent` ONLY (the channel→agent CONTRACT).
       agent: thread.channel,
-      channel: thread.channel,
       mode: thread.mode,
       status: thread.status,
       started_at: startedAt,
@@ -1147,21 +1075,14 @@ export class VaultTransport implements Transport {
    *
    * The query is the canonical "list a channel's transcript" shape from the
    * tagging model: the parent message tag (carried literally on every note) + a
-   * `metadata.channel == <this channel>` filter. Because the parent is on every
-   * note, this returns BOTH inbound and outbound — the slash children are
+   * routing-key filter (`noteAgentKey(meta) == <this channel>`). Because the parent
+   * is on every note, this returns BOTH inbound and outbound — the slash children are
    * namespace, not query inheritance, so we never key off them here.
-   *
-   * DUAL-READ: we union the NEW `#agent/message` parent, the interim
-   * `#agent-message` parent, and the legacy `#channel-message` parent — three
-   * queries deduped by note id — so pre-namespace history still appears alongside
-   * new messages. We WRITE only the namespaced tag; this read-side union is dropped
-   * in a later contract cycle.
    *
    *   GET <vaultUrl>/vault/<vault>/api/notes
    *       ?tag=%23agent%2Fmessage             (the `#` + `/` MUST be percent-encoded)
    *       &include_content=true               (we need the bodies)
    *       &limit=<n>                          (default 200)
-   *   ... and again with ?tag=%23agent-message + ?tag=%23channel-message, unioned client-side.
    *
    * The vault returns a bare JSON array of note objects ({id, content, tags,
    * metadata, ...}). Direction comes from `metadata.direction`, falling back to
@@ -1223,32 +1144,23 @@ export class VaultTransport implements Transport {
       }
     };
 
-    // DUAL-READ: union the new + legacy parent tags, deduped by note id (a note
-    // re-tagged to carry both must not appear twice).
-    const byId = new Map<string, RawNote>();
-    for (const tag of READ_MESSAGE_TAGS) {
-      for (const note of await fetchByTag(tag)) {
-        if (typeof note.id === "string" && note.id && !byId.has(note.id)) {
-          byId.set(note.id, note);
-        }
-      }
-    }
-    const notes = [...byId.values()];
+    // Query the single `#agent/message` parent tag (the channel→agent CONTRACT
+    // dropped the legacy `#channel-message` / interim `#agent-message` union).
+    const notes = await fetchByTag(AGENT_MESSAGE_TAG);
 
     const messages: ChannelMessage[] = [];
     for (const note of notes) {
       if (typeof note.id !== "string" || !note.id) continue;
       const meta = note.metadata ?? {};
-      // Client-side channel filter (see the index-free note above): keep only
-      // notes whose routing key matches this channel. Dual-read `agent ?? channel`.
+      // Client-side routing-key filter (see the index-free note above): keep only
+      // notes whose routing key matches this channel (`noteAgentKey` reads `agent`).
       if (noteAgentKey(meta) !== channel) continue;
       const tags = note.tags ?? [];
-      // Direction: prefer the explicit metadata field; fall back to the child tag
-      // (new OR legacy outbound — dual-read).
+      // Direction: prefer the explicit metadata field; fall back to the outbound child tag.
       let direction: "inbound" | "outbound";
       if (meta.direction === "inbound" || meta.direction === "outbound") {
         direction = meta.direction;
-      } else if (READ_OUTBOUND_TAGS.some((t) => tags.includes(t))) {
+      } else if (tags.includes(AGENT_MESSAGE_OUTBOUND_TAG)) {
         direction = "outbound";
       } else {
         // Default to inbound (a human message) when neither signal is present —
@@ -1288,7 +1200,7 @@ export class VaultTransport implements Transport {
     /**
      * Extra metadata to STAMP onto the inbound note (e.g. the agent-to-agent callback
      * contract). Merged AFTER the base fields but BEFORE the non-overridable invariants
-     * (`channel`/`direction` always win — an inbound note must route + be inbound). A caller
+     * (`agent`/`direction` always win — an inbound note must route + be inbound). A caller
      * must NEVER pass `reply_to` here for a CALLBACK note (the terminal-callback loop guard);
      * see {@link writeCallback}.
      */
@@ -1303,11 +1215,10 @@ export class VaultTransport implements Transport {
     const metadata: Record<string, string> = {
       // Caller-supplied extra fields first, so the invariants below cannot be clobbered.
       ...(extraMeta ?? {}),
-      // Dual-write the routing key (expand phase): new `agent` alias + legacy `channel`.
-      // BOTH must be present here — this is the inbound path the vault trigger fires on
-      // (`has_metadata:["channel"]`), so dropping `channel` would break the trigger.
+      // The routing key under `metadata.agent` ONLY (the channel→agent CONTRACT
+      // dropped the `channel` dual-write). This is the inbound path the vault trigger
+      // fires on — the trigger keys on `has_metadata:["agent"]` to match it.
       agent: channel,
-      channel,
       direction: "inbound",
       sender: sender ?? "operator",
       ts,
@@ -1324,7 +1235,7 @@ export class VaultTransport implements Transport {
         path,
         // Parent (queryable membership) + inbound child (the trigger discriminator
         // that wakes the session). Both literal — the child alone is invisible to
-        // a `tag:#agent/message` query. We WRITE only the NEW tags.
+        // a `tag:#agent/message` query.
         tags: [AGENT_MESSAGE_TAG, AGENT_MESSAGE_INBOUND_TAG],
         metadata,
       }),
@@ -1485,7 +1396,7 @@ export class VaultTransport implements Transport {
     for (const note of notes) {
       if (typeof note.id !== "string" || !note.id) continue;
       const meta = note.metadata ?? {};
-      if (noteAgentKey(meta) !== channel) continue; // client-side filter (index-free); dual-read agent ?? channel.
+      if (noteAgentKey(meta) !== channel) continue; // client-side filter (index-free); noteAgentKey reads `agent` (channel fallback for stragglers).
       const status = coerceInboundStatus(meta[STATUS_META_KEY]);
       // Drop `handled` notes — they are not queue items (#103). Only pending + in-flight
       // make up the actionable queue; counting/returning handled would let them crowd
@@ -1609,7 +1520,7 @@ export class VaultTransport implements Transport {
     for (const note of notes) {
       if (typeof note.id !== "string" || !note.id) continue;
       const m = note.metadata ?? {};
-      const channel = noteAgentKey(m) ?? ""; // dual-read the routing key: agent ?? channel.
+      const channel = noteAgentKey(m) ?? ""; // routing key via noteAgentKey (`agent`, channel fallback for stragglers).
       const cron = typeof m.cron === "string" ? m.cron : "";
       if (!channel || !cron) continue; // not a well-formed job note; skip.
       // The operator-facing id is the slug in `metadata.jobId`; fall back to the
@@ -1655,9 +1566,8 @@ export class VaultTransport implements Transport {
     const path = `${JOB_PATH_PREFIX}/${safeChannel}/jobs/${safeId}`;
     const metadata: JobNoteMetadata = {
       jobId: job.id, // the operator-facing slug, so it survives the vault's note-id assignment.
-      // Dual-write the routing key (expand phase): new `agent` alias + legacy `channel`.
+      // The routing key under `metadata.agent` ONLY (the channel→agent CONTRACT).
       agent: job.channel,
-      channel: job.channel,
       cron: job.cron,
       enabled: job.enabled ? "true" : "false",
       createdAt: job.createdAt,
@@ -1739,16 +1649,15 @@ export class VaultTransport implements Transport {
    * so the subscribed bridge / MCP session wakes. Called by the daemon's
    * `/api/vault/inbound` webhook after it has resolved the channel.
    *
-   * Belt-and-suspenders over the trigger predicate: a note tagged outbound — the
-   * new `#agent/message/outbound` OR (dual-read) the interim `#agent-message/outbound`
-   * / the legacy `#channel-message/outbound` — OR explicitly `direction: "outbound"`
-   * is IGNORED — we never wake on our own reply, even if a mis-wired trigger delivers one.
+   * Belt-and-suspenders over the trigger predicate: a note tagged outbound
+   * (`#agent/message/outbound`) OR explicitly `direction: "outbound"` is IGNORED —
+   * we never wake on our own reply, even if a mis-wired trigger delivers one.
    */
   ingestInbound(note: InboundNote): void {
     if (!this.ctx) throw new Error("vault transport: not started");
     const meta = note.metadata ?? {};
     const tags = note.tags ?? [];
-    if (READ_OUTBOUND_TAGS.some((t) => tags.includes(t)) || meta.direction === "outbound") {
+    if (tags.includes(AGENT_MESSAGE_OUTBOUND_TAG) || meta.direction === "outbound") {
       return; // our own reply — never wake on it.
     }
     // Flatten the note's metadata into the inbound meta (string-valued), then
@@ -1760,15 +1669,14 @@ export class VaultTransport implements Transport {
     }
     this.ctx.emit({
       // `channel` here is the in-memory InboundMessage.channel TS field (NOT serialized
-      // note metadata) — left as the channel name. The routing key alias rides in `meta`.
+      // note metadata) — left as the channel name. The routing key rides in `meta.agent`.
       channel: this.ctx.channel,
       content: note.content ?? "",
       meta: {
         ...flatMeta,
-        // Dual-write the routing key onto the in-memory event meta (expand phase):
-        // new `agent` alias + legacy `channel`, same value.
+        // The routing key on the in-memory event meta under `agent` ONLY (the
+        // channel→agent CONTRACT dropped the `channel` dual-write).
         agent: this.ctx.channel,
-        channel: this.ctx.channel,
         source: "vault",
         note_id: note.id,
         sender: typeof meta.sender === "string" ? meta.sender : "",

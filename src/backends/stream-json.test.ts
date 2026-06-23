@@ -12,7 +12,13 @@
  *  - blank/garbage input → an empty parse, never a throw.
  */
 import { describe, test, expect } from "bun:test";
-import { parseStreamJson, parseStreamJsonStream, type InterimTurnEvent } from "./stream-json.ts";
+import {
+  parseStreamJson,
+  parseStreamJsonStream,
+  MAX_TOOL_INPUT_CHARS,
+  MAX_TOOL_RESULT_CHARS,
+  type InterimTurnEvent,
+} from "./stream-json.ts";
 
 /** Join NDJSON event objects into the line-delimited blob claude emits. */
 function ndjson(...events: unknown[]): string {
@@ -204,7 +210,8 @@ describe("parseStreamJsonStream — interim events + final turn", () => {
     expect(events).toEqual([
       { kind: "init", sessionId: "sess-1" },
       { kind: "text", text: "let me check" },
-      { kind: "tool", tool: "Read" },
+      // empty input `{}` still stringifies to "{}" and rides as the input field
+      { kind: "tool", tool: "Read", input: "{}" },
       { kind: "text", text: " — done." },
     ]);
     // The FINAL turn is exactly what the blob parser would compute — durable path intact.
@@ -306,5 +313,203 @@ describe("parseStreamJsonStream — interim events + final turn", () => {
     expect(turn.success).toBe(false);
     expect(turn.errorMessage).toBe("kaboom");
     expect(turn.sessionId).toBe("err-1");
+  });
+});
+
+describe("parseStreamJsonStream — enriched tool events (inputs + result previews)", () => {
+  test("a tool_use carries its input JSON-stringified on the tool event", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "tin-1" },
+      {
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", id: "tu_1", name: "Read", input: { file_path: "/etc/hosts" } }],
+        },
+        session_id: "tin-1",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "tin-1" },
+    );
+    const { events } = await collectInterim(blob);
+    expect(events).toEqual([
+      { kind: "init", sessionId: "tin-1" },
+      { kind: "tool", tool: "Read", input: JSON.stringify({ file_path: "/etc/hosts" }) },
+    ]);
+  });
+
+  test("an OVERSIZE tool input is truncated with the … marker", async () => {
+    const bigCmd = "x".repeat(MAX_TOOL_INPUT_CHARS + 500);
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "tin-big" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "tool_use", id: "tu_b", name: "Bash", input: { command: bigCmd } }] },
+        session_id: "tin-big",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "tin-big" },
+    );
+    const { events } = await collectInterim(blob);
+    const toolEvent = events.find((e) => e.kind === "tool");
+    expect(toolEvent).toBeDefined();
+    const input = (toolEvent as { input?: string }).input!;
+    // exactly MAX chars + the 1-char marker, and it ends with the marker
+    expect(input.length).toBe(MAX_TOOL_INPUT_CHARS + 1);
+    expect(input.endsWith("…")).toBe(true);
+  });
+
+  test("a tool_use with NO input omits the input field (back-compat shape)", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "tin-none" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "tool_use", id: "tu_n", name: "Glob" }] },
+        session_id: "tin-none",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "tin-none" },
+    );
+    const { events } = await collectInterim(blob);
+    expect(events).toEqual([
+      { kind: "init", sessionId: "tin-none" },
+      { kind: "tool", tool: "Glob" },
+    ]);
+  });
+
+  test("a tool_result → {kind:'tool_result', tool, ok, preview} labeled via the tool_use_id map", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "tr-1" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "tool_use", id: "tu_42", name: "Read", input: { file_path: "/a" } }] },
+        session_id: "tr-1",
+      },
+      {
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "tu_42", is_error: false, content: "file contents here" }],
+        },
+        session_id: "tr-1",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "tr-1" },
+    );
+    const { events } = await collectInterim(blob);
+    expect(events).toContainEqual({
+      kind: "tool_result",
+      tool: "Read", // labeled via the tool_use_id → name map
+      ok: true,
+      preview: "file contents here",
+    });
+  });
+
+  test("a tool_result with array content parts joins the text parts into the preview", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "tr-arr" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "tool_use", id: "tu_arr", name: "Bash", input: { command: "ls" } }] },
+        session_id: "tr-arr",
+      },
+      {
+        type: "user",
+        message: {
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu_arr",
+              is_error: false,
+              content: [
+                { type: "text", text: "line1\n" },
+                { type: "text", text: "line2" },
+              ],
+            },
+          ],
+        },
+        session_id: "tr-arr",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "tr-arr" },
+    );
+    const { events } = await collectInterim(blob);
+    expect(events).toContainEqual({ kind: "tool_result", tool: "Bash", ok: true, preview: "line1\nline2" });
+  });
+
+  test("an OVERSIZE tool_result preview is truncated with the … marker", async () => {
+    const bigOut = "y".repeat(MAX_TOOL_RESULT_CHARS + 500);
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "tr-big" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "tool_use", id: "tu_big", name: "Bash", input: {} }] },
+        session_id: "tr-big",
+      },
+      {
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "tu_big", is_error: false, content: bigOut }] },
+        session_id: "tr-big",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "tr-big" },
+    );
+    const { events } = await collectInterim(blob);
+    const resultEvent = events.find((e) => e.kind === "tool_result");
+    expect(resultEvent).toBeDefined();
+    const preview = (resultEvent as { preview?: string }).preview!;
+    expect(preview.length).toBe(MAX_TOOL_RESULT_CHARS + 1);
+    expect(preview.endsWith("…")).toBe(true);
+  });
+
+  test("is_error:true → ok:false", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "tr-err" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "tool_use", id: "tu_e", name: "Bash", input: { command: "false" } }] },
+        session_id: "tr-err",
+      },
+      {
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "tu_e", is_error: true, content: "command failed" }],
+        },
+        session_id: "tr-err",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "tr-err" },
+    );
+    const { events } = await collectInterim(blob);
+    expect(events).toContainEqual({ kind: "tool_result", tool: "Bash", ok: false, preview: "command failed" });
+  });
+
+  test("a tool_result whose tool_use_id is unknown still emits, just without the tool label", async () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "tr-orphan" },
+      {
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "tu_unknown", is_error: false, content: "orphan result" }],
+        },
+        session_id: "tr-orphan",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "tr-orphan" },
+    );
+    const { events } = await collectInterim(blob);
+    // no `tool` key (unknown id), but ok + preview present
+    expect(events).toContainEqual({ kind: "tool_result", ok: true, preview: "orphan result" });
+  });
+
+  test("the blob parser (no sink) ignores tool inputs + results entirely — final turn unchanged", () => {
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "blob-tr" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "tool_use", id: "tu_x", name: "Read", input: { file_path: "/x" } }] },
+        session_id: "blob-tr",
+      },
+      {
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "tu_x", is_error: false, content: "stuff" }] },
+        session_id: "blob-tr",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "final", session_id: "blob-tr" },
+    );
+    const t = parseStreamJson(blob);
+    expect(t.reply).toBe("final");
+    expect(t.success).toBe(true);
+    expect(t.sessionId).toBe("blob-tr");
   });
 });

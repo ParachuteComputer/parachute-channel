@@ -8,9 +8,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type ConnectionRow,
+  approveAgentGrant,
   defReloadStatus,
   ensureDefReloadConnections,
   HubError,
+  isDaemonDirectOrigin,
   listConnections,
   teardownDefReloadConnections,
 } from "./hub.ts";
@@ -229,6 +231,93 @@ describe("teardownDefReloadConnections", () => {
       name: "HubError",
       status: 403,
     });
+  });
+});
+
+describe("approveAgentGrant", () => {
+  it("OAuth start (no token): POSTs an empty body, credentials:include, returns authorizeUrl", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      jsonResponse(200, {
+        id: "grant_abc",
+        agent: "uni-dev",
+        connection: { kind: "mcp", target: "https://remote/mcp" },
+        status: "pending",
+        authorizeUrl: "https://remote/oauth/authorize?x=1",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const listing = await approveAgentGrant("grant_abc");
+    expect(listing.authorizeUrl).toBe("https://remote/oauth/authorize?x=1");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://hub.example/admin/grants/grant_abc/approve",
+      expect.objectContaining({ method: "POST", credentials: "include" }),
+    );
+    // No token → empty JSON body.
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({});
+  });
+
+  it("static bearer (with token): sends { token } and returns the approved listing (no redirect)", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      jsonResponse(200, {
+        id: "grant_abc",
+        agent: "uni-dev",
+        connection: { kind: "mcp", target: "https://remote/mcp" },
+        status: "approved",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const listing = await approveAgentGrant("grant_abc", "static-bearer-tok");
+    expect(listing.status).toBe("approved");
+    expect(listing.authorizeUrl).toBeUndefined();
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({ token: "static-bearer-tok" });
+  });
+
+  it("URL-encodes the grant id and maps a 404 to the hub-proxied-URL hint (daemon-direct)", async () => {
+    const fetchMock = vi.fn(async () => new Response("", { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(approveAgentGrant("grant/with slash")).rejects.toThrow(/hub-proxied URL/);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://hub.example/admin/grants/grant%2Fwith%20slash/approve",
+      expect.anything(),
+    );
+  });
+
+  it("throws a HubError with the status on a 401", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("", { status: 401 })),
+    );
+    await expect(approveAgentGrant("grant_abc")).rejects.toMatchObject({
+      name: "HubError",
+      status: 401,
+    });
+  });
+});
+
+describe("isDaemonDirectOrigin", () => {
+  it("true on the agent daemon's loopback origin (cookie can't flow there)", () => {
+    vi.stubGlobal("window", {
+      location: { origin: "http://127.0.0.1:1941", hostname: "127.0.0.1", port: "1941" },
+    } as unknown as Window & typeof globalThis);
+    expect(isDaemonDirectOrigin()).toBe(true);
+  });
+
+  it("false on the hub-proxied origin (the cookie→hub Connect works)", () => {
+    vi.stubGlobal("window", {
+      location: { origin: "https://hub.example", hostname: "hub.example", port: "" },
+    } as unknown as Window & typeof globalThis);
+    expect(isDaemonDirectOrigin()).toBe(false);
+  });
+
+  it("false on a loopback HUB port (a local operator on the hub itself)", () => {
+    vi.stubGlobal("window", {
+      location: { origin: "http://127.0.0.1:1939", hostname: "127.0.0.1", port: "1939" },
+    } as unknown as Window & typeof globalThis);
+    expect(isDaemonDirectOrigin()).toBe(false);
   });
 });
 

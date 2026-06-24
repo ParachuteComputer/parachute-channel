@@ -90,6 +90,30 @@ export interface DefVaultBinding {
 export type AgentDefStatus = "enabled" | "pending" | "error";
 
 /**
+ * Per-connection grant info surfaced to the ops UI (the MCP/connections panel) so it
+ * can render a status pill + drive the cookie→hub "Connect" without re-deriving the
+ * hub's grant id client-side (that divergence class already bit this codebase — the
+ * id MUST come from the hub). One entry per declared `wants:` connection.
+ *
+ *   - `key`     — the stable {@link connectionKey} (matches a `wants` entry).
+ *   - `kind`    — `vault` | `service` | `mcp` (the panel only acts on `mcp` today).
+ *   - `target`  — the connection target (for `mcp`, the remote https URL).
+ *   - `status`  — the hub grant's lifecycle as the hub reports it
+ *     (`pending` | `approved` | `revoked` | `needs_consent`), or `pending` when no
+ *     grant could be resolved (no grants client / a registration error).
+ *   - `grantId` — the hub-assigned grant id (the Connect/approve key). Absent when no
+ *     grant was registered/resolved (then the UI can't offer Connect — it shows a
+ *     degraded hint instead).
+ */
+export interface ConnectionInfo {
+  key: string;
+  kind: "vault" | "service" | "mcp";
+  target: string;
+  status: string;
+  grantId?: string;
+}
+
+/**
  * The parse of one `#agent/definition` note: the canonical {@link AgentSpec} the
  * registry instantiates, plus the note bookkeeping (its id for PATCH, the declared
  * connections to surface, and any parse error).
@@ -727,6 +751,12 @@ interface LiveDef {
   pending: string[];
   /** Structured `wants:` connection keys (surfaced for the UI; never a secret). */
   wants: string[];
+  /**
+   * Per-connection grant info (key, kind, target, hub grant status, grant id) — the
+   * source the connections/MCP panel renders + drives Connect from. One entry per
+   * declared `wants:` connection. Never a secret (status + id only, no token).
+   */
+  connections: ConnectionInfo[];
   /** The model the programmatic backend runs turns on (from `metadata.model`); unset = CC default. */
   model?: string;
 }
@@ -755,6 +785,13 @@ export interface AgentDefDetail {
   systemPromptPreview: string;
   /** Structured `wants:` connection keys the agent declared (empty when own-vault only). */
   wants: string[];
+  /**
+   * Per-connection grant info (key, kind, target, hub grant status, grant id) — the
+   * connections/MCP panel renders status pills + drives the cookie→hub Connect from
+   * this. Additive (a back-compat field; older clients ignore it). One entry per
+   * declared `wants:` connection. NO secrets (status + id, never a token).
+   */
+  connections: ConnectionInfo[];
   /** The model the programmatic backend runs turns on (e.g. `opus`); undefined = CC default. */
   model?: string;
   /** The wake channel inbound routes to this agent on (== name). */
@@ -785,6 +822,12 @@ export interface AgentDefFull {
   mode: AgentMode;
   /** Structured `wants:` connection keys the agent declared (empty when own-vault only). */
   wants: string[];
+  /**
+   * Per-connection grant info (key, kind, target, hub grant status, grant id) — same
+   * additive field {@link AgentDefDetail} carries, so the edit view's connections panel
+   * can render status + drive Connect without a second fetch. NO secrets.
+   */
+  connections: ConnectionInfo[];
   /** The model the programmatic backend runs turns on (e.g. `opus`); undefined = CC default. */
   model?: string;
   /** The FULL system prompt — the whole note body (NOT truncated). */
@@ -919,6 +962,7 @@ export class AgentDefRegistry {
         pending: [...d.pending],
         systemPromptPreview: d.systemPromptPreview,
         wants: [...d.wants],
+        connections: d.connections.map((c) => ({ ...c })),
         ...(d.model ? { model: d.model } : {}),
         channel: d.name, // agent ≡ channel.
       }))
@@ -983,6 +1027,7 @@ export class AgentDefRegistry {
       pending: [...d.pending],
       systemPromptPreview: d.systemPromptPreview,
       wants: [...d.wants],
+      connections: d.connections.map((c) => ({ ...c })),
       ...(d.model ? { model: d.model } : {}),
       channel: d.name,
     };
@@ -1038,6 +1083,7 @@ export class AgentDefRegistry {
       vault: detail.vault,
       mode: detail.mode,
       wants: [...detail.wants],
+      connections: detail.connections.map((c) => ({ ...c })),
       ...(detail.model ? { model: detail.model } : {}),
       systemPrompt: typeof note.content === "string" ? note.content : "",
       status: detail.status,
@@ -1468,7 +1514,7 @@ export class AgentDefRegistry {
     // Otherwise fall back to the pure {@link resolveDefStatus} (pending if anything is
     // declared, enabled if nothing is). Either way the agent ALREADY ran its own-vault
     // setup above — an unapproved connection is absent at spawn, never a failure here.
-    const { status, pending } = await this.resolveStatusWithGrants(def);
+    const { status, pending, connections } = await this.resolveStatusWithGrants(def);
     const fullPrompt = def.spec.systemPrompt ?? "";
     const systemPromptPreview =
       fullPrompt.length > SYSTEM_PROMPT_PREVIEW_LEN
@@ -1484,6 +1530,7 @@ export class AgentDefRegistry {
       systemPromptPreview,
       pending: pending ?? [],
       wants: def.wants.map((c) => connectionKey(c)),
+      connections,
       ...(def.spec.model ? { model: def.spec.model } : {}),
     });
     // Track this note in the per-vault seen set (a confident, freshly-parsed read) so the
@@ -1559,33 +1606,67 @@ export class AgentDefRegistry {
    */
   private async resolveStatusWithGrants(
     def: ParsedAgentDef,
-  ): Promise<{ status: AgentDefStatus; pending?: string[] }> {
+  ): Promise<{ status: AgentDefStatus; pending?: string[]; connections: ConnectionInfo[] }> {
     if (!this.grants || def.wants.length === 0) {
-      // No hub wiring / no structured connections → the pure fallback.
-      return resolveDefStatus(def);
+      // No hub wiring / no structured connections → the pure fallback. The connections
+      // list is still surfaced (status `pending`, NO grant id) so the ops panel can
+      // list the agent's declared `mcp:` connections + show the degraded hint when
+      // there's nothing to Connect against (no grant could be resolved here).
+      const fallback = resolveDefStatus(def);
+      const connections: ConnectionInfo[] = def.wants.map((c) => ({
+        key: connectionKey(c),
+        kind: c.kind,
+        target: c.target,
+        status: "pending",
+      }));
+      return { ...fallback, connections };
     }
     const grants = this.grants;
     const statusByKey = new Map<string, string>();
+    // Per-connection grant info (id + status) for the ops panel — keyed by connectionKey
+    // so it lines up with the def's wants. The grant id comes FROM the hub (registerGrant
+    // is an idempotent upsert that echoes the existing grant's id + current status); we
+    // never derive it client-side (the hub's id-slug impl must not be duplicated).
+    const infoByKey = new Map<string, ConnectionInfo>();
     for (const conn of def.wants) {
+      const key = connectionKey(conn);
       try {
         const rec = await grants.registerGrant(def.name, conn);
-        statusByKey.set(connectionKey(conn), rec.status);
+        statusByKey.set(key, rec.status);
+        infoByKey.set(key, {
+          key,
+          kind: conn.kind,
+          target: conn.target,
+          status: rec.status,
+          ...(rec.id ? { grantId: rec.id } : {}),
+        });
       } catch (err) {
         // A failed registration → the connection counts as unapproved (absent from
         // statusByKey). Never fatal — the agent runs own-vault; the operator retries.
+        // Surface it with status `pending` + no grant id (the panel shows it un-Connectable).
+        infoByKey.set(key, { key, kind: conn.kind, target: conn.target, status: "pending" });
         console.warn(
-          `agent-defs: registering grant for "${def.name}" (${connectionKey(conn)}) failed ` +
+          `agent-defs: registering grant for "${def.name}" (${key}) failed ` +
             `(treating as pending): ${(err as Error).message}`,
         );
       }
     }
+    const connections = def.wants.map(
+      (c) =>
+        infoByKey.get(connectionKey(c)) ?? {
+          key: connectionKey(c),
+          kind: c.kind,
+          target: c.target,
+          status: "pending",
+        },
+    );
     const resolved = resolveConnectionStatus(def.wants, statusByKey);
     // Surface legacy `uses:` names alongside the structured pending keys (no grant flow).
     const pending = [...(resolved.pending ?? []), ...def.declaredConnections];
     if (resolved.status === "enabled" && pending.length === 0) {
-      return { status: "enabled" };
+      return { status: "enabled", connections };
     }
-    return { status: "pending", pending };
+    return { status: "pending", pending, connections };
   }
 
   /** Tear down the agent for a given (vault, noteId): deregister + drop its channel. */

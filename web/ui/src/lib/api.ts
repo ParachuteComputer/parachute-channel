@@ -184,6 +184,23 @@ export interface AgentsResponse {
 export type AgentDefStatus = "enabled" | "pending" | "error" | string;
 
 /**
+ * One declared connection's grant info — mirrors `ConnectionInfo` in
+ * `src/agent-defs.ts`. The connections/MCP panel renders a status pill from `status`
+ * and drives the cookie→hub "Connect" with `grantId` (which comes FROM the hub — the
+ * SPA never derives it). `status` is the hub grant lifecycle: `pending` | `approved` |
+ * `revoked` | `needs_consent` (or `pending` when no grant could be resolved). `grantId`
+ * is absent when no grant was registered (then Connect is unavailable — a degraded hint
+ * shows instead). NO secrets (status + id, never a token).
+ */
+export interface ConnectionInfoRow {
+  key: string;
+  kind: "vault" | "service" | "mcp";
+  target: string;
+  status: "pending" | "approved" | "revoked" | "needs_consent" | string;
+  grantId?: string;
+}
+
+/**
  * One entry from `GET /agent/api/agent-defs` — a vault-native
  * `#agent/definition` record. Mirrors `AgentDefDetail` in `src/agent-defs.ts`.
  */
@@ -202,6 +219,13 @@ export interface AgentDefRow {
   systemPromptPreview: string;
   /** Structured `wants:` connection keys (empty when own-vault only). */
   wants: string[];
+  /**
+   * Per-connection grant info (key, kind, target, hub grant status, grant id). The
+   * connections/MCP panel renders status pills + drives Connect from this. OPTIONAL —
+   * an older daemon (pre-this-field) omits it; the UI falls back to deriving display-only
+   * rows from `wants`/`pending` (no Connect, since the grant id is hub-owned). NO secrets.
+   */
+  connections?: ConnectionInfoRow[];
   /** The model the programmatic backend runs turns on (e.g. `opus`); absent = CC default. */
   model?: string;
   /** The wake channel inbound routes to this agent on (== name). */
@@ -303,6 +327,9 @@ export interface AgentDefFull {
   mode: AgentMode;
   /** Structured `wants:` connection keys (empty when own-vault only). */
   wants: string[];
+  /** Per-connection grant info (key, kind, target, hub grant status, grant id). OPTIONAL
+   *  — older daemons omit it. NO secrets. */
+  connections?: ConnectionInfoRow[];
   /** The model the programmatic backend runs turns on (e.g. `opus`); absent = CC default. */
   model?: string;
   /** The FULL system prompt — the whole note body (NOT truncated). */

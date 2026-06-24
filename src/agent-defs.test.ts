@@ -860,6 +860,79 @@ describe("AgentDefRegistry — lifecycle", () => {
     expect(await reg.getFullDef("Agents/ghost")).toBeNull();
   });
 
+  test("listDetailed/getFullDef surface per-connection {key,status,grantId} from the hub grants", async () => {
+    const { deps } = recorderDeps();
+    // The hub grants client's fetch: PUT /admin/grants echoes a grant record with the
+    // hub-assigned id + current status (the id we surface — never derived client-side);
+    // POST .../reconcile is the grant-GC (no-op here). One mcp connection, one vault.
+    const grantFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (method === "PUT" && u.endsWith("/admin/grants")) {
+        const { connection } = JSON.parse(String(init?.body)) as { connection: ConnectionSpec };
+        const key = connectionKey(connection);
+        // The mcp connection is awaiting consent; the vault one is approved.
+        const status = connection.kind === "mcp" ? "needs_consent" : "approved";
+        return new Response(
+          JSON.stringify({ id: `grant_${key}`, agent: "uni-dev", connection, status }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (method === "POST" && u.endsWith("/admin/grants/reconcile")) {
+        return new Response(JSON.stringify({ pruned: 0 }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const grants = new GrantsClient({
+      hubOrigin: "http://127.0.0.1:1939",
+      managerBearer: "host-admin",
+      fetchFn: grantFetch,
+    });
+    const note = {
+      id: "Agents/uni-dev",
+      content: "role",
+      metadata: { name: "uni-dev", wants: "mcp:https://remote/mcp, vault:research:read" },
+    };
+    const fetchFn = vaultFetch({ defs: [note], byId: { "Agents/uni-dev": note } });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+    await reg.loadAll();
+
+    const detail = reg.listDetailed().find((d) => d.name === "uni-dev")!;
+    const byKey = new Map(detail.connections.map((c) => [c.key, c]));
+    const mcp = byKey.get("mcp:https://remote/mcp")!;
+    expect(mcp).toMatchObject({
+      kind: "mcp",
+      target: "https://remote/mcp",
+      status: "needs_consent",
+      grantId: "grant_mcp:https://remote/mcp",
+    });
+    const vault = byKey.get("vault:research:read")!;
+    expect(vault).toMatchObject({ kind: "vault", status: "approved", grantId: "grant_vault:research:read" });
+    // The FULL def carries the same connections (so the edit view needs no second fetch).
+    const full = await reg.getFullDef("Agents/uni-dev");
+    expect(full!.connections.map((c) => c.key).sort()).toEqual(
+      ["mcp:https://remote/mcp", "vault:research:read"],
+    );
+  });
+
+  test("without a grants client, connections are surfaced display-only (status pending, no grant id)", async () => {
+    const { deps } = recorderDeps();
+    const note = {
+      id: "Agents/uni-dev",
+      content: "role",
+      metadata: { name: "uni-dev", wants: "mcp:https://remote/mcp" },
+    };
+    const fetchFn = vaultFetch({ defs: [note], byId: { "Agents/uni-dev": note } });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn }); // no grants
+    await reg.loadAll();
+    const detail = reg.listDetailed().find((d) => d.name === "uni-dev")!;
+    expect(detail.connections).toEqual([
+      { key: "mcp:https://remote/mcp", kind: "mcp", target: "https://remote/mcp", status: "pending" },
+    ]);
+    // No grant id → the panel can't offer Connect (shows the degraded hint instead).
+    expect(detail.connections[0]!.grantId).toBeUndefined();
+  });
+
   test("soleVaultName resolves the single binding (the reload-webhook default)", () => {
     const { deps } = recorderDeps();
     const reg = new AgentDefRegistry(deps, { bindings: [binding] });

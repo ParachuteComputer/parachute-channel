@@ -48,6 +48,32 @@ function hubOrigin(): string {
 }
 
 /**
+ * Whether the SPA is being served DAEMON-DIRECT (the agent daemon's own loopback
+ * origin, e.g. `http://127.0.0.1:1941/agent/app/`) rather than through the hub proxy
+ * (`<hub-origin>/agent/app/`). The cookie→hub "Connect" only works at the hub origin —
+ * served daemon-direct, the hub root paths (`/admin/grants/...`) resolve to the AGENT
+ * daemon, which doesn't serve them (→ 404), AND the operator cookie + CSRF Origin
+ * belt wouldn't accept the daemon's origin anyway. We surface a clear inline note
+ * up front instead of letting the operator hit a confusing error on Connect.
+ *
+ * Heuristic: the daemon binds loopback on the agent port (1941 default; the
+ * PARACHUTE_AGENT_PORT override is for non-standard installs). An exposed hub is
+ * NEVER served from `127.0.0.1`/`localhost` to a remote operator; a local operator
+ * on the hub's own loopback hits the HUB port (1939), not the agent's. So a loopback
+ * host on the agent port is the daemon-direct tell. Conservative: a false "looks
+ * daemon-direct" only HIDES the Connect button (the 60s-equivalent correctness is the
+ * grant still being registered); the authoritative signal remains the approve response
+ * (a 404 maps to the same hub-proxied-URL hint). Returns false in non-browser (SSR).
+ */
+export function isDaemonDirectOrigin(): boolean {
+  if (typeof window === "undefined") return false;
+  const { hostname, port } = window.location;
+  const loopback = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+  // The agent daemon's own port (the SPA is daemon-served only on the daemon's port).
+  return loopback && port === "1941";
+}
+
+/**
  * One connection as `GET /admin/connections` projects it (the fields we read;
  * the wire shape carries more). `source`/`sink` mirror the store records.
  */
@@ -195,6 +221,73 @@ export async function ensureDefReloadConnections(
     throw new HubError(firstStatus, hubErrorMessage(firstStatus, firstDetail || "provisioning failed"));
   }
   return { ok: failures.length === 0, failures };
+}
+
+// ===========================================================================
+// Agent-connector GRANTS — the cookie→hub "Connect" for an MCP server (4b-2).
+//
+// Adding the MCP server is a DAEMON op (PATCH the def's `wants:` to append
+// `mcp:<url>`; the daemon registers the pending grant via its host-admin bearer).
+// APPROVING it (the OAuth dance / static-bearer store) is OPERATOR-COOKIE-gated on
+// the hub — a host-admin Bearer CANNOT approve (isFirstAdmin only). So the browser
+// must call the hub's approve endpoint DIRECTLY with the operator cookie. This works
+// same-origin because the SPA is served at the hub origin (`<hub>/agent/app/`).
+//
+// We MIRROR the hub's proven client impl (parachute-hub web/ui Grants.tsx
+// `onConnectMcp`/`onApprove` + src/admin-agent-grants.ts `approveGrant`):
+//   POST <origin>/admin/grants/<id>/approve   (credentials: "include")
+//     - body `{}`         (no token) → OAuth: response carries `authorizeUrl`;
+//                          the caller full-page-redirects the browser there.
+//     - body `{ token }`  (static bearer) → store + approve immediately, no redirect.
+//   A `needs_consent` grant re-offers the SAME path (the "Reconnect" affordance).
+//
+// Degradation: served daemon-direct (`http://127.0.0.1:1941/agent/app/`,
+// cross-origin to the hub) the cookie won't flow and the CSRF belt rejects it — the
+// approve 404s (no such route on the daemon) / 401s. The 404 maps to the existing
+// "use the hub-proxied URL" hint, so the panel shows a clear message, not a confusing
+// raw error. The brief's `isHubOrigin()` helper gates the affordance up front.
+// ===========================================================================
+
+/**
+ * A grant in the hub's list/echo wire shape (NEVER carries the secret material).
+ * Mirrors `GrantListing` in parachute-hub web/ui/src/lib/api.ts. `authorizeUrl` is
+ * present ONLY on an `approveAgentGrant` OAuth start (no pasted token).
+ */
+export interface GrantListing {
+  id: string;
+  agent: string;
+  connection: { kind: "vault" | "service" | "mcp"; target: string };
+  status: "pending" | "approved" | "revoked" | "needs_consent";
+  reason?: string;
+  approvedAt?: string;
+  /** The remote-issuer consent URL — present only when starting an mcp OAuth flow. */
+  authorizeUrl?: string;
+}
+
+/**
+ * Approve (or start the OAuth flow for) an agent connector grant — the cookie→hub
+ * "Connect" / "Reconnect". `POST <origin>/admin/grants/<id>/approve` with the
+ * operator cookie (`credentials: "include"`); same-origin only (the hub's CSRF belt).
+ *
+ *   - NO `token` → START OAuth: the returned listing carries `authorizeUrl`; the
+ *     caller full-page-redirects the browser to the remote consent screen. The hub's
+ *     callback finishes server-side and flips the grant `approved`.
+ *   - WITH `token` → store a static bearer (non-OAuth MCP) + approve immediately.
+ *
+ * Throws `HubError` on a non-2xx — a 404 maps to the hub-proxied-URL hint (the
+ * daemon-direct degradation), 401 to a sign-in hint. The grant `id` MUST come from
+ * the daemon's def-API (`connections[].grantId`) — never derived client-side.
+ */
+export async function approveAgentGrant(id: string, token?: string): Promise<GrantListing> {
+  const res = await hubFetch(`/admin/grants/${encodeURIComponent(id)}/approve`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(token !== undefined ? { token } : {}),
+  });
+  if (!res.ok) {
+    throw new HubError(res.status, hubErrorMessage(res.status, await errorDetail(res)));
+  }
+  return (await res.json()) as GrantListing;
 }
 
 /**

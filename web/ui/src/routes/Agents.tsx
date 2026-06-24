@@ -33,6 +33,7 @@ import {
   type AgentMode,
   type AgentRow,
   type AgentVaultRow,
+  type ConnectionInfoRow,
   type JobRow,
   addAgentVault,
   createJob,
@@ -56,8 +57,11 @@ import {
 } from "../lib/api.ts";
 import {
   type ConnectionRow,
+  approveAgentGrant,
   defReloadStatus,
   ensureDefReloadConnections,
+  HubError,
+  isDaemonDirectOrigin,
   listConnections,
   teardownDefReloadConnections,
 } from "../lib/hub.ts";
@@ -395,6 +399,10 @@ export function AgentDetail({
                 ))}
               </div>
             </>
+          ) : null}
+
+          {noteId ? (
+            <ConnectionsSection noteId={noteId} def={def} onChanged={onChanged} />
           ) : null}
         </>
       ) : (
@@ -736,6 +744,429 @@ export function DeleteAgentConfirm({
       </div>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Connections / MCP servers (this PR). Add a remote MCP server to THIS agent +
+// authenticate it via OAuth (or a pasted static bearer) — in one place, without
+// bouncing to the hub admin grants page.
+//
+//   - LIST the agent's `mcp:` connections (from `def.connections`, falling back to
+//     deriving display-only rows from `wants`/`pending` for an older daemon) with a
+//     live status pill (Connected / Pending / Needs reconnect).
+//   - ADD: a URL + an auth choice (OAuth default | paste a static bearer). On submit
+//     we PATCH the def's `wants:` to APPEND `mcp:<url>` (preserving the existing
+//     wants), so the DAEMON re-parses + registers the pending grant (its reconcile-GC
+//     prunes any grant not in the live `wants:`, so we must go through the def, NOT
+//     PUT a grant directly).
+//   - CONNECT / RECONNECT: the cookie→hub approve (`approveAgentGrant`) — OAuth
+//     redirect (no token) or static-bearer store (with token). This needs the hub
+//     grant `id` (`connection.grantId`, from the daemon — never derived here).
+//
+// Degradation: the cookie→hub Connect only works at the hub origin. Served
+// daemon-direct (`http://127.0.0.1:1941/agent/app/`) the cookie won't flow + the
+// CSRF belt rejects it, so we detect that (`isDaemonDirectOrigin`) and show a clear
+// inline note instead of a confusing error. Adding the MCP (the def PATCH) still
+// works daemon-direct; only the Connect step needs the hub origin.
+// ---------------------------------------------------------------------------
+
+/** A status pill for a grant lifecycle, mapped to the shared pill classes + a label. */
+function GrantStatusPill({ status }: { status: string }) {
+  if (status === "approved") {
+    return <span className="pill status-enabled" data-testid="conn-status-approved">Connected</span>;
+  }
+  if (status === "needs_consent") {
+    return (
+      <span className="pill status-error" data-testid="conn-status-needs_consent">
+        Needs reconnect
+      </span>
+    );
+  }
+  if (status === "revoked") {
+    return <span className="pill status-error" data-testid="conn-status-revoked">Revoked</span>;
+  }
+  // pending (or any unknown) → awaiting approval.
+  return <span className="pill status-pending" data-testid="conn-status-pending">Pending</span>;
+}
+
+/**
+ * Derive the MCP connection rows to render. Prefer the daemon's `def.connections`
+ * (carries the hub grant id + live status — drives Connect); for an OLDER daemon that
+ * omits the field, fall back to display-only rows derived from `wants` (those whose key
+ * starts `mcp:`), with status inferred from `pending` (in `pending` → pending, else
+ * approved) and NO grant id (so Connect is unavailable — a hint shows instead).
+ */
+export function mcpConnectionRows(def: AgentDefRow): ConnectionInfoRow[] {
+  if (def.connections && def.connections.length > 0) {
+    return def.connections.filter((c) => c.kind === "mcp");
+  }
+  // Fallback: an older daemon. `wants` keys for an mcp connection are `mcp:<url>`.
+  const pending = new Set(def.pending);
+  return def.wants
+    .filter((w) => w.startsWith("mcp:") && /^mcp:https?:\/\//i.test(w))
+    .map((w) => ({
+      key: w,
+      kind: "mcp" as const,
+      target: w.slice("mcp:".length),
+      status: pending.has(w) ? "pending" : "approved",
+    }));
+}
+
+/**
+ * The per-agent Connections / MCP-servers section. `def` carries the current `wants`
+ * + per-connection grant info; `onChanged` refreshes the list after an add (so the new
+ * connection + its grant id appear). A Connect drives a full-page OAuth redirect, so
+ * there's no post-redirect refresh to wire — the hub callback returns the operator to
+ * its own page.
+ */
+export function ConnectionsSection({
+  noteId,
+  def,
+  onChanged,
+}: {
+  noteId: string;
+  def: AgentDefRow;
+  onChanged: () => void;
+}) {
+  const [addOpen, setAddOpen] = useState(false);
+  // The grant id currently mid-connect (so its button shows a spinner) / mid-paste.
+  const [connecting, setConnecting] = useState<string | null>(null);
+  const [pasteFor, setPasteFor] = useState<string | null>(null);
+  const [pasteToken, setPasteToken] = useState("");
+  const [rowError, setRowError] = useState<string | null>(null);
+
+  const rows = mcpConnectionRows(def);
+  // The cookie→hub Connect only works at the hub origin (the cookie + CSRF belt).
+  const daemonDirect = isDaemonDirectOrigin();
+
+  /** Start the OAuth dance (no token) → full-page redirect to the remote consent. */
+  async function onConnect(grantId: string) {
+    setConnecting(grantId);
+    setRowError(null);
+    try {
+      const listing = await approveAgentGrant(grantId);
+      if (listing.authorizeUrl) {
+        // Cross-origin remote consent — full-page nav, NOT react-router.
+        window.location.assign(listing.authorizeUrl);
+        return; // navigating away; keep the spinner.
+      }
+      // No authorizeUrl (e.g. the hub approved without a redirect) → refresh in place.
+      onChanged();
+    } catch (err) {
+      setRowError(connectErrMessage(err));
+    } finally {
+      setConnecting(null);
+    }
+  }
+
+  /** Store a pasted static bearer (no redirect) → approve immediately, then refresh. */
+  async function onPasteToken(grantId: string) {
+    const token = pasteToken.trim();
+    if (token.length === 0) return;
+    setConnecting(grantId);
+    setRowError(null);
+    try {
+      await approveAgentGrant(grantId, token);
+      setPasteFor(null);
+      setPasteToken("");
+      onChanged();
+    } catch (err) {
+      setRowError(connectErrMessage(err));
+    } finally {
+      setConnecting(null);
+    }
+  }
+
+  return (
+    <section className="detail-section" aria-label="Connections" data-testid="connections-section">
+      <div className="section-head">
+        <h3>Connections / MCP servers</h3>
+        <button
+          type="button"
+          className="secondary"
+          data-testid="add-mcp-toggle"
+          onClick={() => {
+            setAddOpen((o) => !o);
+            setRowError(null);
+          }}
+        >
+          {addOpen ? "Cancel" : "Add MCP server"}
+        </button>
+      </div>
+      <p className="muted">
+        Remote MCP servers this agent can reach. Add one, then connect it via OAuth (or
+        paste a static bearer). Each connection is operator-approved before it's granted.
+      </p>
+
+      {daemonDirect ? (
+        <div className="info-banner" role="status" data-testid="connections-daemon-direct">
+          Open this surface via your hub to connect MCP servers — the OAuth/approve step
+          needs the hub origin (you're on the loopback daemon).
+        </div>
+      ) : null}
+
+      {addOpen ? (
+        <AddMcpForm
+          noteId={noteId}
+          def={def}
+          onCancel={() => setAddOpen(false)}
+          onAdded={() => {
+            setAddOpen(false);
+            onChanged();
+          }}
+        />
+      ) : null}
+
+      {rowError ? (
+        <div className="error-banner" role="alert" data-testid="connections-row-error">
+          {rowError}
+        </div>
+      ) : null}
+
+      {rows.length === 0 ? (
+        <div className="empty" data-testid="connections-empty">
+          No MCP servers connected to this agent yet.
+        </div>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>MCP server</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((c) => {
+              const actionable = c.status !== "approved";
+              const canConnect = actionable && !!c.grantId && !daemonDirect;
+              return (
+                <tr key={c.key} data-testid={`connection-row-${c.target}`}>
+                  <td className="cell-name">
+                    <code>{c.target}</code>
+                  </td>
+                  <td>
+                    <GrantStatusPill status={c.status} />
+                  </td>
+                  <td>
+                    {!actionable ? (
+                      <span className="cell-dim">—</span>
+                    ) : pasteFor === c.grantId ? (
+                      <span className="confirm-inline">
+                        <input
+                          type="password"
+                          value={pasteToken}
+                          placeholder="bearer token"
+                          autoComplete="off"
+                          spellCheck={false}
+                          aria-label="Static bearer token"
+                          data-testid={`paste-token-input-${c.target}`}
+                          onChange={(e) => setPasteToken(e.target.value)}
+                        />
+                        <button
+                          type="button"
+                          disabled={connecting === c.grantId || pasteToken.trim().length === 0}
+                          data-testid={`paste-token-save-${c.target}`}
+                          onClick={() => void onPasteToken(c.grantId!)}
+                        >
+                          {connecting === c.grantId ? "Saving…" : "Save"}
+                        </button>
+                        <button
+                          type="button"
+                          className="cancel-link"
+                          onClick={() => {
+                            setPasteFor(null);
+                            setPasteToken("");
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <span className="schedule-row-actions">
+                        <button
+                          type="button"
+                          disabled={!canConnect || connecting === c.grantId}
+                          data-testid={`connect-${c.target}`}
+                          title={
+                            daemonDirect
+                              ? "Open the agent app via your hub origin to connect."
+                              : !c.grantId
+                                ? "No grant registered yet — reload after the daemon registers it."
+                                : undefined
+                          }
+                          onClick={() => void onConnect(c.grantId!)}
+                        >
+                          {connecting === c.grantId
+                            ? "Connecting…"
+                            : c.status === "needs_consent"
+                              ? "Reconnect"
+                              : "Connect"}
+                        </button>
+                        {c.grantId && !daemonDirect ? (
+                          <button
+                            type="button"
+                            className="cancel-link"
+                            data-testid={`paste-token-${c.target}`}
+                            onClick={() => {
+                              setRowError(null);
+                              setPasteToken("");
+                              setPasteFor(c.grantId!);
+                            }}
+                          >
+                            Paste token
+                          </button>
+                        ) : null}
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
+/** A friendly message off a Connect failure (HubError carries the hub's hint). */
+function connectErrMessage(err: unknown): string {
+  if (err instanceof HubError) return err.message;
+  return (err as Error).message;
+}
+
+/**
+ * The inline "Add MCP server" form: a URL + an auth choice (OAuth default | paste a
+ * static bearer). On submit we APPEND `mcp:<url>` to the def's existing `wants:` (so we
+ * don't drop the agent's other connections) and PATCH the def — the daemon re-parses
+ * `wants` and registers the pending grant. The auth choice is informational at THIS
+ * step (adding registers the grant either way); the actual OAuth-vs-token decision is
+ * made at the Connect step on the row. We carry it so the operator's intent is clear +
+ * the OAuth path is the default the row's primary button takes.
+ */
+export function AddMcpForm({
+  noteId,
+  def,
+  onCancel,
+  onAdded,
+}: {
+  noteId: string;
+  def: AgentDefRow;
+  onCancel: () => void;
+  onAdded: () => void;
+}) {
+  const [url, setUrl] = useState("");
+  const [auth, setAuth] = useState<"oauth" | "token">("oauth");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // A valid http(s) URL (the daemon's parseWants requires http(s) for a remote MCP).
+  const trimmed = url.trim();
+  const urlValid = /^https?:\/\/.+/i.test(trimmed) && isParseableUrl(trimmed);
+  // Already declared? (avoid a duplicate `mcp:` entry — the daemon would dedupe by key
+  // but a friendlier pre-submit guard.)
+  const alreadyAdded = def.wants.includes(`mcp:${trimmed}`);
+  const canAdd = urlValid && !alreadyAdded && !saving;
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!canAdd) return;
+    setSaving(true);
+    setError(null);
+    try {
+      // APPEND to the existing wants (preserve the agent's other connections). The
+      // wants keys round-trip through the daemon's parseWants as a comma string.
+      const next = [...def.wants, `mcp:${trimmed}`].join(", ");
+      await editAgentDef(noteId, { wants: next });
+      onAdded();
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? err.status === 401
+            ? "Not signed in to the hub — sign in to the portal, then reload."
+            : err.message
+          : (err as Error).message;
+      setError(message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form className="inline-form" onSubmit={onSubmit} aria-label="Add MCP server" data-testid="add-mcp-form">
+      {error ? (
+        <div className="error-banner" role="alert" data-testid="add-mcp-error">
+          {error}
+        </div>
+      ) : null}
+
+      <div className="field">
+        <label htmlFor="mcp-url">MCP server URL</label>
+        <input
+          id="mcp-url"
+          type="text"
+          value={url}
+          placeholder="https://mcp.example.com/mcp"
+          autoComplete="off"
+          spellCheck={false}
+          onChange={(e) => setUrl(e.target.value)}
+        />
+        {trimmed.length > 0 && !urlValid ? (
+          <p className="field-error" data-testid="mcp-url-invalid">
+            Must be a full http(s) URL.
+          </p>
+        ) : null}
+        {alreadyAdded ? (
+          <p className="field-error" data-testid="mcp-url-duplicate">
+            This MCP server is already connected to the agent.
+          </p>
+        ) : null}
+      </div>
+
+      <fieldset className="field">
+        <legend>Authentication</legend>
+        <p className="muted">You'll enter credentials in the next step &mdash; on the connection's row after it's added.</p>
+        <RadioRow
+          name="mcp-auth"
+          value="oauth"
+          checked={auth === "oauth"}
+          onChange={() => setAuth("oauth")}
+          label="OAuth"
+          help="Sign in to the MCP server in your browser (recommended). Connect on the row after adding."
+          testid="mcp-auth-oauth"
+        />
+        <RadioRow
+          name="mcp-auth"
+          value="token"
+          checked={auth === "token"}
+          onChange={() => setAuth("token")}
+          label="Paste a token"
+          help="For an MCP server with a static bearer token. Paste it on the row's “Paste token” after adding."
+          testid="mcp-auth-token"
+        />
+      </fieldset>
+
+      <div className="form-actions">
+        <button type="submit" disabled={!canAdd} data-testid="add-mcp-submit">
+          {saving ? "Adding…" : "Add MCP server"}
+        </button>
+        <button type="button" className="cancel-link" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/** True if `s` parses as a URL (defensive — the regex already gates the scheme). */
+function isParseableUrl(s: string): boolean {
+  try {
+    new URL(s);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

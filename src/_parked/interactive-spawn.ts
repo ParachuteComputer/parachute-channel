@@ -41,6 +41,7 @@ import { normalizeChannel } from "../sandbox/types.ts";
 import type { SandboxEngine, WrappedCommand } from "../sandbox/index.ts";
 import {
   buildAgentChildEnv,
+  mergeSandboxLaunchEnv,
   resolveAgentCwd,
   seedAgentHome,
   sessionWorkspace,
@@ -282,11 +283,11 @@ export async function spawnAgent(
   const homeEnv = seedAgentHome(workspace, { mcpServers: mcpServerNames, projectRoot: cwd });
 
   const childEnv = buildAgentChildEnv(deps.parentEnv ?? process.env, claudeOauthToken, channelEnv);
-  const launchEnv: Record<string, string | undefined> = {
-    ...childEnv,
-    ...wrapped.env,
-    ...homeEnv,
-  };
+  // Scrub WINS: only allowlisted sandbox/proxy keys from `wrapped.env` (not the whole
+  // daemon `process.env` the engine returns) layer on top. See mergeSandboxLaunchEnv.
+  // (This file is the PARKED/retired interactive backend — kept in sync with the live
+  // programmatic backend's shared seam, not a live spawn path.)
+  const launchEnv = mergeSandboxLaunchEnv(childEnv, wrapped.env, homeEnv);
 
   await deps.tmux.newSession({
     name: session,

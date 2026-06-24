@@ -247,6 +247,100 @@ export function readPersistedSpec(workspace: string): AgentSpec | null {
 }
 
 /**
+ * The ONLY env keys we accept FROM the sandbox engine's returned `wrapped.env`.
+ *
+ * CRITICAL ISOLATION CONTRACT. `@anthropic-ai/sandbox-runtime`'s
+ * `wrapWithSandboxArgv` returns `env: process.env` on macOS/Linux (the proxy/sandbox
+ * vars are baked into the wrapped COMMAND STRING via an `env VAR=… sandbox-exec …`
+ * prefix / bwrap `--setenv`, NOT into the returned env) and `{...process.env, ...proxy}`
+ * on Windows (where the proxy vars DO ride in the returned env). So `wrapped.env` is
+ * essentially the WHOLE daemon env. If we spread it over the scrubbed `childEnv`, the
+ * daemon's ambient `ANTHROPIC_API_KEY` / any other secret would OVERRIDE the scrub and
+ * reach the sandboxed turn — defeating `buildAgentChildEnv` entirely (the
+ * subscription-billing + no-secret-leak guarantee). So we ALLOWLIST: from `wrapped.env`
+ * we keep ONLY these known sandbox/proxy keys (the exact set the runtime's
+ * `generateProxyEnvVars` + the Linux bwrap `--setenv` markers emit — needed so the
+ * egress proxy works, esp. on Windows where they ride in the returned env), and drop
+ * everything else. {@link DENYLISTED_ENV} is re-applied to whatever we keep as belt-
+ * and-suspenders so the Claude-auth trio can NEVER enter via this seam.
+ *
+ * Source of truth: `@anthropic-ai/sandbox-runtime` `sandbox-utils.generateProxyEnvVars`
+ * (`SANDBOX_RUNTIME`, `TMPDIR`, `CA_TRUST_VARS`, `NO_PROXY`/proxy/socks/git-ssh/docker/
+ * cloudsdk/grpc vars) + `linux-sandbox-utils` (`CLAUDE_CODE_HOST_*_PROXY_PORT`). Raise
+ * this set alongside the pinned-engine upgrade gate if the runtime adds a launch var.
+ */
+export const SANDBOX_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
+  // Sandbox markers + the per-session temp dir.
+  "SANDBOX_RUNTIME",
+  "TMPDIR",
+  // CA trust stores (CA_TRUST_VARS) — when the proxy terminates TLS the child must
+  // trust the proxy-minted certs.
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "CURL_CA_BUNDLE",
+  "REQUESTS_CA_BUNDLE",
+  "PIP_CERT",
+  "GIT_SSL_CAINFO",
+  "AWS_CA_BUNDLE",
+  "CARGO_HTTP_CAINFO",
+  "DENO_CERT",
+  // Proxy routing (upper + lower case) — the egress floor. Without these the
+  // sandboxed turn loses network on platforms that carry them in the returned env.
+  "NO_PROXY",
+  "no_proxy",
+  "HTTP_PROXY",
+  "http_proxy",
+  "HTTPS_PROXY",
+  "https_proxy",
+  "ALL_PROXY",
+  "all_proxy",
+  "FTP_PROXY",
+  "ftp_proxy",
+  "RSYNC_PROXY",
+  "GRPC_PROXY",
+  "grpc_proxy",
+  "DOCKER_HTTP_PROXY",
+  "DOCKER_HTTPS_PROXY",
+  "CLOUDSDK_PROXY_TYPE",
+  "CLOUDSDK_PROXY_ADDRESS",
+  "CLOUDSDK_PROXY_PORT",
+  // Git-over-SSH through the SOCKS/HTTP proxy.
+  "GIT_SSH_COMMAND",
+  // Linux bwrap host-proxy-port markers (debug/transparency).
+  "CLAUDE_CODE_HOST_HTTP_PROXY_PORT",
+  "CLAUDE_CODE_HOST_SOCKS_PROXY_PORT",
+]);
+
+/**
+ * Compose the FINAL launch env for a sandboxed turn so the SCRUB WINS.
+ *
+ * Layering (lowest → highest precedence):
+ *   1. `childEnv` — the scrubbed allowlist from {@link buildAgentChildEnv} (authoritative).
+ *   2. the sandbox/proxy ALLOWLIST drawn from `wrappedEnv` ({@link SANDBOX_ENV_ALLOWLIST}),
+ *      with {@link DENYLISTED_ENV} re-applied defensively — only known egress/sandbox
+ *      vars layer on, never the daemon's ambient `process.env` (the old `...wrappedEnv`
+ *      spread leaked it).
+ *   3. `homeEnv` — `seedAgentHome`'s CLAUDE_CONFIG_DIR/XDG/TMP overrides win last.
+ *
+ * `CLAUDE_CODE_OAUTH_TOKEN` (set last by `buildAgentChildEnv`) survives: it is not in the
+ * allowlist AND is denylisted, so step 2 can never overwrite it; step 3 doesn't set it.
+ */
+export function mergeSandboxLaunchEnv(
+  childEnv: Record<string, string>,
+  wrappedEnv: Record<string, string | undefined>,
+  homeEnv: Record<string, string>,
+): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = { ...childEnv };
+  for (const [k, v] of Object.entries(wrappedEnv)) {
+    if (typeof v !== "string" || v.length === 0) continue;
+    if (!SANDBOX_ENV_ALLOWLIST.has(k)) continue; // drop the daemon's ambient env
+    if (DENYLISTED_ENV.has(k)) continue; // never re-admit the Claude-auth trio here
+    out[k] = v;
+  }
+  return { ...out, ...homeEnv };
+}
+
+/**
  * Build the scrubbed child env for the sandboxed claude. Mirrors runner's
  * passthrough allowlist MINUS `ANTHROPIC_API_KEY` (and the `ANTHROPIC_*`/`CLAUDE_*`
  * wildcards, which would re-admit it) — the channel session runs on the
@@ -254,7 +348,10 @@ export function readPersistedSpec(workspace: string): AgentSpec | null {
  * `CLAUDE_CODE_OAUTH_TOKEN` is the session's auth.
  *
  * The sandbox engine's own env (proxy vars, sandbox markers) is layered on TOP of
- * this by the wrap step; this is the base the wrapper extends.
+ * this by {@link mergeSandboxLaunchEnv} — but as an ALLOWLIST
+ * ({@link SANDBOX_ENV_ALLOWLIST}), NOT the whole returned `wrapped.env` (which is the
+ * daemon's `process.env` and would re-admit the scrubbed secrets). This scrubbed env
+ * is authoritative; only known sandbox/proxy keys + the home overrides layer on top.
  *
  * SECURITY POSTURE — the per-channel env injection (`channelEnv`):
  *

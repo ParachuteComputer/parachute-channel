@@ -126,12 +126,36 @@ function fakeEngine(): SandboxEngine & { initializedWith: SandboxRuntimeConfig |
       rec.initializedWith = cfg;
     },
     async wrapWithSandboxArgv(command: string) {
-      // Emulate the real shape: a bash -c wrapper carrying the command + proxy env.
+      // Emulate the REAL `wrapWithSandboxArgv` contract: a bash -c wrapper carrying
+      // the command, and `env` = the daemon's FULL `process.env` (on macOS/Linux the
+      // real engine returns `process.env` verbatim; the proxy vars are baked into the
+      // command string and ALSO present in process.env on Windows). The hand-made
+      // SMALL env the old fake returned could never catch the passthrough leak — the
+      // whole-`process.env`-spread that defeats buildAgentChildEnv's scrub. So the fake
+      // must include the daemon's ambient secrets it would carry in real life PLUS the
+      // proxy/sandbox vars, so a test can prove the leak is closed AND egress survives.
+      //
       // The "argv" the runner spawns is therefore `["/bin/bash","-c","SBX <command>"]`;
       // assertions parse `argv[2]` for the claude flags.
       return {
         argv: ["/bin/bash", "-c", `SBX ${command}`],
-        env: { SANDBOX_RUNTIME: "1", HTTPS_PROXY: "http://localhost:5555", TMPDIR: "/tmp/claude" },
+        env: {
+          // The daemon's ambient env (process.env) the real engine passes through —
+          // these MUST be scrubbed from the launch env (the isolation/billing leak).
+          ANTHROPIC_API_KEY: "sk-ant-DAEMON-AMBIENT-SHOULD-NOT-LEAK",
+          CLAUDE_API_KEY: "daemon-ambient-also-should-not-leak",
+          CLAUDE_CODE_OAUTH_TOKEN: "DAEMON-AMBIENT-WRONG-TOKEN-SHOULD-NOT-WIN",
+          SECRET_THING: "daemon-ambient-secret-should-not-leak",
+          PATH: "/daemon/bin",
+          // The load-bearing sandbox/proxy vars the egress floor depends on — these
+          // MUST survive into the launch env (allowlisted).
+          SANDBOX_RUNTIME: "1",
+          HTTP_PROXY: "http://localhost:5555",
+          HTTPS_PROXY: "http://localhost:5555",
+          NO_PROXY: "localhost,127.0.0.1",
+          TMPDIR: "/tmp/claude",
+          NODE_EXTRA_CA_CERTS: "/tmp/claude/ca.pem",
+        },
       };
     },
     async reset() {},
@@ -564,6 +588,46 @@ describe("ProgrammaticBackend.deliver — argv + env shape", () => {
     expect(env.CLAUDE_API_KEY).toBeUndefined();
     // the sandbox proxy env is layered on top
     expect(env.SANDBOX_RUNTIME).toBe("1");
+  });
+
+  test("REGRESSION (isolation/billing leak): the engine's returned env (= daemon process.env) is NOT spread onto the launch env — only allowlisted sandbox/proxy keys survive; the scrub wins", async () => {
+    // The real `wrapWithSandboxArgv` returns `env: process.env` (the FULL daemon env)
+    // on macOS/Linux. The fakeEngine now mirrors that — its returned env carries the
+    // daemon's ambient ANTHROPIC_API_KEY / CLAUDE_API_KEY / SECRET_THING / a WRONG
+    // CLAUDE_CODE_OAUTH_TOKEN. The old `{ ...childEnv, ...wrapped.env, ...homeEnv }`
+    // spread let those OVERRIDE the scrubbed childEnv → reaching the sandboxed turn
+    // (subscription-billing + secret-leak breach). mergeSandboxLaunchEnv allowlists
+    // wrapped.env, so the scrub stays authoritative.
+    mkDirs("env-leak-regression");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault());
+    await backend.deliver(handle, "hello", freshSession());
+
+    const env = calls[0]!.env;
+
+    // 1. LEAK CLOSED: the daemon's ambient secrets the engine returned never reach
+    //    the launch env (neither the scrubbed childEnv nor the allowlist admits them).
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.CLAUDE_API_KEY).toBeUndefined();
+    expect(env.SECRET_THING).toBeUndefined();
+
+    // 2. MANAGED AUTH WINS: CLAUDE_CODE_OAUTH_TOKEN is the session's resolved token,
+    //    NOT the wrong daemon-ambient one the engine env carried (it's denylisted +
+    //    not allowlisted, so step 2 can never overwrite the scrub's value).
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("OAUTH-CRED-PLACEHOLDER");
+
+    // 3. EGRESS PRESERVED: the load-bearing sandbox/proxy vars DO survive (allowlist),
+    //    so the egress proxy keeps working — the fix doesn't strangle the network.
+    expect(env.SANDBOX_RUNTIME).toBe("1");
+    expect(env.HTTP_PROXY).toBe("http://localhost:5555");
+    expect(env.HTTPS_PROXY).toBe("http://localhost:5555");
+    expect(env.NO_PROXY).toBe("localhost,127.0.0.1");
+    expect(env.NODE_EXTRA_CA_CERTS).toBe("/tmp/claude/ca.pem");
+
+    // 4. The daemon's ambient PATH from the engine env does NOT clobber the scrubbed
+    //    PATH (PATH isn't in the sandbox allowlist; childEnv's passthrough owns it).
+    expect(env.PATH).not.toBe("/daemon/bin");
   });
 
   test("the per-channel env injection (GH_TOKEN) reaches the child; a planted API key is dropped", async () => {

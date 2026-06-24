@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 // SHARED spawn helpers (live tree).
 import {
   buildAgentChildEnv,
+  mergeSandboxLaunchEnv,
+  SANDBOX_ENV_ALLOWLIST,
   resolveAgentCwd,
   seedAgentHome,
   sessionWorkspace,
@@ -230,6 +232,68 @@ describe("buildAgentChildEnv — scrub, inject OAuth, NEVER ANTHROPIC_API_KEY", 
     const env = buildAgentChildEnv({ PATH: "/usr/bin" }, "tok");
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("tok");
     expect(env.PATH).toBe("/usr/bin");
+  });
+});
+
+describe("mergeSandboxLaunchEnv — the scrub WINS over the engine's returned env", () => {
+  // The REAL `wrapWithSandboxArgv` returns `env: process.env` (the FULL daemon env) on
+  // macOS/Linux; on Windows it returns `{...process.env, ...proxy}`. So `wrapped.env` is
+  // essentially the whole daemon env. The old `{ ...childEnv, ...wrapped.env, ...homeEnv }`
+  // spread let that OVERRIDE the scrubbed childEnv — re-admitting the daemon's ambient
+  // ANTHROPIC_API_KEY/secrets into the sandboxed turn (isolation/billing leak).
+
+  const childEnv = buildAgentChildEnv({ PATH: "/usr/bin", HOME: "/h" }, "THE-OAUTH-TOKEN");
+  // A representative `wrapped.env` = the daemon's process.env + the sandbox/proxy vars.
+  const wrappedEnv = {
+    ANTHROPIC_API_KEY: "sk-ant-DAEMON-AMBIENT",
+    CLAUDE_API_KEY: "daemon-ambient",
+    CLAUDE_CODE_OAUTH_TOKEN: "WRONG-DAEMON-TOKEN",
+    SECRET_THING: "daemon-secret",
+    PATH: "/daemon/bin",
+    SANDBOX_RUNTIME: "1",
+    HTTP_PROXY: "http://localhost:5555",
+    HTTPS_PROXY: "http://localhost:5555",
+    NO_PROXY: "localhost,127.0.0.1",
+    NODE_EXTRA_CA_CERTS: "/tmp/claude/ca.pem",
+    TMPDIR: "/tmp/claude",
+  };
+  const homeEnv: Record<string, string> = { CLAUDE_CONFIG_DIR: "/sess/.claude" };
+
+  test("LEAK CLOSED: the daemon's ambient secrets in wrapped.env never reach the launch env", () => {
+    const env = mergeSandboxLaunchEnv(childEnv, wrappedEnv, homeEnv);
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.CLAUDE_API_KEY).toBeUndefined();
+    expect(env.SECRET_THING).toBeUndefined();
+  });
+
+  test("MANAGED AUTH WINS: CLAUDE_CODE_OAUTH_TOKEN is the scrubbed value, not the engine env's wrong one", () => {
+    const env = mergeSandboxLaunchEnv(childEnv, wrappedEnv, homeEnv);
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("THE-OAUTH-TOKEN");
+  });
+
+  test("EGRESS PRESERVED: the allowlisted sandbox/proxy vars survive (the proxy keeps working)", () => {
+    const env = mergeSandboxLaunchEnv(childEnv, wrappedEnv, homeEnv);
+    expect(env.SANDBOX_RUNTIME).toBe("1");
+    expect(env.HTTP_PROXY).toBe("http://localhost:5555");
+    expect(env.HTTPS_PROXY).toBe("http://localhost:5555");
+    expect(env.NO_PROXY).toBe("localhost,127.0.0.1");
+    expect(env.NODE_EXTRA_CA_CERTS).toBe("/tmp/claude/ca.pem");
+  });
+
+  test("the scrubbed PATH wins (PATH is not in the sandbox allowlist)", () => {
+    const env = mergeSandboxLaunchEnv(childEnv, wrappedEnv, homeEnv);
+    expect(env.PATH).toBe("/usr/bin"); // childEnv's, not the engine env's /daemon/bin
+  });
+
+  test("homeEnv wins last (CLAUDE_CONFIG_DIR/XDG/TMP overrides)", () => {
+    const env = mergeSandboxLaunchEnv(childEnv, wrappedEnv, homeEnv);
+    expect(env.CLAUDE_CONFIG_DIR).toBe("/sess/.claude");
+  });
+
+  test("the allowlist never contains the Claude-auth trio (defense-in-depth)", () => {
+    expect(SANDBOX_ENV_ALLOWLIST.has("ANTHROPIC_API_KEY")).toBe(false);
+    expect(SANDBOX_ENV_ALLOWLIST.has("CLAUDE_API_KEY")).toBe(false);
+    expect(SANDBOX_ENV_ALLOWLIST.has("CLAUDE_CODE_OAUTH_TOKEN")).toBe(false);
   });
 });
 

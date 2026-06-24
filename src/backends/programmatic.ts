@@ -61,6 +61,7 @@ import { normalizeChannel } from "../sandbox/types.ts";
 import type { SandboxEngine } from "../sandbox/index.ts";
 import {
   buildAgentChildEnv,
+  mergeSandboxLaunchEnv,
   resolveAgentCwd,
   seedAgentHome,
   sessionWorkspace,
@@ -583,11 +584,13 @@ export class ProgrammaticBackend implements AgentBackend {
         ...(this.deps.ripgrep ? { ripgrep: this.deps.ripgrep } : {}),
       });
 
-      const launchEnv: Record<string, string | undefined> = {
-        ...childEnv,
-        ...wrapped.env,
-        ...homeEnv,
-      };
+      // Compose the launch env so the SCRUB WINS: the scrubbed `childEnv` is
+      // authoritative; only the ALLOWLISTED sandbox/proxy keys from `wrapped.env`
+      // (NOT the whole daemon `process.env` the engine returns) + the home overrides
+      // layer on top. A bare `...wrapped.env` spread would re-admit the daemon's
+      // ambient ANTHROPIC_API_KEY/secrets and defeat buildAgentChildEnv's scrub —
+      // an isolation/billing leak. See mergeSandboxLaunchEnv.
+      const launchEnv = mergeSandboxLaunchEnv(childEnv, wrapped.env, homeEnv);
 
       // Run the turn, with a bounded retry on TRANSIENT upstream errors (API 529/overload,
       // 5xx, rate-limit, network). The argv is fixed (built above for THIS turn's session),

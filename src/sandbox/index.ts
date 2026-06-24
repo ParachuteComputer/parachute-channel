@@ -20,7 +20,10 @@
 // patch releases, and it is the load-bearing isolation engine. Treat a version
 // bump as an upgrade-gate: only raise the pin behind a green run of the sandbox
 // test suite (esp. the LIVE Seatbelt assertions in `live-seatbelt.test.ts`, which
-// prove the real boundary still holds against the new version).
+// prove the real boundary still holds against the new version). On a bump, also
+// re-check `SANDBOX_ENV_ALLOWLIST` (spawn-agent.ts) against the runtime's
+// `generateProxyEnvVars` — a new proxy/launch var the engine emits must be added
+// there or egress silently breaks on Windows (where those vars ride in the env dict).
 import { SandboxManager as RealSandboxManager } from "@anthropic-ai/sandbox-runtime";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { AgentSpec, BaseBinds, SandboxPlatform } from "./types.ts";

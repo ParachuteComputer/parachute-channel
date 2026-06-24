@@ -270,7 +270,10 @@ export function readPersistedSpec(workspace: string): AgentSpec | null {
  * this set alongside the pinned-engine upgrade gate if the runtime adds a launch var.
  */
 export const SANDBOX_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
-  // Sandbox markers + the per-session temp dir.
+  // Sandbox markers + the per-session temp dir. NB: TMPDIR is allowlisted for the
+  // WINDOWS path (where it rides in the returned env dict); on macOS/Linux it's baked
+  // into the command string. Either way `homeEnv` (seedAgentHome's per-workspace tmp)
+  // is layered LAST in mergeSandboxLaunchEnv, so the session's own TMPDIR wins by design.
   "SANDBOX_RUNTIME",
   "TMPDIR",
   // CA trust stores (CA_TRUST_VARS) — when the proxy terminates TLS the child must

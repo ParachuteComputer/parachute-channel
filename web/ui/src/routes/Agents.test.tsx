@@ -28,6 +28,7 @@ vi.mock("../lib/api.ts", async (orig) => {
     listAgentSecrets: vi.fn(),
     setAgentSecret: vi.fn(),
     removeAgentSecret: vi.fn(),
+    listAgentEnv: vi.fn(),
   };
 });
 
@@ -46,6 +47,7 @@ const deleteJob = vi.mocked(api.deleteJob);
 const listAgentSecrets = vi.mocked(api.listAgentSecrets);
 const setAgentSecret = vi.mocked(api.setAgentSecret);
 const removeAgentSecret = vi.mocked(api.removeAgentSecret);
+const listAgentEnv = vi.mocked(api.listAgentEnv);
 
 function agentRow(over: Partial<api.AgentRow> = {}): api.AgentRow {
   return {
@@ -108,6 +110,7 @@ beforeEach(() => {
   listAgentVaults.mockResolvedValue({ vaults: [] });
   listJobs.mockResolvedValue({ jobs: [] });
   listAgentSecrets.mockResolvedValue({ default: [], channels: {} });
+  listAgentEnv.mockResolvedValue({ env: [] });
 });
 
 afterEach(() => {
@@ -565,5 +568,80 @@ describe("Agents — per-agent secrets (#36)", () => {
     await waitFor(() =>
       expect(removeAgentSecret).toHaveBeenCalledWith({ channel: "alpha", name: "GH_TOKEN" }),
     );
+  });
+});
+
+describe("Effective env — the resolved env-var names in the detail panel", () => {
+  function openAgent() {
+    listAgents.mockResolvedValue({
+      agents: [agentRow({ name: "alpha", backend: "programmatic", channel: "alpha", vault: "default" })],
+    });
+    listAgentDefs.mockResolvedValue({ defs: [defRow({ name: "alpha", channel: "alpha" })] });
+  }
+
+  it("renders the resolved names with a source badge per layer (default / channel / grant), no values", async () => {
+    openAgent();
+    listAgentEnv.mockResolvedValue({
+      env: [
+        { name: "DEFAULT_VAR", source: "default" },
+        { name: "CHANNEL_VAR", source: "channel" },
+        { name: "GITHUB_TOKEN", source: "grant:github" },
+      ],
+    });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    const section = await screen.findByTestId("effective-env-section");
+    // Each name appears with its source badge.
+    expect(within(section).getByTestId("effective-env-DEFAULT_VAR-default")).toBeInTheDocument();
+    expect(within(section).getByTestId("effective-env-CHANNEL_VAR-channel")).toBeInTheDocument();
+    expect(within(section).getByTestId("effective-env-GITHUB_TOKEN-grant:github")).toBeInTheDocument();
+    // The source badges render the source label.
+    expect(within(section).getByText("grant:github")).toBeInTheDocument();
+    expect(within(section).getByText("channel")).toBeInTheDocument();
+    // The call resolved THIS agent.
+    expect(listAgentEnv).toHaveBeenCalledWith("alpha");
+    // No value text leaks.
+    expect(within(section).queryByText(/ghp_|secret/i)).not.toBeInTheDocument();
+  });
+
+  it("marks a shadowed lower-precedence entry as overridden", async () => {
+    openAgent();
+    listAgentEnv.mockResolvedValue({
+      env: [
+        { name: "GITHUB_TOKEN", source: "channel" }, // winner
+        { name: "GITHUB_TOKEN", source: "grant:github", overridden: true }, // shadowed
+      ],
+    });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    const section = await screen.findByTestId("effective-env-section");
+    // The grant entry is marked overridden; the channel winner is not.
+    expect(within(section).getByTestId("effective-env-overridden-GITHUB_TOKEN-grant:github")).toBeInTheDocument();
+    expect(within(section).queryByTestId("effective-env-overridden-GITHUB_TOKEN-channel")).not.toBeInTheDocument();
+  });
+
+  it("shows the empty state when nothing resolves", async () => {
+    openAgent();
+    listAgentEnv.mockResolvedValue({ env: [] });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    expect(await screen.findByTestId("effective-env-empty")).toHaveTextContent(
+      "No env vars resolved for this agent.",
+    );
+  });
+
+  it("surfaces the degraded note when no def is registered", async () => {
+    openAgent();
+    listAgentEnv.mockResolvedValue({
+      env: [{ name: "DEFAULT_VAR", source: "default" }],
+      note: "no vault-native #agent/definition found for \"alpha\" — showing the env-store layers only.",
+    });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    expect(await screen.findByTestId("effective-env-note")).toBeInTheDocument();
   });
 });

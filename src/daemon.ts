@@ -67,6 +67,7 @@ import {
 } from "./def-vaults.ts";
 import { mintScopedToken, vaultScope } from "./mint-token.ts";
 import { GrantsClient } from "./grants.ts";
+import { resolveEffectiveEnv } from "./effective-env.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
 import { Runner, realTickDriver } from "./runner.ts";
 import { nextRunAfter } from "./cron.ts";
@@ -2050,6 +2051,45 @@ export function createFetchHandler(
       const denied = await requireScope(req, url, SCOPE_ADMIN);
       if (denied) return denied;
       return json({ vaults: listVaultNames() });
+    }
+
+    // ---------------------------------------------------------------------
+    // EFFECTIVE ENV — the env-var NAMES an agent's `claude -p` turn runs with
+    // (operability: see-what-env-a-turn-runs-with). NAMES ONLY, never values —
+    // the same redaction posture as GET /api/credentials/env (describeChannelEnv).
+    // Composed from three tagged sources, in precedence order channel > default >
+    // grant (mirrors resolveChannelEnv + buildAgentChildEnv's spawn-time merge):
+    //   - "default"         — the operator-level env.default layer
+    //   - "channel"         — the per-agent override layer (env.channels[<agent>])
+    //   - "grant:<service>" — service env vars an APPROVED grant WOULD inject at spawn,
+    //                          derived from the def's already-resolved connections via
+    //                          serviceEnvVar() — NO grant material is fetched.
+    // A lower-precedence entry shadowed by a higher one is marked overridden:true.
+    // RESILIENT: the env-store layers always resolve (a local file read); a missing
+    // def (agent not vault-native / idle registry) returns the env layers + a note,
+    // never a 500. admin-gated to match the rest of the agents surface.
+    //
+    //   GET /api/agents/<name>/env → { env: [{ name, source, overridden? }], note? }
+    //
+    // Externally hub strips `/agent`, so this is `<hub>/agent/api/agents/<name>/env`.
+    // Safe to add AFTER the single-segment `/api/agents/<name>` DELETE + `/restart`
+    // routes above: the `\/env$` suffix + GET-only method never collide with them.
+    // ---------------------------------------------------------------------
+    const envMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/env$/);
+    if (envMatch && req.method === "GET") {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+      const name = decodeURIComponent(envMatch[1]!);
+      // Find the agent's live def by name (agent ≡ channel). Its `connections` carry the
+      // hub-resolved grant status (resolved at instantiate, NOT a live material fetch), so
+      // the grant-env names derive without any secret fetch. Absent → env-store layers only.
+      const def = agentDefs?.listDetailed().find((d) => d.name === name);
+      return json(
+        resolveEffectiveEnv(name, {
+          ...(def ? { connections: def.connections } : {}),
+          hasDef: Boolean(def),
+        }),
+      );
     }
 
     // ---------------------------------------------------------------------

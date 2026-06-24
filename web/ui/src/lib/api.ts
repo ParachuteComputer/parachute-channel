@@ -495,6 +495,44 @@ export function removeAgentSecret(body: {
 }
 
 // ---------------------------------------------------------------------------
+// Effective env — the env-var NAMES an agent's `claude -p` turn will actually run
+// with (operability: "see what env a turn runs with"). NAMES ONLY, never values —
+// mirrors `GET /api/credentials/env`'s redaction posture. Composed daemon-side from
+// three tagged sources (operator default + per-agent override + approved-grant
+// service env), in precedence order channel > default > grant, with shadowed
+// lower-precedence entries marked `overridden`. The grant names are derived from the
+// def's already-resolved connections — NO grant material is fetched.
+// ---------------------------------------------------------------------------
+
+/** Where a resolved env-var name comes from. `grant:<service>` names the service.
+ *  Mirrors `EnvSource` in `src/effective-env.ts`. */
+export type EnvSource = "default" | "channel" | `grant:${string}`;
+
+/** One resolved env-var NAME + its source. NEVER carries a value. Mirrors
+ *  `EffectiveEnvEntry` in `src/effective-env.ts`. */
+export interface EffectiveEnvEntry {
+  name: string;
+  source: EnvSource;
+  /** True when a higher-precedence layer shadows this same name (omitted on the winner). */
+  overridden?: boolean;
+}
+
+/** `GET /api/agents/<name>/env` response — names only, plus an optional advisory note
+ *  (e.g. no def registered → grant layer unavailable). Mirrors `EffectiveEnvResult`. */
+export interface AgentEnvResponse {
+  env: EffectiveEnvEntry[];
+  note?: string;
+}
+
+/**
+ * List the EFFECTIVE env-var NAMES an agent's turn runs with (the three tagged sources,
+ * precedence-resolved). The agent name is URL-encoded. NO values are ever returned.
+ */
+export function listAgentEnv(name: string): Promise<AgentEnvResponse> {
+  return getJson<AgentEnvResponse>(`/agents/${encodeURIComponent(name)}/env`);
+}
+
+// ---------------------------------------------------------------------------
 // Scheduled jobs (Agent UI v2 — Phase 4b). A job is "an automated human": send a
 // message to a vault-backed agent on a cron schedule (design 2026-06-17). The SPA
 // folds the per-agent schedule management into the agent detail panel; these wrap

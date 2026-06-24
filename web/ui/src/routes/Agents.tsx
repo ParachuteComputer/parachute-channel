@@ -49,9 +49,12 @@ import {
   removeAgentVault,
   runJob,
   type AgentSecretsResponse,
+  type AgentEnvResponse,
+  type EffectiveEnvEntry,
   DENYLISTED_ENV_NAMES,
   ENV_NAME_RE,
   listAgentSecrets,
+  listAgentEnv,
   setAgentSecret,
   removeAgentSecret,
 } from "../lib/api.ts";
@@ -456,6 +459,13 @@ export function AgentDetail({
       {agent.channel ? (
         <SecretsSection channel={agent.channel} backend={agent.backend} />
       ) : null}
+
+      {/* Effective env — the env-var NAMES (never values) this agent's `claude -p`
+          turn will actually run with, resolved across the operator default, the
+          per-agent override, and approved-grant service env. The top operability
+          read: "what env does a turn run with?" Keyed by the agent name; guarded on
+          a channel (symmetric with Secrets — a channel-less agent has no per-agent env). */}
+      {agent.channel ? <EffectiveEnvSection name={agent.name} /> : null}
 
       {/* Edit / delete — only for a vault-native def (a note we can mutate). */}
       {noteId ? (
@@ -1596,6 +1606,119 @@ function RadioRow(props: {
         <span className="radio-help">{props.help}</span>
       </span>
     </label>
+  );
+}
+
+/** The CSS pill class for an env source badge — grant gets the accent style, channel
+ *  the warn style (matching the backend pills), default a plain pill. */
+function envSourceBadgeClass(source: string): string {
+  if (source === "channel") return "pill backend-channel";
+  if (source.startsWith("grant:")) return "pill backend-programmatic";
+  return "pill";
+}
+
+/**
+ * The per-agent EFFECTIVE-ENV section (operability: "see what env a turn runs with").
+ * A read-only view over the daemon's `GET /api/agents/<name>/env` — the env-var NAMES
+ * (NEVER values) this agent's `claude -p` turn will actually run with, each with a
+ * source badge: `default` (operator-level), `channel` (this agent's override), or
+ * `grant:<svc>` (a service env an APPROVED hub grant injects). A name shadowed by a
+ * higher-precedence layer is shown with a subtle "overridden" marker, so a
+ * "default sets X but the channel overrides it" is visible at a glance — exactly the
+ * read that makes a `_TOKEN`-vs-`_KEY` mix-up obvious. NO values are ever fetched or
+ * rendered. Names-only mirrors the Secrets section's redaction posture.
+ */
+export function EffectiveEnvSection({ name }: { name: string }) {
+  type LoadState =
+    | { kind: "loading" }
+    | { kind: "error"; message: string }
+    | { kind: "ok"; env: EffectiveEnvEntry[]; note?: string };
+  const [state, setState] = useState<LoadState>({ kind: "loading" });
+
+  const load = useCallback(async () => {
+    setState({ kind: "loading" });
+    try {
+      const res: AgentEnvResponse = await listAgentEnv(name);
+      setState({ kind: "ok", env: res.env, ...(res.note ? { note: res.note } : {}) });
+    } catch (err) {
+      setState({ kind: "error", message: errMessage(err) });
+    }
+  }, [name]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <section className="detail-section" aria-label="Effective env" data-testid="effective-env-section">
+      <div className="section-head">
+        <h3>Effective env</h3>
+        <button type="button" className="secondary" data-testid="effective-env-refresh" onClick={() => void load()}>
+          Refresh
+        </button>
+      </div>
+      <p className="muted">
+        The env-var <strong>names</strong> this agent's sandboxed turn runs with, resolved across the
+        operator default, this agent's override, and approved-grant service env.{" "}
+        <strong>Names only</strong> — values are never shown. Precedence: channel &gt; default &gt; grant.
+      </p>
+
+      {state.kind === "loading" ? <div className="loading">Loading effective env…</div> : null}
+      {state.kind === "error" ? (
+        <div className="error-banner" role="alert" data-testid="effective-env-error">
+          {state.message}{" "}
+          <button type="button" className="secondary" onClick={() => void load()}>
+            Retry
+          </button>
+        </div>
+      ) : null}
+
+      {state.kind === "ok" ? (
+        <>
+          {state.note ? (
+            <p className="muted" data-testid="effective-env-note">
+              {state.note}
+            </p>
+          ) : null}
+          {state.env.length === 0 ? (
+            <div className="empty" data-testid="effective-env-empty">
+              No env vars resolved for this agent.
+            </div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Source</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {state.env.map((e, i) => (
+                  <tr
+                    key={`${e.name}-${e.source}-${i}`}
+                    className={e.overridden ? "cell-dim" : ""}
+                    data-testid={`effective-env-${e.name}-${e.source}`}
+                  >
+                    <td className="cell-name">{e.name}</td>
+                    <td>
+                      <span className={envSourceBadgeClass(e.source)}>{e.source}</span>
+                    </td>
+                    <td>
+                      {e.overridden ? (
+                        <span className="cell-dim" data-testid={`effective-env-overridden-${e.name}-${e.source}`}>
+                          overridden
+                        </span>
+                      ) : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      ) : null}
+    </section>
   );
 }
 

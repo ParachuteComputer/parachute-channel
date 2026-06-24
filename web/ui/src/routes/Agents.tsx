@@ -1126,6 +1126,7 @@ export function AddMcpForm({
 
       <fieldset className="field">
         <legend>Authentication</legend>
+        <p className="muted">You'll enter credentials in the next step &mdash; on the connection's row after it's added.</p>
         <RadioRow
           name="mcp-auth"
           value="oauth"

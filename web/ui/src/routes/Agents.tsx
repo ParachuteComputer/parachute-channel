@@ -146,6 +146,7 @@ function statusPillClass(status: string): string {
 export function Agents() {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [selected, setSelected] = useState<string | null>(null);
+  const [justConnected, setJustConnected] = useState(false);
 
   const load = useCallback(async () => {
     setState({ kind: "loading" });
@@ -178,6 +179,22 @@ export function Agents() {
     void load();
   }, [load]);
 
+  // After an MCP OAuth round-trip the hub 302s back here with `?mcp_connected=1`.
+  // Surface a brief confirmation + strip the param (the mount load() already
+  // refreshes the grant rows, so the now-connected MCP shows its new status).
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("mcp_connected") !== "1") return;
+    setJustConnected(true);
+    params.delete("mcp_connected");
+    const q = params.toString();
+    window.history.replaceState(
+      null,
+      "",
+      window.location.pathname + (q ? `?${q}` : "") + window.location.hash,
+    );
+  }, []);
+
   const merged = useMemo(
     () => (state.kind === "ok" ? mergeAgents(state.agents, state.defs) : []),
     [state],
@@ -202,6 +219,15 @@ export function Agents() {
           {state.message}{" "}
           <button type="button" className="secondary" onClick={() => void load()}>
             Retry
+          </button>
+        </div>
+      ) : null}
+
+      {justConnected ? (
+        <div className="success-banner" role="status">
+          ✓ MCP server connected — it'll be available to the agent on its next run.{" "}
+          <button type="button" className="link" onClick={() => setJustConnected(false)}>
+            Dismiss
           </button>
         </div>
       ) : null}
@@ -844,7 +870,12 @@ export function ConnectionsSection({
     setConnecting(grantId);
     setRowError(null);
     try {
-      const listing = await approveAgentGrant(grantId);
+      // Where to land after the OAuth round-trip — a ROOT-RELATIVE path so the
+      // hub's same-origin guard accepts it and 302s back here (with
+      // `?mcp_connected=1`) instead of the dead-end "close this tab" page.
+      const returnTo =
+        window.location.pathname + window.location.search + window.location.hash;
+      const listing = await approveAgentGrant(grantId, undefined, returnTo);
       if (listing.authorizeUrl) {
         // Cross-origin remote consent — full-page nav, NOT react-router.
         window.location.assign(listing.authorizeUrl);

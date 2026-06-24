@@ -135,7 +135,11 @@ describe("ConnectionsSection — Connect (cookie→hub approve)", () => {
     });
     render(<ConnectionsSection noteId="Agents/alpha" def={def} onChanged={() => {}} />);
     fireEvent.click(screen.getByTestId("connect-https://c/mcp"));
-    await waitFor(() => expect(approveAgentGrant).toHaveBeenCalledWith("g3"));
+    // Connect passes (grantId, no token, a root-relative returnTo) so the hub
+    // can 302 the operator back to this surface after the OAuth round-trip.
+    await waitFor(() =>
+      expect(approveAgentGrant).toHaveBeenCalledWith("g3", undefined, expect.any(String)),
+    );
     await waitFor(() => expect(assign).toHaveBeenCalledWith("https://c/oauth/authorize?x=1"));
     Object.defineProperty(window, "location", { configurable: true, value: realLocation });
   });

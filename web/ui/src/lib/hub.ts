@@ -278,11 +278,21 @@ export interface GrantListing {
  * daemon-direct degradation), 401 to a sign-in hint. The grant `id` MUST come from
  * the daemon's def-API (`connections[].grantId`) — never derived client-side.
  */
-export async function approveAgentGrant(id: string, token?: string): Promise<GrantListing> {
+export async function approveAgentGrant(
+  id: string,
+  token?: string,
+  returnTo?: string,
+): Promise<GrantListing> {
+  const body: Record<string, string> = {};
+  if (token !== undefined) body.token = token;
+  // A ROOT-RELATIVE path (the hub's isSafeHubReturnTo rejects absolute URLs).
+  // The hub 302s back to it after the OAuth round-trip, so the operator lands
+  // back on this surface instead of a dead-end "close this tab" page.
+  if (returnTo) body.returnTo = returnTo;
   const res = await hubFetch(`/admin/grants/${encodeURIComponent(id)}/approve`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(token !== undefined ? { token } : {}),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     throw new HubError(res.status, hubErrorMessage(res.status, await errorDetail(res)));

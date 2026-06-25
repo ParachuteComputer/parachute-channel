@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/agent",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Vault-native agents for Claude Code — a #agent/definition note + an inbound message becomes a sandboxed claude turn; the reply is written back as a note. Messaging gateway on :1941.",
   "license": "AGPL-3.0",
   "type": "module",
@@ -40,5 +40,9 @@
   },
   "devDependencies": {
     "@types/bun": "latest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ParachuteComputer/parachute-agent.git"
   }
 }

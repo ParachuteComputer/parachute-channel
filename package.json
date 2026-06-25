@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/agent",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Vault-native agents for Claude Code — a #agent/definition note + an inbound message becomes a sandboxed claude turn; the reply is written back as a note. Messaging gateway on :1941.",
   "license": "AGPL-3.0",
   "type": "module",
@@ -8,6 +8,14 @@
     "parachute-agent": "src/daemon.ts",
     "parachute-agent-bridge": "src/bridge.ts"
   },
+  "files": [
+    "src",
+    ".parachute",
+    "scripts/spawn-agent.ts",
+    "tsconfig.json",
+    "web/ui/dist",
+    "README.md"
+  ],
   "scripts": {
     "daemon": "bun src/daemon.ts",
     "bridge": "bun src/bridge.ts",
@@ -16,7 +24,9 @@
     "test:spa": "cd web/ui && bun run test",
     "test:all": "bun run test && bun run test:spa",
     "test:e2e": "bun e2e/llm/run.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:spa": "cd web/ui && bun install --frozen-lockfile && bun run build",
+    "prepack": "bun run build:spa"
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.54",

@@ -1138,7 +1138,7 @@ export class VaultTransport implements Transport {
     // empty transcript).
     const fetchByTag = async (tag: string): Promise<RawNote[]> => {
       const params = new URLSearchParams();
-      params.set("tag", tag); // URLSearchParams encodes `#` → `%23`
+      params.set("tag", tag); // URLSearchParams encodes `/` → `%2F`
       params.set("include_content", "true");
       params.set("limit", String(fetchLimit));
       const url = `${this.vaultUrl}/vault/${this.vault}/api/notes?${params.toString()}`;
@@ -1508,7 +1508,7 @@ export class VaultTransport implements Transport {
 
   /**
    * List the scheduled-job notes in THIS channel's vault. Queries by the parent
-   * `#agent/job` tag (URLSearchParams encodes `#`→`%23`, `/`→`%2F`) and returns ALL job
+   * `#agent/job` tag (URLSearchParams encodes `/`→`%2F`) and returns ALL job
    * notes in the vault — the CALLER filters by `metadata.channel` (same index-free
    * pattern as loadTranscript; we don't assume a `channel` index exists). Throws
    * on a non-ok vault response so the API surfaces a clear error rather than a

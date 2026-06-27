@@ -248,7 +248,7 @@ Bearer `vault:<name>:write`).
      - name: channel_inbound
        events: ["created"]
        when:
-         tags: ["#agent/message/inbound"]
+         tags: ["agent/message/inbound"]
          has_metadata: ["agent"]
          missing_metadata: ["channel_inbound_rendered_at"]
        action:

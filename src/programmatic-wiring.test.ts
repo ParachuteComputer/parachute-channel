@@ -264,7 +264,7 @@ describe("inbound for a programmatic channel → deliver → outbound note", () 
         note: {
           id: noteId,
           content,
-          tags: ["#agent/message", "#agent/message/inbound"],
+          tags: ["agent/message", "agent/message/inbound"],
           metadata: { channel, direction: "inbound", sender: "aaron", ts: "2026-06-16T00:00:01Z" },
         },
       }),
@@ -356,7 +356,7 @@ describe("inbound for an EXPECTED-but-not-yet-registered channel → queued pend
         note: {
           id: noteId,
           content,
-          tags: ["#agent/message", "#agent/message/inbound"],
+          tags: ["agent/message", "agent/message/inbound"],
           metadata: { channel, direction: "inbound", sender: "aaron", ts: "2026-06-16T00:00:01Z" },
         },
       }),

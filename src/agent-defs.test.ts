@@ -375,8 +375,8 @@ describe("DefVaultClient", () => {
     const client = new DefVaultClient(binding);
     const notes = await client.listDefNotes();
     expect(urls).toHaveLength(1);
-    // `#agent/definition` → `%23agent%2Fdefinition` (both `#` and `/` encoded).
-    expect(urls[0]).toContain("tag=%23agent%2Fdefinition");
+    // `agent/definition` → `agent%2Fdefinition` (the `/` percent-encoded).
+    expect(urls[0]).toContain("tag=agent%2Fdefinition");
     expect(urls[0]).toContain("include_content=true");
     expect(auth).toBe("Bearer write-token");
     expect(notes.map((n) => n.id)).toEqual(["Agents/uni-dev", "Agents/researcher"]);
@@ -444,7 +444,7 @@ describe("DefVaultClient", () => {
     expect(created.id).toBe("Agents/newbot");
     expect(captured!.method).toBe("POST");
     expect(captured!.url).toContain("/vault/default/api/notes");
-    expect(captured!.body.tags).toEqual(["#agent/definition"]);
+    expect(captured!.body.tags).toEqual(["agent/definition"]);
     expect(captured!.body.content).toBe("P");
     expect((captured!.body.metadata as Record<string, string>).name).toBe("newbot");
     expect(captured!.body.path).toBe("Agents/newbot");
@@ -538,7 +538,7 @@ function vaultFetch(opts: {
       opts.patches?.push({ id, status: meta.status, pending: meta.pending });
       return new Response(null, { status: 200 });
     }
-    if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+    if (u.includes("/api/notes?") && u.includes("tag=agent%2Fdefinition")) {
       return new Response(JSON.stringify(opts.defs ?? []), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -678,7 +678,7 @@ describe("AgentDefRegistry — lifecycle", () => {
       const u = String(url);
       const method = init?.method ?? "GET";
       if (method === "PATCH") return new Response(null, { status: 200 });
-      if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+      if (u.includes("/api/notes?") && u.includes("tag=agent%2Fdefinition")) {
         return new Response(JSON.stringify(present), { status: 200, headers: { "content-type": "application/json" } });
       }
       return new Response("[]", { status: 200 });
@@ -714,7 +714,7 @@ describe("AgentDefRegistry — lifecycle", () => {
       const u = String(url);
       const method = init?.method ?? "GET";
       if (method === "PATCH") return new Response(null, { status: 200 });
-      if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+      if (u.includes("/api/notes?") && u.includes("tag=agent%2Fdefinition")) {
         return new Response(JSON.stringify(current), { status: 200, headers: { "content-type": "application/json" } });
       }
       return new Response("[]", { status: 200 });
@@ -752,7 +752,7 @@ describe("AgentDefRegistry — lifecycle", () => {
     const fetchFn = (async (url: string | URL | Request) => {
       const u = String(url);
       if (u.includes("/vault/default/")) return new Response("boom", { status: 500 });
-      if (u.includes("/vault/research/") && u.includes("tag=%23agent%2Fdefinition")) {
+      if (u.includes("/vault/research/") && u.includes("tag=agent%2Fdefinition")) {
         return new Response(JSON.stringify([{ id: "r1", content: "role", metadata: { name: "r" } }]), {
           status: 200,
         });
@@ -1217,7 +1217,7 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
           );
         }
       }
-      if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+      if (u.includes("/api/notes?") && u.includes("tag=agent%2Fdefinition")) {
         return new Response(JSON.stringify(present), { status: 200, headers: { "content-type": "application/json" } });
       }
       return new Response("[]", { status: 200 });
@@ -1309,7 +1309,7 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
         reconciled.push({ agent: body.agent, liveConnections: body.liveConnections });
         return new Response(JSON.stringify({ pruned: 0 }), { status: 200 });
       }
-      if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+      if (u.includes("/api/notes?") && u.includes("tag=agent%2Fdefinition")) {
         return new Response(JSON.stringify(present), { status: 200, headers: { "content-type": "application/json" } });
       }
       return new Response("[]", { status: 200 });
@@ -1339,7 +1339,7 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
         reconciled.push({ agent: body.agent, liveConnections: body.liveConnections });
         return new Response(JSON.stringify({ pruned: 0 }), { status: 200 });
       }
-      if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+      if (u.includes("/api/notes?") && u.includes("tag=agent%2Fdefinition")) {
         if (listShouldFail) return new Response("boom", { status: 500 });
         return new Response(JSON.stringify(present), { status: 200, headers: { "content-type": "application/json" } });
       }
@@ -1408,7 +1408,7 @@ function vaultFetchWithDelete(opts: {
       return new Response(status >= 400 ? "delete failed" : null, { status });
     }
     if (method === "PATCH") return new Response(null, { status: 200 });
-    if (u.includes("/api/notes?") && u.includes("tag=%23agent%2Fdefinition")) {
+    if (u.includes("/api/notes?") && u.includes("tag=agent%2Fdefinition")) {
       return new Response(JSON.stringify(opts.defs), {
         status: 200,
         headers: { "content-type": "application/json" },

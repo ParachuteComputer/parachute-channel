@@ -90,7 +90,7 @@ const CREATE_EVENT = "note.created";
 const EDIT_EVENT = "note.updated";
 
 /** The def-discriminator tag the trigger filters on (created/edited defs only). */
-const DEFINITION_TAG = "#agent/definition";
+const DEFINITION_TAG = "agent/definition";
 
 /**
  * The stable connection id for a def-reload connector. Per (vault, kind) and

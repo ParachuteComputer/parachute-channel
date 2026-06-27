@@ -210,7 +210,7 @@ function specWithVault(name = "eng"): AgentSpec {
   return {
     name,
     channels: [name],
-    vault: { name: "default", access: "read", tags: ["#agent/message"] },
+    vault: { name: "default", access: "read", tags: ["agent/message"] },
   };
 }
 
@@ -222,7 +222,7 @@ function specWithSystemPrompt(
   return {
     name,
     channels: [name],
-    vault: { name: "default", access: "read", tags: ["#agent/message"] },
+    vault: { name: "default", access: "read", tags: ["agent/message"] },
     systemPrompt: prompt,
     ...(mode ? { systemPromptMode: mode } : {}),
   };
@@ -234,7 +234,7 @@ function specMultiThreaded(name = "eng"): AgentSpec {
     name,
     channels: [name],
     mode: "multi-threaded",
-    vault: { name: "default", access: "read", tags: ["#agent/message"] },
+    vault: { name: "default", access: "read", tags: ["agent/message"] },
   };
 }
 
@@ -735,7 +735,7 @@ function specWithWorkspace(workspace: string, name = "eng"): AgentSpec {
   return {
     name,
     channels: [name],
-    vault: { name: "default", access: "read", tags: ["#agent/message"] },
+    vault: { name: "default", access: "read", tags: ["agent/message"] },
     workspace,
   };
 }
@@ -773,7 +773,7 @@ describe("ProgrammaticBackend.deliver — workspace seam: cwd = workspace, secre
       const spec: AgentSpec = {
         name: "eng",
         channels: ["eng"],
-        vault: { name: "default", access: "read", tags: ["#agent/message"] },
+        vault: { name: "default", access: "read", tags: ["agent/message"] },
         workspace: workspaceDir,
         systemPrompt: "Work in the repo.",
       };

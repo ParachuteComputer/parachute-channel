@@ -130,7 +130,7 @@ function inboundBody(noteId: string, channel = "eng") {
       id: noteId,
       path: `channel/${channel}/${noteId}`,
       content: "wake up session",
-      tags: ["#agent/message", "#agent/message/inbound"],
+      tags: ["agent/message", "agent/message/inbound"],
       metadata: { channel, direction: "inbound", sender: "aaron" },
     },
   });
@@ -596,7 +596,7 @@ describe("C — AGENT_VAULT_TRIGGER_TEMPLATE exposed via /.parachute/config", ()
       // re-registration updates the existing trigger in place. The TAG is
       // #agent/message and the webhook is on the /agent mount.
       expect(body.triggerTemplate.name).toBe("channel_inbound_<channel>");
-      expect(body.triggerTemplate.when.tags).toEqual(["#agent/message/inbound"]);
+      expect(body.triggerTemplate.when.tags).toEqual(["agent/message/inbound"]);
       // CONTRACT: the predicate keys on the `agent` routing key (was `channel`).
       expect(body.triggerTemplate.when.has_metadata).toEqual(["agent"]);
       // The rendered-at marker NAME is unchanged (cosmetic/internal).

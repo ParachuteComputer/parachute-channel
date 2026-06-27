@@ -77,9 +77,9 @@ describe("buildSpecFromBody", () => {
     const spec = buildSpecFromBody({
       name: "a",
       channels: ["c"],
-      vault: { name: "default", access: "write", tags: ["#agent/message"] },
+      vault: { name: "default", access: "write", tags: ["agent/message"] },
     });
-    expect(spec.vault).toEqual({ name: "default", access: "write", tags: ["#agent/message"] });
+    expect(spec.vault).toEqual({ name: "default", access: "write", tags: ["agent/message"] });
   });
 
   test("rejects a bad filesystem / network value", () => {

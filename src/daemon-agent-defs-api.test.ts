@@ -309,7 +309,7 @@ describe("GET /api/agent-defs", () => {
     fake.seed({
       id: "Agents/uni-dev",
       content: "a".repeat(500), // long prompt → preview truncates to 200.
-      tags: ["#agent/definition"],
+      tags: ["agent/definition"],
       metadata: { name: "uni-dev", backend: "attached", mode: "multi-threaded" },
     });
     const { reg } = registryWithFakeVault({ fake });
@@ -351,7 +351,7 @@ describe("GET /api/agent-defs/:noteId (full def)", () => {
     fake.seed({
       id: "Agents/uni-dev",
       content: "F".repeat(500), // long body → list preview truncates; full returns all.
-      tags: ["#agent/definition"],
+      tags: ["agent/definition"],
       metadata: { name: "uni-dev", backend: "attached", mode: "multi-threaded", wants: "vault:research:read" },
     });
     const { reg } = registryWithFakeVault({ fake });
@@ -459,7 +459,7 @@ describe("POST /api/agent-defs", () => {
     // The note was written to the fake vault, tagged the def tag, body = prompt.
     const written = [...fake.notes.values()].find((n) => n.metadata.name === "newbot");
     expect(written).toBeDefined();
-    expect(written!.tags).toContain("#agent/definition");
+    expect(written!.tags).toContain("agent/definition");
     expect(written!.content).toBe("You are newbot.");
     expect(written!.metadata.backend).toBe("programmatic");
     // It instantiated LIVE (the per-note reload ran ensureChannel + register) — not
@@ -555,7 +555,7 @@ describe("POST /api/agent-defs", () => {
     fake.seed({
       id: "Agents/uni-dev",
       content: "p",
-      tags: ["#agent/definition"],
+      tags: ["agent/definition"],
       metadata: { name: "uni-dev", backend: "programmatic" },
     });
     const { reg } = registryWithFakeVault({ fake });
@@ -586,7 +586,7 @@ describe("PATCH /api/agent-defs/:noteId", () => {
     fake.seed({
       id: "Agents/uni-dev",
       content: "old prompt",
-      tags: ["#agent/definition"],
+      tags: ["agent/definition"],
       metadata: { name: "uni-dev", backend: "programmatic" },
     });
     const { reg, calls } = registryWithFakeVault({ fake });
@@ -657,7 +657,7 @@ describe("DELETE /api/agent-defs/:noteId", () => {
     fake.seed({
       id: "Agents/uni-dev",
       content: "p",
-      tags: ["#agent/definition"],
+      tags: ["agent/definition"],
       metadata: { name: "uni-dev", backend: "programmatic" },
     });
     const { reg, calls } = registryWithFakeVault({ fake });

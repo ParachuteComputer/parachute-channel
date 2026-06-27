@@ -16,7 +16,7 @@ describe("parseArgs — name + channels + vault + egress + mounts → the right 
       "--channel",
       "ops:read",
       "--vault",
-      "default:read:#agent/message,#decision",
+      "default:read:agent/message,#decision",
       "--egress",
       "registry.npmjs.org,github.com",
       "--mount",
@@ -38,7 +38,7 @@ describe("parseArgs — name + channels + vault + egress + mounts → the right 
     expect(spec!.vault).toEqual({
       name: "default",
       access: "read",
-      tags: ["#agent/message", "#decision"],
+      tags: ["agent/message", "#decision"],
     });
 
     // Egress: additive host list, comma-split.

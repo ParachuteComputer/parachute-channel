@@ -226,7 +226,7 @@ describe("GET /api/agents/<name>/env — composes all three sources + precedence
     fake.seed({
       id: "Agents/uni-dev",
       content: "You are uni-dev.",
-      tags: ["#agent/definition"],
+      tags: ["agent/definition"],
       metadata: { name: "uni-dev", backend: "programmatic", mode: "single-threaded", wants: "env:github" },
     });
     const grants = grantsClientWith({ github: githubGrantStatus });
@@ -308,7 +308,7 @@ describe("GET /api/agents/<name>/env — resilient when grants/hub unreachable",
     fake.seed({
       id: "Agents/uni-dev",
       content: "You are uni-dev.",
-      tags: ["#agent/definition"],
+      tags: ["agent/definition"],
       metadata: { name: "uni-dev", backend: "programmatic", mode: "single-threaded", wants: "env:github" },
     });
     // A grants client whose hub fetch always throws — registerGrant fails at instantiate,

@@ -105,6 +105,7 @@ function buildServer(initial: Array<{ name: string; secret?: string | null }> = 
       vault: "default",
       vaultUrl: "http://127.0.0.1:1940",
       token: "x",
+      declareSchemaOnStart: false, // fake token — don't 401 the live vault (#32)
       // null → omit (JWT-only channel); undefined → default "s3cret".
       ...(secret === null ? {} : { webhookSecret: secret ?? "s3cret" }),
     });
@@ -360,7 +361,7 @@ describe("B — config-management API (agent:admin)", () => {
         body: JSON.stringify({
           name: "eng",
           transport: "vault",
-          config: { vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "vault-jwt", webhookSecret: "sek" },
+          config: { vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "vault-jwt", webhookSecret: "sek", declareSchemaOnStart: false },
         }),
       });
       expect(create.status).toBe(200);
@@ -416,7 +417,7 @@ describe("B — config-management API (agent:admin)", () => {
         body: JSON.stringify({
           name: "eng",
           transport: "vault",
-          config: { vault: "default", token: "x", webhookSecret: "new" },
+          config: { vault: "default", token: "x", webhookSecret: "new", declareSchemaOnStart: false },
         }),
       });
       expect(res.status).toBe(200);
@@ -544,7 +545,7 @@ describe("B — config-management API (agent:admin)", () => {
       await fetch(`${base}/api/channels`, {
         method: "POST",
         headers: { "content-type": "application/json", ...adminAuth },
-        body: JSON.stringify({ name: "eng", transport: "vault", config: { vault: "default", token: "x", webhookSecret: "sek" } }),
+        body: JSON.stringify({ name: "eng", transport: "vault", config: { vault: "default", token: "x", webhookSecret: "sek", declareSchemaOnStart: false } }),
       });
       const file = channelsFilePath(stateDir);
       expect((JSON.parse(readFileSync(file, "utf8")) as { channels: unknown[] }).channels).toHaveLength(1);

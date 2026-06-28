@@ -1,14 +1,15 @@
 # Intentionally minimal — overrides web/ui/.gitignore for npm packing.
 #
-# Without this, npm (which has no root .npmignore) falls back to .gitignore
-# files for exclusion, and the sibling web/ui/.gitignore's `dist/` rule strips
-# the built SPA bundle (web/ui/dist/) out of the published tarball — even though
-# package.json's `files` allowlist explicitly lists it and the prepack hook
-# builds it for release. A nested .npmignore takes precedence over the nested
-# .gitignore for this subtree, so packing falls back to the `files` allowlist
-# (which ships web/ui/dist/). Keep this minimal: only the dev/test cruft that
-# must never publish.
+# Without this, npm falls back to .gitignore files for exclusion in this subtree,
+# and the sibling web/ui/.gitignore's `dist/` rule strips the built SPA bundle
+# (web/ui/dist/) out of the published tarball — even though package.json's `files`
+# allowlist explicitly lists it and the prepack hook builds it for release. A nested
+# .npmignore takes precedence over the nested .gitignore for this subtree, so packing
+# falls back to the `files` allowlist (which ships web/ui/dist/). The root .npmignore
+# does NOT touch this subtree's dist/. Keep this minimal: only the dev/test cruft that
+# must never publish (tsconfig.json is build-time config, no value to consumers).
 node_modules
 src
+tsconfig.json
 *.tsbuildinfo
 *.log

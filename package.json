@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/agent",
-  "version": "0.2.3-rc.2",
+  "version": "0.2.3-rc.3",
   "description": "Vault-native agents for Claude Code — a #agent/definition note + an inbound message becomes a sandboxed claude turn; the reply is written back as a note. Messaging gateway on :1941.",
   "license": "AGPL-3.0",
   "type": "module",
@@ -24,6 +24,8 @@
     "test:spa": "cd web/ui && bun run test",
     "test:all": "bun run test && bun run test:spa",
     "test:e2e": "bun e2e/llm/run.ts",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
     "typecheck": "tsc --noEmit",
     "build:spa": "cd web/ui && bun install --frozen-lockfile && bun run build",
     "prepack": "bun run build:spa"
@@ -39,6 +41,7 @@
     "typescript": "^5"
   },
   "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
     "@types/bun": "latest"
   },
   "repository": {

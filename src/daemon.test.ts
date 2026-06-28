@@ -413,7 +413,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
   function body(
     noteId: string,
     extraMeta: Record<string, unknown> = {},
-    tags: string[] = ["#agent/message", "#agent/message/inbound"],
+    tags: string[] = ["agent/message", "agent/message/inbound"],
   ) {
     return JSON.stringify({
       trigger: "channel-inbound",
@@ -546,7 +546,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
           note: {
             id: "agent-only-1",
             content: "wake up via agent key",
-            tags: ["#agent/message", "#agent/message/inbound"],
+            tags: ["agent/message", "agent/message/inbound"],
             // NO `channel` field — the routing key is carried ONLY under the new `agent` alias.
             metadata: { agent: "eng", direction: "inbound", sender: "aaron" },
           },
@@ -571,7 +571,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
           note: {
             id: "channel-only-1",
             content: "wake up via legacy channel key",
-            tags: ["#agent/message", "#agent/message/inbound"],
+            tags: ["agent/message", "agent/message/inbound"],
             // ONLY the legacy `channel` field — a pre-expand writer; must still route.
             metadata: { channel: "eng", direction: "inbound", sender: "aaron" },
           },
@@ -618,13 +618,13 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
     }
   });
 
-  test("#agent/message/outbound-tagged note is ack'd 200 but NOT emitted (belt-and-suspenders)", async () => {
+  test("agent/message/outbound-tagged note is ack'd 200 but NOT emitted (belt-and-suspenders)", async () => {
     const { srv, base, emitted } = buildVaultServer();
     try {
       const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: body("ob-1", { direction: "outbound" }, ["#agent/message", "#agent/message/outbound"]),
+        body: body("ob-1", { direction: "outbound" }, ["agent/message", "agent/message/outbound"]),
       });
       expect(res.status).toBe(200);
       expect(emitted).toHaveLength(0);

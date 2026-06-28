@@ -134,7 +134,7 @@ describe("ensureDefReloadConnections", () => {
     expect(create).toMatchObject({
       id: "agentdefs-create-research",
       requestedBy: "agent",
-      source: { module: "vault", vault: "research", filter: { tags: ["#agent/definition"] } },
+      source: { module: "vault", vault: "research", filter: { tags: ["agent/definition"] } },
       sink: { module: "agent", action: "definition.reload" },
     });
     expect(edit).toMatchObject({ id: "agentdefs-edit-research", source: { event: "note.updated" } });

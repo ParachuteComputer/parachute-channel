@@ -74,7 +74,7 @@ describe("module.json — modular-UI declaration", () => {
     expect(tmpl?.requestedBy).toBe("agent");
     expect(tmpl?.source?.module).toBe("vault");
     expect(tmpl?.source?.event).toBe("note.created");
-    expect(tmpl?.source?.filter?.tags).toContain("#agent/message/inbound");
+    expect(tmpl?.source?.filter?.tags).toContain("agent/message/inbound");
     expect(tmpl?.sink?.module).toBe("agent");
     expect(tmpl?.sink?.action).toBe("message.deliver");
     // It's PARAMETERIZED — the operator picks the vault + names the channel.
@@ -128,7 +128,7 @@ describe("module.json — modular-UI declaration", () => {
       expect(tmpl?.requestedBy).toBe("agent");
       expect(tmpl?.source?.module).toBe("vault");
       // Filters on the def tag — and ONLY that tag (no inbound-message keys).
-      expect(tmpl?.source?.filter?.tags).toEqual(["#agent/definition"]);
+      expect(tmpl?.source?.filter?.tags).toEqual(["agent/definition"]);
       expect(tmpl?.sink?.module).toBe("agent");
       expect(tmpl?.sink?.action).toBe("definition.reload");
       // Parameterized: the operator picks which def-vault. No channel param

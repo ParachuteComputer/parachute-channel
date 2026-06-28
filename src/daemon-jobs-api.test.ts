@@ -194,7 +194,7 @@ describe("POST /api/jobs — create + validation", () => {
       expect(body.job.noteId).toBe("Channels/eng/jobs/x"); // vault note id for addressing
       const post = calls.find((c) => c.url.endsWith("/api/notes") && c.init.method === "POST")!;
       const sent = JSON.parse(String(post.init.body));
-      expect(sent.tags).toEqual(["#agent/job"]);
+      expect(sent.tags).toEqual(["agent/job"]);
       expect(sent.content).toBe("do it"); // trimmed
       expect(sent.metadata.enabled).toBe("true");
       expect(sent.metadata.jobId).toBe("x");
@@ -224,7 +224,7 @@ describe("POST /api/jobs/:id/run — fire now", () => {
       // The injected note is INBOUND with the #agent/message tags.
       const inject = calls.find((c) => c.url.endsWith("/api/notes") && c.init.method === "POST")!;
       const sent = JSON.parse(String(inject.init.body));
-      expect(sent.tags).toEqual(["#agent/message", "#agent/message/inbound"]);
+      expect(sent.tags).toEqual(["agent/message", "agent/message/inbound"]);
       expect(sent.metadata.sender).toBe("runner:Channels/eng/jobs/x");
     } finally { srv.stop(true); }
   });

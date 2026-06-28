@@ -261,11 +261,11 @@ export class InboundClaimConflictError extends Error {
 /** Parent tag (NEW, namespaced) — carried LITERALLY on every note WE write; query
  *  this + metadata.channel to see BOTH directions of a channel (the slash children
  *  are namespace, not inheritance). */
-const AGENT_MESSAGE_TAG = "#agent/message";
+const AGENT_MESSAGE_TAG = "agent/message";
 /** Inbound child (NEW) — the vault trigger fires on this exact tag (never matches outbound → no loop). */
-const AGENT_MESSAGE_INBOUND_TAG = "#agent/message/inbound";
+const AGENT_MESSAGE_INBOUND_TAG = "agent/message/inbound";
 /** Outbound child (NEW) — replies carry this; the trigger's exact-match predicate excludes it. */
-const AGENT_MESSAGE_OUTBOUND_TAG = "#agent/message/outbound";
+const AGENT_MESSAGE_OUTBOUND_TAG = "agent/message/outbound";
 
 /** Metadata key carrying the channel-queue claim status (design 2026-06-18). */
 const STATUS_META_KEY = "status";
@@ -369,7 +369,7 @@ function buildThreadSummaryBody(t: {
  * (it always queries the exact leaf tag); it exists for the nice human rollup, per
  * the design's namespacing decision.
  */
-export const AGENT_ROOT_TAG = "#agent";
+export const AGENT_ROOT_TAG = "agent";
 
 /**
  * Agent-definition tag — a vault-native agent IS a `#agent/definition` note (design
@@ -377,7 +377,7 @@ export const AGENT_ROOT_TAG = "#agent";
  * METADATA is the config (name, backend, workspace, isolation, the def-vault binding).
  * The module reads these notes from a def-vault and instantiates each as a live agent.
  */
-export const AGENT_DEFINITION_TAG = "#agent/definition";
+export const AGENT_DEFINITION_TAG = "agent/definition";
 
 /**
  * Scheduled-job tag — the runner's vault-native job store (design
@@ -386,7 +386,7 @@ export const AGENT_DEFINITION_TAG = "#agent/definition";
  * `#agent/message`. Introduced in Phase 2 as the flat `#agent-job`; moved into the
  * `#agent/*` namespace (`#agent/job`) by the vault-native-agents work (Phase 4a).
  */
-export const AGENT_JOB_TAG = "#agent/job";
+export const AGENT_JOB_TAG = "agent/job";
 /** Default path prefix under which job notes are written: `Channels/<ch>/jobs/<id>`. */
 const JOB_PATH_PREFIX = "Channels";
 
@@ -413,7 +413,7 @@ const JOB_PATH_PREFIX = "Channels";
  * The note carries `['#agent/thread']` EXACTLY — NOT a message tag, NOT the inbound
  * child — so it can never wake a session (no loop).
  */
-export const AGENT_THREAD_TAG = "#agent/thread";
+export const AGENT_THREAD_TAG = "agent/thread";
 /** Default path prefix under which thread notes are written: `Threads/<ch>/<leaf>`. */
 const THREAD_PATH_PREFIX = "Threads";
 
@@ -557,7 +557,7 @@ export const AGENT_VAULT_TRIGGER_TEMPLATE = {
   name: "channel_inbound_<channel>", // hub substitutes the channel name
   events: ["created"],
   when: {
-    tags: ["#agent/message/inbound"],
+    tags: ["agent/message/inbound"],
     has_metadata: ["agent"],
     missing_metadata: ["channel_inbound_rendered_at"],
   },
@@ -581,7 +581,7 @@ export const AGENT_DEF_VAULT_TRIGGER_TEMPLATE = {
   name: "agent_def_reload",
   events: ["created", "updated", "deleted"],
   when: {
-    tags: ["#agent/definition"],
+    tags: ["agent/definition"],
   },
   action: {
     webhook: "<hub-origin>/agent/api/vault/agent-def", // hub fills origin + the auth.bearer
@@ -657,11 +657,11 @@ export class VaultTransport implements Transport {
    * `decodeURIComponent`'d (parachute-vault `src/routes.ts` handleTags, the
    * "Routes with tag name" block + `routing.ts` `apiPath.startsWith("/tags")`).
    * Because the route matches a SINGLE path segment (`[^/]+`, no literal slash)
-   * and decodes it, the tag name — which contains BOTH `#` and `/`
-   * (`#agent/message/inbound`) — must be `encodeURIComponent`'d so the `#`
-   * becomes `%23` and the `/` becomes `%2F`; the route then decodes that back to
-   * the literal name. A bare `/` in the URL would fail the `[^/]+` match → 404,
-   * silently dropping the declaration. The PUT body is `{ description?, parent_names? }`.
+   * and decodes it, the tag name — which contains a `/`
+   * (`agent/message/inbound`) — must be `encodeURIComponent`'d so the `/` becomes
+   * `%2F`; the route then decodes that back to the literal name. A bare `/` in the
+   * URL would fail the `[^/]+` match → 404, silently dropping the declaration. The
+   * PUT body is `{ description?, parent_names? }`.
    *
    * Best-effort + non-fatal by contract: every failure is caught and `console.warn`'d,
    * never thrown — the tag-both write floor is the fallback.
@@ -669,8 +669,8 @@ export class VaultTransport implements Transport {
   async ensureSchema(): Promise<void> {
     for (const entry of AGENT_VAULT_TAG_SCHEMA) {
       try {
-        // Single-segment, percent-encoded name: `#agent/message/inbound` →
-        // `%23agent%2Fmessage%2Finbound`. The vault decodes it back to the literal.
+        // Single-segment, percent-encoded name: `agent/message/inbound` →
+        // `agent%2Fmessage%2Finbound`. The vault decodes it back to the literal.
         const url = `${this.vaultUrl}/vault/${this.vault}/api/tags/${encodeURIComponent(entry.name)}`;
         const body: {
           description?: string;
@@ -1099,7 +1099,7 @@ export class VaultTransport implements Transport {
    * namespace, not query inheritance, so we never key off them here.
    *
    *   GET <vaultUrl>/vault/<vault>/api/notes
-   *       ?tag=%23agent%2Fmessage             (the `#` + `/` MUST be percent-encoded)
+   *       ?tag=agent%2Fmessage             (the `/` MUST be percent-encoded)
    *       &include_content=true               (we need the bodies)
    *       &limit=<n>                          (default 200)
    *
@@ -1138,7 +1138,7 @@ export class VaultTransport implements Transport {
     // empty transcript).
     const fetchByTag = async (tag: string): Promise<RawNote[]> => {
       const params = new URLSearchParams();
-      params.set("tag", tag); // URLSearchParams encodes `#` → `%23`
+      params.set("tag", tag); // URLSearchParams encodes `/` → `%2F`
       params.set("include_content", "true");
       params.set("limit", String(fetchLimit));
       const url = `${this.vaultUrl}/vault/${this.vault}/api/notes?${params.toString()}`;
@@ -1380,7 +1380,7 @@ export class VaultTransport implements Transport {
     // Overfetch (the tag query spans all channels) then keep this channel's items.
     const fetchLimit = Math.min(Math.max(limit * 4, 500), 2000);
     const params = new URLSearchParams();
-    params.set("tag", AGENT_MESSAGE_INBOUND_TAG); // → %23agent%2Fmessage%2Finbound
+    params.set("tag", AGENT_MESSAGE_INBOUND_TAG); // → agent%2Fmessage%2Finbound
     params.set("include_content", "true");
     params.set("limit", String(fetchLimit));
     // NEWEST-first at the vault (default order_by is `updated_at`) so a hard cap drops
@@ -1508,7 +1508,7 @@ export class VaultTransport implements Transport {
 
   /**
    * List the scheduled-job notes in THIS channel's vault. Queries by the parent
-   * `#agent/job` tag (URLSearchParams encodes `#`→`%23`, `/`→`%2F`) and returns ALL job
+   * `#agent/job` tag (URLSearchParams encodes `/`→`%2F`) and returns ALL job
    * notes in the vault — the CALLER filters by `metadata.channel` (same index-free
    * pattern as loadTranscript; we don't assume a `channel` index exists). Throws
    * on a non-ok vault response so the API surfaces a clear error rather than a
@@ -1517,7 +1517,7 @@ export class VaultTransport implements Transport {
   async listJobNotes(opts?: { limit?: number }): Promise<JobNote[]> {
     const limit = opts?.limit ?? 500;
     const params = new URLSearchParams();
-    params.set("tag", AGENT_JOB_TAG); // → %23agent%2Fjob
+    params.set("tag", AGENT_JOB_TAG); // → agent%2Fjob
     params.set("include_content", "true");
     params.set("limit", String(limit));
     const url = `${this.vaultUrl}/vault/${this.vault}/api/notes?${params.toString()}`;

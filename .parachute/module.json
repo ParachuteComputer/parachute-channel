@@ -52,7 +52,7 @@
         "module": "vault",
         "event": "note.created",
         "filter": {
-          "tags": ["#agent/message/inbound"],
+          "tags": ["agent/message/inbound"],
           "has_metadata": ["channel"],
           "missing_metadata": ["channel_inbound_rendered_at"]
         }
@@ -85,7 +85,7 @@
         "module": "vault",
         "event": "note.created",
         "filter": {
-          "tags": ["#agent/definition"]
+          "tags": ["agent/definition"]
         }
       },
       "sink": {
@@ -110,7 +110,7 @@
         "module": "vault",
         "event": "note.updated",
         "filter": {
-          "tags": ["#agent/definition"]
+          "tags": ["agent/definition"]
         }
       },
       "sink": {

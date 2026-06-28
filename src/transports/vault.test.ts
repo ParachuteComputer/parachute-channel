@@ -117,10 +117,10 @@ describe("VaultTransport — reply (outbound note write)", () => {
     // a child-only-tagged note is invisible to a `tag:#agent/message` query), and
     // the directional child `#agent/message/outbound` is the trigger discriminator.
     // We WRITE only the `#agent/message*` tags.
-    expect(sent.tags).toEqual(["#agent/message", "#agent/message/outbound"]);
+    expect(sent.tags).toEqual(["agent/message", "agent/message/outbound"]);
     // Regression guard: the queryable parent tag MUST be present literally.
-    expect(sent.tags).toContain("#agent/message");
-    expect(sent.tags).toContain("#agent/message/outbound");
+    expect(sent.tags).toContain("agent/message");
+    expect(sent.tags).toContain("agent/message/outbound");
     // Write-discipline: the interim/legacy tags are gone (CONTRACT dropped them).
     expect(sent.tags).not.toContain("#agent-message");
     expect(sent.tags).not.toContain("#agent-message/outbound");
@@ -246,8 +246,8 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // LOOP SAFETY (HARD CONSTRAINT 4): the thread note carries the thread tag EXACTLY —
     // NOT a message tag + NOT the inbound child — so it can never wake a session.
     expect(sent.tags).toEqual([AGENT_THREAD_TAG]);
-    expect(sent.tags).not.toContain("#agent/message");
-    expect(sent.tags).not.toContain("#agent/message/inbound");
+    expect(sent.tags).not.toContain("agent/message");
+    expect(sent.tags).not.toContain("agent/message/inbound");
     // Indexed/queryable fields.
     expect(sent.metadata.status).toBe("ok");
     expect(sent.metadata.definition).toBe("Agents/digest");
@@ -1007,7 +1007,7 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
         getUrls.push(u);
         capturedAuth = (init?.headers as Record<string, string> | undefined)?.authorization ?? "";
         // CONTRACT: a SINGLE `#agent/message` query (no interim/legacy union).
-        if (u.includes("tag=%23agent%2Fmessage")) {
+        if (u.includes("tag=agent%2Fmessage")) {
           // Return notes OUT of ts order (prove the ascending sort) + a note from a
           // DIFFERENT channel (prove the client-side channel filter excludes it).
           return new Response(
@@ -1015,19 +1015,19 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
               {
                 id: "n-out",
                 content: "session reply",
-                tags: ["#agent/message", "#agent/message/outbound"],
+                tags: ["agent/message", "agent/message/outbound"],
                 metadata: { agent: "eng", direction: "outbound", sender: "session", ts: "2026-06-08T00:00:02Z", in_reply_to: "n-in" },
               },
               {
                 id: "n-other",
                 content: "different channel — must be excluded",
-                tags: ["#agent/message", "#agent/message/inbound"],
+                tags: ["agent/message", "agent/message/inbound"],
                 metadata: { agent: "other", direction: "inbound", sender: "x", ts: "2026-06-08T00:00:03Z" },
               },
               {
                 id: "n-in",
                 content: "hi session",
-                tags: ["#agent/message", "#agent/message/inbound"],
+                tags: ["agent/message", "agent/message/inbound"],
                 metadata: { agent: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:01Z" },
               },
             ]),
@@ -1049,7 +1049,7 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
     // `metadata=` operator filter (the routing-key field isn't indexed on a bare
     // vault; we filter client-side). Overfetches the tag so other channels don't
     // crowd us out.
-    const agentGets = getUrls.filter((u) => u.includes("tag=%23agent%2Fmessage"));
+    const agentGets = getUrls.filter((u) => u.includes("tag=agent%2Fmessage"));
     expect(agentGets).toHaveLength(1);
     // No interim/legacy queries are issued.
     expect(getUrls.some((u) => u.includes("tag=%23agent-message"))).toBe(false);
@@ -1076,12 +1076,12 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
-        if (u.includes("tag=%23agent%2Fmessage")) {
+        if (u.includes("tag=agent%2Fmessage")) {
           return new Response(
             JSON.stringify([1, 2, 3, 4].map((i) => ({
               id: "n" + i,
               content: "m" + i,
-              tags: ["#agent/message", "#agent/message/inbound"],
+              tags: ["agent/message", "agent/message/inbound"],
               metadata: { agent: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:0" + i + "Z" },
             }))),
             { status: 200 },
@@ -1102,13 +1102,13 @@ describe("VaultTransport — loadTranscript (read the durable store)", () => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/api/notes") && (init?.method ?? "GET") === "GET") {
-        if (u.includes("tag=%23agent%2Fmessage")) {
+        if (u.includes("tag=agent%2Fmessage")) {
           return new Response(
             JSON.stringify([
               // Outbound child → direction inferred "outbound".
-              { id: "a", content: "x", tags: ["#agent/message", "#agent/message/outbound"], metadata: { agent: "eng", ts: "2026-06-08T00:00:01Z" } },
+              { id: "a", content: "x", tags: ["agent/message", "agent/message/outbound"], metadata: { agent: "eng", ts: "2026-06-08T00:00:01Z" } },
               // No direction signal at all → defaults to "inbound".
-              { id: "b", content: "y", tags: ["#agent/message", "#agent/message/inbound"], metadata: { agent: "eng", ts: "2026-06-08T00:00:02Z" } },
+              { id: "b", content: "y", tags: ["agent/message", "agent/message/inbound"], metadata: { agent: "eng", ts: "2026-06-08T00:00:02Z" } },
             ]),
             { status: 200 },
           );
@@ -1168,11 +1168,11 @@ describe("VaultTransport — writeInbound (the chat's send → wakes the session
     };
     expect(sent.content).toBe("wake up");
     // The INBOUND tag pair — the child is the trigger discriminator that wakes the session.
-    expect(sent.tags).toEqual(["#agent/message", "#agent/message/inbound"]);
-    expect(sent.tags).toContain("#agent/message");
-    expect(sent.tags).toContain("#agent/message/inbound");
+    expect(sent.tags).toEqual(["agent/message", "agent/message/inbound"]);
+    expect(sent.tags).toContain("agent/message");
+    expect(sent.tags).toContain("agent/message/inbound");
     // It must NOT carry the outbound tag (that would be a reply, never wake).
-    expect(sent.tags).not.toContain("#agent/message/outbound");
+    expect(sent.tags).not.toContain("agent/message/outbound");
     // Write-discipline: the legacy tag family is gone (CONTRACT dropped it).
     expect(sent.tags).not.toContain("#channel-message");
     // CONTRACT: the routing key under `metadata.agent` ONLY — no `channel`. The vault
@@ -1244,8 +1244,8 @@ describe("VaultTransport — writeCallback (agent-to-agent reply_to substrate)",
 
     expect(result.sent).toEqual(["callback-note-1"]);
     // The callback is an INBOUND note (so it wakes the sender via the normal vault trigger).
-    expect(sent!.tags).toEqual(["#agent/message", "#agent/message/inbound"]);
-    expect(sent!.tags).not.toContain("#agent/message/outbound");
+    expect(sent!.tags).toEqual(["agent/message", "agent/message/inbound"]);
+    expect(sent!.tags).not.toContain("agent/message/outbound");
     // The metadata contract — all present fields stamped.
     expect(sent!.metadata.callback).toBe("true");
     expect(sent!.metadata.status).toBe("ok");
@@ -1315,7 +1315,7 @@ describe("VaultTransport — ingestInbound", () => {
     void t.ingestInbound({
       id: "note-in-1",
       content: "hello session",
-      tags: ["#agent/message", "#agent/message/inbound"],
+      tags: ["agent/message", "agent/message/inbound"],
       metadata: { agent: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:00Z" },
     });
     expect(ctx.emitted).toHaveLength(1);
@@ -1341,7 +1341,7 @@ describe("VaultTransport — ingestInbound", () => {
     void t.ingestInbound({
       id: "our-own-reply",
       content: "I am awake",
-      tags: ["#agent/message", "#agent/message/outbound"],
+      tags: ["agent/message", "agent/message/outbound"],
       metadata: { channel: "eng", direction: "outbound", sender: "session" },
     });
     expect(ctx.emitted).toHaveLength(0);
@@ -1382,7 +1382,7 @@ describe("VaultTransport — ingestInbound", () => {
     await t.ingestInbound({
       id: "note-att-1",
       content: "look at these",
-      tags: ["#agent/message", "#agent/message/inbound"],
+      tags: ["agent/message", "agent/message/inbound"],
       metadata: { agent: "eng", direction: "inbound", sender: "aaron" },
       // inline list from the trigger payload — the has-attachments SIGNAL.
       attachments: [{ id: "a1", path: "2026-06-24/pic.png", mimeType: "image/png" }],
@@ -1408,7 +1408,7 @@ describe("VaultTransport — ingestInbound", () => {
     await t.ingestInbound({
       id: "note-att-fail",
       content: "still delivered",
-      tags: ["#agent/message", "#agent/message/inbound"],
+      tags: ["agent/message", "agent/message/inbound"],
       metadata: { agent: "eng", direction: "inbound" },
       attachments: [{ id: "a1", path: "2026-06-24/pic.png", mimeType: "image/png" }],
     });
@@ -1429,7 +1429,7 @@ describe("VaultTransport — ingestInbound", () => {
     void t.ingestInbound({
       id: "note-plain",
       content: "no files",
-      tags: ["#agent/message", "#agent/message/inbound"],
+      tags: ["agent/message", "agent/message/inbound"],
       metadata: { agent: "eng", direction: "inbound" },
     });
     expect(ctx.emitted).toHaveLength(1);
@@ -1447,7 +1447,7 @@ describe("VaultTransport — ingestInbound", () => {
     void t.ingestInbound({
       id: "note-deleg-1",
       content: "do the sub-task",
-      tags: ["#agent/message", "#agent/message/inbound"],
+      tags: ["agent/message", "agent/message/inbound"],
       metadata: {
         channel: "worker",
         direction: "inbound",
@@ -1482,10 +1482,11 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
 
     expect(calls).toHaveLength(AGENT_VAULT_TAG_SCHEMA.length);
 
-    // Namespace ROOT `#agent` — no parent_names, just a description. Plain `#` → `%23`.
+    // Namespace ROOT `agent` — no parent_names, just a description. A single bare
+    // segment needs no percent-encoding.
     const root = calls[0]!;
     expect(root.url).toBe(
-      "http://127.0.0.1:1940/vault/default/api/tags/%23agent",
+      "http://127.0.0.1:1940/vault/default/api/tags/agent",
     );
     expect(root.init.method).toBe("PUT");
     expect((root.init.headers as Record<string, string>).authorization).toBe(
@@ -1497,19 +1498,19 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     };
     expect("parent_names" in rootBody).toBe(false);
 
-    // Definition (NEW) — name carries `#` + `/`; rolls up to the namespace root.
+    // Definition (NEW) — name carries `/`; rolls up to the namespace root.
     const def = calls[1]!;
     expect(def.url).toBe(
-      "http://127.0.0.1:1940/vault/default/api/tags/%23agent%2Fdefinition",
+      "http://127.0.0.1:1940/vault/default/api/tags/agent%2Fdefinition",
     );
-    expect(decodeURIComponent(def.url.split("/api/tags/")[1]!)).toBe("#agent/definition");
+    expect(decodeURIComponent(def.url.split("/api/tags/")[1]!)).toBe("agent/definition");
     const defBody = JSON.parse(String(def.init.body)) as { parent_names?: string[] };
-    expect(defBody.parent_names).toEqual(["#agent"]);
+    expect(defBody.parent_names).toEqual(["agent"]);
 
     // Message parent (NEW) — rolls up to the namespace root.
     const parent = calls[2]!;
     expect(parent.url).toBe(
-      "http://127.0.0.1:1940/vault/default/api/tags/%23agent%2Fmessage",
+      "http://127.0.0.1:1940/vault/default/api/tags/agent%2Fmessage",
     );
     const parentBody = JSON.parse(String(parent.init.body)) as {
       description?: string;
@@ -1518,23 +1519,23 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(parentBody.description).toBe(
       "A message in a Parachute channel (parent of /inbound + /outbound).",
     );
-    expect(parentBody.parent_names).toEqual(["#agent"]);
+    expect(parentBody.parent_names).toEqual(["agent"]);
 
-    // Inbound child (NEW) — name carries BOTH `#` and `/`. The vault route matches a
+    // Inbound child (NEW) — name carries `/`. The vault route matches a
     // single path segment (`[^/]+`) then decodeURIComponent's it, so the `/` MUST
     // be encoded as `%2F` (a bare slash would fail the single-segment match → 404).
     const inbound = calls[3]!;
     expect(inbound.url).toBe(
-      "http://127.0.0.1:1940/vault/default/api/tags/%23agent%2Fmessage%2Finbound",
+      "http://127.0.0.1:1940/vault/default/api/tags/agent%2Fmessage%2Finbound",
     );
     // Confirm the encoding decodes back to the literal tag name the vault stores.
     const encodedSegment = inbound.url.split("/api/tags/")[1]!;
-    expect(decodeURIComponent(encodedSegment)).toBe("#agent/message/inbound");
+    expect(decodeURIComponent(encodedSegment)).toBe("agent/message/inbound");
     const inboundBody = JSON.parse(String(inbound.init.body)) as {
       description?: string;
       parent_names?: string[];
     };
-    expect(inboundBody.parent_names).toEqual(["#agent/message"]);
+    expect(inboundBody.parent_names).toEqual(["agent/message"]);
     expect(inboundBody.description).toBe(
       "Human→session message; the vault trigger fires on this.",
     );
@@ -1542,19 +1543,19 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     // Outbound child (NEW) — same encoding, parent declared.
     const outbound = calls[4]!;
     expect(outbound.url).toBe(
-      "http://127.0.0.1:1940/vault/default/api/tags/%23agent%2Fmessage%2Foutbound",
+      "http://127.0.0.1:1940/vault/default/api/tags/agent%2Fmessage%2Foutbound",
     );
     expect(decodeURIComponent(outbound.url.split("/api/tags/")[1]!)).toBe(
-      "#agent/message/outbound",
+      "agent/message/outbound",
     );
     const outboundBody = JSON.parse(String(outbound.init.body)) as { parent_names?: string[] };
-    expect(outboundBody.parent_names).toEqual(["#agent/message"]);
+    expect(outboundBody.parent_names).toEqual(["agent/message"]);
 
     // Job (NEW) — rolls up to the namespace root.
     const job = calls[5]!;
-    expect(decodeURIComponent(job.url.split("/api/tags/")[1]!)).toBe("#agent/job");
+    expect(decodeURIComponent(job.url.split("/api/tags/")[1]!)).toBe("agent/job");
     const jobBody = JSON.parse(String(job.init.body)) as { parent_names?: string[] };
-    expect(jobBody.parent_names).toEqual(["#agent"]);
+    expect(jobBody.parent_names).toEqual(["agent"]);
   });
 
   test("schema declares ONLY the #agent/* namespace rollup (CONTRACT dropped interim + legacy, 7 entries)", async () => {
@@ -1564,29 +1565,29 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     // schema entries — exactly 7 entries, all under `#agent/*`.
     const names = AGENT_VAULT_TAG_SCHEMA.map((e) => e.name);
     expect(names).toEqual([
-      "#agent",
-      "#agent/definition",
-      "#agent/message",
-      "#agent/message/inbound",
-      "#agent/message/outbound",
-      "#agent/job",
-      "#agent/thread",
+      "agent",
+      "agent/definition",
+      "agent/message",
+      "agent/message/inbound",
+      "agent/message/outbound",
+      "agent/job",
+      "agent/thread",
     ]);
     // The interim/legacy families are gone entirely.
     expect(names).not.toContain("#agent-message");
     expect(names).not.toContain("#channel-message");
     // The namespace children all roll up to the `#agent` root (the human rollup).
     const byName = (n: string) => AGENT_VAULT_TAG_SCHEMA.find((e) => e.name === n)!;
-    expect(byName("#agent/definition").parent_names).toEqual(["#agent"]);
-    expect(byName("#agent/message").parent_names).toEqual(["#agent"]);
-    expect(byName("#agent/job").parent_names).toEqual(["#agent"]);
-    expect(byName("#agent/thread").parent_names).toEqual(["#agent"]);
-    expect(byName("#agent/message/inbound").parent_names).toEqual(["#agent/message"]);
-    expect(byName("#agent/message/outbound").parent_names).toEqual(["#agent/message"]);
+    expect(byName("agent/definition").parent_names).toEqual(["agent"]);
+    expect(byName("agent/message").parent_names).toEqual(["agent"]);
+    expect(byName("agent/job").parent_names).toEqual(["agent"]);
+    expect(byName("agent/thread").parent_names).toEqual(["agent"]);
+    expect(byName("agent/message/inbound").parent_names).toEqual(["agent/message"]);
+    expect(byName("agent/message/outbound").parent_names).toEqual(["agent/message"]);
     // `#agent/thread` declares INDEXED string fields so threads are operator-queryable —
     // "all failed threads" (status), "all threads of agent X" (definition), "all
     // multi-threaded threads" (mode). The three axes carry over from the run record VERBATIM.
-    expect(byName("#agent/thread").fields).toEqual({
+    expect(byName("agent/thread").fields).toEqual({
       // The canonical `agent` routing-key alias is declared indexed.
       agent: { type: "string", indexed: true },
       status: { type: "string", indexed: true },
@@ -1594,11 +1595,11 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
       mode: { type: "string", indexed: true },
     });
     // `#agent/message` declares the indexed `agent` routing key.
-    expect(byName("#agent/message").fields).toEqual({
+    expect(byName("agent/message").fields).toEqual({
       agent: { type: "string", indexed: true },
     });
     // CONTRACT: `#agent/job` indexes the routing key under `agent` ONLY — no `channel`.
-    expect(byName("#agent/job").fields).toEqual({
+    expect(byName("agent/job").fields).toEqual({
       agent: { type: "string", indexed: true },
       enabled: { type: "string", indexed: true },
       lastStatus: { type: "string", indexed: true },
@@ -1691,7 +1692,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     void t.ingestInbound({
       id: "n1",
       content: "still works",
-      tags: ["#agent/message", "#agent/message/inbound"],
+      tags: ["agent/message", "agent/message/inbound"],
       metadata: { channel: "eng", direction: "inbound", sender: "aaron" },
     });
     expect(ctx.emitted).toHaveLength(1);
@@ -1741,7 +1742,7 @@ describe("VaultTransport — injectInbound (runner seam)", () => {
     expect(noteCalls).toHaveLength(1);
     const body = JSON.parse(String(noteCalls[0]!.init.body));
     // Inbound: BOTH the parent + the inbound child (the trigger discriminator).
-    expect(body.tags).toEqual(["#agent/message", "#agent/message/inbound"]);
+    expect(body.tags).toEqual(["agent/message", "agent/message/inbound"]);
     expect(body.content).toBe("Run the morning weave");
     expect(body.metadata.direction).toBe("inbound");
     expect(body.metadata.sender).toBe("runner:morning");
@@ -1789,7 +1790,7 @@ describe("VaultTransport — scheduled-job notes (vault-native store)", () => {
 
     const t = new VaultTransport(baseConfig());
     const jobs = await t.listJobNotes();
-    expect(urls[0]).toContain("tag=%23agent%2Fjob");
+    expect(urls[0]).toContain("tag=agent%2Fjob");
     expect(urls[0]).toContain("include_content=true");
     expect(jobs).toHaveLength(2);
     // id = the slug from metadata.jobId; noteId = the vault note id.
@@ -1825,7 +1826,7 @@ describe("VaultTransport — scheduled-job notes (vault-native store)", () => {
     expect(r.id).toBe("Channels/eng/jobs/m");
     const body = JSON.parse(String(calls[0]!.init.body));
     expect(body.path).toBe("Channels/eng/jobs/m");
-    expect(body.tags).toEqual(["#agent/job"]);
+    expect(body.tags).toEqual(["agent/job"]);
     expect(body.metadata.enabled).toBe("true");
     expect(body.metadata.jobId).toBe("m"); // slug persisted for stable display
     // CONTRACT: routing key under `metadata.agent` ONLY — no `channel`.

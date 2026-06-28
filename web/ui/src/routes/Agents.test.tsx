@@ -138,11 +138,13 @@ describe("mergeAgents (all-backends merge)", () => {
       [
         agentRow({ name: "prog", backend: "programmatic", status: "idle" }),
         agentRow({ name: "chan", backend: "channel", channel: "chan", vault: "default", status: "queued:2" }),
-        agentRow({ name: "tmux", backend: "interactive" }),
+        // A def-less programmatic agent — live from a legacy /api/spawn spec.json,
+        // not a #agent/definition note (no `channel` surfaced, no backing def).
+        agentRow({ name: "solo", backend: "programmatic" }),
       ],
       [],
     );
-    expect(merged.map((m) => m.name)).toEqual(["chan", "prog", "tmux"]); // sorted
+    expect(merged.map((m) => m.name)).toEqual(["chan", "prog", "solo"]); // sorted
     const chan = merged.find((m) => m.name === "chan")!;
     expect(chan.backend).toBe("channel");
     expect(chan.status).toBe("queued:2");
@@ -235,11 +237,12 @@ describe("Agents view states", () => {
   });
 
   it("detail panel notes when an agent has no backing def", async () => {
-    listAgents.mockResolvedValue({ agents: [agentRow({ name: "tmux", backend: "interactive" })] });
+    // A def-less programmatic agent (legacy /api/spawn spec.json, no #agent/definition note).
+    listAgents.mockResolvedValue({ agents: [agentRow({ name: "solo", backend: "programmatic" })] });
     listAgentDefs.mockResolvedValue({ defs: [] });
     renderRoute();
 
-    fireEvent.click(await screen.findByTestId("agent-row-tmux"));
+    fireEvent.click(await screen.findByTestId("agent-row-solo"));
     const detail = await screen.findByTestId("agent-detail");
     expect(within(detail).getByTestId("detail-no-def")).toBeInTheDocument();
   });
@@ -275,10 +278,11 @@ describe("Agents view states", () => {
   });
 
   it("does NOT show edit/delete for an agent with no backing def", async () => {
-    listAgents.mockResolvedValue({ agents: [agentRow({ name: "tmux", backend: "interactive" })] });
+    // A def-less programmatic agent — no #agent/definition note to mutate.
+    listAgents.mockResolvedValue({ agents: [agentRow({ name: "solo", backend: "programmatic" })] });
     listAgentDefs.mockResolvedValue({ defs: [] });
     renderRoute();
-    fireEvent.click(await screen.findByTestId("agent-row-tmux"));
+    fireEvent.click(await screen.findByTestId("agent-row-solo"));
     await screen.findByTestId("agent-detail");
     expect(screen.queryByTestId("detail-actions")).not.toBeInTheDocument();
     expect(screen.queryByTestId("edit-agent")).not.toBeInTheDocument();
@@ -440,12 +444,14 @@ describe("Schedules — per-agent jobs in the detail panel (Phase 4b)", () => {
     expect(within(section).getByText("ok")).toBeInTheDocument();
   });
 
-  it("is ABSENT for a channel-less (interactive) agent", async () => {
-    listAgents.mockResolvedValue({ agents: [agentRow({ name: "tmux", backend: "interactive" })] });
+  it("is ABSENT for a channel-less agent (def-less programmatic, no wake channel surfaced)", async () => {
+    // listProgrammaticAgents surfaces no `channel` field, so a def-less programmatic
+    // agent is channel-less in the view → no schedules section (schedules need a channel).
+    listAgents.mockResolvedValue({ agents: [agentRow({ name: "solo", backend: "programmatic" })] });
     listAgentDefs.mockResolvedValue({ defs: [] });
     renderRoute();
 
-    fireEvent.click(await screen.findByTestId("agent-row-tmux"));
+    fireEvent.click(await screen.findByTestId("agent-row-solo"));
     await screen.findByTestId("agent-detail");
     expect(screen.queryByTestId("schedules-section")).not.toBeInTheDocument();
   });

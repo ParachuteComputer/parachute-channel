@@ -289,10 +289,6 @@ tr.agent-row.selected {
   background: var(--warn-soft);
   border-color: transparent;
 }
-.pill.backend-interactive {
-  color: var(--fg-muted);
-  background: var(--bg-soft);
-}
 .pill.status-enabled,
 .pill.status-idle {
   color: var(--success);

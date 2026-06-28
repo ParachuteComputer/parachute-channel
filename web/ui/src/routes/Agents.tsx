@@ -2,7 +2,7 @@
  * `/agents` — the unified Agents view (Agent UI v2, Phases 2–4a).
  *
  * The one agent-centric surface the v2 design calls for: a single list of
- * EVERY agent across ALL backends (interactive / programmatic / channel) with a
+ * EVERY agent across ALL backends (programmatic / channel) with a
  * detail panel, plus the "Def-vaults" section showing which vaults the module
  * reads `#agent/definition` notes from. It composes the three Phase-1 list
  * endpoints:
@@ -14,7 +14,7 @@
  *   - `GET /agent/api/agent-vaults` → the def-vault list
  *
  * The "all-backends merge" is the load-bearing v2 move (#102): the list shows
- * channel/programmatic/interactive agents in one table instead of separate
+ * channel/programmatic agents in one table instead of separate
  * pages. We dedupe defs that have no corresponding live agent so a def authored
  * but not yet instantiated still appears (as a def-only row), giving the
  * operator the full picture.
@@ -93,7 +93,7 @@ export interface MergedAgent {
   status?: string;
   /** The execution-lifecycle mode, when the agent is backed by a vault-native def. */
   mode?: AgentMode;
-  /** True when a live agent (interactive/programmatic/channel) exists. */
+  /** True when a live agent (programmatic/channel) exists. */
   live: boolean;
   /** The vault-native def, when one defines this agent. */
   def?: AgentDefRow;
@@ -139,7 +139,7 @@ export function mergeAgents(agents: AgentRow[], defs: AgentDefRow[]): MergedAgen
 function backendPillClass(backend: string): string {
   if (backend === "programmatic") return "pill backend-programmatic";
   if (backend === "channel") return "pill backend-channel";
-  return "pill backend-interactive";
+  return "pill";
 }
 
 function statusPillClass(status: string): string {
@@ -216,9 +216,9 @@ export function Agents() {
     <div>
       <h1>Agents</h1>
       <p className="lede">
-        Every agent across all backends, in one place — programmatic, channel, and
-        interactive. Read-only for now; the create flow and def-vault editor land in
-        later phases.
+        Every agent across all backends, in one place — programmatic and channel.
+        Read-only for now; the create flow and def-vault editor land in later
+        phases.
       </p>
 
       {state.kind === "error" ? (
@@ -326,7 +326,7 @@ export function Agents() {
 /**
  * The per-agent detail panel. Surfaces the def's system-prompt preview, mode,
  * wants, vault, and status. For a vault-native def (a row carrying a `noteId`) it
- * offers Edit + Delete; interactive / non-def agents have no def to edit, so those
+ * offers Edit + Delete; non-def agents have no def to edit, so those
  * actions are absent. `onChanged` refreshes the list after an edit; `onDeleted`
  * closes the panel + refreshes after a delete.
  */

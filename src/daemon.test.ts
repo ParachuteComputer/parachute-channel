@@ -206,8 +206,8 @@ describe("Phase 4c — retired pages redirect to the SPA; the data plane survive
   test("FOOTGUN GUARD — GET /ui/events STILL routes to the SSE handler (NOT redirected)", async () => {
     // The /ui page retired, but /ui/events is the message SSE the SPA Chat
     // subscribes to (owned by the http-ui transport's ingestHttp). It must NOT
-    // be swallowed by the `/ui` redirect. With no ?token= it 401s at the SSE
-    // gate — proving it reached the handler, not the 302 page route.
+    // be swallowed by the `/ui` redirect. With no ?ticket= it 401s at the SSE
+    // gate (agent#25) — proving it reached the handler, not the 302 page route.
     const res = await fetch(`${base}/ui/events?channel=ui1`, { redirect: "manual" });
     expect(res.status).toBe(401);
     expect(res.headers.get("content-type")).toContain("application/json");
@@ -362,7 +362,7 @@ describe("Layer 2 — http-ui UI endpoints require a token (401 with none)", () 
     expect(((await res.json()) as { error: string }).error).toBe("unauthorized");
   });
 
-  test("GET /ui/events with no ?token= → 401", async () => {
+  test("GET /ui/events with no ?ticket= → 401", async () => {
     const res = await fetch(`${base}/ui/events?channel=ui1`);
     expect(res.status).toBe(401);
     // Must short-circuit before the SSE stream opens.

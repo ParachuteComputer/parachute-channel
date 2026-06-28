@@ -30,14 +30,15 @@ vi.mock("../lib/api.ts", async (orig) => {
 });
 
 vi.mock("../lib/auth.ts", () => ({
-  getAgentToken: vi.fn(),
+  // Chat opens its SSE streams with a one-time TICKET (agent#25), not the JWT.
+  getSseTicket: vi.fn(),
   clearCachedToken: vi.fn(),
 }));
 
 const listChannels = vi.mocked(api.listChannels);
 const listMessages = vi.mocked(api.listMessages);
 const sendMessage = vi.mocked(api.sendMessage);
-const getAgentToken = vi.mocked(auth.getAgentToken);
+const getSseTicket = vi.mocked(auth.getSseTicket);
 const clearCachedToken = vi.mocked(auth.clearCachedToken);
 
 // ---- a minimal fake EventSource so the SSE paths are drivable in jsdom -------
@@ -92,7 +93,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   FakeEventSource.reset();
   vi.stubGlobal("EventSource", FakeEventSource as unknown as typeof EventSource);
-  getAgentToken.mockResolvedValue("jwt-tok");
+  getSseTicket.mockResolvedValue("tkt-1");
   listChannels.mockResolvedValue({ channels: [chanRow()] });
   listMessages.mockResolvedValue({ messages: [] });
   sendMessage.mockResolvedValue({ ok: true, id: "sent-1" });

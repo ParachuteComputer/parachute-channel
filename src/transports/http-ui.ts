@@ -16,8 +16,9 @@
  *    to them (mirroring the daemon's `/events` SSE pattern for bridges).
  *
  * It owns two HTTP surfaces via `ingestHttp` (scoped to ITS OWN channel name):
- *   1. POST /api/channels/<name>/send   — body {text} → ctx.emit(...) → {ok:true}
- *   2. GET  /ui/events?channel=<name>    — SSE stream the browser subscribes to
+ *   1. POST /api/channels/<name>/send         — body {text} → ctx.emit(...) → {ok:true}
+ *   2. GET  /ui/events?channel=<name>&ticket=  — SSE stream the browser subscribes to
+ *      (one-time ticket auth — agent#25; the JWT never rides in this URL)
  * The static `/ui` chat page itself is global and served by the daemon, since
  * it's a channel picker across all http-ui channels.
  */
@@ -30,7 +31,7 @@ import type {
   PermissionArgs,
 } from "../transport.ts";
 import { sseFrame } from "../routing.ts";
-import { requireScope, json, SCOPE_SEND, SCOPE_READ } from "../auth.ts";
+import { requireScope, requireSseTicket, json, SCOPE_SEND, SCOPE_READ } from "../auth.ts";
 
 /** A connected browser SSE client (one per open chat page on this channel). */
 interface UiClient {
@@ -168,11 +169,12 @@ export class HttpUiTransport implements Transport {
       url.pathname === "/ui/events" &&
       url.searchParams.get("channel") === channel
     ) {
-      // Layer 2: gate on `agent:read`. EventSource can't set headers, so the
-      // token rides in as a `?token=` query param — the ONLY endpoint that opts
-      // into the query-param fallback (allowQueryParam: true). No-token → 401
-      // before the stream opens.
-      const denied = await requireScope(req, url, SCOPE_READ, true);
+      // Layer 2: EventSource can't set headers, so this gates on a one-time
+      // `?ticket=<nonce>` (agent#25) — minted by POST /api/ui/sse-ticket
+      // (Bearer-gated) and consumed single-use here, carrying `agent:read`. The
+      // hub JWT never appears in this URL (the leak the ticket closes). Absent /
+      // expired / already-used ticket → 401 before the stream opens.
+      const denied = requireSseTicket(url, SCOPE_READ);
       if (denied) return denied;
       const clientId = crypto.randomUUID();
       const clients = this.uiClients;

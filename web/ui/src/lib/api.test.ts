@@ -389,37 +389,38 @@ describe("chat — listChannels / listMessages / sendMessage (Phase 4d)", () => 
   });
 });
 
-describe("chat SSE URL builders (Phase 4d)", () => {
-  it("messageStreamUrl appends &token= under the agent mount (origin-relative)", () => {
-    // apiBase() is "/agent/api" in vitest → MOUNT "/agent".
-    expect(messageStreamUrl("eng", "jwt-abc")).toBe(
-      "/agent/ui/events?channel=eng&token=jwt-abc",
+describe("chat SSE URL builders (Phase 4d — one-time ticket auth, agent#25)", () => {
+  it("messageStreamUrl appends &ticket= under the agent mount (origin-relative)", () => {
+    // apiBase() is "/agent/api" in vitest → MOUNT "/agent". Auth rides as a
+    // one-time ticket — NOT the hub JWT — so it never leaks into an access log.
+    expect(messageStreamUrl("eng", "tkt-abc")).toBe(
+      "/agent/ui/events?channel=eng&ticket=tkt-abc",
     );
   });
 
-  it("messageStreamUrl encodes the channel + token", () => {
+  it("messageStreamUrl encodes the channel + ticket", () => {
     expect(messageStreamUrl("eng team", "a/b c")).toBe(
-      "/agent/ui/events?channel=eng%20team&token=a%2Fb%20c",
+      "/agent/ui/events?channel=eng%20team&ticket=a%2Fb%20c",
     );
   });
 
-  it("messageStreamUrl omits the token when null (unguarded dev daemon)", () => {
+  it("messageStreamUrl omits the ticket when null (unguarded dev daemon)", () => {
     expect(messageStreamUrl("eng", null)).toBe("/agent/ui/events?channel=eng");
   });
 
-  it("turnEventsUrl appends ?token= under the agent mount (origin-relative)", () => {
-    expect(turnEventsUrl("eng", "jwt-abc")).toBe(
-      "/agent/api/channels/eng/turn-events?token=jwt-abc",
+  it("turnEventsUrl appends ?ticket= under the agent mount (origin-relative)", () => {
+    expect(turnEventsUrl("eng", "tkt-abc")).toBe(
+      "/agent/api/channels/eng/turn-events?ticket=tkt-abc",
     );
   });
 
-  it("turnEventsUrl encodes the channel + token", () => {
+  it("turnEventsUrl encodes the channel + ticket", () => {
     expect(turnEventsUrl("eng team", "a/b")).toBe(
-      "/agent/api/channels/eng%20team/turn-events?token=a%2Fb",
+      "/agent/api/channels/eng%20team/turn-events?ticket=a%2Fb",
     );
   });
 
-  it("turnEventsUrl omits the token when null", () => {
+  it("turnEventsUrl omits the ticket when null", () => {
     expect(turnEventsUrl("eng", null)).toBe("/agent/api/channels/eng/turn-events");
   });
 });

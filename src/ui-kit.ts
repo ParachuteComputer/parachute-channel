@@ -376,9 +376,12 @@ export const SHELL_JS = `
     el.className = "app-status" + (kind ? " " + kind : "");
   }
   // Hub-minted agent token (cookie-gated to the logged-in operator). Cached on
-  // window.__token; pages attach it as a Bearer header and/or ?token= param.
-  // (Endpoint renamed /admin/channel-token → /admin/agent-token in the
-  // channel→agent rename; the hub 301-redirects the old path for old bookmarks.)
+  // window.__token; pages attach it as a Bearer header. (Browser SSE auth moved
+  // off the query-param token to a one-time ticket in agent#25, so the JWT never
+  // lands in a URL; this template is the retired server-rendered shell, superseded
+  // by the SPA.) Endpoint renamed /admin/channel-token to /admin/agent-token in
+  // the channel-to-agent rename; the hub 301-redirects the old path for old
+  // bookmarks.
   function fetchToken() {
     return fetch(window.location.origin + "/admin/agent-token", { credentials: "include" })
       .then(function (r) { if (!r.ok) throw new Error("token " + r.status); return r.json(); })

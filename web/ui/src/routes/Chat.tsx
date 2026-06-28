@@ -10,11 +10,13 @@
  *   - the durable transcript loaded on select via `GET /api/channels/<ch>/messages`
  *     (sorted ascending by ts, deduped by note id) — direction drives bubble side:
  *     `inbound` = "you" (right), `outbound` = "them" (left);
- *   - live updates over TWO EventSource streams, both authenticated by the agent JWT
- *     as a `?token=` query param (EventSource can't set headers):
- *       1. `/ui/events?channel=<ch>&token=` — message deltas (`reply` / `edit` /
+ *   - live updates over TWO EventSource streams, both authenticated by a one-time
+ *     SSE TICKET in the URL (agent#25 — EventSource can't set a header, and a JWT
+ *     in the URL would leak into access logs; each stream mints its own single-use
+ *     ticket via `lib/auth.ts:getSseTicket` right before connecting):
+ *       1. `/ui/events?channel=<ch>&ticket=` — message deltas (`reply` / `edit` /
  *          `permission` events);
- *       2. `/api/channels/<ch>/turn-events?token=` — the PROGRAMMATIC "watch it
+ *       2. `/api/channels/<ch>/turn-events?ticket=` — the PROGRAMMATIC "watch it
  *          work" stream (interim assistant `text` + `tool` chips, finalized on
  *          `done` / shown errored on `error`);
  *   - a send box (`POST /api/channels/<ch>/send`) with an optimistic echo,
@@ -47,7 +49,7 @@ import {
   sendMessage,
   turnEventsUrl,
 } from "../lib/api.ts";
-import { clearCachedToken, getAgentToken } from "../lib/auth.ts";
+import { clearCachedToken, getSseTicket } from "../lib/auth.ts";
 
 /** A rendered transcript line — either a real message or a local "system" notice. */
 interface Line {
@@ -141,10 +143,12 @@ export function Chat() {
 
   /**
    * Open both live streams for `ch`: the message stream (`/ui/events`) and — for a
-   * vault channel — the programmatic turn-event stream. Both authenticate via the
-   * `?token=` query param. On the message stream's error we re-mint once + reconnect
-   * (mirrors the inline chat's single-retry); the turn stream is best-effort progress
-   * (browser auto-reconnect, no manual re-auth dance).
+   * vault channel — the programmatic turn-event stream. Both authenticate via a
+   * one-time SSE TICKET in the URL (agent#25) — NOT the hub JWT, which would leak
+   * in an access log. Each EventSource needs its OWN single-use ticket, so we mint
+   * one per stream right before opening it. On a stream error we re-mint once +
+   * reconnect (mirrors the inline chat's single-retry); the turn stream is
+   * best-effort progress (browser auto-reconnect, no manual re-auth dance).
    */
   const openStreams = useCallback(
     async (ch: string) => {
@@ -155,29 +159,26 @@ export function Chat() {
       turnEs.current?.close();
       turnEs.current = null;
 
-      const token = await getAgentToken();
-      // If a channel switch / unmount happened during the token mint, this cycle is
-      // stale — bail before creating streams that would escape the cleanup.
-      if (gen !== connectGen.current) return;
-
       const transport = transportFor(ch);
 
       // Shared stream lifecycle: `onopen` marks the chat live + clears the retry latch;
-      // `onerror` re-mints the token ONCE (a stale/short-lived token 401s the stream)
-      // then reconnects, else falls back to the browser's auto-reconnect. Both streams
-      // share the same token, so either erroring re-mints + re-opens both.
+      // `onerror` re-mints a fresh ticket ONCE (a single-use ticket is spent on connect,
+      // and a stale auth would 401 it) then reconnects, else falls back to the browser's
+      // auto-reconnect. The re-run mints brand-new tickets for whichever streams reopen.
       const onStreamOpen = () => {
         sseRetried.current = false;
         setStatus({ text: `live - ${ch}`, kind: "live" });
       };
       const onStreamError = () => {
-        if (!sseRetried.current && token) {
+        if (!sseRetried.current) {
           sseRetried.current = true;
           setStatus({ text: "re-authenticating...", kind: "" });
           msgEs.current?.close();
           msgEs.current = null;
           turnEs.current?.close();
           turnEs.current = null;
+          // Drop the cached JWT so the ticket re-mint forces a fresh token if the
+          // old one had gone stale, then reconnect (which mints new tickets).
           clearCachedToken();
           void openStreams(ch);
           return;
@@ -193,7 +194,11 @@ export function Chat() {
       //    on every chat load. Interactive/http-ui is retired, so in practice this is
       //    rarely taken; it's kept for any lingering http-ui channel.
       if (transport === "http-ui") {
-      const ms = new EventSource(messageStreamUrl(ch, token));
+      // Mint this stream's own one-time ticket. Bail if the connect cycle went stale
+      // during the (async) mint, so a ticket-backed stream can't escape the cleanup.
+      const msgTicket = await getSseTicket();
+      if (gen !== connectGen.current) return;
+      const ms = new EventSource(messageStreamUrl(ch, msgTicket));
       ms.onopen = onStreamOpen;
       ms.addEventListener("reply", (e) => {
         try {
@@ -233,9 +238,13 @@ export function Chat() {
       //    the durable outbound arrives via reload-on-done). Carries the same onopen
       //    (marks live) + onerror (re-mint-once) as the message stream, so a vault
       //    channel — which has no message stream — still shows "live" and recovers from
-      //    a stale token.
+      //    a stale ticket.
       if (isVault(ch)) {
-        const ts = new EventSource(turnEventsUrl(ch, token));
+        // This stream's own one-time ticket (single-use — distinct from the message
+        // stream's). Bail if the connect cycle went stale during the async mint.
+        const turnTicket = await getSseTicket();
+        if (gen !== connectGen.current) return;
+        const ts = new EventSource(turnEventsUrl(ch, turnTicket));
         ts.onopen = onStreamOpen;
         ts.addEventListener("turn", (e) => {
           try {

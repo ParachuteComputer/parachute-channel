@@ -154,15 +154,29 @@ that as the token `iss`); the loopback fallback is dev-only. Hub-as-supervisor s
 starts the module; a manually-run daemon on an exposed box needs it in the environment.
 
 **Layer 2 — human↔UI (done).** The chat-UI traffic endpoints (`POST /api/channels/<name>/send`
-→ scope `agent:send`; `GET /ui/events` → scope `agent:read`) require a hub-issued JWT,
-validated the same way as Layer 1 (shared `requireScope` in `src/auth.ts`). The token comes from
-a hub endpoint — `GET <hub-origin>/admin/agent-token` (cookie-gated to the logged-in portal
-operator), returning `{ token, expires_at, scopes }` with `aud:agent` + `agent:read agent:send`,
-~10min TTL. The chat page fetches it on load (`credentials: "include"`) and attaches it: a Bearer
-header on the send POST, and a `?token=` query param on the `/ui/events` EventSource (which can't
-set headers). On a 401/SSE-error it re-fetches once and retries. `/ui`, `/health`, and
+→ scope `agent:send`; the browser SSE streams `GET /ui/events` + `GET /api/channels/<ch>/turn-events`
+→ scope `agent:read`) require a hub-issued JWT, validated the same way as Layer 1 (shared
+`requireScope` in `src/auth.ts`). The token comes from a hub endpoint —
+`GET <hub-origin>/admin/agent-token` (cookie-gated to the logged-in portal operator), returning
+`{ token, expires_at, scopes }` with `aud:agent` + `agent:read agent:send`, ~10min TTL. The chat
+page fetches it on load (`credentials: "include"`) and attaches it as a Bearer header on the send
+POST and the ticket mint. On a 401/SSE-error it re-fetches once and retries. `/ui`, `/health`, and
 `/.parachute/config[/schema]` stay OPEN — the page must load to bootstrap its token fetch, and the
 config listing is non-sensitive.
+
+**SSE one-time ticket (agent#25).** An `EventSource` can't set an `Authorization` header, so the
+browser SSE streams used to take the hub JWT as a `?token=<JWT>` query param — which leaks the
+credential into any access/proxy log, browser history, or network trace (mitigated before only by
+the ~10min TTL). They now authenticate with a **one-time ticket** instead: the page POSTs its
+bearer to `POST /api/ui/sse-ticket` (Bearer-gated on `agent:read`, `mintSseTicket` in `src/auth.ts`),
+which returns `{ ticket, expires_at }` — an opaque 256-bit base64url nonce held only server-side in
+a TTL'd map (`src/ui-ticket.ts`, ≤60s) carrying the minting token's validated scopes. The page then
+opens `…?ticket=<nonce>`; the SSE consume path (`requireSseTicket`) looks it up, **consumes it
+single-use** (deletes immediately → a replay 401s), and establishes the stream with the ticket's
+scopes (never widened past the JWT's). So the JWT never appears in a URL. Each EventSource mints its
+own ticket; an SSE error re-mints and reconnects. The legacy `?token=` SSE path was REMOVED (pre-1.0,
+no deprecation window). The `agent:admin` terminal WebSocket still uses `?token=` — a separate
+operator-gated mechanism, out of this change's scope.
 
 ## Vault integration (Stage 2) — channels backed by `#agent/message` notes
 

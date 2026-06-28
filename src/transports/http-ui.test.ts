@@ -68,12 +68,19 @@ import { HttpUiTransport } from "./http-ui.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { ClientRegistry } from "../routing.ts";
 import { instantiateTransport } from "../registry.ts";
+import { mintTicket } from "../ui-ticket.ts";
 
 /** Authorization header carrying the sentinel valid token. */
 const AUTH = { authorization: "Bearer " + VALID_TOKEN } as const;
-/** Append the sentinel token as a `?token=` query param (the SSE auth path). */
-function withToken(path: string): string {
-  return path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(VALID_TOKEN);
+/**
+ * Append a FRESH single-use SSE ticket as `?ticket=` (the SSE auth path —
+ * agent#25, replacing the leaky `?token=`). Mints a real ticket against the live
+ * `ui-ticket.ts` store carrying `agent:read`; each call mints its own so a stream
+ * that consumes one doesn't break the next opener.
+ */
+function withTicket(path: string): string {
+  const { ticket } = mintTicket(["agent:read"]);
+  return path + (path.includes("?") ? "&" : "?") + "ticket=" + encodeURIComponent(ticket);
 }
 
 /** A test context that records emitted inbound messages + permission verdicts. */
@@ -167,7 +174,7 @@ describe("HttpUiTransport — direct", () => {
     expect(ctx.emitted).toHaveLength(0);
   });
 
-  test("ingestHttp SSE WITHOUT a ?token= → 401 (Layer 2)", async () => {
+  test("ingestHttp SSE WITHOUT a ?ticket= → 401 (Layer 2)", async () => {
     const t = new HttpUiTransport();
     await t.start(fakeCtx("dev"));
     const req = new Request("http://x/ui/events?channel=dev");
@@ -175,6 +182,17 @@ describe("HttpUiTransport — direct", () => {
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
     expect(res!.headers.get("content-type")).toContain("application/json");
+  });
+
+  test("ingestHttp SSE with a stale `?token=<JWT>` → 401 (legacy path removed)", async () => {
+    // The JWT-in-URL path is gone (agent#25). Even a token that WOULD validate as
+    // a Bearer no longer opens the stream via `?token=`.
+    const t = new HttpUiTransport();
+    await t.start(fakeCtx("dev"));
+    const req = new Request(`http://x/ui/events?channel=dev&token=${VALID_TOKEN}`);
+    const res = await t.ingestHttp(req, new URL(req.url));
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(401);
   });
 
   test("ingestHttp ignores a send for a DIFFERENT channel's path", async () => {
@@ -214,7 +232,7 @@ describe("HttpUiTransport — direct", () => {
     await t.start(fakeCtx("dev"));
 
     // Open the UI SSE stream via ingestHttp (authed via ?token=).
-    const sseReq = new Request("http://x" + withToken("/ui/events?channel=dev"));
+    const sseReq = new Request("http://x" + withTicket("/ui/events?channel=dev"));
     const sseRes = await t.ingestHttp(sseReq, new URL(sseReq.url));
     expect(sseRes).not.toBeNull();
     const reader = sseRes!.body!.getReader();
@@ -233,7 +251,7 @@ describe("HttpUiTransport — direct", () => {
   test("stop() clears UI clients", async () => {
     const t = new HttpUiTransport();
     await t.start(fakeCtx("dev"));
-    const sseReq = new Request("http://x" + withToken("/ui/events?channel=dev"));
+    const sseReq = new Request("http://x" + withTicket("/ui/events?channel=dev"));
     const sseRes = await t.ingestHttp(sseReq, new URL(sseReq.url));
     sseRes!.body!.getReader();
     await t.stop();
@@ -335,7 +353,7 @@ describe("HttpUiTransport — through a daemon-shaped server", () => {
    *  route is Layer-2-gated, so append the sentinel `?token=` for those; the
    *  bridge `/events` route in this harness is ungated (pass through as-is). */
   async function openSse(base: string, path: string) {
-    const url = path.startsWith("/ui/events") ? withToken(path) : path;
+    const url = path.startsWith("/ui/events") ? withTicket(path) : path;
     const res = await fetch(`${base}${url}`);
     const reader = res.body!.getReader();
     return {

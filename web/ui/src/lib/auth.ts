@@ -108,6 +108,77 @@ export function clearCachedToken(): void {
   cached = null;
 }
 
+/**
+ * Mint a one-time SSE TICKET for the browser EventSource streams (agent#25).
+ *
+ * An `EventSource` can't set an `Authorization` header, so the chat used to put
+ * the hub JWT directly in the SSE URL (`?token=<JWT>`) — which leaks the
+ * credential into access logs / history / traces. Instead we POST the JWT (as a
+ * normal Bearer header — no leak) to `/agent/api/ui/sse-ticket`, which returns a
+ * single-use, ≤60s opaque ticket. The caller puts THAT in the SSE URL
+ * (`?ticket=<nonce>`); the server consumes it on connect. The ticket is NOT
+ * cached — it's single-use, so every connect (and every reconnect) mints a fresh
+ * one.
+ *
+ * Returns the ticket string, or `null` when the mint fails (no session / network
+ * / malformed) — the caller (Chat's `openStreams`) then opens no stream, and the
+ * usual re-auth-and-retry on SSE error re-mints. Mirrors `getAgentToken`'s
+ * tolerant failure shape (the SPA renders OPEN; a failed mint is an error state,
+ * not a hard redirect).
+ */
+export async function getSseTicket(): Promise<string | null> {
+  const token = await getAgentToken();
+  if (!token) return null;
+  let res: Response;
+  try {
+    res = await fetch(sseTicketEndpoint(), {
+      method: "POST",
+      headers: { accept: "application/json", authorization: `Bearer ${token}` },
+      credentials: "include",
+    });
+  } catch {
+    return null;
+  }
+  if (res.status === 401) {
+    // 401 = the cached JWT was stale/expired — drop it, re-mint once, retry. (A
+    // 403 means the token lacks agent:read; a fresh fetch wouldn't fix that, so we
+    // DON'T retry it — it falls through to the `!res.ok → null` below.)
+    clearCachedToken();
+    const fresh = await getAgentToken();
+    if (!fresh) return null;
+    try {
+      res = await fetch(sseTicketEndpoint(), {
+        method: "POST",
+        headers: { accept: "application/json", authorization: `Bearer ${fresh}` },
+        credentials: "include",
+      });
+    } catch {
+      return null;
+    }
+  }
+  if (!res.ok) return null;
+  let body: { ticket?: string };
+  try {
+    body = (await res.json()) as typeof body;
+  } catch {
+    return null;
+  }
+  return body.ticket ?? null;
+}
+
+/**
+ * The SSE-ticket mint endpoint — under the AGENT module mount (`/agent/api/...`),
+ * NOT the hub origin root like the token mint. Derived from the SPA base the same
+ * way `lib/api.ts:apiBase` does (`/agent/app/` → `/agent/api`), falling back to
+ * the canonical path in stand-alone dev (the vite proxy forwards it).
+ */
+function sseTicketEndpoint(): string {
+  const base = import.meta.env.BASE_URL || "/";
+  const m = base.match(/^(.*\/)app\/?$/);
+  const apiBase = m ? `${m[1]}api` : "/agent/api";
+  return `${apiBase}/ui/sse-ticket`;
+}
+
 /** Test seam: replace the cached token directly. */
 export function _setCachedTokenForTest(token: string, expiresAt: number): void {
   cached = { token, expiresAt };

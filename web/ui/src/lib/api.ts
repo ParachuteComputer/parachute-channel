@@ -729,19 +729,21 @@ export function connectSessionCommand(name: string, origin: string): string {
 //     sorted ascending by ts — vault.ts:1072).
 //   - POST /api/channels/<ch>/send             — write the inbound + wake the turn
 //     (`agent:send`; daemon.ts ~3437, body `{ text }`, returns `{ ok, id }`).
-//   - GET  /ui/events?channel=<ch>&token=<jwt> — the message SSE (inbound/outbound
-//     deltas; `agent:read`, query-param token — http-ui.ts:168). Events:
+//   - GET  /ui/events?channel=<ch>&ticket=<nonce> — the message SSE (inbound/
+//     outbound deltas; `agent:read` via a one-time ticket — http-ui.ts). Events:
 //     `reply` `{ id, text, files }`, `edit` `{ id, text }`, `permission` {...}.
-//   - GET  /api/channels/<ch>/turn-events?token=<jwt> — the PROGRAMMATIC turn
-//     streaming view (`agent:read`, query-param token — daemon.ts:3353). Event
+//   - GET  /api/channels/<ch>/turn-events?ticket=<nonce> — the PROGRAMMATIC turn
+//     streaming view (`agent:read` via a one-time ticket — daemon.ts). Event
 //     name `"turn"`; payload is the TurnLifecycleEvent union below.
 //
-// EventSource can't set an Authorization header, so the agent JWT rides as the
-// `token` QUERY PARAM (the `?token=` fallback the daemon opts these two SSE routes
-// into). The URLs are built ORIGIN-RELATIVE under the agent module mount
-// (`apiBase()` → `/agent/api`; MOUNT = drop the trailing `/api` → `/agent`) so
-// they resolve correctly BOTH daemon-direct and hub-proxied — mirroring how the
-// inline chat derives MOUNT from the page path (src/daemon.ts ~1194).
+// EventSource can't set an Authorization header. Rather than leak the hub JWT in
+// a `?token=` URL (it lands in access logs / history — agent#25), the chat mints a
+// one-time SSE TICKET (`POST /agent/api/ui/sse-ticket`, Bearer-authed —
+// `lib/auth.ts:getSseTicket`) and rides it as `?ticket=<nonce>`. The ticket is
+// single-use + ≤60s; the server consumes it on connect. The URLs are built
+// ORIGIN-RELATIVE under the agent module mount (`apiBase()` → `/agent/api`; MOUNT =
+// drop the trailing `/api` → `/agent`) so they resolve correctly BOTH daemon-direct
+// and hub-proxied — mirroring how the inline chat derives MOUNT from the page path.
 // ---------------------------------------------------------------------------
 
 /**
@@ -827,28 +829,30 @@ export function sendMessage(ch: string, text: string): Promise<SendMessageRespon
 }
 
 /**
- * Build the message-stream SSE URL: `<MOUNT>/ui/events?channel=<ch>&token=<jwt>`.
+ * Build the message-stream SSE URL: `<MOUNT>/ui/events?channel=<ch>&ticket=<nonce>`.
  * Origin-relative (under the agent mount) so it resolves daemon-direct AND
- * hub-proxied. The token rides as `&token=` (the URL already has `?channel=`),
- * matching the inline chat (src/daemon.ts:1496-1497). A falsy token is omitted —
- * an unguarded dev daemon may accept the stream without one.
+ * hub-proxied. Auth rides as a one-time `&ticket=` (agent#25) — NOT the hub JWT —
+ * so the credential never lands in a URL / access log. A falsy ticket is omitted
+ * (an unguarded dev daemon may accept the stream without one). Mint the ticket via
+ * `lib/auth.ts:getSseTicket` immediately before opening the stream.
  */
-export function messageStreamUrl(ch: string, token: string | null): string {
+export function messageStreamUrl(ch: string, ticket: string | null): string {
   const mount = apiBase().replace(/\/api$/, "");
   let url = `${mount}/ui/events?channel=${encodeURIComponent(ch)}`;
-  if (token) url += `&token=${encodeURIComponent(token)}`;
+  if (ticket) url += `&ticket=${encodeURIComponent(ticket)}`;
   return url;
 }
 
 /**
- * Build the turn-event SSE URL: `<MOUNT>/api/channels/<ch>/turn-events?token=<jwt>`.
+ * Build the turn-event SSE URL: `<MOUNT>/api/channels/<ch>/turn-events?ticket=<nonce>`.
  * Origin-relative (under the agent mount) so it resolves daemon-direct AND
- * hub-proxied. The token rides as `?token=` (the first param), matching the inline
- * chat (src/daemon.ts:1356-1357). A falsy token is omitted.
+ * hub-proxied. Auth rides as a one-time `?ticket=` (agent#25) — NOT the hub JWT.
+ * A falsy ticket is omitted. Mint the ticket via `getSseTicket` right before
+ * opening the stream (single-use — each connect needs its own).
  */
-export function turnEventsUrl(ch: string, token: string | null): string {
+export function turnEventsUrl(ch: string, ticket: string | null): string {
   const mount = apiBase().replace(/\/api$/, "");
   let url = `${mount}/api/channels/${encodeURIComponent(ch)}/turn-events`;
-  if (token) url += `?token=${encodeURIComponent(token)}`;
+  if (ticket) url += `?ticket=${encodeURIComponent(ticket)}`;
   return url;
 }

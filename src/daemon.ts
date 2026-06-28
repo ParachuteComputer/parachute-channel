@@ -85,6 +85,8 @@ import { ClientRegistry, sseFrame } from "./routing.ts";
 import { DeliveryState } from "./delivery-state.ts";
 import {
   requireScope,
+  mintSseTicket,
+  requireSseTicket,
   extractToken,
   json as authJson,
   SCOPE_READ,
@@ -93,6 +95,7 @@ import {
   SCOPE_ADMIN,
   SCOPE_TERMINAL,
 } from "./auth.ts";
+import { mintTicket } from "./ui-ticket.ts";
 import {
   createTerminalWsHandlers,
   type TerminalWsData,
@@ -1124,8 +1127,13 @@ function redirect(location: string): Response {
 // is `agent:write`.
 //
 // Layer 2 — human / chat UI — gates the http-ui transport's `send` (POST,
-// `agent:send`) + `/ui/events` SSE (`?token=` query, `agent:read`) inside
-// `http-ui.ts`'s ingestHttp using the same `requireScope`.
+// `agent:send`, Bearer) with `requireScope`. The browser SSE streams
+// (`/ui/events`, `/api/channels/<ch>/turn-events`, `agent:read`) gate on a
+// ONE-TIME ticket (`requireSseTicket`) instead of a `?token=<JWT>` query —
+// `EventSource` can't set a header, and a JWT in a URL leaks into access logs
+// (agent#25). The page mints the ticket at `POST /api/ui/sse-ticket` (Bearer,
+// agent:read) and opens `…?ticket=<nonce>`; the ticket is single-use + ≤60s and
+// carries only the minting token's scopes.
 //
 // Discovery + the page itself (/health, /.parachute/config[/schema], /ui) stay
 // OPEN — non-sensitive, and /ui must load to bootstrap its token fetch.
@@ -2745,8 +2753,21 @@ export function createFetchHandler(
       return json({ ok: true, reloaded: result });
     }
 
+    // One-time SSE ticket mint — POST /api/ui/sse-ticket (agent#25). The chat
+    // page can't put its hub JWT in an EventSource URL without leaking it into
+    // access logs, so it trades the JWT (presented HERE as a Bearer header — no
+    // leak) for a single-use, ≤60s opaque ticket it puts in the SSE URL instead.
+    // Bearer-gated on `agent:read` (the scope both browser SSE streams require);
+    // the minted ticket carries ONLY the token's own validated scopes, so it can
+    // never authorize more than the JWT did. An unauthenticated mint is impossible
+    // — `mintSseTicket` runs the scope gate before issuing anything. Returns
+    // `{ ticket, expires_at }`. Externally `<hub>/agent/api/ui/sse-ticket`.
+    if (req.method === "POST" && url.pathname === "/api/ui/sse-ticket") {
+      return mintSseTicket(req, url, SCOPE_READ, mintTicket);
+    }
+
     // Turn-event SSE — GET /api/channels/<ch>/turn-events (chat-facing; gated on
-    // `agent:read`, same scope as the transcript poll + /ui/events). The streaming
+    // a one-time SSE ticket carrying `agent:read`). The streaming
     // view (design 2026-06-16 build item #1): the chat subscribes here to watch a
     // PROGRAMMATIC turn work in real time — interim assistant text + tool_use, then a
     // done/error lifecycle event. EPHEMERAL by design: no backlog/replay (the durable
@@ -2758,11 +2779,12 @@ export function createFetchHandler(
     {
       const turnMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/turn-events$/);
       if (req.method === "GET" && turnMatch) {
-        // allowQueryParam=true: this SSE is consumed by a browser EventSource, which
-        // cannot set an Authorization header — it authenticates via ?token=. Without
-        // this the live-streaming view 401s in the browser and never connects. (The
-        // stdio-bridge /events SSE uses a Bearer header, so it doesn't need this.)
-        const denied = await requireScope(req, url, SCOPE_READ, true);
+        // Browser EventSource can't set an Authorization header, so this SSE
+        // authenticates via a one-time `?ticket=<nonce>` (agent#25) — minted by
+        // POST /api/ui/sse-ticket (Bearer-gated) and consumed single-use here. The
+        // hub JWT never rides in this URL. (The stdio-bridge /events SSE uses a
+        // Bearer header, so it never needed a query credential at all.)
+        const denied = requireSseTicket(url, SCOPE_READ);
         if (denied) return denied;
         const channelName = decodeURIComponent(turnMatch[1]!);
         const clientId = crypto.randomUUID();

@@ -388,6 +388,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
       vaultUrl: "http://127.0.0.1:1940",
       token: "x",
       webhookSecret: SECRET,
+      declareSchemaOnStart: false, // fake token — don't 401 the live vault (#32)
     });
     const emitted: InboundMessage[] = [];
     const ctx: TransportContext = {
@@ -477,8 +478,8 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
 
   test("channel-spoofing: a webhook for channel B presenting channel A's secret → 401, no emit", async () => {
     const registry = new ClientRegistry();
-    const eng = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "x", webhookSecret: "eng-secret" });
-    const ops = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "x", webhookSecret: "ops-secret" });
+    const eng = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "x", webhookSecret: "eng-secret", declareSchemaOnStart: false });
+    const ops = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "x", webhookSecret: "ops-secret", declareSchemaOnStart: false });
     const engEmits: InboundMessage[] = [];
     const opsEmits: InboundMessage[] = [];
     void eng.start({ channel: "eng", emit: (m) => engEmits.push(m), emitPermissionVerdict() {} });

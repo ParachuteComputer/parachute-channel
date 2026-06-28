@@ -55,7 +55,7 @@ const readAuth = { authorization: "Bearer " + READ_TOKEN } as const;
 function buildServer() {
   const registry = new ClientRegistry();
   const channels = new Map<string, Channel>();
-  const eng = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "vtok" });
+  const eng = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "vtok", declareSchemaOnStart: false });
   const ctx: TransportContext = { channel: "eng", emit() {}, emitPermissionVerdict() {} };
   void eng.start(ctx);
   channels.set("eng", { name: "eng", transport: eng, entry: { name: "eng", transport: "vault", config: { vault: "default" } } });

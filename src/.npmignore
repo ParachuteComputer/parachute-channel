@@ -1,0 +1,17 @@
+# Trims dev-only cruft from the published tarball, for the `src` subtree.
+#
+# WHY NESTED (src/.npmignore) AND NOT A ROOT .npmignore: package.json declares a
+# `files` allowlist (["src", ".parachute", ...]). When `files` is present, npm uses it
+# as the authoritative include-list and a ROOT .npmignore is NOT consulted at all
+# (verified: npm 11 ignores it). A nested .npmignore INSIDE an included directory IS
+# honored, though — exactly the mechanism web/ui/.npmignore already relies on. So the
+# test/_parked excludes live here, scoped to src/.
+#
+#   - *.test.ts   — ~50 unit-test files, no value to consumers
+#   - _parked/    — the retired interactive-backend PTY spawner, parked not shipped
+#
+# Re-verify after any change with `npm pack --dry-run`: confirm web/ui/dist/ is present
+# and the src/daemon.ts + src/bridge.ts bins keep mode 755 (a 100644 bin breaks
+# supervised start).
+*.test.ts
+_parked/

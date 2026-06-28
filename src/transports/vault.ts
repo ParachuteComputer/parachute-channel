@@ -96,6 +96,17 @@ export interface VaultTransportConfig {
   webhookSecret?: string;
   /** Optional path prefix for written notes. Default `channel`. */
   notePathPrefix?: string;
+  /**
+   * Whether `start()` fires the best-effort `ensureSchema()` tag-schema upsert
+   * against the connected vault. Default `true` (back-compat — the daemon always
+   * declares the module's tag inheritance on connect). Tests that construct a
+   * transport with a fake token set this `false` so `start()` does NOT hit the
+   * live vault on 127.0.0.1:1940 (which 401s the fake token → ~one `console.warn`
+   * per schema entry of benign noise). The "tag both parent + child" write floor
+   * means a channel works regardless, so skipping the declaration is safe; it's
+   * only a setup optimization, not a runtime contract. See #32.
+   */
+  declareSchemaOnStart?: boolean;
 }
 
 /** The note shape the daemon hands `ingestInbound` (a subset of the trigger payload). */
@@ -605,6 +616,8 @@ export class VaultTransport implements Transport {
    */
   readonly webhookSecret?: string;
   private readonly pathPrefix: string;
+  /** See `VaultTransportConfig.declareSchemaOnStart`. Default `true`. */
+  private readonly declareSchemaOnStart: boolean;
 
   constructor(config: VaultTransportConfig) {
     if (!config.vault) {
@@ -621,6 +634,7 @@ export class VaultTransport implements Transport {
     this.token = config.token;
     this.webhookSecret = config.webhookSecret;
     this.pathPrefix = (config.notePathPrefix ?? DEFAULT_PATH_PREFIX).replace(/\/$/, "");
+    this.declareSchemaOnStart = config.declareSchemaOnStart ?? true;
   }
 
   /**
@@ -642,7 +656,11 @@ export class VaultTransport implements Transport {
     // "tag both parent + child" floor in the note writes is the fail-safe, so the
     // channel works even if this declaration never lands. Fire-and-forget — no
     // reason to delay the channel coming up on a schema upsert.
-    void this.ensureSchema();
+    //
+    // Suppressible via `declareSchemaOnStart: false` — tests with a fake token
+    // set this so `start()` doesn't 401 against the live vault (benign warn noise,
+    // #32). The write floor makes the declaration optional anyway.
+    if (this.declareSchemaOnStart) void this.ensureSchema();
   }
 
   // -------------------------------------------------------------------------

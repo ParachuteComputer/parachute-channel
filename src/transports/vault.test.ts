@@ -53,6 +53,13 @@ function baseConfig() {
     vaultUrl: "http://127.0.0.1:1940",
     token: "write-token-xyz",
     webhookSecret: "s3cret",
+    // Default OFF here: these are unit tests for reply/writeThread/transcript etc.
+    // that mock fetch for ONE specific URL and don't want start()'s fire-and-forget
+    // ensureSchema() PUT hitting the (unmocked) tag-schema path → benign 401 warn
+    // spam against the live vault (#32). The dedicated `ensureSchema` describe block
+    // calls `t.ensureSchema()` directly, and the one test that exercises the
+    // start()→ensureSchema fire-and-forget path overrides this back to `true`.
+    declareSchemaOnStart: false,
   };
 }
 
@@ -1683,7 +1690,9 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
       throw new Error("vault unreachable");
     }) as unknown as typeof fetch;
 
-    const t = new VaultTransport(baseConfig());
+    // Override back to true — this test specifically exercises the
+    // start()→ensureSchema fire-and-forget non-fatal path (#32).
+    const t = new VaultTransport({ ...baseConfig(), declareSchemaOnStart: true });
     const ctx = fakeCtx("eng");
     await expect(t.start(ctx)).resolves.toBeUndefined();
     await flush(); // let the fire-and-forget ensureSchema settle (it must not reject globally)

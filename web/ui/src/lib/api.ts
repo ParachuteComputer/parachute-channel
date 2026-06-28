@@ -7,7 +7,7 @@
  * — Phase 4a — edit/delete a def + add/remove a def-vault.
  *
  *   - `GET /agent/api/agents`        — every agent across ALL backends
- *     (interactive / programmatic / channel), with live status.
+ *     (programmatic / channel), with live status.
  *   - `GET /agent/api/agent-defs`    — the vault-native `#agent/definition`
  *     records (the durable defs that instantiate agents).
  *   - `GET /agent/api/agent-vaults`  — the module-level def-vault list
@@ -149,8 +149,13 @@ function deleteJsonWithBody<T>(suffix: string, body: unknown): Promise<T> {
 // daemon emits them; the daemon uses camelCase for these endpoints).
 // ---------------------------------------------------------------------------
 
-/** The backend that drives an agent. The primary axis of the v2 view. */
-export type AgentBackend = "interactive" | "programmatic" | "channel";
+/**
+ * The backend that drives an agent. The primary axis of the v2 view. The
+ * `interactive` (tmux) backend was retired (#114) and can never be returned by
+ * the daemon, so it's gone from the display type too (#115). `"channel"` is the
+ * SPA's label for the daemon's `attached` backend.
+ */
+export type AgentBackend = "programmatic" | "channel";
 
 /** Execution-lifecycle mode — the top-level branch. Rides in `metadata.mode`. */
 export type AgentMode = "single-threaded" | "multi-threaded";

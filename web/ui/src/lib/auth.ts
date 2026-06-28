@@ -140,7 +140,9 @@ export async function getSseTicket(): Promise<string | null> {
     return null;
   }
   if (res.status === 401) {
-    // The cached token was stale — drop it, re-mint once, retry the ticket.
+    // 401 = the cached JWT was stale/expired — drop it, re-mint once, retry. (A
+    // 403 means the token lacks agent:read; a fresh fetch wouldn't fix that, so we
+    // DON'T retry it — it falls through to the `!res.ok → null` below.)
     clearCachedToken();
     const fresh = await getAgentToken();
     if (!fresh) return null;

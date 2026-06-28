@@ -16,8 +16,14 @@
  * test.ts uses — accept paths run without a live hub/JWKS; the no-token reject
  * still hits the real short-circuit.
  */
-import { describe, test, expect, mock } from "bun:test";
+import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 import type { ServerWebSocket } from "bun";
+import { mkdtempSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+
+/** Throwaway state dir for the step-up PIN store (set per terminal-auth test). */
+let stateDir: string;
 
 // Sentinel tokens → fixed scope sets. Mirrors daemon-config-api.test.ts so this
 // process-wide mock stays compatible. ADMIN_TOKEN carries agent:admin (==
@@ -63,6 +69,11 @@ import {
 } from "./terminal.ts";
 import { authorizeTerminalUpgrade } from "./daemon.ts";
 import type { Channel } from "./registry.ts";
+import {
+  setStepUpPin,
+  mintStepUpToken,
+  _resetStepUpTokensForTest,
+} from "./step-up.ts";
 
 // ===========================================================================
 // Fakes — a recording pty + a controllable ServerWebSocket.
@@ -432,7 +443,24 @@ describe("tmuxAttachEnv — forces a real TERM so `tmux attach` finds terminfo",
 // ===========================================================================
 // Daemon-side terminal auth — authorizeTerminalUpgrade (pure fn)
 // ===========================================================================
-describe("authorizeTerminalUpgrade — operator-gated agent:admin", () => {
+describe("authorizeTerminalUpgrade — operator-gated agent:admin + step-up (agent#80)", () => {
+  // A terminal needs a STEP-UP token (agent#80) on top of agent:admin. Configure a
+  // PIN in a throwaway state dir + mint a valid token; the `ok:true` cases pass it
+  // as `&step_up=`. STEP is recomputed per test so a prior test can't strand state.
+  let STEP = "";
+  beforeEach(async () => {
+    stateDir = mkdtempSync(join(tmpdir(), "agent-term-stepup-"));
+    process.env.PARACHUTE_AGENT_STATE_DIR = stateDir;
+    _resetStepUpTokensForTest();
+    await setStepUpPin("4242", stateDir);
+    STEP = mintStepUpToken().token;
+  });
+  afterEach(() => {
+    try {
+      rmSync(stateDir, { recursive: true, force: true });
+    } catch {}
+  });
+
   function channels(names: string[] = ["eng"]): Map<string, Channel> {
     const m = new Map<string, Channel>();
     for (const name of names) {
@@ -466,8 +494,18 @@ describe("authorizeTerminalUpgrade — operator-gated agent:admin", () => {
     if (!d.ok) expect(d.response.status).toBe(403);
   });
 
-  test("valid agent:admin token → ok, with the right tmux session + geometry", async () => {
-    const { req: r, url } = req(`?token=${ADMIN_TOKEN}&cols=120&rows=40`);
+  test("valid agent:admin token but NO step-up → reject (403 step_up_required)", async () => {
+    const { req: r, url } = req(`?token=${ADMIN_TOKEN}`);
+    const d = await authorizeTerminalUpgrade(r, url, channels(), "eng");
+    expect(d.ok).toBe(false);
+    if (!d.ok) {
+      expect(d.response.status).toBe(403);
+      expect((await d.response.json()).error).toBe("step_up_required");
+    }
+  });
+
+  test("valid agent:admin + step-up token → ok, with the right tmux session + geometry", async () => {
+    const { req: r, url } = req(`?token=${ADMIN_TOKEN}&step_up=${STEP}&cols=120&rows=40`);
     const d = await authorizeTerminalUpgrade(r, url, channels(), "eng");
     expect(d.ok).toBe(true);
     if (d.ok) {
@@ -478,11 +516,11 @@ describe("authorizeTerminalUpgrade — operator-gated agent:admin", () => {
     }
   });
 
-  test("legacy channel:admin token still authorizes (dual-accept back-compat)", async () => {
+  test("legacy channel:admin token (+ step-up) still authorizes (dual-accept back-compat)", async () => {
     // A token minted before the channel→agent rename carries channel:admin (and
     // aud:"channel"). requireScope's dual-accept (hasScope) must still authorize
     // the agent:admin-gated terminal until live tokens are re-minted.
-    const { req: r, url } = req(`?token=${LEGACY_ADMIN_TOKEN}&cols=100&rows=30`);
+    const { req: r, url } = req(`?token=${LEGACY_ADMIN_TOKEN}&step_up=${STEP}&cols=100&rows=30`);
     const d = await authorizeTerminalUpgrade(r, url, channels(), "eng");
     expect(d.ok).toBe(true);
     if (d.ok) {
@@ -493,7 +531,7 @@ describe("authorizeTerminalUpgrade — operator-gated agent:admin", () => {
   });
 
   test("geometry defaults (80×24) when cols/rows absent or out-of-range", async () => {
-    const { req: r, url } = req(`?token=${ADMIN_TOKEN}&cols=0&rows=abc`);
+    const { req: r, url } = req(`?token=${ADMIN_TOKEN}&step_up=${STEP}&cols=0&rows=abc`);
     const d = await authorizeTerminalUpgrade(r, url, channels(), "eng");
     expect(d.ok).toBe(true);
     if (d.ok) {
@@ -506,7 +544,7 @@ describe("authorizeTerminalUpgrade — operator-gated agent:admin", () => {
     // The terminal attaches to an AGENT (tmux <name>-agent), not a channel — so a
     // valid-slug name that isn't in the channel map is accepted (a non-existent
     // session just fails to attach downstream with a clean 1000, no 404 here).
-    const url = new URL(`http://127.0.0.1/terminal/weaver?token=${ADMIN_TOKEN}`);
+    const url = new URL(`http://127.0.0.1/terminal/weaver?token=${ADMIN_TOKEN}&step_up=${STEP}`);
     const r = new Request(url, { headers: { upgrade: "websocket" } });
     const d = await authorizeTerminalUpgrade(r, url, channels(["eng"]), "weaver");
     expect(d.ok).toBe(true);
@@ -515,7 +553,7 @@ describe("authorizeTerminalUpgrade — operator-gated agent:admin", () => {
 
   test("a path-traversal-shaped name is rejected by the slug guard → 400 (no escape into tmux -t)", async () => {
     const weird = "../../etc";
-    const url = new URL(`http://127.0.0.1/terminal/${encodeURIComponent(weird)}?token=${ADMIN_TOKEN}`);
+    const url = new URL(`http://127.0.0.1/terminal/${encodeURIComponent(weird)}?token=${ADMIN_TOKEN}&step_up=${STEP}`);
     const r = new Request(url, { headers: { upgrade: "websocket" } });
     const d = await authorizeTerminalUpgrade(r, url, channels(["eng"]), weird);
     expect(d.ok).toBe(false);

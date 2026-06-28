@@ -20,6 +20,7 @@ import { Link, Route, Routes, useLocation } from "react-router-dom";
 import { Agents } from "./routes/Agents.tsx";
 import { Chat } from "./routes/Chat.tsx";
 import { CreateAgentRoute } from "./routes/CreateAgent.tsx";
+import { StepUpProvider, useStepUp } from "./StepUpModal.tsx";
 
 const WORDMARK = "Parachute Agent";
 
@@ -30,8 +31,17 @@ function subtitleFor(pathname: string): string {
 }
 
 export function App() {
+  return (
+    <StepUpProvider>
+      <AppShell />
+    </StepUpProvider>
+  );
+}
+
+function AppShell() {
   const { pathname } = useLocation();
   const subtitle = subtitleFor(pathname);
+  const { openSettings } = useStepUp();
 
   return (
     <div className="page">
@@ -43,6 +53,14 @@ export function App() {
         <NavSection to="/" label="Agents" exact />
         <NavSection to="/create" label="New agent" />
         <NavSection to="/chat" label="Chat" />
+        <button
+          type="button"
+          className="nav-link nav-link-button"
+          onClick={openSettings}
+          title="Set or change the step-up PIN that gates high-privilege actions"
+        >
+          Step-up PIN
+        </button>
       </nav>
 
       <Routes>

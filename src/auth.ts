@@ -40,6 +40,7 @@
 import { validateHubJwt, HubJwtError } from "./hub-jwt.ts";
 import { extractBearer } from "@openparachute/scope-guard";
 import { consumeTicket } from "./ui-ticket.ts";
+import { isStepUpTokenValid, isStepUpConfigured } from "./step-up.ts";
 
 /** Agent scopes, declared here so callers share one spelling. */
 export const SCOPE_READ = "agent:read" as const;
@@ -226,4 +227,82 @@ export function requireSseTicket(url: URL, scope: string): Response | null {
     );
   }
   return null;
+}
+
+/**
+ * The header a request carries the step-up token on (agent#80). The terminal
+ * WebSocket — which `new WebSocket()` can't set a header on — uses the
+ * `?step_up=` query param instead (mirroring the `?token=` exception).
+ */
+export const STEP_UP_TOKEN_HEADER = "x-step-up-token";
+
+/** Extract a presented step-up token: the header first, then `?step_up=` when allowed. */
+export function extractStepUpToken(req: Request, url: URL, allowQueryParam = false): string | null {
+  const header = req.headers.get(STEP_UP_TOKEN_HEADER);
+  if (header && header.length > 0) return header;
+  if (allowQueryParam) {
+    const q = url.searchParams.get("step_up");
+    if (q && q.length > 0) return q;
+  }
+  return null;
+}
+
+/**
+ * SECOND-FACTOR gate (agent#80) for the genuinely dangerous `agent:admin` actions:
+ * set/rotate credentials, open a terminal, spawn a `filesystem: full` agent. The
+ * caller runs {@link requireScope}(`agent:admin`) FIRST; this asserts — IN ADDITION —
+ * a valid step-up token (the operator entered their PIN recently).
+ *
+ *   - Step-up NOT configured (no PIN set) → returns `{ ok: false, reason: "setup" }`.
+ *     The caller maps it to `403 { error: "step_up_required", reason: "setup" }` so
+ *     the UI runs its FIRST-TIME PIN-setup flow before the action.
+ *   - PIN configured + valid token → `{ ok: true }` (the action proceeds).
+ *   - PIN configured + missing/expired token → `{ ok: false, reason: "token" }` →
+ *     `403 { error: "step_up_required" }` so the UI PROMPTS for the PIN.
+ *
+ * The 403 is deliberately DISTINCT from `requireScope`'s 401 (no/invalid Bearer):
+ * a 401 means "re-authenticate", a 403 `step_up_required` means "enter your PIN".
+ * The step-up token NEVER widens scope — the request already passed `agent:admin`;
+ * this is purely a recency re-confirm on top.
+ *
+ * `allowQueryParam: true` accepts `?step_up=` for the terminal WebSocket only.
+ * Pure in-memory token check — no I/O on the gated request path, no secret logged.
+ */
+export function requireStepUp(
+  req: Request,
+  url: URL,
+  allowQueryParam = false,
+  opts?: { configured?: () => boolean; valid?: (token: string | null) => boolean },
+): { ok: true } | { ok: false; response: Response } {
+  const isConfigured = opts?.configured ?? (() => isStepUpConfigured());
+  const isValid = opts?.valid ?? ((t: string | null) => isStepUpTokenValid(t));
+  if (!isConfigured()) {
+    // No PIN yet — the UI must set one before this action can proceed.
+    return {
+      ok: false,
+      response: json(
+        {
+          error: "step_up_required",
+          reason: "setup",
+          message: "set a step-up PIN before performing this action",
+        },
+        403,
+      ),
+    };
+  }
+  const token = extractStepUpToken(req, url, allowQueryParam);
+  if (!isValid(token)) {
+    return {
+      ok: false,
+      response: json(
+        {
+          error: "step_up_required",
+          reason: "token",
+          message: "enter your step-up PIN to confirm this action",
+        },
+        403,
+      ),
+    };
+  }
+  return { ok: true };
 }

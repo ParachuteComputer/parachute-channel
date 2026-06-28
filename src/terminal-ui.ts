@@ -164,6 +164,65 @@ ${SHELL_JS}
     });
   }
 
+  // --- step-up PIN (agent#80) --------------------------------------------
+  // A terminal is a raw host shell — the most dangerous capability — so the WS
+  // upgrade requires a STEP-UP TOKEN on top of the agent:admin Bearer. The WS
+  // can't set a header, so we present it as a step_up query param. We fetch the step-up
+  // status, prompt for the PIN (or set one first), exchange it for a short-TTL
+  // token, and cache it on window.__stepUp. Re-prompt on expiry / WS auth-fail.
+  // This page is server-rendered (no React) so the prompt is a native dialog.
+  function authedJson(suffix, init) {
+    init = init || {};
+    var headers = init.headers || {};
+    headers["accept"] = "application/json";
+    if (window.__token) headers["authorization"] = "Bearer " + window.__token;
+    init.headers = headers;
+    return fetch(MOUNT + "/api" + suffix, init);
+  }
+  function ensureStepUp() {
+    if (window.__stepUp && window.__stepUpExp && Date.now() < window.__stepUpExp - 5000) {
+      return Promise.resolve(window.__stepUp);
+    }
+    return authedJson("/step-up").then(function (r) {
+      return r.json();
+    }).then(function (s) {
+      if (!s.configured) {
+        var np = window.prompt("Set a step-up PIN (4-12 digits) — required to open a terminal:");
+        if (!np) return null;
+        var confirm = window.prompt("Confirm the PIN:");
+        if (confirm !== np) { showNotice("The PINs didn't match — try again.", true); return null; }
+        return authedJson("/step-up/pin", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ newPin: np }),
+        }).then(function (r) {
+          if (!r.ok) { showNotice("Could not set the PIN (must be 4-12 digits).", true); return null; }
+          return exchangePin(np);
+        });
+      }
+      var pin = window.prompt("Enter your step-up PIN to open a terminal:");
+      if (!pin) return null;
+      return exchangePin(pin);
+    });
+  }
+  function exchangePin(pin) {
+    return authedJson("/step-up", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pin: pin }),
+    }).then(function (r) {
+      if (r.status === 401) { showNotice("Incorrect PIN.", true); return null; }
+      if (r.status === 429) { showNotice("Too many PIN attempts — wait a minute.", true); return null; }
+      if (!r.ok) { showNotice("Step-up failed (" + r.status + ").", true); return null; }
+      return r.json();
+    }).then(function (body) {
+      if (!body || !body.stepUpToken) return null;
+      window.__stepUp = body.stepUpToken;
+      window.__stepUpExp = body.expires_at ? new Date(body.expires_at).getTime() : Date.now() + 5 * 60000;
+      return window.__stepUp;
+    });
+  }
+
   // --- WebSocket relay ----------------------------------------------------
   // The path segment is the AGENT name — the daemon attaches to that agent's tmux
   // session (<name>-agent). NOT a channel.
@@ -172,6 +231,7 @@ ${SHELL_JS}
     var dims = "cols=" + term.cols + "&rows=" + term.rows;
     var u = proto + "//" + location.host + MOUNT + "/terminal/" + encodeURIComponent(agent) + "?" + dims;
     if (window.__token) u += "&token=" + encodeURIComponent(window.__token);
+    if (window.__stepUp) u += "&step_up=" + encodeURIComponent(window.__stepUp);
     return u;
   }
 
@@ -181,6 +241,19 @@ ${SHELL_JS}
     if (ws) { manualClose = true; try { ws.close(); } catch (_e) {} ws = null; }
     manualClose = false;
     clearNotice();
+    // Step-up FIRST — a terminal needs the PIN-minted token (agent#80). Only open
+    // the socket once we hold one; a cancelled prompt leaves the page idle.
+    setStatus("step-up…");
+    ensureStepUp().then(function (tok) {
+      if (!tok) { setStatus("step-up required", "err"); return; }
+      openSocket(agent);
+    }).catch(function () {
+      setStatus("step-up failed", "err");
+      showNotice("Could not complete step-up. Reload and try again.", true);
+    });
+  }
+
+  function openSocket(agent) {
     setStatus("connecting…");
     doFit();
     var socket = new WebSocket(wsUrl(agent));

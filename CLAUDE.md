@@ -178,6 +178,26 @@ own ticket; an SSE error re-mints and reconnects. The legacy `?token=` SSE path 
 no deprecation window). The `agent:admin` terminal WebSocket still uses `?token=` — a separate
 operator-gated mechanism, out of this change's scope.
 
+**Step-up auth — PIN second factor on the dangerous actions (agent#80).** A single
+`agent:admin` session can do anything dangerous with no re-confirm — set/rotate credentials
+(→ exfiltrate vault/channel/Claude tokens), open a **terminal** (→ raw host shell), or spawn a
+`filesystem: full` agent (→ read the whole disk). So those actions require a **step-up token**
+IN ADDITION to `agent:admin`. The operator sets a PIN once (hashed+salted via `Bun.password`
+argon2id in `~/.parachute/agent/step-up.json`, mode 0600 — `src/step-up.ts`); `POST /api/step-up
+{ pin }` validates it (rate-limited, 5 wrong / 5 min lockout) and mints an opaque CSPRNG nonce
+(TTL ~5min, server-side TTL'd map, REUSABLE within its window — like `ui-ticket.ts` but not
+single-use). `POST /api/step-up/pin { newPin, currentPin? }` sets/rotates the PIN (rotation
+requires the current PIN). The gate (`requireStepUp` in `src/auth.ts`) is enforced SERVER-side
+on: **set-credentials** (`POST`/`DELETE` `/api/credentials/env` + `/api/credentials/claude[/:channel]`),
+the **terminal** WS (`authorizeTerminalUpgrade`), and the **`filesystem: "full"` spawn** path
+(ordinary sandboxed spawns stay frictionless). A gate miss returns `403 { error:
+"step_up_required", reason: "setup"|"token" }` — DISTINCT from a plain 401 (no/invalid bearer) —
+so the SPA prompts (first-time setup vs PIN entry) instead of re-authenticating. The token rides
+the `X-Step-Up-Token` header (or `?step_up=` for the terminal WS, which can't set a header). The
+SPA holds it in memory and attaches it transparently in `lib/api.ts:authedFetch` (re-prompt on
+expiry); the PIN is never logged or returned. The step-up token NEVER widens scope — it's a
+second factor on top of `agent:admin`, never a substitute.
+
 ## Vault integration (Stage 2) — channels backed by `#agent/message` notes
 
 A `vault` transport backs a channel with notes in a Parachute vault, so messages

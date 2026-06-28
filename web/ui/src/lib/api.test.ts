@@ -32,6 +32,7 @@ import {
   setAgentSecret,
   turnEventsUrl,
 } from "./api.ts";
+import { registerStepUpPrompt, setStepUpToken, _resetStepUpForTest } from "./step-up.ts";
 
 const getAgentToken = vi.mocked(auth.getAgentToken);
 const clearCachedToken = vi.mocked(auth.clearCachedToken);
@@ -168,6 +169,68 @@ describe("listAgents / listAgentDefs / listAgentVaults", () => {
       vi.fn(async () => new Response("", { status: 401 })),
     );
     await expect(listAgents()).rejects.toBeInstanceOf(HttpError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Step-up gate (agent#80): a `403 step_up_required` drives the prompt, then the
+// request retries once with the `X-Step-Up-Token` header attached.
+// ---------------------------------------------------------------------------
+describe("authedFetch — step-up gate (403 step_up_required)", () => {
+  beforeEach(() => {
+    _resetStepUpForTest();
+  });
+
+  it("prompts for the PIN, then retries once with X-Step-Up-Token; success", async () => {
+    // The prompt handler mints + caches a token (as the real exchange would).
+    registerStepUpPrompt(async () => {
+      setStepUpToken("step-tok", Date.now() + 300_000);
+      return "step-tok";
+    });
+    const fetchMock = fetchFn(async () => jsonResponse(403, { error: "step_up_required", reason: "token" }));
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(403, { error: "step_up_required", reason: "token" }))
+      .mockResolvedValueOnce(jsonResponse(200, { ok: true, scope: "default", name: "GH_TOKEN" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await setAgentSecret({ name: "GH_TOKEN", value: "ghp_x" });
+    expect(res.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The first call had no step-up header; the retry carries the minted token.
+    expect(new Headers(fetchMock.mock.calls[0]![1]?.headers).get("x-step-up-token")).toBeNull();
+    expect(new Headers(fetchMock.mock.calls[1]![1]?.headers).get("x-step-up-token")).toBe("step-tok");
+  });
+
+  it("surfaces the 403 when the operator cancels the prompt (returns null)", async () => {
+    registerStepUpPrompt(async () => null);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(403, { error: "step_up_required", reason: "token" })),
+    );
+    await expect(setAgentSecret({ name: "GH_TOKEN", value: "ghp_x" })).rejects.toMatchObject({
+      status: 403,
+    });
+  });
+
+  it("a PLAIN 403 (not step_up_required) surfaces normally — no prompt", async () => {
+    const handler = vi.fn();
+    registerStepUpPrompt(handler);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(403, { error: "insufficient_scope" })),
+    );
+    await expect(setAgentSecret({ name: "GH_TOKEN", value: "ghp_x" })).rejects.toMatchObject({
+      status: 403,
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("attaches a HELD step-up token up-front (no prompt needed)", async () => {
+    setStepUpToken("held-tok", Date.now() + 300_000);
+    const fetchMock = fetchFn(async () => jsonResponse(200, { ok: true, scope: "default", name: "GH_TOKEN" }));
+    vi.stubGlobal("fetch", fetchMock);
+    await setAgentSecret({ name: "GH_TOKEN", value: "ghp_x" });
+    expect(new Headers(fetchMock.mock.calls[0]![1]?.headers).get("x-step-up-token")).toBe("held-tok");
   });
 });
 

@@ -67,6 +67,7 @@ import {
   describeChannelEnv,
 } from "./credentials.ts";
 import type { TransportContext, InboundMessage } from "./transport.ts";
+import { setStepUpPin, mintStepUpToken, _resetStepUpTokensForTest } from "./step-up.ts";
 
 const sendAuth = { authorization: "Bearer " + SEND_TOKEN } as const;
 const adminAuth = { authorization: "Bearer " + ADMIN_TOKEN } as const;
@@ -74,8 +75,15 @@ const readAuth = { authorization: "Bearer " + READ_TOKEN } as const;
 const legacySendAuth = { authorization: "Bearer " + LEGACY_SEND_TOKEN } as const;
 
 let stateDir: string;
+/**
+ * agent:admin Bearer + a valid step-up token (agent#80). The credential-store
+ * routes (D + E below) are step-up-gated; this header lets the store-behavior
+ * tests reach the handler. The dedicated step-up tests live in
+ * daemon-step-up.test.ts. Recomputed per test in `beforeEach`.
+ */
+let stepAdminAuth: Record<string, string>;
 
-beforeEach(() => {
+beforeEach(async () => {
   // Sandbox channels.json under a throwaway state dir — the config API resolves
   // STATE_DIR from PARACHUTE_AGENT_STATE_DIR (read once at daemon module load),
   // so set it BEFORE importing... but the module is already imported. Instead the
@@ -83,6 +91,11 @@ beforeEach(() => {
   // and the tests that touch the file assert under that path. Re-resolve per test.
   stateDir = mkdtempSync(join(tmpdir(), "agent-cfg-"));
   process.env.PARACHUTE_AGENT_STATE_DIR = stateDir;
+  // Step-up: configure a PIN + mint a token so the credential-store routes pass
+  // their step-up gate. The store under test is in this same temp dir.
+  _resetStepUpTokensForTest();
+  await setStepUpPin("4242", stateDir);
+  stepAdminAuth = { ...adminAuth, "x-step-up-token": mintStepUpToken().token };
 });
 
 afterEach(() => {
@@ -618,7 +631,7 @@ describe("D — Claude credential store API (agent:admin)", () => {
     try {
       const res = await fetch(`${base}/api/credentials/claude`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ token: "oat_DEFAULT-OPERATOR" }),
       });
       expect(res.status).toBe(200);
@@ -639,12 +652,12 @@ describe("D — Claude credential store API (agent:admin)", () => {
     try {
       await fetch(`${base}/api/credentials/claude`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ token: "oat_DEFAULT" }),
       });
       const res = await fetch(`${base}/api/credentials/claude/aaron-dev`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ token: "oat_AARON-OVERRIDE" }),
       });
       expect(res.status).toBe(200);
@@ -662,12 +675,12 @@ describe("D — Claude credential store API (agent:admin)", () => {
     try {
       await fetch(`${base}/api/credentials/claude`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ token: "oat_SECRET-DEFAULT" }),
       });
       await fetch(`${base}/api/credentials/claude/aaron-dev`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ token: "oat_SECRET-OVERRIDE" }),
       });
 
@@ -690,17 +703,17 @@ describe("D — Claude credential store API (agent:admin)", () => {
     try {
       await fetch(`${base}/api/credentials/claude`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ token: "oat_DEFAULT" }),
       });
       await fetch(`${base}/api/credentials/claude/aaron-dev`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ token: "oat_OVERRIDE" }),
       });
       const del = await fetch(`${base}/api/credentials/claude/aaron-dev`, {
         method: "DELETE",
-        headers: { ...adminAuth },
+        headers: { ...stepAdminAuth },
       });
       expect(del.status).toBe(200);
       expect(await del.json()).toMatchObject({ ok: true, channel: "aaron-dev", removed: true });
@@ -715,13 +728,13 @@ describe("D — Claude credential store API (agent:admin)", () => {
     try {
       const empty = await fetch(`${base}/api/credentials/claude`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ token: "" }),
       });
       expect(empty.status).toBe(400);
       const missing = await fetch(`${base}/api/credentials/claude`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({}),
       });
       expect(missing.status).toBe(400);
@@ -789,7 +802,7 @@ describe("E — per-channel env-var store API (agent:admin)", () => {
     try {
       const res = await fetch(`${base}/api/credentials/env`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ name: "GH_TOKEN", value: "ghp_DEFAULT-SECRET" }),
       });
       expect(res.status).toBe(200);
@@ -809,12 +822,12 @@ describe("E — per-channel env-var store API (agent:admin)", () => {
     try {
       await fetch(`${base}/api/credentials/env`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ name: "GH_TOKEN", value: "ghp_DEFAULT" }),
       });
       const res = await fetch(`${base}/api/credentials/env`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ channel: "aaron-dev", name: "GH_TOKEN", value: "ghp_AARON" }),
       });
       expect(res.status).toBe(200);
@@ -833,7 +846,7 @@ describe("E — per-channel env-var store API (agent:admin)", () => {
       for (const name of ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]) {
         const res = await fetch(`${base}/api/credentials/env`, {
           method: "POST",
-          headers: { "content-type": "application/json", ...adminAuth },
+          headers: { "content-type": "application/json", ...stepAdminAuth },
           body: JSON.stringify({ name, value: "x" }),
         });
         expect(res.status).toBe(400);
@@ -850,12 +863,12 @@ describe("E — per-channel env-var store API (agent:admin)", () => {
     try {
       await fetch(`${base}/api/credentials/env`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ name: "GH_TOKEN", value: "ghp_SECRET-DEFAULT" }),
       });
       await fetch(`${base}/api/credentials/env`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ channel: "aaron-dev", name: "CLOUDFLARE_API_TOKEN", value: "cf_SECRET" }),
       });
       const res = await fetch(`${base}/api/credentials/env`, { headers: { ...adminAuth } });
@@ -876,18 +889,18 @@ describe("E — per-channel env-var store API (agent:admin)", () => {
     try {
       await fetch(`${base}/api/credentials/env`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ name: "GH_TOKEN", value: "ghp_DEFAULT" }),
       });
       await fetch(`${base}/api/credentials/env`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ channel: "aaron-dev", name: "GH_TOKEN", value: "ghp_AARON" }),
       });
       // Delete the channel override (via body).
       const del = await fetch(`${base}/api/credentials/env`, {
         method: "DELETE",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ channel: "aaron-dev", name: "GH_TOKEN" }),
       });
       expect(del.status).toBe(200);
@@ -897,7 +910,7 @@ describe("E — per-channel env-var store API (agent:admin)", () => {
       // Delete the default too.
       const delDef = await fetch(`${base}/api/credentials/env`, {
         method: "DELETE",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ name: "GH_TOKEN" }),
       });
       expect(delDef.status).toBe(200);
@@ -913,13 +926,13 @@ describe("E — per-channel env-var store API (agent:admin)", () => {
     try {
       const noName = await fetch(`${base}/api/credentials/env`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ value: "x" }),
       });
       expect(noName.status).toBe(400);
       const noVal = await fetch(`${base}/api/credentials/env`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...adminAuth },
+        headers: { "content-type": "application/json", ...stepAdminAuth },
         body: JSON.stringify({ name: "GH_TOKEN" }),
       });
       expect(noVal.status).toBe(400);

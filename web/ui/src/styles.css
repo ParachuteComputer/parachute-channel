@@ -811,3 +811,88 @@ button.button-danger:disabled {
   flex: 0 0 auto;
   align-self: flex-end;
 }
+
+/* ---- Step-up PIN: the nav button + the modal (agent#80) ---- */
+.nav .nav-link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 0.95rem;
+  font-family: inherit;
+}
+.nav .nav-link-button:hover {
+  color: var(--fg);
+}
+.step-up-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(44, 42, 38, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  z-index: 1000;
+}
+.step-up-modal {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(44, 42, 38, 0.2);
+  padding: 1.5rem;
+  width: 100%;
+  max-width: 26rem;
+}
+.step-up-modal h2 {
+  margin: 0 0 0.5rem;
+  font-family: var(--font-serif);
+  font-size: 1.25rem;
+}
+.step-up-sub {
+  color: var(--fg-muted);
+  font-size: 0.9rem;
+  margin: 0 0 1rem;
+}
+.step-up-field {
+  display: block;
+  margin-bottom: 0.85rem;
+}
+.step-up-field > span {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  margin-bottom: 0.3rem;
+}
+.step-up-field input {
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 1.1rem;
+  letter-spacing: 0.25em;
+  background: var(--bg);
+  color: var(--fg);
+  box-sizing: border-box;
+}
+.step-up-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.step-up-error {
+  color: var(--error);
+  background: var(--error-soft);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  font-size: 0.85rem;
+  margin: 0 0 0.85rem;
+}
+.step-up-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+}

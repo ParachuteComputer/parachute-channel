@@ -23,6 +23,13 @@
  * vite.config.ts forwards to the loopback daemon.
  */
 import { clearCachedToken, getAgentToken } from "./auth.ts";
+import {
+  STEP_UP_HEADER,
+  currentStepUpToken,
+  clearStepUpToken,
+  requestStepUpToken,
+  type StepUpReason,
+} from "./step-up.ts";
 
 /** Status code carried alongside the message so callers can branch numerically. */
 export class HttpError extends Error {
@@ -55,13 +62,39 @@ export function apiBase(): string {
  * the SPA mirror of `src/ui-kit.ts:authedFetch`. On a clean 401 we drop the
  * cached token, re-mint once, and retry; a persistent 401 surfaces as an
  * `HttpError`.
+ *
+ * STEP-UP (agent#80): a gated action (set credentials, terminal, full-fs spawn)
+ * needs a step-up token IN ADDITION to the Bearer. We attach any HELD token
+ * up-front, and on a `403 step_up_required` we drive the PIN-prompt modal
+ * (`requestStepUpToken`), then retry ONCE with the fresh `X-Step-Up-Token`. This
+ * keeps the gate transparent to every call site — no per-call-site PIN plumbing.
+ * `_stepUpRetried` guards against an infinite prompt loop.
  */
-async function authedFetch(path: string, init: RequestInit = {}): Promise<Response> {
+async function authedFetch(
+  path: string,
+  init: RequestInit = {},
+  _stepUpRetried = false,
+): Promise<Response> {
   const token = await getAgentToken();
   const headers = new Headers(init.headers);
   headers.set("accept", "application/json");
   if (token) headers.set("authorization", `Bearer ${token}`);
+  const step = currentStepUpToken();
+  if (step) headers.set(STEP_UP_HEADER, step);
   const res = await fetch(path, { ...init, headers });
+
+  // Step-up gate: prompt for the PIN, then retry once with the minted token.
+  if (res.status === 403 && !_stepUpRetried) {
+    const reason = await stepUpReasonOf(res);
+    if (reason) {
+      // A held token we *thought* was valid but the server rejected → drop it.
+      if (currentStepUpToken()) clearStepUpToken();
+      const fresh = await requestStepUpToken(reason);
+      if (!fresh) return res; // operator cancelled / no prompt → surface the 403
+      return authedFetch(path, init, true);
+    }
+  }
+
   if (res.status !== 401) return res;
   // Re-mint once and retry. The first mint may have been stale/absent.
   clearCachedToken();
@@ -70,7 +103,29 @@ async function authedFetch(path: string, init: RequestInit = {}): Promise<Respon
   const retryHeaders = new Headers(init.headers);
   retryHeaders.set("accept", "application/json");
   retryHeaders.set("authorization", `Bearer ${fresh}`);
+  const stepRetry = currentStepUpToken();
+  if (stepRetry) retryHeaders.set(STEP_UP_HEADER, stepRetry);
   return fetch(path, { ...init, headers: retryHeaders });
+}
+
+/**
+ * Peek a 403 body for the `step_up_required` signal + its reason WITHOUT consuming
+ * the caller's response (we clone). Returns the reason (`"setup"` | `"token"`) when
+ * it's a step-up 403, else null (a plain insufficient-scope 403 surfaces normally).
+ */
+async function stepUpReasonOf(res: Response): Promise<StepUpReason | null> {
+  try {
+    const body = (await res.clone().json()) as { error?: string; reason?: string };
+    if (body.error !== "step_up_required") return null;
+    // Only the two reasons the server emits drive a prompt. An unrecognized reason
+    // (a future server adding a third) surfaces the 403 normally rather than silently
+    // prompting for a PIN — fail safe, don't guess.
+    if (body.reason === "setup") return "setup";
+    if (body.reason === "token") return "token";
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /** Pull the server `error` (or text) off a non-2xx response for an HttpError. */

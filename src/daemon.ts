@@ -87,6 +87,8 @@ import {
   requireScope,
   mintSseTicket,
   requireSseTicket,
+  requireStepUp,
+  grantsScope,
   extractToken,
   json as authJson,
   SCOPE_READ,
@@ -95,6 +97,15 @@ import {
   SCOPE_ADMIN,
   SCOPE_TERMINAL,
 } from "./auth.ts";
+import {
+  isStepUpConfigured,
+  isValidPinFormat,
+  setStepUpPin,
+  verifyStepUpPin,
+  mintStepUpToken,
+  stepUpLimiter,
+  StepUpPinFormatError,
+} from "./step-up.ts";
 import { mintTicket } from "./ui-ticket.ts";
 import {
   createTerminalWsHandlers,
@@ -1190,6 +1201,12 @@ export async function authorizeTerminalUpgrade(
   const denied = await requireScope(req, url, SCOPE_TERMINAL, true);
   if (denied) return { ok: false, response: denied };
 
+  // STEP-UP required (agent#80): a terminal is a raw host shell — the single most
+  // dangerous capability. allowQueryParam: true so the WS presents the step-up
+  // token as `?step_up=` (it can't set the `X-Step-Up-Token` header).
+  const step = requireStepUp(req, url, true);
+  if (!step.ok) return { ok: false, response: step.response };
+
   // tmux session name convention: `<name>-agent`. Attach a viewer pty to THIS
   // session; the session itself is created by the spawn path.
   const session = `${agentName}-agent`;
@@ -1792,6 +1809,169 @@ export function createFetchHandler(
     }
 
     // ---------------------------------------------------------------------
+    // STEP-UP AUTH (PIN) — second factor for high-privilege actions (agent#80).
+    //
+    // The dangerous `agent:admin` actions (set credentials, open a terminal,
+    // spawn a `filesystem: full` agent) require a step-up token IN ADDITION to
+    // the `agent:admin` Bearer. This block is the PIN setup + exchange surface;
+    // the gating lives at each dangerous endpoint (via `requireStepUp`).
+    //
+    //   GET  /api/step-up          → { configured } — is a PIN set? (UI: setup vs prompt)
+    //   POST /api/step-up { pin }  → validate PIN (rate-limited) → { stepUpToken, expires_at }
+    //   POST /api/step-up/pin { newPin, currentPin? } → set/rotate the PIN
+    //
+    // All `agent:admin`-gated (the operator's cookie-minted Bearer). The PIN is
+    // hashed+salted server-side (step-up.ts); it is NEVER returned or logged.
+    // Externally hub strips `/agent`, so these are `<hub>/agent/api/step-up`.
+    // ---------------------------------------------------------------------
+    if (url.pathname === "/api/step-up" && req.method === "GET") {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+      // Whether a PIN is configured — the UI branches setup-flow vs PIN-prompt.
+      return json({ configured: isStepUpConfigured() });
+    }
+
+    if (url.pathname === "/api/step-up" && req.method === "POST") {
+      // Exchange: validate the PIN, then mint a short-lived step-up token. The
+      // session must already hold `agent:admin` (this is a SECOND factor on top,
+      // never a substitute — the token carries no scope of its own).
+      let claims;
+      try {
+        const token = extractToken(req, url);
+        if (!token) return json({ error: "unauthorized", message: "Bearer token required" }, 401);
+        claims = await validateHubJwt(token);
+      } catch (err) {
+        return json(
+          { error: "unauthorized", message: err instanceof Error ? err.message : "invalid token" },
+          401,
+        );
+      }
+      if (!grantsScope(claims.scopes, SCOPE_ADMIN)) {
+        return json(
+          { error: "insufficient_scope", message: `requires ${SCOPE_ADMIN}`, granted: claims.scopes },
+          403,
+        );
+      }
+      // No PIN configured yet — there's nothing to exchange. Tell the UI to run
+      // its first-time setup (distinct from a wrong-PIN 401).
+      if (!isStepUpConfigured()) {
+        return json(
+          { error: "step_up_not_configured", message: "set a step-up PIN first (POST /api/step-up/pin)" },
+          409,
+        );
+      }
+      let body: { pin?: unknown };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      if (typeof body.pin !== "string" || body.pin.length === 0) {
+        return json({ error: "body.pin (non-empty string) is required" }, 400);
+      }
+      // Rate-limit BEFORE the (expensive, brute-forceable) argon2 verify, keyed by
+      // the operator subject — a stolen-cookie attacker can't grind the PIN. A
+      // DENIED attempt returns 429 (the limiter does not count it again).
+      const limited = stepUpLimiter.checkAndRecord(`step-up:${claims.sub}`);
+      if (!limited.allowed) {
+        return new Response(
+          JSON.stringify({
+            error: "rate_limited",
+            message: "too many PIN attempts — wait before retrying",
+            retry_after_seconds: limited.retryAfterSeconds,
+          }),
+          {
+            status: 429,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": String(limited.retryAfterSeconds ?? 60),
+            },
+          },
+        );
+      }
+      const ok = await verifyStepUpPin(body.pin);
+      if (!ok) {
+        // Wrong PIN — 401. The attempt already counted toward the lockout above.
+        // Never echo the PIN back.
+        return json({ error: "invalid_pin", message: "incorrect PIN" }, 401);
+      }
+      // Correct PIN — clear the attempt bucket (a fresh window for the next time)
+      // and mint a reusable, short-TTL step-up token.
+      stepUpLimiter.clear(`step-up:${claims.sub}`);
+      const { token: stepUpToken, expiresAt } = mintStepUpToken();
+      return json({ stepUpToken, expires_at: new Date(expiresAt).toISOString() });
+    }
+
+    if (url.pathname === "/api/step-up/pin" && req.method === "POST") {
+      // Set (first time) or rotate the step-up PIN. agent:admin-gated; if a PIN
+      // already exists, the CURRENT PIN must be supplied + verified (rotation
+      // needs the old PIN, so a hijacked session can't silently replace it).
+      let claims;
+      try {
+        const token = extractToken(req, url);
+        if (!token) return json({ error: "unauthorized", message: "Bearer token required" }, 401);
+        claims = await validateHubJwt(token);
+      } catch (err) {
+        return json(
+          { error: "unauthorized", message: err instanceof Error ? err.message : "invalid token" },
+          401,
+        );
+      }
+      if (!grantsScope(claims.scopes, SCOPE_ADMIN)) {
+        return json(
+          { error: "insufficient_scope", message: `requires ${SCOPE_ADMIN}`, granted: claims.scopes },
+          403,
+        );
+      }
+      let body: { newPin?: unknown; currentPin?: unknown };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      if (!isValidPinFormat(body.newPin)) {
+        return json({ error: "body.newPin must be 4–12 digits" }, 400);
+      }
+      // Rotation: a PIN already exists → require + verify the current one (rate-limited).
+      // SHARES the exchange bucket (same `step-up:<sub>` key) on purpose: both verify
+      // the PIN, so an attacker can't get a fresh grind window by alternating endpoints.
+      if (isStepUpConfigured()) {
+        const limited = stepUpLimiter.checkAndRecord(`step-up:${claims.sub}`);
+        if (!limited.allowed) {
+          return new Response(
+            JSON.stringify({
+              error: "rate_limited",
+              message: "too many PIN attempts — wait before retrying",
+              retry_after_seconds: limited.retryAfterSeconds,
+            }),
+            {
+              status: 429,
+              headers: {
+                "content-type": "application/json",
+                "retry-after": String(limited.retryAfterSeconds ?? 60),
+              },
+            },
+          );
+        }
+        if (typeof body.currentPin !== "string" || !(await verifyStepUpPin(body.currentPin))) {
+          return json(
+            { error: "invalid_pin", message: "the current PIN is required to change it" },
+            401,
+          );
+        }
+        stepUpLimiter.clear(`step-up:${claims.sub}`);
+      }
+      try {
+        await setStepUpPin(body.newPin);
+      } catch (err) {
+        if (err instanceof StepUpPinFormatError) return json({ error: err.message }, 400);
+        return json({ error: `failed to set PIN: ${(err as Error).message}` }, 500);
+      }
+      // Echo back only the fact of the write — never the PIN.
+      return json({ ok: true, configured: true });
+    }
+
+    // ---------------------------------------------------------------------
     // Claude OAuth credential store (design §6) — the per-channel secret a
     // launched agent session runs on (`CLAUDE_CODE_OAUTH_TOKEN`). Same
     // `agent:admin` gate + 0600 file-store + redaction-on-read posture as the
@@ -1810,11 +1990,15 @@ export function createFetchHandler(
 
       if (req.method === "GET") {
         // Inspect WITHOUT leaking the secret: whether a default is set + which
-        // channels carry an override (names only).
+        // channels carry an override (names only). A status read — no step-up.
         return json(describeClaudeCredentials(defaultStateDir()));
       }
 
-      // POST — set the default / operator-level token.
+      // POST — set the default / operator-level token. STEP-UP required (agent#80):
+      // setting a credential can exfiltrate the operator's Claude token.
+      const step = requireStepUp(req, url);
+      if (!step.ok) return step.response;
+
       let credBody: { token?: unknown };
       try {
         credBody = (await req.json()) as typeof credBody;
@@ -1837,6 +2021,10 @@ export function createFetchHandler(
     if (credMatch && (req.method === "POST" || req.method === "DELETE")) {
       const denied = await requireScope(req, url, SCOPE_ADMIN);
       if (denied) return denied;
+      // STEP-UP required (agent#80): both set + remove of a per-channel Claude
+      // credential are high-privilege credential-store mutations.
+      const step = requireStepUp(req, url);
+      if (!step.ok) return step.response;
       const channel = decodeURIComponent(credMatch[1]!);
 
       if (req.method === "DELETE") {
@@ -1891,8 +2079,14 @@ export function createFetchHandler(
 
       if (req.method === "GET") {
         // Inspect WITHOUT leaking values: names per channel + the default layer.
+        // A status read — no step-up.
         return json(describeChannelEnv(defaultStateDir()));
       }
+
+      // STEP-UP required (agent#80): set/remove of an env secret (GH_TOKEN,
+      // CLOUDFLARE_API_TOKEN, …) is a credential-store mutation.
+      const step = requireStepUp(req, url);
+      if (!step.ok) return step.response;
 
       let envBody: { channel?: unknown; name?: unknown; value?: unknown };
       try {
@@ -1985,6 +2179,15 @@ export function createFetchHandler(
       } catch (err) {
         if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
         throw err;
+      }
+
+      // STEP-UP required (agent#80) ONLY for the dangerous filesystem case: a
+      // `filesystem: "full"` agent runs UNSANDBOXED with read access to the whole
+      // disk. Ordinary sandboxed (workspace-confined) spawns stay frictionless —
+      // gate just the high-blast-radius case.
+      if (spec.filesystem === "full") {
+        const step = requireStepUp(req, url);
+        if (!step.ok) return step.response;
       }
 
       // CHANNEL EXCLUSION: a channel routes inbound to at most one agent. Refuse a

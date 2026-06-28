@@ -389,6 +389,15 @@ export function parseAgentDef(note: {
   }
 
   // Filesystem read scope.
+  //
+  // NOTE (step-up, agent#80): `filesystem: "full"` is the dangerous, full-disk
+  // case. The step-up PIN gate is enforced on the HTTP spawn path only
+  // (`POST /api/agents` in daemon.ts). This VAULT-NATIVE path (a #agent/definition
+  // note with `filesystem: full`) is NOT step-up-gated — registering it requires
+  // `vault:write` to author the note, which is itself separately scope-gated, so a
+  // step-up challenge here would gate a capability the caller already had to hold a
+  // write credential to reach. If the threat model is ever revisited (e.g. less-
+  // trusted note authors), this is the gap to close.
   const filesystem = metaStr(meta.filesystem);
   if (filesystem !== undefined) {
     if (filesystem !== "workspace" && filesystem !== "full") {

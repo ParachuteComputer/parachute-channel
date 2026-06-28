@@ -29,6 +29,9 @@ vi.mock("../lib/api.ts", async (orig) => {
     setAgentSecret: vi.fn(),
     removeAgentSecret: vi.fn(),
     listAgentEnv: vi.fn(),
+    getClaudeCredentialStatus: vi.fn(),
+    setClaudeCredential: vi.fn(),
+    removeClaudeChannelCredential: vi.fn(),
   };
 });
 
@@ -48,6 +51,9 @@ const listAgentSecrets = vi.mocked(api.listAgentSecrets);
 const setAgentSecret = vi.mocked(api.setAgentSecret);
 const removeAgentSecret = vi.mocked(api.removeAgentSecret);
 const listAgentEnv = vi.mocked(api.listAgentEnv);
+const getClaudeCredentialStatus = vi.mocked(api.getClaudeCredentialStatus);
+const setClaudeCredential = vi.mocked(api.setClaudeCredential);
+const removeClaudeChannelCredential = vi.mocked(api.removeClaudeChannelCredential);
 
 function agentRow(over: Partial<api.AgentRow> = {}): api.AgentRow {
   return {
@@ -111,6 +117,7 @@ beforeEach(() => {
   listJobs.mockResolvedValue({ jobs: [] });
   listAgentSecrets.mockResolvedValue({ default: [], channels: {} });
   listAgentEnv.mockResolvedValue({ env: [] });
+  getClaudeCredentialStatus.mockResolvedValue({ defaultSet: false, channels: [] });
 });
 
 afterEach(() => {
@@ -643,5 +650,88 @@ describe("Effective env — the resolved env-var names in the detail panel", () 
 
     fireEvent.click(await screen.findByTestId("agent-row-alpha"));
     expect(await screen.findByTestId("effective-env-note")).toBeInTheDocument();
+  });
+});
+
+describe("Claude auth — the operator-level setup-token (the gap operators hit)", () => {
+  it("shows 'not configured' when no default token is set", async () => {
+    getClaudeCredentialStatus.mockResolvedValue({ defaultSet: false, channels: [] });
+    renderRoute();
+
+    await screen.findByTestId("claude-auth-section");
+    expect(await screen.findByTestId("claude-default-missing")).toHaveTextContent(/not configured/i);
+    expect(await screen.findByTestId("claude-default-empty")).toBeInTheDocument();
+  });
+
+  it("shows 'configured' once a default token is set, and never renders a token value", async () => {
+    getClaudeCredentialStatus.mockResolvedValue({ defaultSet: true, channels: [] });
+    renderRoute();
+
+    await screen.findByTestId("claude-auth-section");
+    expect(await screen.findByTestId("claude-default-configured")).toHaveTextContent(/configured/i);
+    // The status carries no token value — the section never has one to leak.
+    expect(screen.queryByDisplayValue(/sk-|oauth|token-value/i)).not.toBeInTheDocument();
+  });
+
+  it("saves the DEFAULT token (no channel) via setClaudeCredential", async () => {
+    getClaudeCredentialStatus.mockResolvedValue({ defaultSet: false, channels: [] });
+    setClaudeCredential.mockResolvedValue({ ok: true, scope: "default" });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("set-claude-token-toggle"));
+    const form = await screen.findByTestId("set-claude-token-form");
+    fireEvent.change(within(form).getByLabelText(/^token$/i), { target: { value: "setup-token-abc" } });
+    fireEvent.click(within(form).getByRole("button", { name: /save token/i }));
+
+    await waitFor(() => expect(setClaudeCredential).toHaveBeenCalledWith({ token: "setup-token-abc" }));
+    expect(await screen.findByTestId("claude-saved-notice")).toBeInTheDocument();
+  });
+
+  it("saves a per-CHANNEL override when a channel is given", async () => {
+    getClaudeCredentialStatus.mockResolvedValue({ defaultSet: true, channels: [] });
+    setClaudeCredential.mockResolvedValue({ ok: true, scope: "channel", channel: "aaron-dev" });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("set-claude-token-toggle"));
+    const form = await screen.findByTestId("set-claude-token-form");
+    fireEvent.change(within(form).getByLabelText(/^token$/i), { target: { value: "override-xyz" } });
+    fireEvent.change(within(form).getByLabelText(/channel/i), { target: { value: "  aaron-dev  " } });
+    fireEvent.click(within(form).getByRole("button", { name: /save token/i }));
+
+    await waitFor(() =>
+      expect(setClaudeCredential).toHaveBeenCalledWith({ token: "override-xyz", channel: "aaron-dev" }),
+    );
+  });
+
+  it("disables save with an empty token (no call fires)", async () => {
+    getClaudeCredentialStatus.mockResolvedValue({ defaultSet: false, channels: [] });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("set-claude-token-toggle"));
+    const form = await screen.findByTestId("set-claude-token-form");
+    const save = within(form).getByRole("button", { name: /save token/i });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+    expect(setClaudeCredential).not.toHaveBeenCalled();
+  });
+
+  it("lists per-channel overrides and removes one (confirm-gated)", async () => {
+    getClaudeCredentialStatus.mockResolvedValue({ defaultSet: true, channels: ["aaron-dev"] });
+    removeClaudeChannelCredential.mockResolvedValue({ ok: true, channel: "aaron-dev", removed: true });
+    renderRoute();
+
+    await screen.findByTestId("claude-override-aaron-dev");
+    // First click arms the confirm; the remove only fires on the confirm button.
+    fireEvent.click(screen.getByTestId("claude-override-remove-aaron-dev"));
+    expect(removeClaudeChannelCredential).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByTestId("claude-override-remove-confirm-aaron-dev"));
+    await waitFor(() => expect(removeClaudeChannelCredential).toHaveBeenCalledWith("aaron-dev"));
+  });
+
+  it("surfaces a load error with a retry", async () => {
+    getClaudeCredentialStatus.mockRejectedValueOnce(new api.HttpError(403, "requires agent:admin"));
+    renderRoute();
+
+    expect(await screen.findByTestId("claude-auth-load-error")).toHaveTextContent(/agent:admin/i);
   });
 });

@@ -495,6 +495,66 @@ export function removeAgentSecret(body: {
 }
 
 // ---------------------------------------------------------------------------
+// Claude auth credential (the `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`).
+// Thin client over the daemon's `/api/credentials/claude` endpoints (all
+// `agent:admin`). This is the secret a programmatic (`claude -p`) turn RUNS ON — the
+// agent's Claude-subscription auth, NOT API billing. It lives in its OWN endpoint
+// (the generic env store deliberately REJECTS `CLAUDE_CODE_OAUTH_TOKEN`). The token
+// is write-only: the GET shape is STATUS ONLY (a boolean + channel names), never the
+// value, mirroring `describeClaudeCredentials` in `src/credentials.ts`.
+//
+//   GET    /api/credentials/claude          → { defaultSet, channels:[names] } (NO secret)
+//   POST   /api/credentials/claude          { token } → set the default/operator token
+//   POST   /api/credentials/claude/:channel { token } → set a per-channel override
+//   DELETE /api/credentials/claude/:channel → remove an override (falls back to default)
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /api/credentials/claude` — STATUS ONLY. `defaultSet` is whether an
+ * operator-level token is configured; `channels` is the names of channels that
+ * carry a per-channel override. The raw token is NEVER returned. Mirrors
+ * `describeClaudeCredentials` in `src/credentials.ts`.
+ */
+export interface ClaudeCredentialStatus {
+  defaultSet: boolean;
+  channels: string[];
+}
+
+/** Read the Claude-auth status (presence + override channel names; never the token). */
+export function getClaudeCredentialStatus(): Promise<ClaudeCredentialStatus> {
+  return getJson<ClaudeCredentialStatus>("/credentials/claude");
+}
+
+/**
+ * Set the Claude OAuth token — the default/operator token (no `channel`) or a
+ * per-channel override (`channel` given). The daemon stores it 0600 in
+ * credentials.json and returns only the fact of the write (never the token).
+ * Throws `HttpError` (400 on an empty token) so the form surfaces the daemon's
+ * message inline.
+ */
+export function setClaudeCredential(body: {
+  token: string;
+  channel?: string;
+}): Promise<{ ok: boolean; scope: string; channel?: string }> {
+  const ch = body.channel?.trim();
+  if (ch && ch.length > 0) {
+    return postJson(`/credentials/claude/${encodeURIComponent(ch)}`, { token: body.token });
+  }
+  return postJson("/credentials/claude", { token: body.token });
+}
+
+/**
+ * Remove a per-channel Claude override (it falls back to the default after). The
+ * default/operator token has no remove route here (replace it by setting a new
+ * one). Returns `removed` (false when there was nothing to remove).
+ */
+export function removeClaudeChannelCredential(
+  channel: string,
+): Promise<{ ok: boolean; channel: string; removed: boolean }> {
+  return deleteJson(`/credentials/claude/${encodeURIComponent(channel)}`);
+}
+
+// ---------------------------------------------------------------------------
 // Effective env — the env-var NAMES an agent's `claude -p` turn will actually run
 // with (operability: "see what env a turn runs with"). NAMES ONLY, never values —
 // mirrors `GET /api/credentials/env`'s redaction posture. Composed daemon-side from

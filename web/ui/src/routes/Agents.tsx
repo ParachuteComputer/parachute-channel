@@ -57,6 +57,10 @@ import {
   listAgentEnv,
   setAgentSecret,
   removeAgentSecret,
+  type ClaudeCredentialStatus,
+  getClaudeCredentialStatus,
+  setClaudeCredential,
+  removeClaudeChannelCredential,
 } from "../lib/api.ts";
 import {
   type ConnectionRow,
@@ -309,6 +313,8 @@ export function Agents() {
               </table>
             )}
           </section>
+
+          <ClaudeAuthSection />
 
           <DefVaultsSection vaults={state.vaults} onChanged={() => void load()} />
         </>
@@ -1963,6 +1969,280 @@ export function SecretsSection({
             </tbody>
           </table>
         )
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * "Claude auth" section: the operator-level Claude OAuth token (from
+ * `claude setup-token`) that the daemon runs each programmatic (`claude -p`) turn
+ * on. This is the gap operators hit — the SPA showed def-vaults but had nowhere to
+ * set the Claude token, so a vault-native programmatic agent failed at spawn with
+ * `no Claude credential …`.
+ *
+ * Operator-level + per-channel, mirroring the daemon's credential store: a single
+ * DEFAULT token used by every agent, plus optional per-channel OVERRIDES (the
+ * multi-principal seam). The status is read STATUS-ONLY (`getClaudeCredentialStatus`
+ * → `{ defaultSet, channels }`) — the token value is NEVER returned, shown, or
+ * re-displayed. Setting writes through `setClaudeCredential` (the dedicated
+ * `/api/credentials/claude` endpoint, NOT the generic env store, which rejects the
+ * Claude-auth trio). Per-channel overrides can be removed; replacing the default is
+ * a re-set (there's no default-remove route).
+ */
+export function ClaudeAuthSection() {
+  type LoadState =
+    | { kind: "loading" }
+    | { kind: "error"; message: string }
+    | { kind: "ok"; status: ClaudeCredentialStatus };
+  const [state, setState] = useState<LoadState>({ kind: "loading" });
+  // The set form: a token + an optional channel (blank = the operator default).
+  const [setOpen, setSetOpen] = useState(false);
+  const [token, setToken] = useState("");
+  const [channel, setChannel] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [setError, setSetError] = useState<string | null>(null);
+  const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  // Per-channel override removal.
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setState({ kind: "loading" });
+    try {
+      const status = await getClaudeCredentialStatus();
+      setState({ kind: "ok", status });
+    } catch (err) {
+      setState({ kind: "error", message: errMessage(err) });
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const trimmedChannel = channel.trim();
+  const canSave = token.length > 0 && !saving;
+
+  async function onSave(e: React.FormEvent) {
+    e.preventDefault();
+    if (!canSave) return;
+    setSaving(true);
+    setSetError(null);
+    setSavedNotice(null);
+    try {
+      await setClaudeCredential({
+        token,
+        ...(trimmedChannel.length > 0 ? { channel: trimmedChannel } : {}),
+      });
+      setToken("");
+      setChannel("");
+      setSetOpen(false);
+      setSavedNotice(
+        trimmedChannel.length > 0
+          ? `Saved a Claude token override for "${trimmedChannel}".`
+          : "Saved the default Claude token.",
+      );
+      await load();
+    } catch (err) {
+      setSetError(errMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function onRemove(ch: string) {
+    setRemoving(ch);
+    setRowError(null);
+    try {
+      await removeClaudeChannelCredential(ch);
+      setConfirmRemove(null);
+      await load();
+    } catch (err) {
+      setRowError(errMessage(err));
+    } finally {
+      setRemoving(null);
+    }
+  }
+
+  return (
+    <section className="card" aria-label="Claude auth" data-testid="claude-auth-section">
+      <div className="section-head">
+        <h2>Claude auth</h2>
+        <span className="section-head-actions">
+          {state.kind === "ok" ? (
+            state.status.defaultSet ? (
+              <span className="pill status-enabled" data-testid="claude-default-configured">
+                configured
+              </span>
+            ) : (
+              <span className="pill status-error" data-testid="claude-default-missing">
+                not configured
+              </span>
+            )
+          ) : null}
+          <button
+            type="button"
+            className="secondary"
+            data-testid="set-claude-token-toggle"
+            onClick={() => {
+              setSetOpen((o) => !o);
+              setSetError(null);
+              setSavedNotice(null);
+            }}
+          >
+            {setOpen ? "Cancel" : "Set token"}
+          </button>
+        </span>
+      </div>
+      <p className="muted">
+        The token from <code>claude setup-token</code> that the daemon runs each agent turn
+        on. It's stored locally (<code>credentials.json</code>, 0600) and used to run turns on
+        your <strong>Claude subscription</strong> — <strong>not</strong> API billing. It's
+        write-only: the value is never shown again. Set a <strong>default</strong> token (used by
+        every agent) or a per-<strong>channel</strong> override.
+      </p>
+
+      {savedNotice ? (
+        <div className="info-banner" role="status" data-testid="claude-saved-notice">
+          {savedNotice}
+        </div>
+      ) : null}
+
+      {setOpen ? (
+        <form
+          className="inline-form"
+          onSubmit={onSave}
+          aria-label="Set Claude token"
+          aria-busy={saving}
+          data-testid="set-claude-token-form"
+        >
+          {setError ? (
+            <div className="error-banner" role="alert" data-testid="set-claude-token-error">
+              {setError}
+            </div>
+          ) : null}
+          <div className="field">
+            <label htmlFor="claude-token">Token</label>
+            <input
+              id="claude-token"
+              type="password"
+              value={token}
+              placeholder="paste the output of `claude setup-token`"
+              autoComplete="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              onChange={(e) => setToken(e.target.value)}
+            />
+            <p className="field-hint">
+              Run <code>claude setup-token</code> on a machine where you're signed in, then paste
+              it here. Stored 0600 on disk (access-controlled, not encrypted). Write-only — never
+              re-displayed.
+            </p>
+          </div>
+          <div className="field">
+            <label htmlFor="claude-channel">Channel (optional)</label>
+            <input
+              id="claude-channel"
+              type="text"
+              value={channel}
+              placeholder="leave blank for the default (operator) token"
+              autoComplete="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              onChange={(e) => setChannel(e.target.value)}
+            />
+            <p className="field-hint">
+              A channel name to override just that agent; blank sets the default token every agent
+              falls back to.
+            </p>
+          </div>
+          <div className="form-actions">
+            <button type="submit" disabled={!canSave}>
+              {saving ? "Saving…" : "Save token"}
+            </button>
+          </div>
+        </form>
+      ) : null}
+
+      {rowError ? (
+        <div className="error-banner" role="alert" data-testid="claude-row-error">
+          {rowError}
+        </div>
+      ) : null}
+
+      {state.kind === "loading" ? <div className="loading">Loading Claude auth…</div> : null}
+      {state.kind === "error" ? (
+        <div className="error-banner" role="alert" data-testid="claude-auth-load-error">
+          {state.message}{" "}
+          <button type="button" className="secondary" onClick={() => void load()}>
+            Retry
+          </button>
+        </div>
+      ) : null}
+      {state.kind === "ok" ? (
+        <>
+          {!state.status.defaultSet ? (
+            <div className="empty" data-testid="claude-default-empty">
+              No default Claude token set — programmatic agents can't run turns until one is set
+              (or a per-channel override covers them).
+            </div>
+          ) : null}
+          {state.status.channels.length > 0 ? (
+            <table>
+              <thead>
+                <tr>
+                  <th>Channel override</th>
+                  <th>Token</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {state.status.channels.map((ch) => (
+                  <tr key={ch} data-testid={`claude-override-${ch}`}>
+                    <td className="cell-name">{ch}</td>
+                    <td className="cell-dim">••••••••</td>
+                    <td>
+                      {confirmRemove === ch ? (
+                        <span className="confirm-inline">
+                          <button
+                            type="button"
+                            className="button-danger"
+                            data-testid={`claude-override-remove-confirm-${ch}`}
+                            disabled={removing === ch}
+                            onClick={() => void onRemove(ch)}
+                          >
+                            {removing === ch ? "Removing…" : "Confirm remove"}
+                          </button>
+                          <button
+                            type="button"
+                            className="cancel-link"
+                            onClick={() => setConfirmRemove(null)}
+                          >
+                            Cancel
+                          </button>
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="button-danger"
+                          data-testid={`claude-override-remove-${ch}`}
+                          onClick={() => {
+                            setRowError(null);
+                            setConfirmRemove(ch);
+                          }}
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : null}
+        </>
       ) : null}
     </section>
   );

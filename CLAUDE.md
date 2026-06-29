@@ -196,7 +196,17 @@ so the SPA prompts (first-time setup vs PIN entry) instead of re-authenticating.
 the `X-Step-Up-Token` header (or `?step_up=` for the terminal WS, which can't set a header). The
 SPA holds it in memory and attaches it transparently in `lib/api.ts:authedFetch` (re-prompt on
 expiry); the PIN is never logged or returned. The step-up token NEVER widens scope — it's a
-second factor on top of `agent:admin`, never a substitute.
+second factor on top of `agent:admin`, never a substitute. (The PIN is 4–12 digits —
+convenience-grade, bounded by the 5-wrong/5-min lockout + the `agent:admin` barrier — by design.)
+
+> **Upgrade note (the step-up build).** Upgrading to the build that introduced step-up
+> (agent#80) makes the credential / terminal / full-filesystem-spawn actions require a step-up
+> PIN. On a fresh upgrade NO PIN is set yet, so the FIRST time you trigger one of those actions
+> the daemon returns `403 step_up_required` with `reason: "setup"` and the admin UI prompts you
+> to set a PIN (then immediately proceeds). If you script those endpoints directly (no UI),
+> you'll get the same `403 step_up_required (setup)` until you set a PIN via the admin UI (or
+> `POST /api/step-up/pin { newPin }`) and send the minted token as `X-Step-Up-Token`. Ordinary
+> sandboxed spawns + every read stay frictionless — only the three dangerous actions are gated.
 
 ## Vault integration (Stage 2) — channels backed by `#agent/message` notes
 

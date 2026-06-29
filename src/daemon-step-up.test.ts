@@ -531,3 +531,53 @@ describe("B — filesystem:full spawn gating (sandboxed spawn NOT gated)", () =>
     }
   });
 });
+
+// ===========================================================================
+// C. Deliberate NON-gates (#154) — these admin POSTs are intentionally NOT
+// step-up-gated. Pin the exclusions so a future reader doesn't "fix" a non-gap:
+//   - POST /api/agent-vaults — mints a VAULT-scoped token (lower blast radius).
+//   - POST /api/agent-defs   — authoring a #agent/definition note already requires
+//     a scope-gated vault:write; the filesystem:full SPAWN path is gated, not this.
+// A PIN is configured (so a gate, if wrongly present, would 403 reason:"token"
+// rather than "setup"); no step-up token is sent. The handlers may fail downstream
+// for other reasons (e.g. no def-vaults), but MUST NOT 403 step_up_required.
+// ===========================================================================
+describe("C — deliberate non-gates (#154)", () => {
+  test("POST /api/agent-vaults is NOT step-up-gated (vault-scoped token, lower blast radius)", async () => {
+    const { srv, base } = buildServer();
+    try {
+      await setupAndExchange(base); // a PIN exists, but we deliberately send no step-up token
+      const res = await fetch(`${base}/api/agent-vaults`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ vault: "default" }),
+      });
+      expect(res.status).not.toBe(403);
+      if (res.status === 403) {
+        expect((await res.json()).error).not.toBe("step_up_required");
+      }
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("POST /api/agent-defs is NOT step-up-gated (authoring already requires vault:write)", async () => {
+    const { srv, base } = buildServer();
+    try {
+      await setupAndExchange(base); // a PIN exists, but we deliberately send no step-up token
+      const res = await fetch(`${base}/api/agent-defs`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ vault: "default", name: "x", backend: "programmatic", systemPrompt: "" }),
+      });
+      // With no def-vaults configured the handler 400s — what matters is it never
+      // 403s step_up_required (the authoring path is intentionally not gated).
+      expect(res.status).not.toBe(403);
+      if (res.status === 403) {
+        expect((await res.json()).error).not.toBe("step_up_required");
+      }
+    } finally {
+      srv.stop(true);
+    }
+  });
+});

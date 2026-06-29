@@ -2353,6 +2353,14 @@ export function createFetchHandler(
     // ---------------------------------------------------------------------
     if (url.pathname === "/api/agent-defs" && (req.method === "GET" || req.method === "POST")) {
       // GET is READ-scoped (a listing, no secrets); POST is admin (it mints/writes).
+      //
+      // NOTE (step-up, agent#80/#154): POST is intentionally NOT step-up-gated, even
+      // though a `#agent/definition` note can carry `filesystem: "full"`. Authoring a
+      // def already requires the scope-gated `vault:write` (the daemon writes the note
+      // with a vault token), so a step-up challenge here would gate a capability the
+      // caller already had to hold a write credential to reach — mirrors the carve-out
+      // comment on the vault-native parse path in agent-defs.ts. The `filesystem:full`
+      // SPAWN path (`POST /api/agents`) IS step-up-gated; this AUTHORING path is not.
       const scope = req.method === "GET" ? SCOPE_READ : SCOPE_ADMIN;
       const denied = await requireScope(req, url, scope);
       if (denied) return denied;
@@ -2506,6 +2514,12 @@ export function createFetchHandler(
       // GET is READ-scoped to mirror GET /api/agent-defs — the listing is non-sensitive
       // ({vault,url,tokenPresent}); `tokenPresent` is a boolean, NEVER the token value.
       // POST is admin (it mints a token + writes config).
+      //
+      // NOTE (step-up, agent#80/#154): POST is intentionally NOT step-up-gated. It mints
+      // a VAULT-SCOPED token (`vault:<name>:write`) — a lower blast radius than the
+      // Claude OAuth credential / terminal / full-fs spawn the step-up PIN guards (those
+      // can exfiltrate every token or open a raw host shell). A def-vault token only
+      // reaches the named vault's notes, so `agent:admin` alone is the right bar here.
       const scope = req.method === "GET" ? SCOPE_READ : SCOPE_ADMIN;
       const denied = await requireScope(req, url, scope);
       if (denied) return denied;

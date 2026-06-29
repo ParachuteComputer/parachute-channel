@@ -90,12 +90,15 @@ export type WriteOutbound = (
   reply: string,
   inReplyTo?: string,
   /**
-   * The per-turn thread id this reply belongs to — the explicit definition→thread→message
-   * link the outbound note carries (stamped into `metadata.thread`). For multi-threaded it
-   * IS the per-fire thread note's leaf (an exact link); for single-threaded it's a per-turn
-   * correlation id (the note's stable deterministic leaf is the def name — single-threaded
-   * outbound→note linkage by the stable path is a follow-up). INBOUND-note stamping is
-   * deferred (those notes are externally written; see the PR notes).
+   * The RESOLVABLE, MODE-CORRECT thread id this reply belongs to — the explicit
+   * definition→thread→message link the outbound note carries (stamped into `metadata.thread`),
+   * mirroring the callback `source_thread` fix (agent#124/#163). For multi-threaded it IS the
+   * per-fire thread note's leaf (`Threads/<channel>/<id>`); for single-threaded it is the
+   * DETERMINISTIC thread-NOTE id (`Threads/<channel>/<name>`), STABLE across turns — so an
+   * observer reading the outbound note's `metadata.thread` resolves the agent's ONE thread
+   * with `query-notes { id }`, instead of the per-turn correlation UUID that changed every
+   * run (the pre-#163 bug that looked like a fresh session each time). INBOUND-note stamping
+   * is deferred (those notes are externally written; see the PR notes).
    */
   threadId?: string,
 ) => Promise<{ id?: string } | void>;
@@ -300,6 +303,32 @@ export function isTransientOutboundError(err: unknown): boolean {
 /** Sleep helper for the outbound retry backoff (injectable-free; small + bounded). */
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The thread id to stamp into an OUTBOUND note's `metadata.thread` (agent#163) — the
+ * MODE-CORRECT, RESOLVABLE definition→thread→message link, mirroring the callback
+ * `source_thread` fix (agent#124):
+ *
+ *  - SINGLE-THREADED — the resolvable thread-NOTE id (the deterministic
+ *    `Threads/<safeChannel>/<safeName>` note), so an observer reading the outbound note's
+ *    `metadata.thread` resolves the agent's ONE stable thread with `query-notes { id }`.
+ *    The pre-#163 bug stamped the per-turn correlation UUID here, which changed every turn
+ *    and resolved to nothing — misleading an observer into "a fresh session each run" when
+ *    the single-threaded session is actually stable + resumed across turns.
+ *  - MULTI-THREADED — the per-fire id (`turnThreadId`), which IS that fire's thread-note leaf
+ *    (`Threads/<safeChannel>/<turnThreadId>`) — correct as-is: each fire is its own thread.
+ *
+ * Falls back to `turnThreadId` when no resolvable note id surfaced (no durable thread store
+ * wired, or the thread-note write failed) — never undefined, so the link is always stamped.
+ */
+export function outboundThreadId(
+  multiThreaded: boolean,
+  turnThreadId: string,
+  threadNoteId: string | undefined,
+): string {
+  if (multiThreaded) return turnThreadId;
+  return threadNoteId ?? turnThreadId;
 }
 
 /** A queued inbound message awaiting its serial turn. */
@@ -806,7 +835,11 @@ export class ProgrammaticAgentRegistry {
       // start+end never double-count. Best-effort: a start-ensure write failure is logged
       // (inside recordThread) and the turn STILL runs — a missing/stale working note must
       // never strand the queue or skip the turn.
-      await this.recordThread(handle, msg, "working", "", startedAt, undefined, {
+      // Capture the start-ensure's WRITTEN thread-note id. For single-threaded this is the
+      // DETERMINISTIC `Threads/<safeChannel>/<safeName>` note (the same every turn) — so a
+      // resolvable thread id is available BEFORE the turn runs, for the failure-note +
+      // outbound `metadata.thread` stamping (agent#163), even on a turn that fails early.
+      const startThreadNoteId = await this.recordThread(handle, msg, "working", "", startedAt, undefined, {
         threadId: turnThreadId,
         phase: "start",
         // NO session on the start-ensure: it runs BEFORE claude, so claude may never
@@ -816,6 +849,11 @@ export class ProgrammaticAgentRegistry {
         // the `end` record, and ONLY the id claude actually echoed (FIX 2). For a
         // single-threaded resume turn the prior session is preserved by writeThread anyway.
       });
+      // The MODE-CORRECT, RESOLVABLE thread id stamped into outbound + failure notes
+      // (agent#163): single-threaded → the deterministic thread-NOTE id (stable across turns);
+      // multi-threaded → the per-fire `turnThreadId`. Computed once from the start-ensure id so
+      // every path (early failure, ok, outbound-failure) stamps the same resolvable link.
+      const outThreadId = outboundThreadId(multiThreaded, turnThreadId, startThreadNoteId);
 
       let result;
       try {
@@ -854,8 +892,8 @@ export class ProgrammaticAgentRegistry {
         });
         this.emitTurnEvent(channel, { kind: "error", error: reason });
         // Post a user-facing failure note so the channel shows SOMETHING (not a silent
-        // no-reply) — best-effort.
-        await this.postFailureNote(channel, msg.inReplyTo, turnThreadId, reason);
+        // no-reply) — best-effort. Stamp the MODE-CORRECT resolvable thread id (agent#163).
+        await this.postFailureNote(channel, msg.inReplyTo, outThreadId, reason);
         // CALLBACK on the failure too — an orchestrator MUST learn its sub-task failed, not
         // hang waiting forever. No outbound note was produced, so no `source_message`; the
         // RESOLVABLE thread-note id (written above) is `source_thread` so the orchestrator can
@@ -886,8 +924,8 @@ export class ProgrammaticAgentRegistry {
         });
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
         // Post a user-facing failure note so the channel shows SOMETHING (not a silent
-        // no-reply) — best-effort.
-        await this.postFailureNote(channel, msg.inReplyTo, turnThreadId, result.error);
+        // no-reply) — best-effort. Stamp the MODE-CORRECT resolvable thread id (agent#163).
+        await this.postFailureNote(channel, msg.inReplyTo, outThreadId, result.error);
         // CALLBACK on the failure-as-value too (status:error) — the orchestrator learns the
         // sub-task failed and can react. No delivered reply, so no `source_message`; the
         // RESOLVABLE thread-note id (written above) is `source_thread` (agent#124).
@@ -931,7 +969,12 @@ export class ProgrammaticAgentRegistry {
           channel,
           result.reply,
           msg.inReplyTo,
-          turnThreadId,
+          // agent#163: stamp the MODE-CORRECT, RESOLVABLE thread id into the outbound note's
+          // `metadata.thread` — single-threaded → the deterministic thread-NOTE id (stable
+          // across turns; an observer resolves the ONE thread), multi-threaded → the per-fire
+          // id. NOT the per-turn correlation UUID (the pre-#163 bug that looked like a fresh
+          // session every run).
+          outThreadId,
         );
         if (delivered.ok) sourceMessage = delivered.noteId;
         if (!delivered.ok) {

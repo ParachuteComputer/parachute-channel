@@ -761,11 +761,14 @@ export class VaultTransport implements Transport {
     // Thread the reply to the inbound note id when the bridge passes it through.
     const inReplyTo = args.meta?.in_reply_to;
     if (inReplyTo) metadata.in_reply_to = inReplyTo;
-    // The explicit definition→thread→message link: stamp the outbound note with its thread
-    // id (the programmatic worker passes the per-turn thread id through `meta.thread`). For a
-    // multi-threaded turn this IS the per-fire `#agent/thread` note's leaf; for a
-    // single-threaded turn it's a per-turn correlation id. INBOUND-note stamping is deferred
-    // (those notes are written externally, before the turn knows its thread).
+    // The explicit definition→thread→message link: stamp the outbound note with its
+    // RESOLVABLE, mode-correct thread id (the programmatic worker passes it through
+    // `meta.thread`, agent#163). For a multi-threaded turn this IS the per-fire `#agent/thread`
+    // note's leaf; for a single-threaded turn it's the DETERMINISTIC thread-NOTE id
+    // (`Threads/<channel>/<name>`), STABLE across turns — so an observer resolves the agent's
+    // ONE thread from `metadata.thread`, not a per-turn UUID that changed every run.
+    // INBOUND-note stamping is deferred (those notes are written externally, before the turn
+    // knows its thread).
     const threadId = args.meta?.thread;
     if (threadId) metadata.thread = threadId;
 

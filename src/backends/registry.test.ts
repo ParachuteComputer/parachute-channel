@@ -16,6 +16,7 @@ import {
   PENDING_INBOUND_CAP,
   MAX_DELEGATION_DEPTH,
   isTransientOutboundError,
+  outboundThreadId,
   type WriteOutbound,
   type WriteThread,
   type WriteCallback,
@@ -119,6 +120,24 @@ function recorder(): { calls: { channel: string; reply: string; inReplyTo?: stri
   const calls: { channel: string; reply: string; inReplyTo?: string }[] = [];
   const fn: WriteOutbound = async (channel, reply, inReplyTo) => {
     calls.push({ channel, reply, ...(inReplyTo ? { inReplyTo } : {}) });
+  };
+  return { calls, fn };
+}
+
+/**
+ * A recorder WriteOutbound that ALSO captures the stamped `threadId` (the outbound note's
+ * `metadata.thread`, agent#163) — kept separate from {@link recorder} so the existing
+ * exact-`toEqual` reply assertions stay unaffected. Used to pin that a single-threaded
+ * outbound carries the DETERMINISTIC thread-NOTE id and a multi-threaded one carries the
+ * per-fire id.
+ */
+function recorderWithThreadId(): {
+  calls: { channel: string; reply: string; inReplyTo?: string; threadId?: string }[];
+  fn: WriteOutbound;
+} {
+  const calls: { channel: string; reply: string; inReplyTo?: string; threadId?: string }[] = [];
+  const fn: WriteOutbound = async (channel, reply, inReplyTo, threadId) => {
+    calls.push({ channel, reply, ...(inReplyTo ? { inReplyTo } : {}), ...(threadId ? { threadId } : {}) });
   };
   return { calls, fn };
 }
@@ -1723,5 +1742,128 @@ describe("ProgrammaticAgentRegistry — agent-to-agent callbacks (reply_to)", ()
     const { meta } = cb.calls[0]!;
     // A bare per-turn UUID fallback — present (never undefined), just not a thread-note path.
     expect(meta.source_thread).toMatch(/^[0-9a-f-]{36}$/);
+  });
+});
+
+describe("outboundThreadId — mode-correct, resolvable thread id (agent#163)", () => {
+  test("single-threaded → the resolvable thread-NOTE id; multi-threaded → the per-fire id", () => {
+    // single-threaded: prefer the resolvable note id (the deterministic thread-NOTE path).
+    expect(outboundThreadId(false, "turn-uuid", "Threads/eng/eng")).toBe("Threads/eng/eng");
+    // multi-threaded: ALWAYS the per-fire turn id (which IS that fire's note leaf).
+    expect(outboundThreadId(true, "turn-uuid", "Threads/eng/turn-uuid")).toBe("turn-uuid");
+  });
+
+  test("falls back to the per-turn id when no resolvable note id surfaced (never undefined)", () => {
+    // single-threaded with no durable store / failed thread write → the per-turn id, never undefined.
+    expect(outboundThreadId(false, "turn-uuid", undefined)).toBe("turn-uuid");
+    expect(outboundThreadId(true, "turn-uuid", undefined)).toBe("turn-uuid");
+  });
+});
+
+describe("ProgrammaticAgentRegistry — outbound metadata.thread is the resolvable thread id (agent#163)", () => {
+  test("a SINGLE-THREADED outbound carries the DETERMINISTIC thread-NOTE id (NOT a per-turn UUID)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorderWithThreadId();
+    const threads = threadRecorderWithIds();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+    });
+    // specFor → no mode → single-threaded (the default).
+    await reg.register(specFor("uni-weaver"));
+
+    reg.enqueue("uni-weaver", { content: "hello" });
+    await until(() => rec.calls.length === 1);
+
+    // The stamped `metadata.thread` is the agent's ONE deterministic thread-note id — the
+    // SAME `query-notes { id }` resolves it across every turn (the stable resumed session),
+    // NOT the per-turn correlation UUID that misled an observer into "a fresh session each run".
+    const expected = `Threads/uni-weaver/uni-weaver`;
+    expect(rec.calls[0]!.threadId).toBe(expected);
+    expect(rec.calls[0]!.threadId).not.toMatch(/^[0-9a-f-]{36}$/); // it's a path, not a UUID.
+    // It matches the actual written thread-note's id (faithful to VaultTransport's path-as-id).
+    expect(rec.calls[0]!.threadId).toBe(threads.idFor(threads.ends()[0]!));
+  });
+
+  test("a single-threaded outbound carries the SAME thread id across turns (stable, not per-turn)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorderWithThreadId();
+    const threads = threadRecorderWithIds();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+    });
+    await reg.register(specFor("uni-weaver"));
+
+    reg.enqueue("uni-weaver", { content: "turn 1" });
+    reg.enqueue("uni-weaver", { content: "turn 2" });
+    await until(() => rec.calls.length === 2);
+
+    // The whole point of #163: the stamped thread id is STABLE across turns (the resumed
+    // single-threaded session), unlike the per-turn UUID that changed every run.
+    expect(rec.calls[0]!.threadId).toBe(`Threads/uni-weaver/uni-weaver`);
+    expect(rec.calls[1]!.threadId).toBe(rec.calls[0]!.threadId);
+  });
+
+  test("a MULTI-THREADED outbound carries the PER-FIRE id (distinct per fire — correct there)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorderWithThreadId();
+    const threads = threadRecorderWithIds();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+    });
+    await reg.register(specMultiThreaded("digest", "digest", "Agents/digest"));
+
+    reg.enqueue("digest", { content: "fire 1" });
+    reg.enqueue("digest", { content: "fire 2" });
+    await until(() => rec.calls.length === 2);
+
+    // Multi-threaded: each fire is its own thread, so the per-fire id (the note leaf) is the
+    // right link — and the two fires carry DIFFERENT ids (not collapsed to one).
+    expect(rec.calls[0]!.threadId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(rec.calls[1]!.threadId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(rec.calls[0]!.threadId).not.toBe(rec.calls[1]!.threadId);
+    // The stamped per-fire id is the leaf of that fire's written thread note.
+    const end0 = threads.ends().find((t) => t.input === "fire 1")!;
+    expect(threads.idFor(end0)).toBe(`Threads/digest/${rec.calls[0]!.threadId}`);
+  });
+
+  test("a single-threaded FAILURE note also carries the deterministic thread-note id (agent#163)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: false, error: "mint refused" }); // a failed turn → failure note.
+    const rec = recorderWithThreadId();
+    const threads = threadRecorderWithIds();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+    });
+    await reg.register(specFor("uni-weaver"));
+
+    reg.enqueue("uni-weaver", { content: "do it" });
+    await until(() => rec.calls.length === 1);
+
+    // The user-facing failure note (the only outbound on a failed turn) carries the SAME
+    // resolvable, deterministic thread-note id — not a per-turn UUID.
+    expect(rec.calls[0]!.reply).toContain("mint refused");
+    expect(rec.calls[0]!.threadId).toBe(`Threads/uni-weaver/uni-weaver`);
+    expect(rec.calls[0]!.threadId).not.toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  test("with NO durable thread store wired, a single-threaded outbound falls back to a per-turn id (never undefined)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorderWithThreadId();
+    // No writeThread → no resolvable note id → fall back to the per-turn UUID (still stamped).
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hi" });
+    await until(() => rec.calls.length === 1);
+
+    expect(rec.calls[0]!.threadId).toMatch(/^[0-9a-f-]{36}$/); // present, the fallback.
   });
 });

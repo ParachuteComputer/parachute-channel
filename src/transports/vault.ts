@@ -299,11 +299,21 @@ const STATUS_META_KEY = "status";
 /** Metadata key carrying the ISO timestamp an inbound was claimed (for the TTL sweep). */
 const CLAIMED_AT_META_KEY = "claimedAt";
 
-/** The agent (routing) key carried on a vault note's metadata. Reads the canonical
- *  `agent` field, falling back to the legacy `channel` field as a read-only TOLERANCE
- *  for any in-flight note written by an older build during the live cutover. New writes
- *  carry `agent` only (the channel→agent CONTRACT dropped the `channel` dual-write). */
+/** The agent (routing) key carried on a vault note's metadata — a THREE-LEVEL dual-read
+ *  (threads-only Phase B — DESIGN-2026-06-29-threads-only.md §5/§9): the NEW `thread`
+ *  field (the thread-id address) FIRST, then the canonical `agent` field, then the legacy
+ *  `channel` field as a read-only TOLERANCE for any in-flight note written by an older
+ *  build during the live cutover.
+ *
+ *  BACK-COMPAT (load-bearing): the 4 live def agents (uni, steward, uni-evolve,
+ *  eco-civilization) — and the 4am steward weave job — carry `metadata.agent` and NO
+ *  `metadata.thread`, so they route EXACTLY as before this change. The `thread` read is an
+ *  ADDITIVE parallel path: nothing WRITES `metadata.thread` yet (Phase C flips the writer),
+ *  so it is dormant until a thread-addressed inbound appears. New writes carry `agent` only
+ *  (the channel→agent CONTRACT dropped the `channel` dual-write). */
 export function noteAgentKey(meta: Record<string, unknown> | undefined | null): string | undefined {
+  const t = meta?.thread;
+  if (typeof t === "string" && t) return t;
   const a = meta?.agent;
   if (typeof a === "string" && a) return a;
   const c = meta?.channel;

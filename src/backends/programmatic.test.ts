@@ -566,16 +566,27 @@ describe("ProgrammaticBackend.deliver — the backend is a pure function of the 
 describe("ProgrammaticBackend.deliver — composed system prompt (threads-only Phase A: arity-N loadout)", () => {
   const ROLE = "You are the eng agent. Be terse.";
 
-  /** A spec whose def-note PATH (spec.definition) is set — the self-entry header source. */
-  function specWithDef(prompt: string, definition: string, name = "eng"): AgentSpec {
-    return { ...specWithSystemPrompt(prompt, undefined, name), definition };
+  /**
+   * A spec whose def-note PATH (`spec.definitionPath`) is the self-entry header source (#169).
+   * It ALSO carries a realistic `spec.definition` = the note ID (a timestamp-slug, NOT a path),
+   * so these tests prove the header derives from the PATH and IGNORES the id — the exact #169
+   * fix (before it, the header wrongly read `# <spec.definition>` = the timestamp-id).
+   */
+  const DEF_NOTE_ID = "2026-06-20-07-30-56-487050"; // a realistic timestamp-slug note id
+  function specWithDef(prompt: string, definitionPath: string, name = "eng"): AgentSpec {
+    return {
+      ...specWithSystemPrompt(prompt, undefined, name),
+      definition: DEF_NOTE_ID, // the note ID (timestamp-slug) — must NOT be the header
+      definitionPath, // the legible PATH — the header source
+    };
   }
 
   test("NO-LOADOUT INVARIANT: system-prompt.txt = `# <path>\\n\\n<body>`, body byte-identical (the steward weave path)", async () => {
     mkDirs("compose-none");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-CP1", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
-    // def note PATH set → the self entry is labeled with it (resolved from spec.definition).
+    // def note PATH set → the self entry is labeled with it (resolved from spec.definitionPath,
+    // NOT spec.definition = the timestamp-id) — the #169 fix.
     const handle = await backend.start(specWithDef(ROLE, "Agents/steward", "eng"));
 
     // deliver WITHOUT a loadout — exactly the weave call shape (no 7th param).
@@ -587,21 +598,30 @@ describe("ProgrammaticBackend.deliver — composed system prompt (threads-only P
     // EXACTLY the self entry: `# <path>\n\n<body>`. The header line is the ONLY change to a
     // no-loadout prompt; the body after `# <path>\n\n` is BYTE-IDENTICAL to spec.systemPrompt.
     expect(written).toBe(`# Agents/steward\n\n${ROLE}`);
+    // #169 — the header is the PATH, NOT the timestamp-id (`spec.definition`): the id never appears.
+    expect(written).not.toContain(DEF_NOTE_ID);
+    expect(written.startsWith(`# Agents/steward\n\n`)).toBe(true);
     // And asserted from the other direction: strip the header → the body is the role verbatim.
     expect(written.slice(`# Agents/steward\n\n`.length)).toBe(ROLE);
   });
 
-  test("self-entry PATH falls back to spec.name when spec.definition is absent", async () => {
+  test("self-entry PATH falls back to spec.name when spec.definitionPath is absent (the note-id is NEVER the header)", async () => {
     mkDirs("compose-fallback");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-CP1b", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
-    // No definition set → the self entry header is the spec name.
-    const handle = await backend.start(specWithSystemPrompt(ROLE, undefined, "eng"));
+    // No definitionPath set, but a `definition` (note ID) IS present → the header is the spec
+    // NAME, NOT the timestamp-id (#169 — the id never becomes the header even as the fallback).
+    const handle = await backend.start({
+      ...specWithSystemPrompt(ROLE, undefined, "eng"),
+      definition: DEF_NOTE_ID,
+    });
 
     await backend.deliver(handle, "go", createSession("sess-CP1b"));
 
     const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
-    expect(readFileSync(promptPath, "utf8")).toBe(`# eng\n\n${ROLE}`);
+    const written = readFileSync(promptPath, "utf8");
+    expect(written).toBe(`# eng\n\n${ROLE}`);
+    expect(written).not.toContain(DEF_NOTE_ID); // the note-id is never the header label.
   });
 
   test("empty/whitespace loadout → still just the self entry (treated as no loadout)", async () => {

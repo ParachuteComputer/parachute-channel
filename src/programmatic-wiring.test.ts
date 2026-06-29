@@ -204,6 +204,8 @@ function buildServer(opts: {
   channels: Map<string, Channel>;
   programmatic: ProgrammaticAgentRegistry;
   deliveryState?: DeliveryState;
+  /** threads-only Phase B: the resolve-or-create gate (a not-yet-live thread is RESOLVABLE). */
+  threadResolvable?: (threadId: string) => boolean | Promise<boolean>;
 }) {
   const registry = new ClientRegistry();
   const srv = Bun.serve({
@@ -213,6 +215,7 @@ function buildServer(opts: {
     fetch: createFetchHandler(opts.channels, registry, {
       programmatic: opts.programmatic,
       ...(opts.deliveryState ? { deliveryState: opts.deliveryState } : {}),
+      ...(opts.threadResolvable ? { threadResolvable: opts.threadResolvable } : {}),
     }),
   });
   return { srv, base: `http://127.0.0.1:${srv.port}` };
@@ -355,6 +358,216 @@ describe("inbound for a programmatic channel → deliver → outbound note", () 
       // A failed turn now posts a single user-facing failure note (carrying the reason).
       expect(rec.calls).toHaveLength(1);
       expect(rec.calls[0]!.reply).toContain("mint refused");
+    } finally {
+      srv.stop(true);
+    }
+  });
+});
+
+describe("threads-only Phase B — inbound routing (metadata.thread dual-read + resolve-or-create)", () => {
+  /** POST an inbound carrying an arbitrary routing-key metadata shape (agent and/or thread). */
+  async function inboundWith(
+    base: string,
+    metadata: Record<string, unknown>,
+    noteId: string,
+    content: string,
+  ) {
+    return fetch(`${base}/api/vault/inbound`, {
+      method: "POST",
+      headers: { ...adminAuth, "content-type": "application/json" },
+      body: JSON.stringify({
+        note: {
+          id: noteId,
+          content,
+          tags: ["agent/message", "agent/message/inbound"],
+          metadata: { direction: "inbound", sender: "aaron", ts: "2026-06-29T00:00:01Z", ...metadata },
+        },
+      }),
+    });
+  }
+
+  // ── BACK-COMPAT (load-bearing): the 4 live def agents (uni, STEWARD [4am weave], uni-evolve,
+  // eco-civilization) carry `metadata.agent` and NO `metadata.thread`, so they route EXACTLY as
+  // before Phase B — to the def channel, one on-demand turn. This proves the live steward weave
+  // route is unchanged.
+  test("BACK-COMPAT: a `metadata.agent`-ONLY inbound (the steward weave) routes to the def channel exactly as today", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await programmatic.register({ name: "steward", channels: ["steward"], backend: "programmatic" });
+
+    const registry = new ClientRegistry();
+    const deliveryState = new DeliveryState();
+    const channels = new Map<string, Channel>([
+      ["steward", vaultChannel("steward", registry, deliveryState, programmatic)],
+    ]);
+    // threadResolvable wired but it must NEVER be consulted for a `metadata.agent` inbound.
+    let resolvableCalls = 0;
+    const { srv, base } = buildServer({
+      channels,
+      programmatic,
+      deliveryState,
+      threadResolvable: () => {
+        resolvableCalls++;
+        return true;
+      },
+    });
+    try {
+      // The weave fires `metadata.agent: steward`, NO `metadata.thread`.
+      const res = await inboundWith(base, { agent: "steward" }, "weave-note-1", "run the weave");
+      expect(res.status).toBe(200);
+      await until(() => rec.calls.length === 1);
+      // Routed to the steward def channel + ran one turn (byte-identical to HEAD).
+      expect(backend.calls).toEqual([{ channel: "steward", message: "run the weave", loadout: [] }]);
+      expect(rec.calls).toEqual([{ channel: "steward", reply: "reply:run the weave", inReplyTo: "weave-note-1" }]);
+      // resolve-or-create was NOT consulted — the def path is untouched.
+      expect(resolvableCalls).toBe(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("a `metadata.thread` inbound for a LIVE thread routes to it (thread-id ≡ the live channel)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    // The thread agent is LIVE under thread-id "eng" (≡ channel for the live cast).
+    await programmatic.register({ name: "eng", channels: ["eng"], backend: "programmatic" });
+
+    const registry = new ClientRegistry();
+    const deliveryState = new DeliveryState();
+    const channels = new Map<string, Channel>([
+      ["eng", vaultChannel("eng", registry, deliveryState, programmatic)],
+    ]);
+    const { srv, base } = buildServer({ channels, programmatic, deliveryState });
+    try {
+      // `metadata.thread` (read FIRST by noteAgentKey) addresses the live thread.
+      const res = await inboundWith(base, { thread: "eng" }, "t-note-1", "thread hello");
+      expect(res.status).toBe(200);
+      await until(() => rec.calls.length === 1);
+      expect(backend.calls).toEqual([{ channel: "eng", message: "thread hello", loadout: [] }]);
+      expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:thread hello", inReplyTo: "t-note-1" }]);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("RESOLVE-OR-CREATE: a `metadata.thread` inbound for a NOT-YET-LIVE but resolvable thread is OWNED (buffered, 200) then REPLAYED on register — NOT 401/dropped", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    // NO agent live for thread "proj-thread" yet — the old code would 401 (→ permanent loss).
+    const registry = new ClientRegistry();
+    const deliveryState = new DeliveryState();
+    const channels = new Map<string, Channel>(); // no channels yet.
+    const { srv, base } = buildServer({
+      channels,
+      programmatic,
+      deliveryState,
+      threadResolvable: (threadId) => threadId === "proj-thread", // a thread note exists for it.
+    });
+    try {
+      const res = await inboundWith(base, { thread: "proj-thread" }, "p-note-1", "queued work");
+      // OWNED, not dropped: 200 (not 401), and buffered pending under the thread-id.
+      expect(res.status).toBe(200);
+      expect(programmatic.isExpected("proj-thread")).toBe(true);
+      expect(programmatic.pendingCount("proj-thread")).toBe(1);
+      expect(backend.calls).toHaveLength(0); // nothing ran yet (no live agent).
+
+      // The thread agent finally registers → the buffered inbound REPLAYS (not lost).
+      await programmatic.register({ name: "proj-thread", channels: ["proj-thread"], backend: "programmatic" });
+      await until(() => rec.calls.length === 1);
+      expect(backend.calls).toEqual([{ channel: "proj-thread", message: "queued work", loadout: [] }]);
+      expect(programmatic.pendingCount("proj-thread")).toBe(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("a genuinely UNKNOWN thread (no thread note, no def) still 401s — no silent-drop change", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    const channels = new Map<string, Channel>(); // nothing live.
+    const { srv, base } = buildServer({
+      channels,
+      programmatic,
+      threadResolvable: () => false, // NOT resolvable — no thread note, no def.
+    });
+    try {
+      const res = await inboundWith(base, { thread: "ghost" }, "g-note-1", "into the void");
+      expect(res.status).toBe(401); // today's behavior — not owned, not buffered.
+      expect(programmatic.isExpected("ghost")).toBe(false);
+      expect(programmatic.pendingCount("ghost")).toBe(0);
+    } finally {
+      srv.stop(true);
+    }
+  });
+});
+
+describe("threads-only Phase B — thread-status teardown webhook (POST /api/vault/thread-status)", () => {
+  async function threadStatus(base: string, metadata: Record<string, unknown>) {
+    return fetch(`${base}/api/vault/thread-status`, {
+      method: "POST",
+      headers: { ...adminAuth, "content-type": "application/json" },
+      body: JSON.stringify({ event: "updated", note: { id: "Threads/x/y", metadata } }),
+    });
+  }
+
+  test("a status transition to ARCHIVE tears the thread's queues + indexes down", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    // A not-yet-live thread that has been OWNED (expected + a buffered message).
+    programmatic.resolveOrCreateThread("proj-thread", true);
+    programmatic.queuePending("proj-thread", { content: "buffered", thread: "proj-thread" });
+    expect(programmatic.pendingCount("proj-thread")).toBe(1);
+
+    const { srv, base } = buildServer({ channels: new Map(), programmatic });
+    try {
+      const res = await threadStatus(base, { thread: "proj-thread", status: "archived" });
+      expect(res.status).toBe(200);
+      expect((await res.json()) as { ok: boolean; torn_down: boolean }).toEqual({ ok: true, torn_down: true });
+      // The thread's buffered message + expected mark are gone (the def-set-diff teardown replacement).
+      expect(programmatic.pendingCount("proj-thread")).toBe(0);
+      expect(programmatic.isExpected("proj-thread")).toBe(false);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("a NON-archive status (e.g. running) is a clean no-op ack (does not tear down)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    programmatic.resolveOrCreateThread("proj-thread", true);
+    programmatic.queuePending("proj-thread", { content: "buffered", thread: "proj-thread" });
+
+    const { srv, base } = buildServer({ channels: new Map(), programmatic });
+    try {
+      const res = await threadStatus(base, { thread: "proj-thread", status: "running" });
+      expect(res.status).toBe(200);
+      expect((await res.json()) as { ok: boolean; torn_down: boolean }).toEqual({ ok: true, torn_down: false });
+      // Still buffered — a running thread is NOT torn down.
+      expect(programmatic.pendingCount("proj-thread")).toBe(1);
+      expect(programmatic.isExpected("proj-thread")).toBe(true);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("the teardown webhook requires agent:send (401 without a valid token)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    const { srv, base } = buildServer({ channels: new Map(), programmatic });
+    try {
+      const res = await fetch(`${base}/api/vault/thread-status`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer bogus" },
+        body: JSON.stringify({ note: { metadata: { thread: "x", status: "archived" } } }),
+      });
+      expect(res.status).toBe(401);
     } finally {
       srv.stop(true);
     }

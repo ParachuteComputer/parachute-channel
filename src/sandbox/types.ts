@@ -350,6 +350,17 @@ export interface AgentSpec {
    * definition link).
    */
   definition?: string;
+  /**
+   * The def note's PATH (e.g. `Agents/steward`) — distinct from {@link definition},
+   * the note ID (a timestamp-slug like `2026-06-20-07-30-56-487050`). Used for the
+   * composed system prompt's SELF-ENTRY HEADER (`# Agents/steward`), so the header
+   * reads as the human-legible loadout PATH the design specifies (#169) rather than an
+   * opaque id. Set by {@link parseAgentDef} from `note.path`; unset for a spec not
+   * sourced from a def note OR a def note whose read didn't carry a path — the self
+   * entry then falls back to {@link name} (the note ID {@link definition} is NOT used for
+   * the header — it's an opaque timestamp-slug, not the legible path).
+   */
+  definitionPath?: string;
 }
 
 /**

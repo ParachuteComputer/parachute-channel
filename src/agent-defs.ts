@@ -53,6 +53,8 @@ import {
   resolveConnectionStatus,
   WantsParseError,
   GrantsClient,
+  isPackNote,
+  packPathKey,
   type ConnectionSpec,
 } from "./grants.ts";
 
@@ -589,10 +591,11 @@ export class DefVaultClient {
     return out;
   }
 
-  /** Fetch ONE note by id (for a created/updated reload). Null on 404/miss. */
+  /** Fetch ONE note by id (for a created/updated reload). Null on 404/miss. `tags` is carried
+   *  through (threads-only Phase B′ — reconcilePack needs it for the `#pack` security gate). */
   async getNote(
     id: string,
-  ): Promise<{ id: string; path?: string; content?: string; metadata?: Record<string, unknown> } | null> {
+  ): Promise<{ id: string; path?: string; content?: string; metadata?: Record<string, unknown>; tags?: unknown } | null> {
     const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(id)}?include_content=true`;
     const res = await this.fetchFn(url, { headers: { authorization: `Bearer ${this.token}` } });
     if (res.status === 404) return null;
@@ -606,7 +609,7 @@ export class DefVaultClient {
     } catch (err) {
       throw new Error(`def-vault "${this.vault}": get note ${id} — bad JSON: ${(err as Error).message}`);
     }
-    const n = (parsed ?? {}) as { id?: string; path?: string; note?: { id?: string; path?: string; content?: string; metadata?: Record<string, unknown> }; content?: string; metadata?: Record<string, unknown> };
+    const n = (parsed ?? {}) as { id?: string; path?: string; note?: { id?: string; path?: string; content?: string; metadata?: Record<string, unknown>; tags?: unknown }; content?: string; metadata?: Record<string, unknown>; tags?: unknown };
     const note = n.note ?? n;
     if (typeof note.id !== "string" || !note.id) return null;
     return {
@@ -615,6 +618,8 @@ export class DefVaultClient {
       ...(typeof note.path === "string" && note.path ? { path: note.path } : {}),
       content: note.content,
       metadata: note.metadata,
+      // Carry tags for the pack security gate (Phase B′ — reconcilePack reads `#pack`).
+      ...(note.tags !== undefined ? { tags: note.tags } : {}),
     };
   }
 
@@ -1314,6 +1319,123 @@ export class AgentDefRegistry {
       return "deregistered";
     }
     return (await this.instantiate(vault, note)) ? "instantiated" : "skipped";
+  }
+
+  /**
+   * Reconcile ONE PACK's grants (threads-only Phase B′ — DESIGN-2026-06-29-threads-only.md §4).
+   * Driven by the per-pack vault trigger (`POST /api/vault/pack` → here), NOT by load (load is
+   * per-turn). A pack is the GRANT-DECLARING note; its `wants:` is keyed on the hub by the pack's
+   * slugged PATH ({@link packPathKey}) — its OWN prune partition, so this reconcile can NEVER
+   * touch a def's grants or another pack's (the `feedback_cross_repo_derived_key_divergence`
+   * class is structurally avoided: the live set is trivially this one note's current `wants:`).
+   *
+   * Outcomes (mirrors the def-load grant discipline):
+   *   - `deleted` event (FORWARD-COMPATIBLE — the vault has no `deleted` trigger today, so the
+   *     live delete path is the 404 case below + the 60s loadAll poll; the explicit handling is
+   *     kept so a future `deleted` trigger Just Works), OR the note is gone (404), OR it no
+   *     longer carries `#pack`, OR it declares no `wants:`  → PRUNE that pack's partition to []
+   *     (`reconcileGrants(packKey, [])`). Per-pack, so safe.
+   *   - a clean parse of a `#pack` note's `wants:` → REGISTER each connection under `packKey`
+   *     (idempotent upsert) + RECONCILE to that live set (prune any want it no longer declares).
+   *   - a PARSE ERROR on `wants:` → stamp the note `status:error`, NEVER reconcile (a malformed
+   *     pack must not present a stale/empty live set that nukes its approved grants — the same
+   *     safety rule the def path uses).
+   *   - no grants client (hub not provisioned) → no-op (best-effort).
+   *
+   * Best-effort + non-fatal throughout — a reconcile/registration fault logs + returns; it never
+   * throws out of the webhook path. The pack's PATH is read off the note (fallback: the note id).
+   */
+  async reconcilePack(
+    vault: string,
+    noteId: string,
+    event?: "created" | "updated" | "deleted",
+  ): Promise<"reconciled" | "pruned" | "error" | "skipped"> {
+    if (!this.grants) return "skipped"; // hub not provisioned → no grant store to reconcile.
+    const client = this.clients.get(vault);
+    if (!client) {
+      console.warn(`agent-defs: pack reconcile for unknown vault "${vault}" — ignoring.`);
+      return "skipped";
+    }
+    // A delete event: the note is gone — prune its partition without a fetch (a CONFIRMED removal).
+    if (event === "deleted") {
+      await this.prunePackGrants(packPathKey(noteId));
+      return "pruned";
+    }
+    let note: Awaited<ReturnType<DefVaultClient["getNote"]>>;
+    try {
+      note = await client.getNote(noteId);
+    } catch (err) {
+      // A fetch FAILURE is NOT a confirmed removal — never prune from an inconclusive read.
+      console.error(`agent-defs: pack reconcile fetch of ${noteId} from "${vault}" failed: ${(err as Error).message}`);
+      return "skipped";
+    }
+    if (!note) {
+      // 404 — the pack is gone (deleted / no longer visible). CONFIRMED removal → prune its partition.
+      await this.prunePackGrants(packPathKey(noteId));
+      return "pruned";
+    }
+    // The grant key is the pack's PATH (slugged), mirroring the slug discipline grantId uses.
+    // Fall back to the note id when the vault didn't surface a path.
+    const packPath = typeof note.path === "string" && note.path ? note.path : noteId;
+    const packKey = packPathKey(packPath);
+    // THE SECURITY GATE: only a `#pack` note's `wants:` is honored. A note that lost the pack
+    // tag (or never had it) drops to prune-to-[] for its partition — its `wants:` is inert.
+    if (!isPackNote({ tags: (note as { tags?: unknown }).tags })) {
+      await this.prunePackGrants(packKey);
+      return "pruned";
+    }
+    let wants: ConnectionSpec[];
+    try {
+      wants = parseWants(note.metadata?.wants);
+    } catch (err) {
+      // A malformed `wants:` → stamp the note `status:error`, NEVER reconcile (don't present a
+      // stale/empty live set that would nuke this pack's approved grants). Best-effort stamp.
+      console.error(`agent-defs: pack ${noteId} in "${vault}" has a malformed wants: ${(err as Error).message}`);
+      await client.patchStatus(noteId, "error").catch(() => {});
+      return "error";
+    }
+    if (wants.length === 0) {
+      // The pack declares no wants (or dropped them) → prune its partition to [] (per-pack, safe).
+      await this.prunePackGrants(packKey);
+      return "pruned";
+    }
+    // REGISTER each want under the pack key (idempotent upsert) + RECONCILE to this live set.
+    const grants = this.grants;
+    for (const conn of wants) {
+      try {
+        await grants.registerGrant(packKey, conn);
+      } catch (err) {
+        // A single registration fault is non-fatal — the others still register; the operator
+        // approves later. (The reconcile below sends the live SPECS, so a missed register
+        // doesn't get pruned.)
+        console.warn(
+          `agent-defs: registering pack grant for "${packKey}" (${connectionKey(conn)}) failed ` +
+            `(continuing): ${(err as Error).message}`,
+        );
+      }
+    }
+    try {
+      const { pruned } = await grants.reconcileGrants(packKey, wants);
+      if (pruned > 0) console.log(`agent-defs: pruned ${pruned} stale grant(s) for pack "${packKey}".`);
+    } catch (err) {
+      console.warn(`agent-defs: reconciling pack grants for "${packKey}" failed (continuing): ${(err as Error).message}`);
+    }
+    return "reconciled";
+  }
+
+  /**
+   * Prune a pack's grant partition to [] (`reconcileGrants(packKey, [])`) — the per-pack GC for a
+   * deleted pack / a pack that dropped `wants:` / a note that lost the `#pack` tag. Per-pack, so
+   * it can never touch a def's or another pack's grants. Best-effort: a fault logs + returns.
+   */
+  private async prunePackGrants(packKey: string): Promise<void> {
+    if (!this.grants) return;
+    try {
+      const { pruned } = await this.grants.reconcileGrants(packKey, []);
+      if (pruned > 0) console.log(`agent-defs: pruned ${pruned} grant(s) for removed pack "${packKey}".`);
+    } catch (err) {
+      console.warn(`agent-defs: pruning pack grants for "${packKey}" failed (continuing): ${(err as Error).message}`);
+    }
   }
 
   // ---------------------------------------------------------------------------

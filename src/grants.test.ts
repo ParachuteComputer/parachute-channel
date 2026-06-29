@@ -21,11 +21,16 @@ import {
   connectionKey,
   resolveConnectionStatus,
   resolveInjectedGrants,
+  resolveInjectedGrantsUnion,
   serviceEnvVar,
   serviceMcpUrl,
   grantVaultEntryKey,
   grantServiceEntryKey,
   grantMcpEntryKey,
+  packPathKey,
+  isPackNote,
+  packWants,
+  PACK_TAG,
   GrantsClient,
   GrantsApiError,
   WantsParseError,
@@ -634,5 +639,207 @@ describe("resolveInjectedGrants", () => {
     // Two spawns → two material fetches (no cache between them — revocation takes
     // effect next spawn precisely because we re-fetch).
     expect(called).toEqual(["g1", "g1"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// threads-only Phase B′ — pack-only grants (DESIGN-2026-06-29-threads-only.md §4)
+// ---------------------------------------------------------------------------
+
+describe("packPathKey — the pack grant-holder key (slugged path, `pack--` prefixed)", () => {
+  test("slugs the path (non-slug chars → -) under a `pack--` prefix", () => {
+    expect(packPathKey("Uni/Packs/github")).toBe("pack--Uni-Packs-github");
+    expect(packPathKey("Packs/Read.ai")).toBe("pack--Packs-Read-ai");
+  });
+  test("the pack key namespace can never collide with a bare def name (a slug, no `--`)", () => {
+    // A def `metadata.name` is a `[a-zA-Z0-9_-]+` slug — it has no `--`, so the `pack--`
+    // prefix partitions the two grant-holder namespaces.
+    expect(packPathKey("steward").startsWith("pack--")).toBe(true);
+    expect("steward").not.toContain("--");
+  });
+});
+
+describe("isPackNote / packWants — the SECURITY GATE (wants only from PACKS)", () => {
+  test("PACK_TAG is the bare `pack` tag", () => {
+    expect(PACK_TAG).toBe("pack");
+  });
+  test("isPackNote: true for a `pack`-tagged note (array or string tags, tolerant of `#`)", () => {
+    expect(isPackNote({ tags: ["pack"] })).toBe(true);
+    expect(isPackNote({ tags: ["#pack"] })).toBe(true); // stray leading # tolerated
+    expect(isPackNote({ tags: "foo, pack, bar" })).toBe(true);
+    expect(isPackNote({ tags: ["other"] })).toBe(false);
+    expect(isPackNote({ tags: undefined })).toBe(false);
+    // A substring match must NOT count as `pack` (exact tag, not prefix).
+    expect(isPackNote({ tags: ["packaged"] })).toBe(false);
+    expect(isPackNote({ tags: ["pack/sub"] })).toBe(false);
+  });
+
+  test("a `#pack` note WITH wants → parsed specs", () => {
+    const note = { tags: ["pack"], metadata: { wants: "vault:research:read, env:github" } };
+    expect(packWants(note)).toEqual([
+      { kind: "vault", target: "research", access: "read" },
+      { kind: "service", target: "github", inject: ["env"] },
+    ]);
+  });
+
+  test("THE GATE: a NON-pack note with wants → null (its wants are IGNORED/inert)", () => {
+    // A plain content note declaring `wants:` must NOT contribute any capability.
+    const note = { tags: ["reference"], metadata: { wants: "vault:research:read, env:github" } };
+    expect(packWants(note)).toBeNull();
+    // Same content, but now tagged `pack` → honored. The ONLY difference is the tag.
+    expect(packWants({ tags: ["pack"], metadata: { wants: "vault:research:read" } })).not.toBeNull();
+  });
+
+  test("a pack with NO wants → null; a pack with empty wants → null", () => {
+    expect(packWants({ tags: ["pack"], metadata: {} })).toBeNull();
+    expect(packWants({ tags: ["pack"], metadata: { wants: "" } })).toBeNull();
+  });
+
+  test("a pack with a MALFORMED wants → null (the reconcile path stamps status:error)", () => {
+    expect(packWants({ tags: ["pack"], metadata: { wants: "garbage-no-colon" } })).toBeNull();
+  });
+});
+
+/**
+ * A grants client whose list returns DIFFERENT grants PER agent key (for union tests).
+ * Material is keyed by grant id. `byAgent` maps a grant-holder key → its grant list.
+ */
+function multiAgentClient(opts: {
+  byAgent: Record<string, Array<{ id: string; connection: ConnectionSpec; status: string }>>;
+  material?: Record<string, GrantMaterial>;
+  listStatusByAgent?: Record<string, number>; // force a non-200 LIST for a given agent key
+  onListCall?: (agent: string) => void;
+}): GrantsClient {
+  const fetchFn = (async (url: string | URL | Request) => {
+    const u = String(url);
+    if (u.includes("/admin/grants/") && u.endsWith("/material")) {
+      const id = u.split("/admin/grants/")[1]!.replace("/material", "");
+      const m = opts.material?.[id];
+      if (!m) return new Response("no", { status: 404 });
+      return new Response(JSON.stringify(m), { status: 200 });
+    }
+    // list — parse the ?agent=<key>
+    const agent = decodeURIComponent(new URL(u).searchParams.get("agent") ?? "");
+    opts.onListCall?.(agent);
+    const forced = opts.listStatusByAgent?.[agent];
+    if (forced && forced !== 200) return new Response("boom", { status: forced });
+    const grants = (opts.byAgent[agent] ?? []).map((g) => ({
+      id: g.id,
+      agent,
+      connection: g.connection,
+      status: g.status,
+    }));
+    return new Response(JSON.stringify({ grants }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  return new GrantsClient({ hubOrigin: HUB, managerBearer: BEARER, fetchFn });
+}
+
+describe("resolveInjectedGrantsUnion — union of def key + pack keys", () => {
+  test("LEGACY CONTINUITY: a single source (no packs) === resolveInjectedGrants(spec.name)", async () => {
+    const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
+    const byAgent = { steward: [{ id: "g1", connection: conn, status: "approved" }] };
+    const material = { g1: { kind: "service" as const, token: "GHTOK", inject: ["env" as const] } };
+    // The exact same fake, queried both ways.
+    const single = multiAgentClient({ byAgent, material });
+    const unioned = multiAgentClient({ byAgent, material });
+    const fromSingle = await resolveInjectedGrants(single, "steward");
+    const fromUnion = await resolveInjectedGrantsUnion(unioned, ["steward"]);
+    // BYTE-IDENTICAL injected struct — the union with one source is the legacy path.
+    expect(fromUnion).toEqual(fromSingle);
+    expect(fromUnion.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
+  });
+
+  test("a thread loading ONE pack → def grants UNIONED with the pack's path-keyed grants", async () => {
+    const packKey = packPathKey("Packs/github");
+    const client = multiAgentClient({
+      byAgent: {
+        steward: [
+          { id: "d1", connection: { kind: "vault", target: "ops", access: "read" }, status: "approved" },
+        ],
+        [packKey]: [
+          { id: "p1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" },
+        ],
+      },
+      material: {
+        d1: { kind: "vault", token: "OPSTOK", mcpUrl: "https://hub/vault/ops/mcp" },
+        p1: { kind: "service", token: "GHTOK", inject: ["env"] },
+      },
+    });
+    const out = await resolveInjectedGrantsUnion(client, ["steward", packKey]);
+    expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" }); // from the pack
+    expect(out.mcpEntries).toEqual([
+      { name: grantVaultEntryKey("ops"), url: "https://hub/vault/ops/mcp", token: "OPSTOK" }, // from the def
+    ]);
+  });
+
+  test("TWO packs → all three sources unioned (def + pack A + pack B)", async () => {
+    const keyA = packPathKey("Packs/github");
+    const keyB = packPathKey("Packs/research");
+    const client = multiAgentClient({
+      byAgent: {
+        steward: [{ id: "d1", connection: { kind: "service", target: "cloudflare", inject: ["env"] }, status: "approved" }],
+        [keyA]: [{ id: "a1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
+        [keyB]: [{ id: "b1", connection: { kind: "vault", target: "research", access: "read" }, status: "approved" }],
+      },
+      material: {
+        d1: { kind: "service", token: "CFTOK", inject: ["env"] },
+        a1: { kind: "service", token: "GHTOK", inject: ["env"] },
+        b1: { kind: "vault", token: "RTOK", mcpUrl: "https://hub/vault/research/mcp" },
+      },
+    });
+    const out = await resolveInjectedGrantsUnion(client, ["steward", keyA, keyB]);
+    expect(out.env).toEqual({ CLOUDFLARE_API_TOKEN: "CFTOK", GITHUB_TOKEN: "GHTOK" });
+    expect(out.mcpEntries).toEqual([
+      { name: grantVaultEntryKey("research"), url: "https://hub/vault/research/mcp", token: "RTOK" },
+    ]);
+  });
+
+  test("dedupe: a key appearing twice (or equal to spec.name) is fetched ONCE", async () => {
+    const calls: string[] = [];
+    const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
+    const client = multiAgentClient({
+      byAgent: { steward: [{ id: "g1", connection: conn, status: "approved" }] },
+      material: { g1: { kind: "service" as const, token: "GHTOK", inject: ["env" as const] } },
+      onListCall: (a) => calls.push(a),
+    });
+    const out = await resolveInjectedGrantsUnion(client, ["steward", "steward", ""]);
+    expect(calls).toEqual(["steward"]); // deduped + empty key skipped
+    expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
+  });
+
+  test("dedupe on collision: first source wins an env-var / MCP-name collision (def first)", async () => {
+    const packKey = packPathKey("Packs/github");
+    const client = multiAgentClient({
+      byAgent: {
+        steward: [{ id: "d1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
+        [packKey]: [{ id: "p1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
+      },
+      material: {
+        d1: { kind: "service", token: "DEF-GHTOK", inject: ["env"] },
+        p1: { kind: "service", token: "PACK-GHTOK", inject: ["env"] },
+      },
+    });
+    const out = await resolveInjectedGrantsUnion(client, ["steward", packKey]);
+    // The def (first source) wins the GITHUB_TOKEN collision.
+    expect(out.env).toEqual({ GITHUB_TOKEN: "DEF-GHTOK" });
+  });
+
+  test("per-source isolation: ONE source's list failure is skipped, the others still inject", async () => {
+    const packKey = packPathKey("Packs/github");
+    const client = multiAgentClient({
+      byAgent: {
+        steward: [{ id: "d1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
+        [packKey]: [{ id: "p1", connection: { kind: "vault", target: "x", access: "read" }, status: "approved" }],
+      },
+      material: { d1: { kind: "service", token: "GHTOK", inject: ["env"] } },
+      listStatusByAgent: { [packKey]: 500 }, // the pack's LIST fails
+    });
+    const out = await resolveInjectedGrantsUnion(client, ["steward", packKey]);
+    // The def still injected; the failing pack source is simply absent (never throws).
+    expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
+    expect(out.mcpEntries).toEqual([]);
   });
 });

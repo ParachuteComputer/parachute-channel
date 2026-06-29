@@ -1397,6 +1397,100 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// threads-only Phase B′ — pack-keyed grant UNION (DESIGN-2026-06-29-threads-only.md §4)
+// ---------------------------------------------------------------------------
+
+/** A per-agent-key fake hub grants API (for union/legacy tests). `byAgent[key]` = that key's
+ *  approved grants; material keyed by grant id. Records the LIST keys queried. */
+function grantsClientByKey(opts: {
+  byAgent: Record<string, Array<{ id: string; connection: ConnectionSpec; status: string }>>;
+  material?: Record<string, GrantMaterial>;
+  onListKey?: (key: string) => void;
+}): GrantsClient {
+  const fetchFn = (async (url: string | URL | Request) => {
+    const u = String(url);
+    if (u.includes("/admin/grants/") && u.endsWith("/material")) {
+      const id = u.split("/admin/grants/")[1]!.replace("/material", "");
+      const m = opts.material?.[id];
+      if (!m) return new Response("no", { status: 404 });
+      return new Response(JSON.stringify(m), { status: 200 });
+    }
+    const key = decodeURIComponent(new URL(u).searchParams.get("agent") ?? "");
+    opts.onListKey?.(key);
+    const grants = (opts.byAgent[key] ?? []).map((g) => ({ id: g.id, agent: key, connection: g.connection, status: g.status }));
+    return new Response(JSON.stringify({ grants }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  return new GrantsClient({ hubOrigin: "https://hub.example.com", managerBearer: "MGR", fetchFn });
+}
+
+describe("ProgrammaticBackend.deliver — pack-keyed grant union (Phase B′)", () => {
+  test("LEGACY CONTINUITY: a def with NO packKeys injects EXACTLY listGrants(spec.name) (only spec.name queried)", async () => {
+    mkDirs("pk-legacy");
+    const listKeys: string[] = [];
+    const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
+    const grants = grantsClientByKey({
+      byAgent: { eng: [{ id: "d1", connection: conn, status: "approved" }] },
+      material: { d1: { kind: "service", token: "ghp_DEF", inject: ["env"] } },
+      onListKey: (k) => listKeys.push(k),
+    });
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    // No packKeys param (undefined) — the no-loadout path every current def agent takes.
+    await backend.deliver(handle, "hi", freshSession());
+    // ONLY the def's own name was queried (= the legacy single-source path).
+    expect(listKeys).toEqual(["eng"]);
+    // The def's grant injected; nothing else. Own-vault + the def's GITHUB_TOKEN, no pack entries.
+    expect(calls[0]!.env.GITHUB_TOKEN).toBe("ghp_DEF");
+    expect(Object.keys(readMcpServers("eng"))).toEqual([vaultEntryKey("default")]);
+  });
+
+  test("an EMPTY packKeys array is byte-identical to the no-packKeys legacy path", async () => {
+    mkDirs("pk-empty");
+    const listKeys: string[] = [];
+    const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
+    const grants = grantsClientByKey({
+      byAgent: { eng: [{ id: "d1", connection: conn, status: "approved" }] },
+      material: { d1: { kind: "service", token: "ghp_DEF", inject: ["env"] } },
+      onListKey: (k) => listKeys.push(k),
+    });
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    // Explicit empty packKeys (a thread with no #pack-with-wants loaded) — same as legacy.
+    await backend.deliver(handle, "hi", freshSession(), undefined, undefined, undefined, undefined, undefined, []);
+    expect(listKeys).toEqual(["eng"]);
+    expect(calls[0]!.env.GITHUB_TOKEN).toBe("ghp_DEF");
+    expect(Object.keys(readMcpServers("eng"))).toEqual([vaultEntryKey("default")]);
+  });
+
+  test("a loaded pack key → the pack's grants are UNIONED with the def's (def + pack queried)", async () => {
+    mkDirs("pk-union");
+    const packKey = "pack--Packs-github";
+    const grants = grantsClientByKey({
+      byAgent: {
+        eng: [{ id: "d1", connection: { kind: "vault", target: "ops", access: "read" }, status: "approved" }],
+        [packKey]: [{ id: "p1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
+      },
+      material: {
+        d1: { kind: "vault", token: "OPSTOK", mcpUrl: "https://hub/vault/ops/mcp" },
+        p1: { kind: "service", token: "ghp_PACK", inject: ["env"] },
+      },
+    });
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    // The drain would pass the loaded pack's path key here.
+    await backend.deliver(handle, "hi", freshSession(), undefined, undefined, undefined, undefined, undefined, [packKey]);
+    // The pack's GITHUB_TOKEN (env) AND the def's granted ops vault (MCP) both injected.
+    expect(calls[0]!.env.GITHUB_TOKEN).toBe("ghp_PACK");
+    const servers = readMcpServers("eng");
+    expect(servers[vaultEntryKey("default")]).toBeDefined(); // own def-vault
+    expect(servers[grantVaultEntryKey("ops")]!.headers!.Authorization).toBe("Bearer OPSTOK"); // the def's grant
+  });
+});
+
 describe("ProgrammaticBackend.deliver — transient-error retry with incremental backoff", () => {
   const transientResult = (sid: string, msg: string) =>
     ndjson(

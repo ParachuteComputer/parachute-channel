@@ -277,6 +277,24 @@ export interface Transport {
     subject?: string,
   ): Promise<{ path: string; content: string }[]>;
   /**
+   * Optional: read the thread's loaded-PACK grant KEYS (threads-only Phase B′ —
+   * DESIGN-2026-06-29-threads-only.md §4). Resolves the same `metadata.loadout` paths as
+   * {@link readThreadLoadout}, but reads each note's METADATA (not its content) to find the
+   * loaded notes that are PACKS — i.e. carry the `#pack` tag AND declare a non-empty `wants:`.
+   * Returns each such pack's hub grant-holder key (the slugged PATH, `packPathKey`). This is
+   * the SECURITY GATE: a plain content note's `wants:` is IGNORED (only `#pack` notes
+   * contribute), and the metadata read is DELIBERATELY SEPARATE from the content-only prompt
+   * read (loading a note for context never adds capabilities). The backend unions these with
+   * the def's own `spec.name` grants. `subject` resolves the subject-scoped thread note.
+   * Absent `metadata.loadout` / no pack with `wants:` → an empty array (every current thread).
+   * Only a durable transport (the VaultTransport) implements it; others omit it.
+   */
+  readThreadPackKeys?(
+    channel: string,
+    name: string,
+    subject?: string,
+  ): Promise<string[]>;
+  /**
    * Optional: write an agent-to-agent CALLBACK as an INBOUND note on THIS channel (the
    * "reply_to" substrate). A recipient agent's drain, on turn completion, calls this on the
    * SENDER's channel transport to wake the sender with a completion notification. The note

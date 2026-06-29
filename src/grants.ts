@@ -656,6 +656,136 @@ export async function resolveInjectedGrants(
   return { mcpEntries, env };
 }
 
+/**
+ * UNION an agent's injected grants across MULTIPLE grant-source keys (threads-only
+ * Phase B′ — DESIGN-2026-06-29-threads-only.md §4). The injected grants for a turn are
+ * the union of `resolveInjectedGrants(client, key)` over `[spec.name, ...packKeys]`:
+ *
+ *   - `spec.name`  — the LEGACY def path (UNCHANGED): a `#agent/definition` keeps its
+ *     grants keyed by its `metadata.name`. For the 4 live def agents (uni, steward, …)
+ *     this is the ONLY key, so with no loaded packs the union has one source and the
+ *     result is byte-identical to {@link resolveInjectedGrants}(client, spec.name).
+ *   - each `packKey` — a slugged pack PATH ({@link packPathKey}) for every loaded note
+ *     that is a `#pack` declaring `wants:`. Loading a pack into a thread unions that
+ *     pack's path-keyed APPROVED grants in.
+ *
+ * Dedupe rule: MCP entries are deduped by their entry `name` (first source wins);
+ * env vars are deduped by var name (first source wins). The legacy `spec.name` source
+ * is conventionally first, so a def's own grant wins a name collision with a pack's.
+ *
+ * Keys are deduped + processed in order; a duplicate key (e.g. the same pack twice in
+ * a loadout, or a pack key that happens to equal `spec.name`) is fetched ONCE. A single
+ * source's grant-LIST failure is logged + SKIPPED (its grants are simply absent this
+ * turn — the others still inject), so a flaky hub on one pack never sinks the whole
+ * turn's injection. Material is fetched FRESH per source (never cached), same as the
+ * single-source path.
+ */
+export async function resolveInjectedGrantsUnion(
+  client: GrantsClient,
+  keys: string[],
+): Promise<InjectedGrants> {
+  const mcpByName = new Map<string, InjectedMcpEntry>();
+  const env: Record<string, string> = {};
+  const seenKeys = new Set<string>();
+
+  for (const key of keys) {
+    if (!key || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    let injected: InjectedGrants;
+    try {
+      injected = await resolveInjectedGrants(client, key);
+    } catch (err) {
+      // A single source's grant LIST failing must not sink the others — that source's
+      // grants are simply absent this turn (its own-vault is unaffected; another
+      // source's grants still inject). Never log a token (there is none in the error).
+      console.warn(
+        `parachute-agent: resolving grants for source "${key}" failed ` +
+          `(skipping this source's grants for this turn): ${(err as Error).message}`,
+      );
+      continue;
+    }
+    for (const entry of injected.mcpEntries) {
+      if (!mcpByName.has(entry.name)) mcpByName.set(entry.name, entry);
+    }
+    for (const [varName, value] of Object.entries(injected.env)) {
+      if (!(varName in env)) env[varName] = value;
+    }
+  }
+
+  return { mcpEntries: [...mcpByName.values()], env };
+}
+
+/**
+ * The hub grant-holder KEY for a PACK (threads-only Phase B′ §4) — the slugged note
+ * PATH, mirroring the slug discipline the hub's `grantId` uses (`/`→`-`, all non-slug
+ * chars collapse). Prefixed `pack--` so it reads UNAMBIGUOUSLY as a pack source and is
+ * practically partitioned from def keys: a def `metadata.name` is an operator-authored
+ * `[a-zA-Z0-9_-]+` slug (the live cast — `uni`, `steward`, … — have no `--`), so the
+ * `pack--` prefix keeps the two namespaces apart in normal operation. (The def-name regex
+ * technically accepts `--`, so a deliberately-crafted def named `pack--<x>` could share a
+ * pack's partition — but that's an operator-trust corner, not an exploitable boundary: an
+ * operator who can author such a def can author the pack too.) The hub keys
+ * `grantId(agent, spec) = ${agent}--${connectionKey}` on this opaque holder string;
+ * each pack is therefore its OWN prune partition on the hub (`listGrantsForAgent`),
+ * so a pack's reconcile can never touch a def's grants or another pack's.
+ *
+ * Examples: `Uni/Packs/github` → `pack--Uni-Packs-github`; `Packs/Read.ai` → `pack--Packs-Read-ai`.
+ */
+export function packPathKey(notePath: string): string {
+  // Mirror sandbox/types.ts `slug`: collapse every non-`[a-zA-Z0-9_-]` char to `-`.
+  const slugged = notePath.replace(/[^a-zA-Z0-9_-]/g, "-");
+  return `pack--${slugged}`;
+}
+
+/** The bare tag (post-canonicalization) that marks a note as a PACK. */
+export const PACK_TAG = "pack";
+
+/**
+ * Is this loaded note a PACK that declares `wants:`? — the SECURITY GATE (threads-only
+ * Phase B′ §"Security refinement — wants only from PACKS"). A note's `wants:` is honored
+ * ONLY if the note carries the `#pack`/`pack` tag; a plain content note's `wants:` is
+ * IGNORED (inert) even if present, so loading arbitrary notes for context can NEVER add
+ * capabilities. PURE — no I/O. Tag matching tolerates a stray leading `#` (pre-/post-
+ * canonicalization) so a `#pack`-authored note is recognized either way.
+ *
+ * Returns the parsed `wants:` connection specs when the note is a pack WITH a non-empty,
+ * cleanly-parsing `wants:`; otherwise `null` (not a pack, no `wants:`, or a parse error —
+ * a parse error is surfaced via {@link packWantsOrError}, this fast-path just returns null).
+ */
+export function packWants(note: {
+  tags?: unknown;
+  metadata?: Record<string, unknown>;
+}): ConnectionSpec[] | null {
+  if (!isPackNote(note)) return null;
+  const raw = note.metadata?.wants;
+  if (raw === undefined || raw === null) return null;
+  let specs: ConnectionSpec[];
+  try {
+    specs = parseWants(raw);
+  } catch {
+    return null; // parse error — the reconcile path stamps status:error; injection ignores it.
+  }
+  return specs.length > 0 ? specs : null;
+}
+
+/**
+ * Does this note carry the `#pack` tag? Tolerates the `tags` field being an array of
+ * strings (the vault REST shape) or a comma/space-joined string, and a stray leading
+ * `#` on the tag value. PURE.
+ */
+export function isPackNote(note: { tags?: unknown }): boolean {
+  const tags = note.tags;
+  let list: string[];
+  if (Array.isArray(tags)) {
+    list = tags.map((t) => (typeof t === "string" ? t : String(t)));
+  } else if (typeof tags === "string") {
+    list = tags.split(/[,\s]+/);
+  } else {
+    return false;
+  }
+  return list.some((t) => t.trim().replace(/^#/, "") === PACK_TAG);
+}
+
 /** MCP entry key for a GRANTED vault — namespaced so it never collides with the
  *  agent's OWN def-vault entry (`parachute-vault-<name>`). */
 export function grantVaultEntryKey(vault: string): string {

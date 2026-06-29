@@ -361,6 +361,17 @@ export interface AgentBackend {
    * clobber each other. ADDITIVE — omitted/empty → `sessions/<name>/` (byte-identical to HEAD;
    * the null-subject invariant). Distinct from `loadout` (which is prompt CONTENT); this is
    * the workspace IDENTITY.
+   *
+   * `packKeys` (optional, threads-only Phase B′ — DESIGN-2026-06-29-threads-only.md §4) is the
+   * list of hub grant-holder KEYS for the loaded PACKS in this thread's loadout — the slugged
+   * PATH (`packPathKey`) of every loaded note that is a `#pack` declaring `wants:`. The
+   * programmatic backend UNIONS each pack's APPROVED grants with the def's own (`spec.name`),
+   * so a thread that loads a pack gains that pack's capabilities. This is SEPARATE from
+   * `loadout` (prompt content) by design: the SECURITY GATE — a non-pack note's `wants:` is
+   * IGNORED — is enforced where `packKeys` is built (the transport reads the loaded notes'
+   * METADATA, never folding it into the prompt). ADDITIVE — omitted/empty (every current agent;
+   * no thread loads a `#pack` with `wants:` today) → the grant source set is exactly
+   * `[spec.name]`, BYTE-IDENTICAL to the legacy single-source injection (legacy continuity).
    */
   deliver(
     handle: AgentHandle,
@@ -371,6 +382,7 @@ export interface AgentBackend {
     runContext?: RunContext,
     loadout?: LoadoutEntry[],
     subject?: string,
+    packKeys?: string[],
   ): Promise<DeliverResult>;
 
   /**

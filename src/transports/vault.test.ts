@@ -26,6 +26,7 @@
 
 import { describe, test, expect, afterEach } from "bun:test";
 import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError, noteAgentKey, parseLoadoutPaths } from "./vault.ts";
+import { packPathKey } from "../grants.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
 
@@ -2416,5 +2417,114 @@ describe("VaultTransport — readThreadLoadout (the Phase A loader)", () => {
     const loadout = await t.readThreadLoadout("eng", "eng", "launch blockers");
     expect(loadout).toEqual([{ path: "Note/A", content: "A body" }]);
     expect(reads[0]).toBe("Threads/eng/eng--launch-blockers");
+  });
+});
+
+// ── threads-only Phase B′: readThreadPackKeys (the pack-detect SECURITY GATE) ──
+describe("VaultTransport — readThreadPackKeys (the Phase B′ pack-grant-key reader)", () => {
+  test("THE GATE: a loaded note with wants but NO #pack tag → IGNORED (no key)", async () => {
+    const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
+      "Threads/eng/eng": { metadata: { loadout: ["Refs/leaky"] }, content: "x" },
+      // A plain content note that DECLARES wants but is NOT a pack → its wants are inert.
+      "Refs/leaky": { tags: ["reference"], metadata: { wants: "vault:secrets:read, env:github" }, content: "body" },
+    };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      const m = /\/api\/notes\/([^?]+)/.exec(u);
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      const note = noteByPath[path];
+      if (!note) return new Response("not found", { status: 404 });
+      return new Response(JSON.stringify(note), { status: 200 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    // A non-pack note's wants contribute ZERO grant keys — loading context never adds caps.
+    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([]);
+  });
+
+  test("a loaded #pack with wants → its slugged-path key; a non-pack sibling stays ignored", async () => {
+    const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
+      "Threads/eng/eng": { metadata: { loadout: ["Packs/github", "Projects/Surface"] }, content: "x" },
+      "Packs/github": { tags: ["pack"], metadata: { wants: "env:github" }, content: "pack body" },
+      // A plain project note (no #pack) — even if it had wants it would be ignored; here it has none.
+      "Projects/Surface": { tags: ["project"], metadata: { status: "active" }, content: "proj body" },
+    };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      const m = /\/api\/notes\/([^?]+)/.exec(u);
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      const note = noteByPath[path];
+      if (!note) return new Response("not found", { status: 404 });
+      return new Response(JSON.stringify(note), { status: 200 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([packPathKey("Packs/github")]);
+  });
+
+  test("TWO packs with wants → both path keys (deduped, in loadout order)", async () => {
+    const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
+      "Threads/eng/eng": { metadata: { loadout: ["Packs/github", "Packs/research", "Packs/github"] }, content: "x" },
+      "Packs/github": { tags: ["pack"], metadata: { wants: "env:github" }, content: "a" },
+      "Packs/research": { tags: ["pack"], metadata: { wants: "vault:research:read" }, content: "b" },
+    };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      const m = /\/api\/notes\/([^?]+)/.exec(u);
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      const note = noteByPath[path];
+      if (!note) return new Response("not found", { status: 404 });
+      return new Response(JSON.stringify(note), { status: 200 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    // Deduped (github listed twice → one key), declared order preserved.
+    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([
+      packPathKey("Packs/github"),
+      packPathKey("Packs/research"),
+    ]);
+  });
+
+  test("a #pack with NO wants → no key (only capability-declaring packs count)", async () => {
+    const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
+      "Threads/eng/eng": { metadata: { loadout: ["Packs/empty"] }, content: "x" },
+      "Packs/empty": { tags: ["pack"], metadata: {}, content: "a context-only pack" },
+    };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      const m = /\/api\/notes\/([^?]+)/.exec(u);
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      const note = noteByPath[path];
+      if (!note) return new Response("not found", { status: 404 });
+      return new Response(JSON.stringify(note), { status: 200 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([]);
+  });
+
+  test("LEGACY CONTINUITY: no thread note / no loadout → empty (every current thread)", async () => {
+    globalThis.fetch = (async () => new Response("not found", { status: 404 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([]);
+  });
+
+  test("a missing loadout path (404) is skipped (never throws)", async () => {
+    const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
+      "Threads/eng/eng": { metadata: { loadout: ["Gone/Stale", "Packs/github"] }, content: "x" },
+      "Packs/github": { tags: ["pack"], metadata: { wants: "env:github" }, content: "a" },
+    };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      const m = /\/api\/notes\/([^?]+)/.exec(u);
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      const note = noteByPath[path];
+      if (!note) return new Response("not found", { status: 404 });
+      return new Response(JSON.stringify(note), { status: 200 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([packPathKey("Packs/github")]);
   });
 });

@@ -70,6 +70,12 @@ import type {
 // subject-scoped deterministic thread-note leaf (`<name>--<slug(subject)>`) so the path
 // math matches the registry's drain key exactly (no drift).
 import { threadKey } from "../sandbox/types.ts";
+// threads-only Phase B′ (§4): the pure pack-detection helpers — `packWants` is the
+// SECURITY GATE (a note's `wants:` is honored only if it is a `#pack`), `packPathKey`
+// derives the hub grant-holder key from the pack's slugged path. The metadata read here
+// is DELIBERATELY SEPARATE from the content-only loadout read (loading a note for context
+// never adds capabilities).
+import { packWants, packPathKey, isPackNote } from "../grants.ts";
 
 /** The safe basename of a (possibly path-ful, possibly untrusted) string — the LAST
  *  path segment, with traversal markers stripped. Used to derive a display `filename`
@@ -1115,7 +1121,7 @@ export class VaultTransport implements Transport {
    */
   private async readThreadNote(
     path: string,
-  ): Promise<{ metadata?: Record<string, unknown>; content?: string } | undefined> {
+  ): Promise<{ metadata?: Record<string, unknown>; content?: string; tags?: unknown } | undefined> {
     const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(path)}`;
     let res: Response;
     try {
@@ -1138,14 +1144,15 @@ export class VaultTransport implements Transport {
     try {
       const parsed = (await res.json()) as unknown;
       // Tolerate a bare note object OR a `{ note: {...} }` envelope OR a 1-element array.
+      // `tags` is carried through (Phase B′ — readThreadPackKeys needs it for pack-detection).
       if (Array.isArray(parsed)) {
-        return parsed[0] as { metadata?: Record<string, unknown>; content?: string } | undefined;
+        return parsed[0] as { metadata?: Record<string, unknown>; content?: string; tags?: unknown } | undefined;
       }
-      const obj = parsed as { note?: unknown; metadata?: unknown; content?: unknown };
+      const obj = parsed as { note?: unknown; metadata?: unknown; content?: unknown; tags?: unknown };
       if (obj.note && typeof obj.note === "object") {
-        return obj.note as { metadata?: Record<string, unknown>; content?: string };
+        return obj.note as { metadata?: Record<string, unknown>; content?: string; tags?: unknown };
       }
-      return obj as { metadata?: Record<string, unknown>; content?: string };
+      return obj as { metadata?: Record<string, unknown>; content?: string; tags?: unknown };
     } catch {
       // Bad JSON — treat as no prior (don't strand the write on a parse hiccup).
       return undefined;
@@ -1228,6 +1235,75 @@ export class VaultTransport implements Transport {
       out.push({ path, content: typeof note.content === "string" ? note.content : "" });
     }
     return out;
+  }
+
+  /**
+   * Read the thread's loaded-PACK grant KEYS (threads-only Phase B′ —
+   * DESIGN-2026-06-29-threads-only.md §4). Resolves the SAME `metadata.loadout` note paths as
+   * {@link readThreadLoadout}, but reads each note's METADATA (+ tags) — NOT its content — to
+   * find the loaded notes that are PACKS: a note carrying the `#pack` tag AND a non-empty,
+   * cleanly-parsing `wants:`. Each such pack contributes its hub grant-holder key (the slugged
+   * PATH via {@link packPathKey}); the backend unions `listGrants(packKey)` for each with the
+   * def's own `listGrants(spec.name)`.
+   *
+   * THE SECURITY GATE: a loaded note's `wants:` is honored ONLY if the note is a `#pack`
+   * (`packWants` returns null for a non-pack note even when it declares `wants:`). So loading
+   * an arbitrary content note for context can NEVER add capabilities. This metadata read is
+   * DELIBERATELY a SEPARATE pass from the content-only {@link readThreadLoadout} (the prompt
+   * composition is unchanged — Phase A content-only), at the cost of re-reading the loadout
+   * notes' metadata.
+   *
+   * Skip-and-warn per path (mirrors the loadout discipline): a 404/renamed path or a read
+   * error on one note is skipped — never thrown — so one stale path can't brick a turn. No
+   * thread note / absent `metadata.loadout` / no pack with `wants:` → an empty array (every
+   * current thread). Keys are deduped (a pack listed twice yields one key). `subject` resolves
+   * the subject-scoped thread note (path math reuses {@link singleThreadedPath}).
+   */
+  async readThreadPackKeys(channel: string, name: string, subject?: string): Promise<string[]> {
+    const thread = await this.readThreadNote(this.singleThreadedPath(channel, name, subject));
+    if (!thread) return []; // no thread note yet (first turn) → no packs.
+    const paths = parseLoadoutPaths(thread.metadata?.loadout);
+    if (paths.length === 0) return [];
+    const keys: string[] = [];
+    const seen = new Set<string>();
+    for (const path of paths) {
+      let note: { metadata?: Record<string, unknown>; content?: string; tags?: unknown } | undefined;
+      try {
+        note = await this.readThreadNote(path);
+      } catch (err) {
+        console.warn(
+          `parachute-agent: pack-detect read for loadout note "${path}" failed (skipping): ${(err as Error).message}`,
+        );
+        continue;
+      }
+      if (!note) continue; // 404 — a stale/renamed loadout path. Skip (the loadout reader warns).
+      // THE SECURITY GATE: honor `wants:` ONLY when the note is a `#pack`. A non-pack note's
+      // `wants:` returns null here → never contributes a grant source.
+      const wants = packWants(note);
+      if (!wants) {
+        // Observability: a `#pack` note whose `wants:` is present but unparseable contributes
+        // nothing here (it injects nothing this turn). The reconcile path (POST /api/vault/pack)
+        // stamps `status:error` on save — that's the primary surface — but warn here too so an
+        // operator can diagnose "my pack stopped working" from the daemon log. A non-pack note
+        // (the gate) or a pack with no `wants:` is silent (expected, not an error).
+        if (
+          note.metadata?.wants !== undefined &&
+          note.metadata?.wants !== null &&
+          isPackNote(note) // only warn for PACKS with bad wants, never plain (gated-out) notes.
+        ) {
+          console.warn(
+            `parachute-agent: loaded pack "${path}" has an unusable wants: — contributing no grants ` +
+              `this turn (the pack-save reconcile stamps status:error; check the note's wants:).`,
+          );
+        }
+        continue;
+      }
+      const key = packPathKey(path);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      keys.push(key);
+    }
+    return keys;
   }
 
   // react / edit / download: vault has no reactions; v1 is reply-only. Omitted.

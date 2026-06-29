@@ -898,6 +898,27 @@ export function buildReadLoadout(
 }
 
 /**
+ * Build the {@link ProgrammaticAgentRegistry}'s pre-turn loaded-PACK grant-KEY read
+ * (threads-only Phase B′ — DESIGN-2026-06-29-threads-only.md §4). Resolves the channel's
+ * transport and reads the loaded `#pack` notes' grant keys (the slugged paths of the loadout
+ * notes that are `#pack`s declaring `wants:`) off the thread's `#agent/thread` note. The backend
+ * UNIONS each pack's APPROVED grants with the def's own (`spec.name`). Only the VaultTransport
+ * implements `readThreadPackKeys`; other transports omit it → no pack keys (the def's grants
+ * alone — legacy continuity). The SECURITY GATE (a non-pack note's `wants:` is ignored) lives in
+ * the transport resolver. Mirrors {@link buildReadLoadout}, but reads METADATA (pack-detection),
+ * not content (prompt).
+ */
+export function buildReadPackKeys(
+  channels: Map<string, Channel>,
+): (channel: string, name: string, subject?: string) => Promise<string[]> {
+  return async (channel, name, subject) => {
+    const ch = channels.get(channel);
+    if (!ch?.transport.readThreadPackKeys) return [];
+    return ch.transport.readThreadPackKeys(channel, name, subject);
+  };
+}
+
+/**
  * Build the REAL programmatic-agent registry — the {@link ProgrammaticBackend}
  * wired to the env-resolved spawn deps, plus the outbound-write + thread-note +
  * session-read seams over the live `channels`. The session UUID lives on the durable
@@ -960,6 +981,8 @@ export function createDefaultProgrammaticRegistry(
     // so the backend composes the arity-N system prompt. SUPERSEDES the never-wired
     // subjectDossier seam. Empty loadout (no metadata.loadout) → the def body alone.
     readLoadout: buildReadLoadout(channels),
+    // threads-only Phase B′: the pre-turn loaded-PACK grant-key read (union pack grants).
+    readPackKeys: buildReadPackKeys(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }
@@ -3126,6 +3149,66 @@ export function createFetchHandler(
           : undefined;
       const result = await agentDefs.reload(vault, noteId, event);
       return json({ ok: true, reloaded: result });
+    }
+
+    // ---------------------------------------------------------------------
+    // PACK grant-reconcile webhook — POST /api/vault/pack
+    // (threads-only Phase B′, DESIGN-2026-06-29-threads-only.md §4). A vault trigger on a
+    // `#pack` note created/updated POSTs here; we reconcile THAT pack's `wants:` under its
+    // path key (register each + prune its OWN partition). This is the PER-PACK reconcile —
+    // analogous to /api/vault/agent-def but keyed by the pack PATH, and it NEVER touches a
+    // def's grants or another pack's. Mirrors /api/vault/agent-def's auth (hub JWT, scope
+    // agent:send) + uniform-401 + vault resolution. Body: { event?, vault?, note: { id/path,
+    // metadata } }. A non-pack note / dropped-wants / parse-error is handled inside
+    // reconcilePack (prune-to-[] / status:error). Externally `<hub>/agent/api/vault/pack`.
+    // ---------------------------------------------------------------------
+    if (req.method === "POST" && url.pathname === "/api/vault/pack") {
+      const denied = await requireScope(req, url, SCOPE_SEND);
+      if (denied) return json({ error: "unauthorized" }, 401);
+      if (!agentDefs) {
+        // No def-vaults configured — nothing to reconcile. Clean ack.
+        return json({ ok: true, reconciled: "skipped" });
+      }
+      let body: {
+        event?: "created" | "updated" | "deleted";
+        vault?: string;
+        note?: { id?: string; path?: string; metadata?: Record<string, unknown> };
+      };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      const noteId =
+        typeof body.note?.id === "string" && body.note.id
+          ? body.note.id
+          : typeof body.note?.path === "string"
+            ? body.note.path
+            : undefined;
+      if (!noteId) {
+        return json({ error: "body must include note.id" }, 400);
+      }
+      // Resolve the source vault: the explicit `vault` field, else the sole configured
+      // def-vault (the single-vault default), else 400. (Identical to the agent-def path.)
+      let vault = typeof body.vault === "string" && body.vault ? body.vault : undefined;
+      if (!vault) {
+        const names = agentDefs.list();
+        const distinct = new Set([...names.map((d) => d.vault)]);
+        if (agentDefs.vaultCount === 1) {
+          vault = agentDefs.soleVaultName();
+        } else if (distinct.size === 1) {
+          vault = [...distinct][0];
+        }
+      }
+      if (!vault) {
+        return json({ error: "body.vault is required (multiple def-vaults configured)" }, 400);
+      }
+      const event =
+        body.event === "created" || body.event === "updated" || body.event === "deleted"
+          ? body.event
+          : undefined;
+      const result = await agentDefs.reconcilePack(vault, noteId, event);
+      return json({ ok: true, reconciled: result });
     }
 
     // ---------------------------------------------------------------------

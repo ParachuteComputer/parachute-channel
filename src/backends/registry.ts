@@ -554,6 +554,22 @@ export class ProgrammaticAgentRegistry {
     name: string,
     subject?: string,
   ) => Promise<LoadoutEntry[]>;
+  /**
+   * Optional pre-turn loaded-PACK grant-KEY read (threads-only Phase B′ —
+   * DESIGN-2026-06-29-threads-only.md §4). Resolves the SAME `metadata.loadout` paths as
+   * {@link readLoadout}, but reads the loaded notes' METADATA to find the `#pack` notes
+   * declaring `wants:`, returning each such pack's slugged-path grant key (`packPathKey`). Read
+   * in {@link drain} and passed to `deliver`, which UNIONS each pack's APPROVED grants with the
+   * def's own (`spec.name`). The SECURITY GATE (a non-pack note's `wants:` is ignored) lives in
+   * the resolver. SEPARATE from {@link readLoadout} so the prompt composition stays content-only
+   * (Phase A). UNWIRED / no pack with `wants:` → empty → the grant source set is exactly
+   * `[spec.name]` (legacy continuity — byte-identical injection for every current agent).
+   */
+  private readonly readPackKeys?: (
+    channel: string,
+    name: string,
+    subject?: string,
+  ) => Promise<string[]>;
   /** Base backoff (ms) between outbound retries (FIX 1). Injectable so tests run fast. */
   private readonly outboundRetryBaseMs: number;
 
@@ -580,6 +596,13 @@ export class ProgrammaticAgentRegistry {
      * alone, the no-loadout invariant). `subject` resolves the subject-scoped thread note.
      */
     readLoadout?: (channel: string, name: string, subject?: string) => Promise<LoadoutEntry[]>;
+    /**
+     * Read the thread's loaded-PACK grant KEYS (threads-only Phase B′) — the slugged paths of
+     * the loaded `#pack` notes that declare `wants:`. Optional — UNWIRED → no pack keys (the
+     * def's `spec.name` grants alone, legacy continuity). `subject` resolves the subject-scoped
+     * thread note.
+     */
+    readPackKeys?: (channel: string, name: string, subject?: string) => Promise<string[]>;
     /** Override the outbound-retry backoff base (ms). Default {@link OUTBOUND_RETRY_BASE_MS}. */
     outboundRetryBaseMs?: number;
   }) {
@@ -591,6 +614,7 @@ export class ProgrammaticAgentRegistry {
     if (deps.readSession) this.readSession = deps.readSession;
     if (deps.clearSession) this.clearSession = deps.clearSession;
     if (deps.readLoadout) this.readLoadout = deps.readLoadout;
+    if (deps.readPackKeys) this.readPackKeys = deps.readPackKeys;
     this.outboundRetryBaseMs = deps.outboundRetryBaseMs ?? OUTBOUND_RETRY_BASE_MS;
   }
 
@@ -1230,6 +1254,27 @@ export class ProgrammaticAgentRegistry {
         }
       }
 
+      // PACK GRANT KEYS (threads-only Phase B′ — DESIGN-2026-06-29-threads-only.md §4): resolve
+      // the loaded-PACK grant keys (the slugged paths of the loaded `#pack` notes declaring
+      // `wants:`) off the SAME thread note. The backend UNIONS each pack's APPROVED grants with
+      // the def's own (`spec.name`). SEPARATE metadata read from the content-only loadout (so the
+      // prompt composition is unchanged). The SECURITY GATE — a non-pack note's `wants:` is
+      // ignored — lives in the resolver. UNWIRED / no pack with `wants:` (every current thread)
+      // → empty → the grant sources are exactly `[spec.name]` (legacy continuity, byte-identical
+      // injection). Best-effort: a read failure logs + the turn injects the def's grants alone.
+      let packKeys: string[] = [];
+      if (this.readPackKeys) {
+        try {
+          packKeys = await this.readPackKeys(handle.channel, handle.spec.name, turnSubject);
+        } catch (err) {
+          console.error(
+            `parachute-agent: pack-key read for channel "${channel}"` +
+              (turnSubject ? ` subject "${turnSubject}"` : "") +
+              ` failed (turn injects the def's grants alone): ${(err as Error).message}`,
+          );
+        }
+      }
+
       let result;
       try {
         // Forward each interim event to the streaming-view sink (keyed by channel)
@@ -1254,6 +1299,10 @@ export class ProgrammaticAgentRegistry {
           // subjects of one agent never clobber each other's per-turn `.mcp.json` /
           // `system-prompt.txt` / HOME. Undefined → `sessions/<name>/` (HEAD, unchanged).
           turnSubject,
+          // threads-only Phase B′: the loaded-PACK grant keys — the backend unions each pack's
+          // APPROVED grants with the def's own (`spec.name`). Empty (every current thread) →
+          // the grant sources are exactly `[spec.name]` (legacy continuity, byte-identical).
+          packKeys,
         );
       } catch (err) {
         // The backend contract is failure-as-VALUE, never a throw — but defend so a

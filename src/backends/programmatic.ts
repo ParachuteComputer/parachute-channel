@@ -76,7 +76,7 @@ import {
 } from "../mint-token.ts";
 import { buildAgentMcpConfigJson, vaultEntryKey } from "../agent-mcp-config.ts";
 import { resolveClaudeCredential, resolveChannelEnv } from "../credentials.ts";
-import { resolveInjectedGrants, type GrantsClient } from "../grants.ts";
+import { resolveInjectedGrantsUnion, type GrantsClient } from "../grants.ts";
 import { parseStreamJsonStream } from "./stream-json.ts";
 import { composeSystemPrompt } from "./types.ts";
 import type {
@@ -177,13 +177,17 @@ export interface ProgrammaticBackendDeps {
    */
   grants?: GrantsClient | null;
   /**
-   * The agent NAME used to key the agent's grants on the hub (`GET
-   * /admin/grants?agent=<name>`). Defaults to `spec.name` when absent. The grants are
-   * keyed by the agent name (= the def's name), which equals `spec.name` for a
-   * vault-native agent. Threaded explicitly so a future channel/agent-name split
-   * doesn't silently fetch the wrong agent's grants.
+   * The LEGACY-def grant KEY — the hub grant-holder string for the def's OWN grants
+   * (`GET /admin/grants?agent=<key>`). Defaults to `spec.name` when absent (= the def's
+   * `metadata.name`, the legacy continuity key — the 4 live def agents inject exactly
+   * `listGrants(spec.name)`). Renamed from `grantsAgentName` (threads-only Phase B′ —
+   * the locked lexicon drops the "agent" framing). It is the DORMANT per-thread override
+   * escape hatch: the PRIMARY grant path is the loadout-pack UNION (see `deliver` /
+   * resolveInjectedGrantsUnion), NOT this single key. Do NOT set it unless a thread
+   * genuinely needs creds keyed off something other than its def name (the rare per-thread
+   * override + the migration seam) — else you'd fetch the wrong source's grants.
    */
-  grantsAgentName?: string;
+  grantsKey?: string;
   /**
    * The subprocess spawner — runs the sandbox-wrapped `claude -p`. Tests inject a
    * fake that emits canned stream-json; the daemon uses the real Bun.spawn adapter.
@@ -446,6 +450,7 @@ export class ProgrammaticBackend implements AgentBackend {
     runContext?: RunContext,
     loadout?: LoadoutEntry[],
     subject?: string,
+    packKeys?: string[],
   ): Promise<DeliverResult> {
     const spec = handle.spec;
     if (!spec) {
@@ -528,22 +533,37 @@ export class ProgrammaticBackend implements AgentBackend {
     let grantMcpEntries: { name: string; url: string; token: string }[] = [];
     let grantEnv: Record<string, string> = {};
     if (this.deps.grants) {
-      // The grants are keyed on the hub by the AGENT name, which for vault-native defs
-      // is `spec.name`. `grantsAgentName` is an explicit override reserved for a future
-      // channel-name≠agent-name split; today no caller sets it, so it falls through to
-      // `spec.name` — do NOT set it unless that split lands (else you'd fetch the wrong
-      // agent's grants).
-      const agentName = this.deps.grantsAgentName ?? spec.name;
+      // GRANT INJECTION = UNION OF SOURCES (threads-only Phase B′ — §4). The injected
+      // grants for a turn are the union of:
+      //   1. the LEGACY def key — `grantsKey ?? spec.name` (UNCHANGED): a
+      //      `#agent/definition` keeps its grants keyed by its `metadata.name`. For the 4
+      //      live def agents (uni/steward/uni-evolve/eco-civilization) this is the only
+      //      source. `grantsKey` (was `grantsAgentName`) is the dormant per-thread override
+      //      escape hatch (§"Activate the dormant hook") — today no caller sets it, so it
+      //      falls through to `spec.name`. Do NOT make it the primary path; the primary is
+      //      this union.
+      //   2. each loaded PACK's path key (`packKeys`) — the slugged PATH (packPathKey) of
+      //      every loaded note in the thread's loadout that is a `#pack` declaring `wants:`.
+      //      The SECURITY GATE (a non-pack note's `wants:` is ignored) is enforced UPSTREAM
+      //      where packKeys is built (the transport's readThreadPackKeys), so a plain
+      //      content note's `wants:` never reaches here. Empty packKeys (every current
+      //      agent — no thread loads a `#pack` with `wants:` today) → the union is exactly
+      //      `[spec.name]` → BYTE-IDENTICAL to the legacy single-source path. (legacy continuity)
+      const legacyKey = this.deps.grantsKey ?? spec.name;
+      const sources = [legacyKey, ...(packKeys ?? [])];
       try {
-        const injected = await resolveInjectedGrants(this.deps.grants, agentName);
+        const injected = await resolveInjectedGrantsUnion(this.deps.grants, sources);
         grantMcpEntries = injected.mcpEntries;
         grantEnv = injected.env;
       } catch (err) {
-        // A failed grant LIST aborts only the cross-resource injection — the turn
-        // still runs with own-vault. (A revoked-mid-list / hub blip class.)
+        // resolveInjectedGrantsUnion is per-source best-effort (each source's list failure
+        // is logged + skipped inside it), so this catch is defense-in-depth — a surprise
+        // throw aborts only the cross-resource injection; the turn still runs with own-vault.
         console.warn(
-          `parachute-agent: resolving grants for "${agentName}" failed (running this turn ` +
-            `WITHOUT cross-resource grants — own-vault unaffected): ${(err as Error).message}`,
+          `parachute-agent: resolving grants for "${legacyKey}"` +
+            (packKeys && packKeys.length > 0 ? ` (+${packKeys.length} pack source(s))` : "") +
+            ` failed (running this turn WITHOUT cross-resource grants — own-vault unaffected): ` +
+            `${(err as Error).message}`,
         );
       }
     }

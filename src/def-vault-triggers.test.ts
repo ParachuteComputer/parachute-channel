@@ -88,12 +88,27 @@ describe("buildDefVaultTriggers — the bare-keyed shapes", () => {
     return t;
   }
 
-  test("emits exactly three triggers: def-watch create, def-watch edit, inbound", () => {
+  test("emits five triggers: def-watch create/edit, inbound, pack-watch create/edit", () => {
     expect(triggers.map((t) => t.name)).toEqual([
       "conn_agentdefs-create-default",
       "conn_agentdefs-edit-default",
       "conn_agentinbound-default",
+      // threads-only Phase B′ — the per-pack reconcile triggers.
+      "conn_packs-create-default",
+      "conn_packs-edit-default",
     ]);
+  });
+
+  test("pack-watch triggers are bare `pack`-keyed and webhook the pack reconcile endpoint", () => {
+    for (const name of ["conn_packs-create-default", "conn_packs-edit-default"]) {
+      const t = byName(name);
+      expect(t.when.tags).toEqual(["pack"]);
+      expect(t.action.webhook).toBe(`${HUB}/agent/api/vault/pack`);
+      expect(t.action.send).toBe("json");
+      expect(t.action.auth?.bearer).toBe("BEARER");
+    }
+    expect(byName("conn_packs-create-default").events).toEqual(["created"]);
+    expect(byName("conn_packs-edit-default").events).toEqual(["updated"]);
   });
 
   test("def-watch triggers are BARE-keyed (agent/definition, NOT #agent/definition)", () => {
@@ -146,7 +161,7 @@ describe("buildDefVaultTriggers — the bare-keyed shapes", () => {
 });
 
 describe("registerDefVaultTriggers — the live registration path", () => {
-  test("mints agent:send + vault:<v>:admin, POSTs all three triggers with the admin bearer", async () => {
+  test("mints agent:send + vault:<v>:admin, POSTs all five triggers with the admin bearer", async () => {
     const { fetchFn, mintCalls, triggerCalls } = fakeFetch();
     const result = await registerDefVaultTriggers(BINDING, {
       hubOrigin: HUB,
@@ -158,14 +173,16 @@ describe("registerDefVaultTriggers — the live registration path", () => {
     expect(mintCalls.map((c) => c.scope).sort()).toEqual(["agent:send", "vault:default:admin"]);
     for (const c of mintCalls) expect(c.auth).toBe("Bearer OP-BEARER");
 
-    // All three triggers registered, posted to the vault's triggers API.
+    // All five triggers registered, posted to the vault's triggers API.
     expect(result.failures).toEqual([]);
     expect(result.registered).toEqual([
       "conn_agentdefs-create-default",
       "conn_agentdefs-edit-default",
       "conn_agentinbound-default",
+      "conn_packs-create-default",
+      "conn_packs-edit-default",
     ]);
-    expect(triggerCalls).toHaveLength(3);
+    expect(triggerCalls).toHaveLength(5);
     for (const c of triggerCalls) {
       expect(c.url).toBe("http://127.0.0.1:1940/vault/default/api/triggers");
       // The ADMIN token (not the write token) authenticates the triggers POST.
@@ -227,9 +244,9 @@ describe("registerDefVaultTriggers — the live registration path", () => {
       managerBearer: "OP-BEARER",
       fetchFn,
     });
-    expect(triggerCalls).toHaveLength(3); // all three attempted
+    expect(triggerCalls).toHaveLength(5); // all five attempted
     expect(result.registered).toEqual([]);
-    expect(result.failures).toHaveLength(3);
+    expect(result.failures).toHaveLength(5);
     for (const f of result.failures) expect(f).toContain("HTTP 403");
   });
 
@@ -257,10 +274,11 @@ describe("registerAllDefVaultTriggers — fan-out over bindings", () => {
     );
     expect(results.map((r) => r.vault)).toEqual(["default", "work"]);
     expect(results.every((r) => r.failures.length === 0)).toBe(true);
-    // 3 triggers × 2 vaults.
-    expect(triggerCalls).toHaveLength(6);
+    // 5 triggers × 2 vaults.
+    expect(triggerCalls).toHaveLength(10);
     const names = new Set(triggerCalls.map((c) => c.body.name));
     expect(names.has("conn_agentdefs-create-work")).toBe(true);
     expect(names.has("conn_agentinbound-default")).toBe(true);
+    expect(names.has("conn_packs-create-work")).toBe(true);
   });
 });

@@ -676,6 +676,75 @@ describe("ProgrammaticBackend.deliver — composed system prompt (threads-only P
     );
   });
 
+  test("THREAD CONTENT composes BETWEEN the def and the loadout: [self, thread-content, ...loadout]", async () => {
+    mkDirs("compose-thread-content");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-TC1", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/uni", "eng"));
+
+    // deliver with a loadout (7th param) AND a threadContent (10th param).
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-TC1"),
+      undefined,
+      undefined,
+      undefined,
+      [{ path: "Skills/Weave", content: "Skill body." }],
+      undefined,
+      undefined,
+      { path: "Threads/eng/uni", content: "This thread's standing mandate." },
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Agents/uni\n\n${ROLE}` +
+        `\n\n---\n\n# Threads/eng/uni\n\nThis thread's standing mandate.` +
+        `\n\n---\n\n# Skills/Weave\n\nSkill body.`,
+    );
+  });
+
+  test("NO thread content (undefined) → [self, ...loadout], unchanged (the no-thread-content invariant)", async () => {
+    mkDirs("compose-no-thread-content");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-TC2", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/uni", "eng"));
+
+    // A loadout but NO threadContent (10th param omitted) → def + loadout only.
+    await backend.deliver(handle, "go", createSession("sess-TC2"), undefined, undefined, undefined, [
+      { path: "Skills/Weave", content: "Skill body." },
+    ]);
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Agents/uni\n\n${ROLE}\n\n---\n\n# Skills/Weave\n\nSkill body.`,
+    );
+  });
+
+  test("BLANK thread content → skipped (treated as no thread content); the prompt is the def alone", async () => {
+    mkDirs("compose-blank-thread-content");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-TC3", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/uni", "eng"));
+
+    // A whitespace-only thread content + no loadout → byte-identical to the no-loadout invariant.
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-TC3"),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { path: "Threads/eng/uni", content: "   \n\t  " },
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(`# Agents/uni\n\n${ROLE}`);
+  });
+
   test("no spec.systemPrompt + a loadout → NO system-prompt file (the role-less case is unchanged)", async () => {
     mkDirs("compose-noprompt");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-CP4", "ok") });

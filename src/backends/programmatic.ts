@@ -451,6 +451,7 @@ export class ProgrammaticBackend implements AgentBackend {
     loadout?: LoadoutEntry[],
     subject?: string,
     packKeys?: string[],
+    threadContent?: LoadoutEntry,
   ): Promise<DeliverResult> {
     const spec = handle.spec;
     if (!spec) {
@@ -617,15 +618,17 @@ export class ProgrammaticBackend implements AgentBackend {
     // robust to long/multiline prompts and keeps the prompt visible-on-disk. Its
     // lifecycle is tied to the workspace (like .mcp.json) — it disappears with it.
     //
-    // COMPOSED PROMPT (threads-only Phase A — DESIGN-2026-06-29-threads-only.md §1/§9):
-    // the system prompt is an ORDERED LIST of loaded notes — a direct arity-N generalization
-    // of the rc.13 arity-2 `roleBody [+ dossier]` seam. Entry 0 is the thread's SELF entry:
-    // the spec's `systemPrompt` (the def body), labeled with the def note's human-legible
-    // PATH (`spec.definitionPath`, e.g. `Agents/steward`; fallback `spec.name`). Entries
-    // 1..N are the resolved `loadout` notes (read CONTENT-only, never metadata).
-    // composeSystemPrompt dedupes by path, skips blank entries, renders each as
-    // `# <path>\n\n<content>`, joins with `\n\n---\n\n`, and enforces the byte budget
-    // (truncate loadout-notes-first, NEVER the self entry).
+    // COMPOSED PROMPT (threads-only Phase A — DESIGN-2026-06-29-threads-only.md §1/§9; thread
+    // content — DESIGN-2026-06-29-thread-content-and-skills.md): the system prompt is an ORDERED
+    // LIST of loaded notes — a direct arity-N generalization of the rc.13 arity-2 `roleBody
+    // [+ dossier]` seam. Entry 0 is the thread's SELF entry: the spec's `systemPrompt` (the def
+    // body), labeled with the def note's human-legible PATH (`spec.definitionPath`, e.g.
+    // `Agents/steward`; fallback `spec.name`). Entry 1 (when present) is THIS thread's CONTENT —
+    // the thread note's authored body, its per-thread standing mandate. Entries 2..N are the
+    // resolved `loadout` notes (read CONTENT-only, never metadata). composeSystemPrompt dedupes
+    // by path, skips blank entries, renders each as `# <path>\n\n<content>`, joins with
+    // `\n\n---\n\n`, and enforces the byte budget (truncate the LOADOUT TAIL first, NEVER the
+    // def or the thread content — the PROTECTED leading prefix).
     //
     // #169 — the self-entry header uses the def note's PATH, NOT its id. The note ID is a
     // timestamp-slug (`2026-06-20-07-30-56-487050`); the legible loadout path is
@@ -633,10 +636,11 @@ export class ProgrammaticBackend implements AgentBackend {
     // `note.path`); when absent (a spec not sourced from a def note, or a reader that didn't
     // surface a path) the header falls back to `spec.name`.
     //
-    // NO-LOADOUT INVARIANT (the live 4am steward weave path): a thread with NO loadout
-    // composes to EXACTLY `# <path>\n\n<def body>` — `<def body>` byte-identical to
-    // `spec.systemPrompt`. The single `# <path>` header is the ONLY change to a no-loadout
-    // prompt (design decision #4, accepted). The run-context preamble stays on the MESSAGE.
+    // NO-LOADOUT / NO-THREAD-CONTENT INVARIANT (the live 4am steward weave path): a thread with
+    // NO loadout AND no authored thread content composes to EXACTLY `# <path>\n\n<def body>` —
+    // `<def body>` byte-identical to `spec.systemPrompt`. The single `# <path>` header is the
+    // ONLY change to such a prompt (design decision #4, accepted). The run-context preamble
+    // stays on the MESSAGE.
     let systemPromptFile: string | undefined;
     if (typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0) {
       // Self entry: the def body, labeled by the def note's PATH (`spec.definitionPath`);
@@ -646,11 +650,21 @@ export class ProgrammaticBackend implements AgentBackend {
         typeof spec.definitionPath === "string" && spec.definitionPath.length > 0
           ? spec.definitionPath
           : spec.name;
+      // The thread-content entry sits BETWEEN the self entry and the loadout. Include it only
+      // when it carries real (non-blank) content — a blank thread note is the no-thread-content
+      // case. Gate the inclusion AND the protected-prefix count on the SAME non-blank check, so
+      // composeSystemPrompt's protected prefix (def [+ thread content]) stays exactly aligned
+      // with the entries actually inserted (a blank entry would be skipped, shifting the prefix).
+      const hasThreadContent =
+        !!threadContent && typeof threadContent.content === "string" && threadContent.content.trim().length > 0;
       const entries: LoadoutEntry[] = [
         { path: selfPath, content: spec.systemPrompt },
+        ...(hasThreadContent ? [threadContent!] : []),
         ...(loadout ?? []),
       ];
-      const composed = composeSystemPrompt(entries);
+      // Protect the def (always) and the thread content (when present) from budget truncation —
+      // both are load-bearing; only the loadout tail (entries beyond the prefix) sheds.
+      const composed = composeSystemPrompt(entries, { protectedCount: hasThreadContent ? 2 : 1 });
       systemPromptFile = join(workspace, "system-prompt.txt");
       writeFileSync(systemPromptFile, composed, { mode: 0o600 });
     }

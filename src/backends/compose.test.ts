@@ -118,3 +118,75 @@ describe("composeSystemPrompt — byte budget", () => {
     expect(LOADOUT_BUDGET_BYTES).toBe(600_000);
   });
 });
+
+describe("composeSystemPrompt — protectedCount (the def + thread-content protected prefix)", () => {
+  test("protectedCount=2 protects BOTH leading entries (def + thread content), tail-drops only the loadout (index ≥2)", () => {
+    // The shape the backend builds: [self(def), thread-content, ...loadout].
+    const self = { path: "Agents/uni", content: "DEF-" + "d".repeat(200) };
+    const threadContent = { path: "Threads/eng/uni", content: "THREAD-" + "t".repeat(200) };
+    const big = (p: string) => ({ path: p, content: p + "-" + "x".repeat(400) });
+    const warnings: string[] = [];
+    // Budget fits the two protected entries but not the loadout notes.
+    const budget = 600;
+    const out = composeSystemPrompt([self, threadContent, big("n1"), big("n2")], {
+      budgetBytes: budget,
+      protectedCount: 2,
+      onWarn: (m) => warnings.push(m),
+    });
+    // BOTH protected entries survive in full, in order (def first, thread content second).
+    expect(out).toBe(`# ${self.path}\n\n${self.content}\n\n---\n\n# ${threadContent.path}\n\n${threadContent.content}`);
+    // The loadout tail was shed (over budget), with a loud warn naming the dropped notes.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("over budget");
+    expect(warnings[0]).toContain("n1");
+    expect(warnings[0]).toContain("n2");
+    // The warn names neither the def nor the thread content.
+    expect(warnings[0]).not.toContain("Agents/uni");
+    expect(warnings[0]).not.toContain("Threads/eng/uni");
+  });
+
+  test("protectedCount=2 keeps BOTH protected entries even when their COMBINED size alone exceeds the budget", () => {
+    const self = { path: "self", content: "S".repeat(1000) };
+    const threadContent = { path: "thread", content: "T".repeat(1000) };
+    const warnings: string[] = [];
+    const out = composeSystemPrompt([self, threadContent, { path: "n1", content: "x".repeat(50) }], {
+      budgetBytes: 100, // smaller than even the protected prefix
+      protectedCount: 2,
+      onWarn: (m) => warnings.push(m),
+    });
+    // Both protected entries are preserved whole — the no-truncate-prefix guarantee outweighs the cap.
+    expect(out).toBe(`# ${self.path}\n\n${self.content}\n\n---\n\n# ${threadContent.path}\n\n${threadContent.content}`);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("n1");
+  });
+
+  test("the thread-content entry renders BETWEEN the def and the loadout (ordered prefix)", () => {
+    const out = composeSystemPrompt(
+      [
+        { path: "Agents/uni", content: "def body" },
+        { path: "Threads/eng/uni", content: "thread mandate" },
+        { path: "Skills/Weave", content: "skill body" },
+      ],
+      { protectedCount: 2 },
+    );
+    expect(out).toBe(
+      "# Agents/uni\n\ndef body" +
+        "\n\n---\n\n# Threads/eng/uni\n\nthread mandate" +
+        "\n\n---\n\n# Skills/Weave\n\nskill body",
+    );
+  });
+
+  test("protectedCount defaults to 1 — only the self entry is protected (the no-thread-content path)", () => {
+    const self = { path: "self", content: "S".repeat(500) };
+    const big = (p: string) => ({ path: p, content: p + "-" + "x".repeat(400) });
+    const warnings: string[] = [];
+    // No protectedCount → default 1. Over budget → only self survives; the loadout sheds.
+    const out = composeSystemPrompt([self, big("n1"), big("n2")], {
+      budgetBytes: 600,
+      onWarn: (m) => warnings.push(m),
+    });
+    expect(out).toBe(`# ${self.path}\n\n${self.content}`);
+    expect(warnings[0]).toContain("n1");
+    expect(warnings[0]).toContain("n2");
+  });
+});

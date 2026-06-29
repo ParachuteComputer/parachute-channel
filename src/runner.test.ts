@@ -473,7 +473,6 @@ describe("Runner — a scheduled fire honors the def's mode", () => {
     expect(threads.ends()).toHaveLength(1);
     expect(threads.ends()[0]!.mode).toBe("multi-threaded");
     expect(threads.ends()[0]!.status).toBe("ok");
-    expect(threads.ends()[0]!.input).toBe("run the digest");
   });
 
   test("REGRESSION: a SINGLE-THREADED def's scheduled fire RESUMES the thread + materializes ONE thread note", async () => {

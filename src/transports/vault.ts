@@ -382,63 +382,6 @@ export function parseLoadoutPaths(v: unknown): string[] {
 }
 
 /**
- * Build the `#agent/thread` note BODY — the rolling SUMMARY of the thread (design
- * 2026-06-18: "hold a summary of this thread in the content; maybe another agent
- * facilitates that"). The MODULE writes a useful default, STRUCTURED (`## Summary` /
- * `## Latest turn`) so the `## Summary` section is the slot a future summarizer agent is
- * EARMARKED to own/enrich; the `## Latest turn` block + the metadata roll-up are always
- * module-owned. The same shape serves both modes (multi-threaded = one turn).
- *
- * v1 LIMITATION — the module OVERWRITES the `## Summary` section every turn. This function
- * REGENERATES the whole body from scratch using only the rolled-up aggregates (passed in
- * from `prior.metadata`); it NEVER reads `prior.content`. So a summarizer agent's
- * enrichment of `## Summary` would be CLOBBERED on the next turn. Summarizer-agent
- * enrichment needs a read-prior-content → merge path (preserve a summarizer-owned section
- * across the regenerate), which is DEFERRED. Until then, "may own" means EARMARKED, not
- * PRESERVED.
- */
-function buildThreadSummaryBody(t: {
-  name: string;
-  mode: string;
-  turnCount: number;
-  status: "ok" | "error" | "working";
-  lastTurnAt: string;
-  input: string;
-  output: string;
-}): string {
-  const turns = t.turnCount === 1 ? "1 turn" : `${t.turnCount} turns`;
-  // `## Summary` is EARMARKED for a future summarizer agent — but v1 OVERWRITES it every
-  // turn (this body is fully regenerated from metadata; `prior.content` is never read), so
-  // it's a module-owned default for now, NOT a preserved slot (see the function doc).
-  // The `## Latest turn` block + the metadata roll-up are always module-owned.
-  //
-  // WORKING (the thread-as-container start-ensure, before the turn finishes): show the input
-  // and a clear "awaiting reply" state — NEVER print a fake reply. The thread is visible the
-  // moment processing starts; the end-record overwrites this body with the real ok/error
-  // reply once the turn completes.
-  if (t.status === "working") {
-    // No turn has COMPLETED yet, so don't print a (confusing) "0 turns" count — the prior
-    // completed count rides in the metadata for queries; the body just says it's working.
-    const priorTurns = t.turnCount === 0 ? "first turn" : `${turns} so far`;
-    const auto = `${t.mode} thread for ${t.name} — working on the ${t.turnCount === 0 ? "first turn" : "next turn"} (${priorTurns}, awaiting reply).`;
-    return (
-      `## Summary\n\n${auto}\n\n` +
-      `## Latest turn\n\n` +
-      `**Input:** ${t.input}\n\n` +
-      `**Status:** working — awaiting reply.\n`
-    );
-  }
-  const auto = `${t.mode} thread for ${t.name} — ${turns}, last ${t.status} at ${t.lastTurnAt}.`;
-  const turnHeading = t.status === "ok" ? "Reply" : "Error";
-  return (
-    `## Summary\n\n${auto}\n\n` +
-    `## Latest turn\n\n` +
-    `**Input:** ${t.input}\n\n` +
-    `**${turnHeading}:** ${t.output}\n`
-  );
-}
-
-/**
  * The module-owned root namespace tag. Declared (with the three children rolling up
  * to it via `parent_names`) so a human `tag:#agent` query expands to EVERYTHING the
  * module owns — definitions, messages, jobs. The module itself never queries by this
@@ -906,9 +849,12 @@ export class VaultTransport implements Transport {
    * Materialize a `#agent/thread` note for ONE completed turn — the UNIFIED model
    * (`definition -> thread -> message`). Written for BOTH execution-lifecycle modes
    * (the structural unification): EVERYTHING is a thread, a "run" was always a thread
-   * with one turn. The note BODY is a rolling SUMMARY of the thread; the metadata is the
-   * thread state. The INDEXED fields (`status`/`definition`/`mode`) make threads
-   * operator-queryable. This note carries `['#agent/thread']` EXACTLY — NOT a
+   * with one turn. This write touches METADATA ONLY (the thread state); the note BODY is
+   * the thread's per-thread standing CONTEXT, AUTHORED by a human/agent and NEVER written
+   * by the daemon (DESIGN-2026-06-29-thread-content-and-skills.md) — the note is created
+   * with EMPTY content when missing and its content is PRESERVED untouched on every later
+   * upsert (the PATCH omits `content`). The INDEXED fields (`status`/`definition`/`mode`)
+   * make threads operator-queryable. This note carries `['#agent/thread']` EXACTLY — NOT a
    * `#agent/message`, NO inbound child — so it can never wake a session (no loop).
    *
    * The MODE governs the thread's IDENTITY + whether it upserts:
@@ -1055,22 +1001,20 @@ export class VaultTransport implements Transport {
       if (costUsd) metadata.total_cost_usd = String(Math.round(costUsd * 1e9) / 1e9);
     }
 
-    const body = buildThreadSummaryBody({
-      name: thread.name ?? thread.channel,
-      mode: thread.mode,
-      turnCount,
-      status: thread.status,
-      lastTurnAt,
-      input: thread.input,
-      output: thread.output,
-    });
-
+    // CONTENT = the thread's per-thread standing context, AUTHORED by a human/agent — an INPUT
+    // to the prompt, NOT a module-generated summary (DESIGN-2026-06-29-thread-content-and-skills.md).
+    // The daemon NEVER writes or overwrites it: this PATCH omits `content` entirely, so the
+    // vault CREATES the note with EMPTY content when missing (its create branch defaults
+    // `content ?? ""`) and PRESERVES the existing content untouched on every later upsert (its
+    // update branch only touches `content` when the body carries it). The thread body is read
+    // back CONTENT-only and composed into the system prompt via `readThreadContent`.
+    //
     // Upsert by path via PATCH + `if_missing: "create"` (vault#309) — NOT POST. POST
     // /api/notes 409s `path_conflict` on an existing path (it does not upsert), so a
     // single-threaded thread note would create on turn 1 and 409 on every turn after.
     // PATCH-by-path is the real upsert: the vault resolves the (decoded) path, UPDATES it
-    // when present (single-threaded turn 2+: content replaced, metadata merged) or CREATES
-    // it when missing (turn 1, and every multi-threaded fresh-uuid fire). `force: true`
+    // when present (single-threaded turn 2+: metadata merged, content left as authored) or
+    // CREATES it when missing (turn 1, and every multi-threaded fresh-uuid fire). `force: true`
     // satisfies the vault's 428 mutation precondition (mirrors `setInboundStatus`). The
     // path is one URL segment (percent-encoded `/`); the route `decodeURIComponent`s it.
     // The `tags` array is consumed ONLY by the create branch. VERIFIED against the vault
@@ -1087,7 +1031,6 @@ export class VaultTransport implements Transport {
         authorization: `Bearer ${this.token}`,
       },
       body: JSON.stringify({
-        content: body,
         path,
         tags: [AGENT_THREAD_TAG],
         metadata,
@@ -1186,6 +1129,35 @@ export class VaultTransport implements Transport {
       const detail = await res.text().catch(() => "");
       throw new Error(`vault transport: clear thread session failed (${res.status}) ${detail}`.trim());
     }
+  }
+
+  /**
+   * Read the thread's own CONTENT — its per-thread standing context
+   * (DESIGN-2026-06-29-thread-content-and-skills.md). The thread note's authored BODY (CONTENT
+   * only — NEVER metadata) becomes the prompt entry BETWEEN the def and the loadout. `subject`
+   * resolves the subject-scoped thread note; omitted → the def-named note (HEAD). The path math
+   * reuses {@link singleThreadedPath}, so it agrees with writeThread / readThreadSession /
+   * readThreadLoadout.
+   *
+   * Returns `{ path, content }` ONLY when the note exists AND carries non-blank content (the
+   * path is the thread-note path, the composer's `# <path>` header). No thread note yet (404,
+   * the first turn before the start-ensure has run / a per-fire thread with no def-named note)
+   * OR blank/whitespace content → `undefined` (the no-thread-content case: the prompt is
+   * `[self, ...loadout]`, unchanged). Best-effort: a network blip surfaces as `undefined` (via
+   * {@link readThreadNote}, which logs it); an UNEXPECTED non-404 read error propagates to the
+   * registry's try/catch (the turn runs with the def body alone).
+   */
+  async readThreadContent(
+    channel: string,
+    name: string,
+    subject?: string,
+  ): Promise<{ path: string; content: string } | undefined> {
+    const path = this.singleThreadedPath(channel, name, subject);
+    const thread = await this.readThreadNote(path);
+    if (!thread) return undefined; // no thread note yet → no authored content.
+    const content = typeof thread.content === "string" ? thread.content : "";
+    if (content.trim().length === 0) return undefined; // blank body → no thread content.
+    return { path, content };
   }
 
   /**

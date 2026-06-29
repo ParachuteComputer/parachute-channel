@@ -287,8 +287,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       definition: "Agents/digest",
       mode: "multi-threaded",
       status: "ok",
-      input: "run the daily digest",
-      output: "digest complete: 3 items",
       started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:12.000Z",
       usage: { inputTokens: 100, outputTokens: 40, totalCostUsd: 0.002 },
@@ -309,7 +307,7 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect((call.init.headers as Record<string, string>).authorization).toBe("Bearer write-token-xyz");
 
     const sent = JSON.parse(String(call.init.body)) as {
-      content: string;
+      content?: string;
       path: string;
       tags: string[];
       metadata: Record<string, string>;
@@ -339,11 +337,9 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(sent.metadata.input_tokens).toBe("100");
     expect(sent.metadata.output_tokens).toBe("40");
     expect(sent.metadata.total_cost_usd).toBe("0.002");
-    // The body is a rolling SUMMARY with the two documented sections.
-    expect(sent.content).toContain("## Summary");
-    expect(sent.content).toContain("## Latest turn");
-    expect(sent.content).toContain("run the daily digest");
-    expect(sent.content).toContain("digest complete: 3 items");
+    // METADATA-ONLY WRITE: the daemon NEVER writes the thread body — `content` is omitted from
+    // the PATCH, so the vault creates-empty / preserves any authored thread content.
+    expect("content" in sent).toBe(false);
     // Multi-threaded path leaf is a fresh uuid under Threads/<channel>/.
     expect(sent.path.startsWith("Threads/eng/")).toBe(true);
   });
@@ -374,8 +370,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       name: "eng",
       mode: "single-threaded",
       status: "ok",
-      input: "hello",
-      output: "hi there",
       started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z",
       usage: { inputTokens: 10, outputTokens: 5 },
@@ -392,7 +386,7 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       path: string;
       tags: string[];
       metadata: Record<string, string>;
-      content: string;
+      content?: string;
       if_missing: string;
       force: boolean;
     };
@@ -404,8 +398,8 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(sent.metadata.turn_count).toBe("1"); // first turn (no prior).
     expect(sent.metadata.started_at).toBe("2026-06-18T07:00:00.000Z");
     expect(sent.metadata.last_turn_at).toBe("2026-06-18T07:00:05.000Z");
-    expect(sent.content).toContain("## Summary");
-    expect(sent.content).toContain("single-threaded thread for eng");
+    // METADATA-ONLY WRITE: no `content` in the PATCH (the daemon never writes the thread body).
+    expect("content" in sent).toBe(false);
   });
 
   test("SINGLE-THREADED over TWO turns: same deterministic path, turn_count==2, summed usage, preserved started_at", async () => {
@@ -435,8 +429,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       name: "eng",
       mode: "single-threaded",
       status: "ok",
-      input: "turn one",
-      output: "reply one",
       started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z",
       usage: { inputTokens: 10, outputTokens: 5, totalCostUsd: 0.001 },
@@ -448,8 +440,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       name: "eng",
       mode: "single-threaded",
       status: "ok",
-      input: "turn two",
-      output: "reply two",
       started_at: "2026-06-18T08:00:00.000Z", // a LATER start — must NOT overwrite the first.
       ended_at: "2026-06-18T08:00:09.000Z",
       usage: { inputTokens: 20, outputTokens: 8, totalCostUsd: 0.002 },
@@ -463,10 +453,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(stored!.metadata.total_cost_usd).toBe("0.003"); // 0.001 + 0.002
     expect(stored!.metadata.started_at).toBe("2026-06-18T07:00:00.000Z"); // first turn's, preserved.
     expect(stored!.metadata.last_turn_at).toBe("2026-06-18T08:00:09.000Z"); // latest turn.
-    // The body's summary reflects 2 turns + the latest turn's content.
-    expect(stored!.content).toContain("2 turns");
-    expect(stored!.content).toContain("turn two");
-    expect(stored!.content).toContain("reply two");
   });
 
   test("SINGLE-THREADED re-record of the SAME turn (sameTurn) flips status WITHOUT double-counting turn_count (PR #3 FIX 1)", async () => {
@@ -492,19 +478,18 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     await t.start(fakeCtx("eng"));
     await t.writeThread({
       channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
-      input: "q", output: "a", started_at: "2026-06-18T07:00:00.000Z",
+      started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z", threadId: "t1",
     });
     expect(stored!.metadata.turn_count).toBe("1");
     // Re-record the SAME turn as error (outbound delivery failed). sameTurn → no increment.
     await t.writeThread({
       channel: "eng", name: "eng", mode: "single-threaded", status: "error",
-      input: "q", output: "reply produced but NOT delivered", started_at: "2026-06-18T07:00:00.000Z",
+      started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:06.000Z", threadId: "t1", sameTurn: true,
     });
     expect(stored!.metadata.turn_count).toBe("1"); // NOT 2 — the same turn, not a new one.
     expect(stored!.metadata.status).toBe("error");
-    expect(stored!.content).toContain("NOT delivered");
   });
 
   test("SINGLE-THREADED FULL lifecycle start→end(ok)→end(error,sameTurn): count goes 0→1→1, never double-counts (thread-as-container + FIX 1)", async () => {
@@ -531,19 +516,19 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
     const base = {
-      channel: "eng", name: "eng", mode: "single-threaded" as const, input: "q",
+      channel: "eng", name: "eng", mode: "single-threaded" as const,
       started_at: "2026-06-18T07:00:00.000Z", ended_at: "2026-06-18T07:00:05.000Z", threadId: "t1",
     };
     // 1) start-ensure (working) — the container, BEFORE the turn. Must NOT count.
-    await t.writeThread({ ...base, status: "working", output: "", phase: "start" });
+    await t.writeThread({ ...base, status: "working", phase: "start" });
     expect(stored!.metadata.turn_count).toBe("0");
     expect(stored!.metadata.status).toBe("working");
     // 2) end(ok) — the turn completed: count once.
-    await t.writeThread({ ...base, status: "ok", output: "a", phase: "end" });
+    await t.writeThread({ ...base, status: "ok", phase: "end" });
     expect(stored!.metadata.turn_count).toBe("1");
     expect(stored!.metadata.status).toBe("ok");
     // 3) end(error, sameTurn) — outbound write failed, re-record the SAME turn. No increment.
-    await t.writeThread({ ...base, status: "error", output: "reply produced but NOT delivered", phase: "end", sameTurn: true });
+    await t.writeThread({ ...base, status: "error", phase: "end", sameTurn: true });
     expect(stored!.metadata.turn_count).toBe("1"); // STILL 1 — start didn't count, sameTurn didn't re-count.
     expect(stored!.metadata.status).toBe("error");
   });
@@ -562,11 +547,11 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     await t.start(fakeCtx("eng"));
     const base = {
       channel: "eng", name: "d", mode: "multi-threaded" as const,
-      input: "q", started_at: "2026-06-18T07:00:00.000Z", ended_at: "2026-06-18T07:00:05.000Z",
+      started_at: "2026-06-18T07:00:00.000Z", ended_at: "2026-06-18T07:00:05.000Z",
       threadId: "fixed-uuid",
     };
-    await t.writeThread({ ...base, status: "ok", output: "a" });
-    await t.writeThread({ ...base, status: "error", output: "undelivered", sameTurn: true });
+    await t.writeThread({ ...base, status: "ok" });
+    await t.writeThread({ ...base, status: "error", sameTurn: true });
     // Both writes hit the SAME per-fire path (the reused threadId) — without the fix the
     // second would mint a fresh uuid → a DIFFERENT path → a duplicate note for one turn.
     const threadPatches = patchPaths.filter((p) => p.includes("/Threads/eng/"));
@@ -602,8 +587,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       name: "eng",
       mode: "single-threaded",
       status: "ok",
-      input: "turn one",
-      output: "reply one",
       started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z",
     });
@@ -616,8 +599,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       name: "eng",
       mode: "single-threaded",
       status: "error",
-      input: "turn two",
-      output: "claude -p exited 1: boom",
       started_at: "2026-06-18T08:00:00.000Z", // later — must NOT overwrite the first.
       ended_at: "2026-06-18T08:00:09.000Z",
     });
@@ -626,9 +607,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(stored!.metadata.status).toBe("error"); // the latest turn's outcome.
     expect(stored!.metadata.started_at).toBe("2026-06-18T07:00:00.000Z"); // preserved.
     expect(stored!.metadata.last_turn_at).toBe("2026-06-18T08:00:09.000Z"); // advanced.
-    // The body's latest-turn section is the Error block.
-    expect(stored!.content).toContain("**Error:**");
-    expect(stored!.content).toContain("claude -p exited 1: boom");
   });
 
   test("SINGLE-THREADED: a 500 on the read-back GET rejects (not a silent aggregate reset)", async () => {
@@ -652,8 +630,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
         name: "eng",
         mode: "single-threaded",
         status: "ok",
-        input: "x",
-        output: "y",
         started_at: "2026-06-18T07:00:00.000Z",
         ended_at: "2026-06-18T07:00:01.000Z",
       }),
@@ -685,8 +661,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       name: "eng",
       mode: "single-threaded",
       status: "ok",
-      input: "one",
-      output: "r1",
       started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z",
       usage: { totalCostUsd: 0.1 },
@@ -696,8 +670,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       name: "eng",
       mode: "single-threaded",
       status: "ok",
-      input: "two",
-      output: "r2",
       started_at: "2026-06-18T08:00:00.000Z",
       ended_at: "2026-06-18T08:00:09.000Z",
       usage: { totalCostUsd: 0.2 },
@@ -708,9 +680,9 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(stored!.metadata.total_cost_usd).toBe("0.3");
   });
 
-  test("writeThread() on a MULTI-THREADED error turn records status:error + the failure reason in the body (NO read-back)", async () => {
+  test("writeThread() on a MULTI-THREADED error turn records status:error in METADATA, no content write (NO read-back)", async () => {
     const calls: { url: string; init: RequestInit }[] = [];
-    let captured: { tags: string[]; metadata: Record<string, string>; content: string } | undefined;
+    let captured: { tags: string[]; metadata: Record<string, string>; content?: string } | undefined;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       calls.push({ url: String(url), init: init ?? {} });
       if (String(url).includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
@@ -725,8 +697,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       channel: "eng",
       mode: "multi-threaded",
       status: "error",
-      input: "do the thing",
-      output: "claude -p exited 1: boom",
       started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:01.000Z",
     });
@@ -734,9 +704,9 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(captured!.metadata.status).toBe("error");
     // No definition → the field is absent (not an empty string).
     expect("definition" in captured!.metadata).toBe(false);
-    // The body's latest-turn section is the Error block on a failure.
-    expect(captured!.content).toContain("**Error:**");
-    expect(captured!.content).toContain("claude -p exited 1: boom");
+    // METADATA-ONLY WRITE: the failure is captured in metadata.status; the daemon never writes
+    // the thread body (no `content` in the PATCH).
+    expect("content" in captured!).toBe(false);
     // Multi-threaded does NO read-back even on the error path (fresh per fire).
     expect(
       calls.filter((c) => c.url.includes("/api/notes/") && (c.init.method ?? "GET") === "GET"),
@@ -758,8 +728,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
         channel: "eng",
         mode: "multi-threaded",
         status: "ok",
-        input: "x",
-        output: "y",
         started_at: "2026-06-18T07:00:00.000Z",
         ended_at: "2026-06-18T07:00:01.000Z",
       }),
@@ -794,28 +762,23 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // START-ENSURE (before the turn): status working, turn_count UNCHANGED (prior 0 → 0).
     await t.writeThread({
       channel: "eng", name: "eng", mode: "single-threaded", status: "working",
-      input: "turn one", output: "", started_at: "2026-06-18T07:00:00.000Z",
+      started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:00.000Z", threadId: "t1", phase: "start",
     });
     expect(stored!.metadata.status).toBe("working");
     expect(stored!.metadata.turn_count).toBe("0"); // NOT counted yet.
-    // The working body shows the input + an awaiting-reply state — NO fake reply.
-    expect(stored!.content).toContain("turn one");
-    expect(stored!.content).toContain("working");
-    expect(stored!.content).not.toContain("**Reply:**");
     // last_turn_at is not stamped on a brand-new working-ensure (no turn completed yet).
     expect(stored!.metadata.last_turn_at).toBeUndefined();
 
     // END (after the turn): status ok, turn_count now 1 (counted exactly once).
     await t.writeThread({
       channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
-      input: "turn one", output: "reply one", started_at: "2026-06-18T07:00:00.000Z",
+      started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z", threadId: "t1", phase: "end",
     });
     expect(stored!.metadata.status).toBe("ok");
     expect(stored!.metadata.turn_count).toBe("1"); // counted ONCE across start+end.
     expect(stored!.metadata.last_turn_at).toBe("2026-06-18T07:00:05.000Z");
-    expect(stored!.content).toContain("reply one");
   });
 
   test("SINGLE-THREADED turn 2 start preserves prior count (1), end increments to 2 — start never double-counts", async () => {
@@ -836,37 +799,37 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     }) as typeof fetch;
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
-    const tn = (status: "working" | "ok", input: string, output: string, ended: string, phase: "start" | "end") => ({
+    const tn = (status: "working" | "ok", ended: string, phase: "start" | "end") => ({
       channel: "eng", name: "eng", mode: "single-threaded" as const, status,
-      input, output, started_at: "2026-06-18T07:00:00.000Z", ended_at: ended, phase,
+      started_at: "2026-06-18T07:00:00.000Z", ended_at: ended, phase,
     });
 
     // Turn 1 — start (0) then end (1).
-    await t.writeThread(tn("working", "one", "", "2026-06-18T07:00:00.000Z", "start"));
+    await t.writeThread(tn("working", "2026-06-18T07:00:00.000Z", "start"));
     expect(stored!.metadata.turn_count).toBe("0");
-    await t.writeThread(tn("ok", "one", "reply one", "2026-06-18T07:00:05.000Z", "end"));
+    await t.writeThread(tn("ok", "2026-06-18T07:00:05.000Z", "end"));
     expect(stored!.metadata.turn_count).toBe("1");
 
     // Turn 2 — start reads prior=1 → writes 1 (UNCHANGED, the no-double-count invariant),
     // then end increments to 2. The start working-ensure must NOT bump the count.
-    await t.writeThread(tn("working", "two", "", "2026-06-18T08:00:00.000Z", "start"));
+    await t.writeThread(tn("working", "2026-06-18T08:00:00.000Z", "start"));
     expect(stored!.metadata.turn_count).toBe("1"); // start preserves the count.
     expect(stored!.metadata.status).toBe("working");
     expect(stored!.metadata.started_at).toBe("2026-06-18T07:00:00.000Z"); // first turn's, preserved.
-    await t.writeThread(tn("ok", "two", "reply two", "2026-06-18T08:00:09.000Z", "end"));
+    await t.writeThread(tn("ok", "2026-06-18T08:00:09.000Z", "end"));
     expect(stored!.metadata.turn_count).toBe("2"); // counted twice total — once per turn.
     expect(stored!.metadata.last_turn_at).toBe("2026-06-18T08:00:09.000Z");
   });
 
   test("MULTI-THREADED start writes turn_count 0 (working) at the per-fire path; end writes 1 at the SAME path", async () => {
-    const patches: { path: string; metadata: Record<string, string>; content: string }[] = [];
+    const patches: { path: string; metadata: Record<string, string>; hasContent: boolean }[] = [];
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
         const body = JSON.parse(String(init?.body)) as {
-          path: string; metadata: Record<string, string>; content: string;
+          path: string; metadata: Record<string, string>;
         };
-        patches.push({ path: decodeURIComponent(u), metadata: body.metadata, content: body.content });
+        patches.push({ path: decodeURIComponent(u), metadata: body.metadata, hasContent: "content" in body });
         return new Response(JSON.stringify({ id: "x" }), { status: 200 });
       }
       return new Response("{}", { status: 200 });
@@ -874,13 +837,13 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
     const base = {
-      channel: "eng", name: "d", mode: "multi-threaded" as const, input: "q",
+      channel: "eng", name: "d", mode: "multi-threaded" as const,
       started_at: "2026-06-18T07:00:00.000Z", threadId: "fire-1",
     };
     // START — working, turn_count 0, the per-fire note created.
-    await t.writeThread({ ...base, status: "working", output: "", ended_at: "2026-06-18T07:00:00.000Z", phase: "start" });
+    await t.writeThread({ ...base, status: "working", ended_at: "2026-06-18T07:00:00.000Z", phase: "start" });
     // END — ok, turn_count 1, the SAME per-fire path (same threadId).
-    await t.writeThread({ ...base, status: "ok", output: "a", ended_at: "2026-06-18T07:00:05.000Z", phase: "end" });
+    await t.writeThread({ ...base, status: "ok", ended_at: "2026-06-18T07:00:05.000Z", phase: "end" });
 
     expect(patches).toHaveLength(2);
     expect(patches[0]!.metadata.status).toBe("working");
@@ -890,9 +853,10 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // Both writes hit the SAME per-fire path (the reused threadId) — start updates, not dupes.
     expect(patches[0]!.path).toContain("/Threads/eng/fire-1");
     expect(patches[1]!.path).toContain("/Threads/eng/fire-1");
-    // The working body shows no fake reply; the end body carries the real reply.
-    expect(patches[0]!.content).not.toContain("**Reply:**");
-    expect(patches[1]!.content).toContain("a");
+    // METADATA-ONLY WRITE: neither the start nor the end write a thread body (the daemon never
+    // writes content — the per-fire note is created with empty content).
+    expect(patches[0]!.hasContent).toBe(false);
+    expect(patches[1]!.hasContent).toBe(false);
   });
 
   // ── thread ≡ session (metadata.session — the unified record) ──────────────────────────
@@ -914,8 +878,6 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       channel: "eng",
       mode: "multi-threaded",
       status: "ok",
-      input: "q",
-      output: "a",
       started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z",
       session: "11111111-1111-4111-8111-111111111111",
@@ -947,7 +909,7 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // Turn 1 END establishes the session on the note.
     await t.writeThread({
       channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
-      input: "one", output: "reply one", started_at: "2026-06-18T07:00:00.000Z",
+      started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z", phase: "end",
       session: "sess-ESTABLISHED",
     });
@@ -956,7 +918,7 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // Turn 2 START-ENSURE carries NO session — the upsert must PRESERVE the prior one.
     await t.writeThread({
       channel: "eng", name: "eng", mode: "single-threaded", status: "working",
-      input: "two", output: "", started_at: "2026-06-18T08:00:00.000Z",
+      started_at: "2026-06-18T08:00:00.000Z",
       ended_at: "2026-06-18T08:00:00.000Z", phase: "start",
     });
     expect(stored!.metadata.session).toBe("sess-ESTABLISHED"); // preserved, not dropped.
@@ -991,13 +953,13 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // Fire 1 of subject "eco-civ" — creates the deterministic subject note, turn_count 1.
     const r1 = await t.writeThread({
       channel: "pm", name: "pm", subject: "eco-civ", mode: "multi-threaded", status: "ok",
-      input: "kickoff", output: "ok1", started_at: "2026-06-18T07:00:00.000Z",
+      started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z", session: "sess-ECO", phase: "end",
     });
     // Fire 2 of the SAME subject — UPSERTS the same note (turn_count 2), proving continuity.
     const r2 = await t.writeThread({
       channel: "pm", name: "pm", subject: "eco-civ", mode: "multi-threaded", status: "ok",
-      input: "next", output: "ok2", started_at: "2026-06-18T08:00:00.000Z",
+      started_at: "2026-06-18T08:00:00.000Z",
       ended_at: "2026-06-18T08:00:09.000Z", session: "sess-ECO", phase: "end",
     });
 
@@ -1014,7 +976,7 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // A DIFFERENT subject of the same agent is a DISTINCT note (distinct leaf).
     const r3 = await t.writeThread({
       channel: "pm", name: "pm", subject: "ai-livelihood", mode: "multi-threaded", status: "ok",
-      input: "other", output: "ok3", started_at: "2026-06-18T09:00:00.000Z",
+      started_at: "2026-06-18T09:00:00.000Z",
       ended_at: "2026-06-18T09:00:03.000Z", phase: "end",
     });
     expect(r3.sent[0]).toBe("Threads/pm/pm--ai-livelihood");
@@ -1039,7 +1001,7 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("pm"));
     await t.writeThread({
-      channel: "pm", name: "pm", mode: "multi-threaded", status: "ok", input: "q", output: "a",
+      channel: "pm", name: "pm", mode: "multi-threaded", status: "ok",
       started_at: "2026-06-18T07:00:00.000Z", ended_at: "2026-06-18T07:00:01.000Z", threadId: "fire-xyz",
     });
     // Per-fire uuid leaf, NO read-back (HEAD multi-threaded behavior — byte-identical).
@@ -1072,7 +1034,7 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // Write a subject thread carrying a session…
     await t.writeThread({
       channel: "pm", name: "pm", subject: "eco-civ", mode: "multi-threaded", status: "ok",
-      input: "q", output: "a", started_at: "2026-06-18T07:00:00.000Z",
+      started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z", session: "sess-SUBJECT", phase: "end",
     });
     // …readThreadSession(subject) reads it back off the SUBJECT-scoped path.
@@ -1110,7 +1072,7 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // Write a thread note carrying a session…
     await t.writeThread({
       channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
-      input: "x", output: "y", started_at: "2026-06-18T07:00:00.000Z",
+      started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z", phase: "end",
       session: "sess-ROUNDTRIP",
     });
@@ -1151,7 +1113,7 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // Establish a session, then RESET it.
     await t.writeThread({
       channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
-      input: "x", output: "y", started_at: "2026-06-18T07:00:00.000Z",
+      started_at: "2026-06-18T07:00:00.000Z",
       ended_at: "2026-06-18T07:00:05.000Z", phase: "end", session: "sess-TO-CLEAR",
     });
     expect(await t.readThreadSession("eng", "eng")).toBe("sess-TO-CLEAR");
@@ -1191,6 +1153,60 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
     await expect(t.clearThreadSession("eng", "eng")).rejects.toThrow(/clear thread session failed/);
+  });
+
+  test("PRESERVES authored thread content across an upsert — the PATCH omits content; metadata updates, the body is untouched", async () => {
+    // A stateful vault MIRRORING the real PATCH semantics (verified against routes.ts): omitting
+    // `content` leaves the existing body untouched on UPDATE; a create with no content → "".
+    const store = new Map<string, { metadata: Record<string, string>; content: string }>();
+    let sawContentKey = false;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = decodeURIComponent(String(url));
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        const path = u.split("/api/notes/")[1]!;
+        const hit = store.get(path);
+        return hit ? new Response(JSON.stringify(hit), { status: 200 }) : new Response("nf", { status: 404 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { path: string; metadata: Record<string, string>; content?: string };
+        if ("content" in body) sawContentKey = true;
+        const prior = store.get(body.path);
+        const content = "content" in body ? (body.content ?? "") : (prior?.content ?? ""); // omit → preserve / create-empty.
+        store.set(body.path, { metadata: { ...(prior?.metadata ?? {}), ...body.metadata }, content });
+        return new Response(JSON.stringify({ id: body.path }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    // A human/agent has AUTHORED this thread's standing context onto the note.
+    store.set("Threads/eng/eng", { metadata: { turn_count: "1" }, content: "AUTHORED standing mandate — keep me." });
+
+    // A turn completes → writeThread updates METADATA ONLY.
+    await t.writeThread({
+      channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
+      started_at: "2026-06-18T07:00:00.000Z", ended_at: "2026-06-18T07:00:05.000Z",
+      session: "sess-KEEP",
+    });
+
+    const note = store.get("Threads/eng/eng")!;
+    // The authored content is UNTOUCHED…
+    expect(note.content).toBe("AUTHORED standing mandate — keep me.");
+    // …the PATCH carried NO content key (the metadata-only write)…
+    expect(sawContentKey).toBe(false);
+    // …and the metadata WAS updated (turn counted from the prior, session persisted).
+    expect(note.metadata.turn_count).toBe("2");
+    expect(note.metadata.session).toBe("sess-KEEP");
+    expect(note.metadata.status).toBe("ok");
+
+    // And it round-trips through readThreadContent for the next turn's prompt.
+    expect(await t.readThreadContent("eng", "eng")).toEqual({
+      path: "Threads/eng/eng",
+      content: "AUTHORED standing mandate — keep me.",
+    });
   });
 });
 
@@ -2416,6 +2432,72 @@ describe("VaultTransport — readThreadLoadout (the Phase A loader)", () => {
     await t.start(fakeCtx("eng"));
     const loadout = await t.readThreadLoadout("eng", "eng", "launch blockers");
     expect(loadout).toEqual([{ path: "Note/A", content: "A body" }]);
+    expect(reads[0]).toBe("Threads/eng/eng--launch-blockers");
+  });
+});
+
+// ── thread content as context (DESIGN-2026-06-29-thread-content-and-skills.md) ──
+describe("VaultTransport — readThreadContent (the thread's own authored body, composed as context)", () => {
+  test("returns { path, content } when the thread note has authored content (CONTENT only, never metadata)", async () => {
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = decodeURIComponent(String(url)); // the path's `/` is percent-encoded in the URL.
+      if (u.includes("Threads/eng/eng")) {
+        return new Response(
+          JSON.stringify({
+            metadata: { session: "s1", loadout: ["Skills/Weave"] },
+            content: "This thread's standing mandate.",
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadContent("eng", "eng")).toEqual({
+      path: "Threads/eng/eng",
+      content: "This thread's standing mandate.",
+    });
+  });
+
+  test("no thread note yet (first turn, 404) → undefined (no thread content)", async () => {
+    globalThis.fetch = (async () => new Response("not found", { status: 404 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadContent("eng", "eng")).toBeUndefined();
+  });
+
+  test("a BLANK/whitespace thread body → undefined (the no-thread-content invariant)", async () => {
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = decodeURIComponent(String(url)); // the path's `/` is percent-encoded in the URL.
+      if (u.includes("Threads/eng/eng")) {
+        return new Response(JSON.stringify({ metadata: { session: "s1" }, content: "   \n\t  " }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadContent("eng", "eng")).toBeUndefined();
+  });
+
+  test("a SUBJECT resolves the subject-scoped thread note (Threads/eng/eng--subj)", async () => {
+    const reads: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      const m = /\/api\/notes\/([^?]+)/.exec(u);
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      reads.push(path);
+      if (path === "Threads/eng/eng--launch-blockers") {
+        return new Response(JSON.stringify({ metadata: {}, content: "subject mandate" }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadContent("eng", "eng", "launch blockers")).toEqual({
+      path: "Threads/eng/eng--launch-blockers",
+      content: "subject mandate",
+    });
     expect(reads[0]).toBe("Threads/eng/eng--launch-blockers");
   });
 });

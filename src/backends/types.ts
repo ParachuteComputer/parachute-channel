@@ -141,9 +141,11 @@ export interface LoadoutEntry {
 }
 
 /**
- * The total composed-system-prompt BUDGET (bytes, UTF-8). When the composed loadout exceeds
- * this, the composer truncates the LOADOUT notes (entries 1..N) FIRST — NEVER the self entry
- * (entry 0, the def body) — with a loud warn (threads-only Phase A, §9.5 / R5).
+ * The total composed-system-prompt BUDGET (bytes, UTF-8). When the composed prompt exceeds
+ * this, the composer truncates the LOADOUT TAIL FIRST — NEVER the PROTECTED leading entries
+ * (the def body, entry 0, and — when present — the thread content, entry 1; see
+ * `protectedCount` on {@link composeSystemPrompt}) — with a loud warn (threads-only Phase A,
+ * §9.5 / R5; thread-content protection — DESIGN-2026-06-29-thread-content-and-skills.md).
  *
  * Chosen sane cap: 600_000 bytes (~150k tokens at ~4 bytes/token). Claude's context window is
  * ~200k tokens; this leaves headroom for the turn message, attachments, and tool I/O while
@@ -164,27 +166,36 @@ export const LOADOUT_BUDGET_BYTES = 600_000;
  *     .join("\n\n---\n\n")
  *
  * Then enforce {@link LOADOUT_BUDGET_BYTES}: if the composed byte length exceeds the cap,
- * drop trailing LOADOUT entries (index ≥ 1) until it fits — the self entry (index 0) is
- * NEVER truncated. A loud warn fires on truncation (via `onWarn`, defaulting to console.warn).
+ * drop trailing LOADOUT entries until it fits — the PROTECTED leading entries are NEVER
+ * truncated. `protectedCount` (default 1) is how many leading entries are load-bearing: 1
+ * protects just the self entry (index 0, the def body) — the no-loadout default; 2 protects
+ * the self entry AND the thread-content entry (index 1) once the caller has inserted it
+ * (DESIGN-2026-06-29-thread-content-and-skills.md — thread content is load-bearing like the
+ * def). Only entries beyond the protected prefix shed (tail-first). A loud warn fires on
+ * truncation (via `onWarn`, defaulting to console.warn).
  *
  * The NO-LOADOUT INVARIANT: with exactly one (self) entry whose content is the def body, the
  * result is `# <path>\n\n<body>` where `<body>` is byte-identical to the def body — the single
  * header line is the ONLY change to a no-loadout (e.g. the steward weave) prompt.
  *
- * PURE (apart from the injectable `onWarn`). The caller resolves the entries (self + loadout
- * notes) and supplies them in order; this function only dedupes, skips, renders, and budgets.
+ * PURE (apart from the injectable `onWarn`). The caller resolves the entries (self [+ thread
+ * content] + loadout notes) and supplies them in order, and tells us how many leading entries
+ * are protected; this function only dedupes, skips, renders, and budgets. The caller MUST keep
+ * `protectedCount` consistent with the entries it passed — only include a non-blank protected
+ * entry and count it (a blank protected entry would be skipped below, shifting the prefix).
  */
 export function composeSystemPrompt(
   entries: LoadoutEntry[],
-  opts?: { budgetBytes?: number; onWarn?: (msg: string) => void },
+  opts?: { budgetBytes?: number; onWarn?: (msg: string) => void; protectedCount?: number },
 ): string {
   const budget = opts?.budgetBytes ?? LOADOUT_BUDGET_BYTES;
   const warn = opts?.onWarn ?? ((m: string) => console.warn(m));
   const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
 
-  // Dedupe by path (first occurrence wins) + skip blank/whitespace content. The self entry
-  // (index 0) is processed exactly like the rest — but it is index 0, so the budget step
-  // below can never drop it (the steward's def body survives any over-budget loadout).
+  // Dedupe by path (first occurrence wins) + skip blank/whitespace content. The protected
+  // leading entries (the self entry at index 0, and the thread content at index 1 when the
+  // caller inserted it) are processed exactly like the rest — but they lead, so the budget
+  // step below never drops them (the def body + thread content survive any over-budget loadout).
   const seen = new Set<string>();
   const kept: LoadoutEntry[] = [];
   for (const e of entries) {
@@ -200,12 +211,13 @@ export function composeSystemPrompt(
   let composed = render(kept);
   if (byteLen(composed) <= budget) return composed;
 
-  // OVER BUDGET — keep the self entry (index 0) ALWAYS, then keep loadout entries from the
-  // front while they fit and STOP at the first that doesn't (tail-drop: the loadout's order
-  // IS its priority — earlier notes win, the tail is shed first). The self entry survives even
-  // if it alone exceeds the budget.
-  const fit: LoadoutEntry[] = kept.length > 0 ? [kept[0]!] : [];
-  for (let i = 1; i < kept.length; i++) {
+  // OVER BUDGET — keep the PROTECTED leading entries (the def body, and the thread content
+  // when present) ALWAYS, then keep loadout entries from the front while they fit and STOP at
+  // the first that doesn't (tail-drop: the loadout's order IS its priority — earlier notes win,
+  // the tail is shed first). The protected prefix survives even if it alone exceeds the budget.
+  const protect = Math.min(Math.max(opts?.protectedCount ?? 1, 0), kept.length);
+  const fit: LoadoutEntry[] = kept.slice(0, protect);
+  for (let i = protect; i < kept.length; i++) {
     if (byteLen(render([...fit, kept[i]!])) <= budget) fit.push(kept[i]!);
     else break;
   }
@@ -213,7 +225,7 @@ export function composeSystemPrompt(
   composed = render(fit);
   warn(
     `parachute-agent: LOADOUT over budget (${byteLen(render(kept))} > ${budget} bytes) — ` +
-      `truncated ${dropped.length} loadout note(s), NEVER the self entry. ` +
+      `truncated ${dropped.length} loadout note(s), NEVER the def or thread content. ` +
       `Dropped: ${dropped.join(", ")}`,
   );
   return composed;
@@ -372,6 +384,16 @@ export interface AgentBackend {
    * METADATA, never folding it into the prompt). ADDITIVE — omitted/empty (every current agent;
    * no thread loads a `#pack` with `wants:` today) → the grant source set is exactly
    * `[spec.name]`, BYTE-IDENTICAL to the legacy single-source injection (legacy continuity).
+   *
+   * `threadContent` (optional, DESIGN-2026-06-29-thread-content-and-skills.md) is THIS thread's
+   * own standing context — the thread note's authored BODY (`{ path, content }`, CONTENT only,
+   * the thread-note path as the header). The programmatic backend composes it as the entry
+   * BETWEEN the self entry and the loadout: `[self, thread-content, ...loadout]`. It is
+   * load-bearing like the def — composed with a protected prefix so an over-budget loadout
+   * sheds its tail but NEVER the def or the thread content. ADDITIVE — omitted, or blank/
+   * whitespace content → the thread-content entry is skipped and the prompt is `[self, ...loadout]`
+   * exactly as before (the no-thread-content invariant). The daemon NEVER writes this content;
+   * a human/agent authors it on the thread note and the backend reads it CONTENT-only each turn.
    */
   deliver(
     handle: AgentHandle,
@@ -383,6 +405,7 @@ export interface AgentBackend {
     loadout?: LoadoutEntry[],
     subject?: string,
     packKeys?: string[],
+    threadContent?: LoadoutEntry,
   ): Promise<DeliverResult>;
 
   /**

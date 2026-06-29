@@ -65,6 +65,8 @@ class FakeBackend implements AgentBackend {
     subject?: string;
     /** threads-only Phase A: the resolved LOADOUT entries the drain threaded in. */
     loadout?: LoadoutEntry[];
+    /** thread content: the thread's own authored body the drain threaded in (between def + loadout). */
+    threadContent?: LoadoutEntry;
   }[] = [];
   /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial — PER drain key). */
   maxConcurrent = 0;
@@ -118,6 +120,8 @@ class FakeBackend implements AgentBackend {
     runContext?: RunContext,
     loadout?: LoadoutEntry[],
     subject?: string,
+    _packKeys?: string[],
+    threadContent?: LoadoutEntry,
   ): Promise<DeliverResult> {
     this.calls.push({
       channel: handle.channel,
@@ -126,6 +130,7 @@ class FakeBackend implements AgentBackend {
       ...(runContext ? { runContext } : {}),
       ...(subject ? { subject } : {}),
       ...(loadout ? { loadout } : {}),
+      ...(threadContent ? { threadContent } : {}),
     });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);
@@ -454,7 +459,7 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
 });
 
 describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, BOTH modes)", () => {
-  test("a completed MULTI-THREADED turn materializes an #agent/thread note (status ok) carrying input/output/definition/mode/name", async () => {
+  test("a completed MULTI-THREADED turn materializes an #agent/thread note (status ok) carrying definition/mode/name", async () => {
     const backend = new FakeBackend();
     const rec = recorder();
     const threads = threadRecorder();
@@ -475,8 +480,6 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(thread.status).toBe("ok");
     expect(thread.mode).toBe("multi-threaded");
     expect(thread.definition).toBe("Agents/digest");
-    expect(thread.input).toBe("run the digest");
-    expect(thread.output).toBe("reply:run the digest");
     expect(typeof thread.started_at).toBe("string");
     expect(typeof thread.ended_at).toBe("string");
     // The start + end target the SAME per-fire note (same threadId) — no duplicate minted.
@@ -509,8 +512,6 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(threads.ends()[0]!.mode).toBe("single-threaded");
     expect(threads.ends()[0]!.name).toBe("eng");
     expect(threads.ends()[0]!.channel).toBe("eng");
-    expect(threads.ends()[0]!.input).toBe("hello");
-    expect(threads.ends()[0]!.output).toBe("reply:hello");
     // The single-threaded outbound reply was still written (no regression).
     expect(rec.calls).toHaveLength(1);
   });
@@ -542,8 +543,6 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(t2!.name).toBe("eng"); // SAME upsert key → same note, upserted.
     expect(t1!.channel).toBe("eng");
     expect(t2!.channel).toBe("eng");
-    expect(t1!.input).toBe("turn one");
-    expect(t2!.input).toBe("turn two");
   });
 
   test("a multi-threaded fire writes a thread note per fire (each carries this fire's turn — distinct records)", async () => {
@@ -561,7 +560,6 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     // assigns each a fresh uuid path, so they're distinct records). Each fire's start-ensure
     // shares that fire's threadId (so start + end target the SAME per-fire note).
     expect(threads.ends()).toHaveLength(2);
-    expect(threads.ends().map((t) => t.input)).toEqual(["fire A", "fire B"]);
     expect(threads.ends().every((t) => t.mode === "multi-threaded")).toBe(true);
     expect(threads.starts()).toHaveLength(2);
     // Per fire the working-ensure + final record share a threadId (distinct across fires).
@@ -586,8 +584,8 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(threads.ends()).toHaveLength(1);
     expect(threads.ends()[0]!.mode).toBe("multi-threaded");
     expect(threads.ends()[0]!.status).toBe("error");
-    expect(threads.ends()[0]!.output).toBe("mint refused");
-    // A user-facing failure note IS now written for a failed turn (carries the reason).
+    // A user-facing failure note IS now written for a failed turn (carries the reason — the
+    // reason lives in that note + the turn event, NOT the thread body the daemon no longer writes).
     expect(rec.calls).toHaveLength(1);
     expect(rec.calls[0]!.reply).toContain("mint refused");
   });
@@ -610,13 +608,13 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     expect(threads.ends()[0]!.mode).toBe("single-threaded");
     expect(threads.ends()[0]!.name).toBe("eng");
     expect(threads.ends()[0]!.status).toBe("error");
-    expect(threads.ends()[0]!.output).toBe("mint refused");
-    // A user-facing failure note IS now written for a failed turn (carries the reason).
+    // A user-facing failure note IS now written for a failed turn (carries the reason — the
+    // reason lives in that note + the turn event, NOT the thread body the daemon no longer writes).
     expect(rec.calls).toHaveLength(1);
     expect(rec.calls[0]!.reply).toContain("mint refused");
   });
 
-  test("a turn with an empty reply STILL materializes a thread note (status ok, empty output)", async () => {
+  test("a turn with an empty reply STILL materializes a thread note (status ok)", async () => {
     const backend = new FakeBackend();
     backend.resultFor = () => ({ ok: true, reply: "" });
     const rec = recorder();
@@ -626,11 +624,9 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
 
     reg.enqueue("digest", { content: "tool-only run" });
     await until(() => threads.ends().length === 1);
-    // The working-ensure (phase:start, no fake reply) preceded the empty-reply final record.
+    // The working-ensure (phase:start) preceded the empty-reply final record.
     expect(threads.starts()).toHaveLength(1);
-    expect(threads.starts()[0]!.output).toBe("");
     expect(threads.ends()[0]!.status).toBe("ok");
-    expect(threads.ends()[0]!.output).toBe("");
     // Empty reply → no outbound message note (the thread note IS the record).
     expect(rec.calls).toHaveLength(0);
   });
@@ -669,16 +665,74 @@ describe("ProgrammaticAgentRegistry — #agent/thread notes (unified lifecycle, 
     // First FINAL (optimistic) record was `ok`; the second re-records the failure so the
     // durable thread record does NOT falsely claim the reply landed.
     expect(threads.ends()[0]!.status).toBe("ok");
-    expect(threads.ends()[0]!.output).toBe("reply:fire it");
     expect(threads.ends()[1]!.status).toBe("error");
     expect(threads.ends()[1]!.mode).toBe("single-threaded");
-    // The undelivered reply text is preserved in the error record for recovery.
-    expect(threads.ends()[1]!.output).toContain("reply:fire it");
     // The re-record reuses the SAME per-turn threadId + sameTurn (no double-count, no dup).
     expect(threads.ends()[1]!.threadId).toBe(threads.ends()[0]!.threadId!);
     expect(threads.ends()[1]!.sameTurn).toBe(true);
     // Transient → the outbound was retried the full budget (1 initial + OUTBOUND_MAX_RETRIES).
     expect(outboundAttempts).toBe(1 + OUTBOUND_MAX_RETRIES);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — thread content as context (DESIGN-2026-06-29-thread-content-and-skills.md)", () => {
+  test("the drain READS thread content (readThreadContent) + PASSES it to deliver (the threadContent param)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const seen: { channel: string; name: string; subject?: string }[] = [];
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readThreadContent: async (channel, name, subject) => {
+        seen.push({ channel, name, ...(subject ? { subject } : {}) });
+        return { path: `Threads/${channel}/${name}`, content: "this thread's standing mandate" };
+      },
+    });
+    await reg.register(specFor("eng")); // single-threaded (default).
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+
+    // The drain consulted readThreadContent with the channel + def name…
+    expect(seen).toEqual([{ channel: "eng", name: "eng" }]);
+    // …and passed the resolved entry to deliver as `threadContent` (composed into the prompt
+    // BETWEEN the def and the loadout — the composition order is asserted in programmatic.test.ts).
+    expect(backend.calls[0]!.threadContent).toEqual({
+      path: "Threads/eng/eng",
+      content: "this thread's standing mandate",
+    });
+  });
+
+  test("UNWIRED readThreadContent → deliver receives no thread content (the no-thread-content invariant)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.threadContent).toBeUndefined();
+  });
+
+  test("a readThreadContent THROW is swallowed — the turn still runs (best-effort, no thread content)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      readThreadContent: async () => {
+        throw new Error("vault unreachable");
+      },
+    });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+    // The turn ran (the read failure didn't strand it) with no thread content.
+    expect(backend.calls[0]!.threadContent).toBeUndefined();
+    expect(rec.calls).toHaveLength(1);
   });
 });
 
@@ -934,10 +988,9 @@ describe("ProgrammaticAgentRegistry — outbound retry on transient failure (FIX
     expect(errorEvents.length).toBeGreaterThanOrEqual(1);
     expect(turn.events.some((e) => e.event.kind === "done")).toBe(false);
     // The FINAL thread record does NOT falsely claim a clean ok: the second final record is
-    // error, carrying the un-delivered reply text for recovery. (A working-ensure preceded.)
+    // error (status only — the daemon no longer writes the thread body). (A working-ensure preceded.)
     expect(threads.ends()).toHaveLength(2);
     expect(threads.ends()[1]!.status).toBe("error");
-    expect(threads.ends()[1]!.output).toContain("reply:doomed");
   });
 
   test("a PERMANENT (4xx) outbound failure does NOT retry — gives up immediately", async () => {
@@ -1713,8 +1766,6 @@ describe("ProgrammaticAgentRegistry — thread-as-container working-ensure (Part
     await until(() => backend.calls.length === 1);
     expect(threads.starts()).toHaveLength(1);
     expect(threads.starts()[0]!.status).toBe("working");
-    expect(threads.starts()[0]!.output).toBe(""); // NO fake reply while working.
-    expect(threads.starts()[0]!.input).toBe("do work");
     // The turn is in flight but hasn't produced its end record yet (gated).
     expect(backend.calls).toHaveLength(1);
     expect(threads.ends()).toHaveLength(0);
@@ -1726,7 +1777,7 @@ describe("ProgrammaticAgentRegistry — thread-as-container working-ensure (Part
     expect(threads.ends()[0]!.threadId).toBe(threads.starts()[0]!.threadId!);
   });
 
-  test("the start-ensure does NOT write a fake reply even though the turn ultimately replies", async () => {
+  test("the start-ensure is status:working and the end is status:ok (the daemon never writes the thread body)", async () => {
     const backend = new FakeBackend();
     const rec = recorder();
     const threads = threadRecorder();
@@ -1735,10 +1786,11 @@ describe("ProgrammaticAgentRegistry — thread-as-container working-ensure (Part
 
     reg.enqueue("eng", { content: "hi" });
     await until(() => threads.ends().length === 1);
-    // The working-ensure carries status:working + empty output; the end carries the reply.
+    // The working-ensure carries status:working; the end carries status:ok. Neither carries a
+    // body — the daemon writes metadata only (the reply lives in the outbound transcript note).
     expect(threads.starts()[0]!.status).toBe("working");
-    expect(threads.starts()[0]!.output).toBe("");
-    expect(threads.ends()[0]!.output).toBe("reply:hi");
+    expect(threads.ends()[0]!.status).toBe("ok");
+    expect(rec.calls[0]!.reply).toBe("reply:hi");
   });
 
   test("the OUTBOUND reply is stamped with the turn's thread id (definition→thread→message link); multi-threaded → the per-fire note leaf", async () => {
@@ -2367,8 +2419,9 @@ describe("ProgrammaticAgentRegistry — outbound metadata.thread is the resolvab
     expect(rec.calls[0]!.threadId).toMatch(/^[0-9a-f-]{36}$/);
     expect(rec.calls[1]!.threadId).toMatch(/^[0-9a-f-]{36}$/);
     expect(rec.calls[0]!.threadId).not.toBe(rec.calls[1]!.threadId);
-    // The stamped per-fire id is the leaf of that fire's written thread note.
-    const end0 = threads.ends().find((t) => t.input === "fire 1")!;
+    // The stamped per-fire id is the leaf of that fire's written thread note (FIFO drain →
+    // ends()[0] is fire 1).
+    const end0 = threads.ends()[0]!;
     expect(threads.idFor(end0)).toBe(`Threads/digest/${rec.calls[0]!.threadId}`);
   });
 

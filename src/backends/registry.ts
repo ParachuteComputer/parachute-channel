@@ -132,14 +132,11 @@ export interface ThreadNote {
   mode: AgentMode;
   /**
    * Outcome / lifecycle state after THIS write — `working` (the start-ensure, written
-   * BEFORE the turn: input shown, no reply yet), `ok` (success), or `error` (failed).
-   * `working` is only valid alongside `phase: "start"`.
+   * BEFORE the turn finishes — the turn has started but not completed), `ok` (success), or
+   * `error` (failed). `working` is only valid alongside `phase: "start"`. This is metadata
+   * only — the daemon does not write the thread BODY (the authored thread content is preserved).
    */
   status: "ok" | "error" | "working";
-  /** The inbound text handed to the turn (the `-p` prompt). */
-  input: string;
-  /** The reply on success, the failure reason on error, or "" while `working`. */
-  output: string;
   /**
    * The Claude session UUID for this turn — the transport persists it to the thread
    * note's `metadata.session` (the thread≡session record), so the NEXT turn can
@@ -570,6 +567,20 @@ export class ProgrammaticAgentRegistry {
     name: string,
     subject?: string,
   ) => Promise<string[]>;
+  /**
+   * Optional pre-turn THREAD-CONTENT read (DESIGN-2026-06-29-thread-content-and-skills.md). The
+   * thread note's own authored BODY (`{ path, content }` — CONTENT only) becomes the prompt entry
+   * BETWEEN the def (self) and the loadout. Read in {@link drain} and passed to the backend's
+   * `deliver`, which composes `[self, thread-content, ...loadout]` (the def + thread content
+   * protected from budget truncation). The daemon NEVER writes this content. UNWIRED / no thread
+   * note / blank body → undefined → the prompt is `[self, ...loadout]` (the no-thread-content
+   * invariant). Best-effort: a read failure logs + the turn runs without thread content.
+   */
+  private readonly readThreadContent?: (
+    channel: string,
+    name: string,
+    subject?: string,
+  ) => Promise<{ path: string; content: string } | undefined>;
   /** Base backoff (ms) between outbound retries (FIX 1). Injectable so tests run fast. */
   private readonly outboundRetryBaseMs: number;
 
@@ -603,6 +614,18 @@ export class ProgrammaticAgentRegistry {
      * thread note.
      */
     readPackKeys?: (channel: string, name: string, subject?: string) => Promise<string[]>;
+    /**
+     * Read the thread's own CONTENT (DESIGN-2026-06-29-thread-content-and-skills.md) — the
+     * thread note's authored body as `{ path, content }`, composed BETWEEN the def and the
+     * loadout. Optional — UNWIRED / no thread note / blank body → undefined (the prompt is
+     * `[self, ...loadout]`, the no-thread-content invariant). `subject` resolves the
+     * subject-scoped thread note.
+     */
+    readThreadContent?: (
+      channel: string,
+      name: string,
+      subject?: string,
+    ) => Promise<{ path: string; content: string } | undefined>;
     /** Override the outbound-retry backoff base (ms). Default {@link OUTBOUND_RETRY_BASE_MS}. */
     outboundRetryBaseMs?: number;
   }) {
@@ -615,6 +638,7 @@ export class ProgrammaticAgentRegistry {
     if (deps.clearSession) this.clearSession = deps.clearSession;
     if (deps.readLoadout) this.readLoadout = deps.readLoadout;
     if (deps.readPackKeys) this.readPackKeys = deps.readPackKeys;
+    if (deps.readThreadContent) this.readThreadContent = deps.readThreadContent;
     this.outboundRetryBaseMs = deps.outboundRetryBaseMs ?? OUTBOUND_RETRY_BASE_MS;
   }
 
@@ -1197,7 +1221,7 @@ export class ProgrammaticAgentRegistry {
       // DETERMINISTIC `Threads/<safeChannel>/<safeName>` note (the same every turn) — so a
       // resolvable thread id is available BEFORE the turn runs, for the failure-note +
       // outbound `metadata.thread` stamping (agent#163), even on a turn that fails early.
-      const startThreadNoteId = await this.recordThread(handle, msg, "working", "", startedAt, undefined, {
+      const startThreadNoteId = await this.recordThread(handle, msg, "working", startedAt, undefined, {
         threadId: turnThreadId,
         phase: "start",
         // NO session on the start-ensure: it runs BEFORE claude, so claude may never
@@ -1275,6 +1299,26 @@ export class ProgrammaticAgentRegistry {
         }
       }
 
+      // THREAD CONTENT (DESIGN-2026-06-29-thread-content-and-skills.md): the thread note's own
+      // authored body — THIS thread's standing context — read CONTENT-only off its mode-correct
+      // `#agent/thread` note (subject-scoped when a subject narrows the thread). The backend
+      // composes it BETWEEN the def (self) and the loadout. Undefined (unwired / no thread note /
+      // blank body) → the no-thread-content invariant (the prompt is the def + loadout). The
+      // daemon NEVER writes this content. Best-effort: a read failure logs + the turn runs without
+      // thread content (never strands the queue).
+      let threadContent: LoadoutEntry | undefined;
+      if (this.readThreadContent) {
+        try {
+          threadContent = await this.readThreadContent(handle.channel, handle.spec.name, turnSubject);
+        } catch (err) {
+          console.error(
+            `parachute-agent: thread-content read for channel "${channel}"` +
+              (turnSubject ? ` subject "${turnSubject}"` : "") +
+              ` failed (turn runs without thread content): ${(err as Error).message}`,
+          );
+        }
+      }
+
       let result;
       try {
         // Forward each interim event to the streaming-view sink (keyed by channel)
@@ -1303,6 +1347,11 @@ export class ProgrammaticAgentRegistry {
           // APPROVED grants with the def's own (`spec.name`). Empty (every current thread) →
           // the grant sources are exactly `[spec.name]` (legacy continuity, byte-identical).
           packKeys,
+          // thread content (DESIGN-2026-06-29-thread-content-and-skills.md): THIS thread's
+          // authored standing context, composed BETWEEN the def and the loadout (def + thread
+          // content protected from budget truncation). Undefined / blank → the def + loadout
+          // alone (the no-thread-content invariant).
+          threadContent,
         );
       } catch (err) {
         // The backend contract is failure-as-VALUE, never a throw — but defend so a
@@ -1317,7 +1366,7 @@ export class ProgrammaticAgentRegistry {
         // thread note captures the turn outcome, so a failed turn is still a queryable
         // `status:error` (single-threaded upserts the rolling thread; multi-threaded writes
         // a per-fire note).
-        const threadNoteId = await this.recordThread(handle, msg, "error", reason, startedAt, undefined, {
+        const threadNoteId = await this.recordThread(handle, msg, "error", startedAt, undefined, {
           threadId: turnThreadId,
           phase: "end",
           // No `result` (the backend threw) → NO session to persist. We never write a
@@ -1347,7 +1396,7 @@ export class ProgrammaticAgentRegistry {
         // BOTH modes record the failed turn (status:error) on the thread note so a failure
         // always leaves a queryable trace (single-threaded upserts the rolling thread,
         // marking it errored; multi-threaded writes a per-fire status:error note).
-        const threadNoteId = await this.recordThread(handle, msg, "error", result.error, startedAt, undefined, {
+        const threadNoteId = await this.recordThread(handle, msg, "error", startedAt, undefined, {
           threadId: turnThreadId,
           phase: "end",
           // Persist ONLY the session claude ECHOED (FIX 2). A turn can fail AFTER
@@ -1380,7 +1429,7 @@ export class ProgrammaticAgentRegistry {
       // (agent#124). The same note id is reused for the outbound-failure re-record below
       // (sameTurn → same note), so a callback on either terminal path points at a pullable
       // thread record.
-      let threadNoteId = await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage, {
+      let threadNoteId = await this.recordThread(handle, msg, "ok", startedAt, result.usage, {
         threadId: turnThreadId,
         phase: "end",
         // Persist the session claude ECHOED (FIX 2) so the next turn `--resume`s this
@@ -1422,8 +1471,10 @@ export class ProgrammaticAgentRegistry {
           //      single-threaded; writes/overwrites the per-fire note for multi-threaded).
           //   2. Resolve the live view to ERROR (not `done`) so the UI doesn't drop the
           //      in-progress bubble + poll for a note that isn't there (PR #83 nit).
-          // We do NOT re-run the `claude -p` turn (that forks/burns quota) — the reply text
-          // is preserved IN the error thread note's output for an operator to recover.
+          // We do NOT re-run the `claude -p` turn (that forks/burns quota). The reply text is
+          // not persisted (the transcript write is what failed, and the daemon no longer writes
+          // the thread body) — the turn is recorded `status:error` so the failure is visible and
+          // the `error` turn-event carries the "reply produced but not saved" reason.
           console.error(
             `parachute-agent: programmatic outbound write for channel "${channel}" failed ` +
               `after ${OUTBOUND_MAX_RETRIES} retries: ${delivered.error}`,
@@ -1438,8 +1489,6 @@ export class ProgrammaticAgentRegistry {
             handle,
             msg,
             "error",
-            `reply produced but NOT delivered (outbound write failed: ${delivered.error}). ` +
-              `Undelivered reply text: ${result.reply}`,
             startedAt,
             result.usage,
             {
@@ -1586,7 +1635,6 @@ export class ProgrammaticAgentRegistry {
     handle: ProgrammaticAgentHandle,
     msg: QueuedMessage,
     status: "ok" | "error" | "working",
-    output: string,
     startedAt: string,
     usage: ThreadNote["usage"],
     opts: { threadId?: string; sameTurn?: boolean; phase?: "start" | "end"; session?: string } = {},
@@ -1604,8 +1652,6 @@ export class ProgrammaticAgentRegistry {
       ...(handle.spec.definition ? { definition: handle.spec.definition } : {}),
       mode: handle.spec.mode ?? "single-threaded",
       status,
-      input: msg.content,
-      output,
       started_at: startedAt,
       ended_at: new Date().toISOString(),
       ...(usage ? { usage } : {}),

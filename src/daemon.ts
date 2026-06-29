@@ -764,8 +764,6 @@ export function buildWriteThread(channels: Map<string, Channel>): WriteThread {
       ...(thread.definition ? { definition: thread.definition } : {}),
       mode: thread.mode,
       status: thread.status,
-      input: thread.input,
-      output: thread.output,
       started_at: thread.started_at,
       ended_at: thread.ended_at,
       ...(thread.usage ? { usage: thread.usage } : {}),
@@ -898,6 +896,25 @@ export function buildReadLoadout(
 }
 
 /**
+ * Build the {@link ProgrammaticAgentRegistry}'s pre-turn THREAD-CONTENT read
+ * (DESIGN-2026-06-29-thread-content-and-skills.md). Resolve the channel's transport and read the
+ * thread note's OWN authored body (`{ path, content }` — CONTENT only) off its `#agent/thread`
+ * note. Only the VaultTransport implements `readThreadContent`; other transports omit it →
+ * undefined (the no-thread-content case — the prompt is the def + loadout). The registry calls
+ * this BEFORE a turn so the backend composes the thread content BETWEEN the def and the loadout.
+ * Mirrors {@link buildReadLoadout}.
+ */
+export function buildReadThreadContent(
+  channels: Map<string, Channel>,
+): (channel: string, name: string, subject?: string) => Promise<{ path: string; content: string } | undefined> {
+  return async (channel, name, subject) => {
+    const ch = channels.get(channel);
+    if (!ch?.transport.readThreadContent) return undefined;
+    return ch.transport.readThreadContent(channel, name, subject);
+  };
+}
+
+/**
  * Build the {@link ProgrammaticAgentRegistry}'s pre-turn loaded-PACK grant-KEY read
  * (threads-only Phase B′ — DESIGN-2026-06-29-threads-only.md §4). Resolves the channel's
  * transport and reads the loaded `#pack` notes' grant keys (the slugged paths of the loadout
@@ -983,6 +1000,10 @@ export function createDefaultProgrammaticRegistry(
     readLoadout: buildReadLoadout(channels),
     // threads-only Phase B′: the pre-turn loaded-PACK grant-key read (union pack grants).
     readPackKeys: buildReadPackKeys(channels),
+    // thread content (DESIGN-2026-06-29-thread-content-and-skills.md): the pre-turn read of the
+    // thread note's own authored body — composed BETWEEN the def and the loadout. The daemon
+    // never WRITES it; this only READS it. Undefined / blank → the def + loadout alone.
+    readThreadContent: buildReadThreadContent(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }

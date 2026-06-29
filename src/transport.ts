@@ -96,16 +96,14 @@ export interface ThreadRecord {
   /**
    * Outcome / lifecycle state of the thread after THIS write:
    *  - `working` — the turn has STARTED but not finished (the thread-as-container
-   *    start-ensure, written BEFORE `deliver()`): the input is shown, NO reply yet.
-   *    Only valid with `phase: "start"`.
-   *  - `ok` — the turn finished successfully (the reply landed in `output`).
-   *  - `error` — the turn failed (the reason is in `output`).
+   *    start-ensure, written BEFORE `deliver()`). Only valid with `phase: "start"`.
+   *  - `ok` — the turn finished successfully.
+   *  - `error` — the turn failed.
+   * This is a METADATA field; the turn's text (prompt + reply) lives in the `#agent/message`
+   * transcript notes, NOT the thread body (the daemon never writes the thread content —
+   * DESIGN-2026-06-29-thread-content-and-skills.md).
    */
   status: "ok" | "error" | "working";
-  /** The inbound text the turn was handed (the `-p` prompt). */
-  input: string;
-  /** The reply text on success, the failure reason on error, or "" while `working`. */
-  output: string;
   /** ISO timestamp the turn started (single-threaded preserves the FIRST turn's). */
   started_at: string;
   /** ISO timestamp the turn ended (becomes the thread's `last_turn_at`; not advanced on a start-ensure). */
@@ -261,6 +259,21 @@ export interface Transport {
    * (telegram) omit it.
    */
   clearThreadSession?(channel: string, name: string, subject?: string): Promise<void>;
+  /**
+   * Optional: read the thread's own CONTENT — its per-thread standing context
+   * (DESIGN-2026-06-29-thread-content-and-skills.md). The thread note's authored BODY (CONTENT
+   * only — NEVER metadata, as `{ path, content }`) becomes the prompt entry BETWEEN the def and
+   * the loadout. `subject` resolves the subject-scoped note; omitted → the def-named note (HEAD).
+   * Returns `undefined` when there is no thread note yet OR the body is blank/whitespace (the
+   * no-thread-content case — the prompt stays `[self, ...loadout]`). The daemon NEVER writes this
+   * content; a human/agent authors it. Only a durable transport (the VaultTransport) implements
+   * it; transports without a durable thread store omit it.
+   */
+  readThreadContent?(
+    channel: string,
+    name: string,
+    subject?: string,
+  ): Promise<{ path: string; content: string } | undefined>;
   /**
    * Optional: read the thread's LOADOUT (threads-only Phase A —
    * DESIGN-2026-06-29-threads-only.md §9) — the `metadata.loadout` array of note PATHS on the

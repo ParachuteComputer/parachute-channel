@@ -205,12 +205,34 @@ function deleteJsonWithBody<T>(suffix: string, body: unknown): Promise<T> {
 // ---------------------------------------------------------------------------
 
 /**
- * The backend that drives an agent. The primary axis of the v2 view. The
- * `interactive` (tmux) backend was retired (#114) and can never be returned by
- * the daemon, so it's gone from the display type too (#115). `"channel"` is the
- * SPA's label for the daemon's `attached` backend.
+ * The backend that drives an agent — the SPA's DISPLAY vocabulary. The primary
+ * axis of the v2 view. The `interactive` (tmux) backend was retired (#114) and can
+ * never be returned by the daemon, so it's gone from the display type too (#115).
+ * `"channel"` is the SPA's label for the daemon's `attached` backend.
  */
 export type AgentBackend = "programmatic" | "channel";
+
+/**
+ * The backend value the DAEMON puts on the wire. The daemon's canonical name for
+ * the channel-backend agent is `"attached"` (`AgentBackendKind` in
+ * `src/sandbox/types.ts`); the SPA displays it as `"channel"`. This wire type is
+ * the input to the one normalization point (`normalizeBackend`) — the rest of the
+ * SPA only ever sees the display `AgentBackend`. (#150)
+ */
+export type WireAgentBackend = "programmatic" | "channel" | "attached";
+
+/**
+ * Map the daemon's wire backend to the SPA's display vocabulary, in ONE place
+ * (the cross-repo derived value's canonical INPUT is the daemon's `backend`; the
+ * SPA derives its display from it here — #150). The daemon emits `"attached"` for
+ * a channel-backend agent; we display it as `"channel"` so the pill class
+ * (`backendPillClass` branches on `"channel"`) AND the pill text both line up
+ * with the create flow's "Channel" label. `"channel"` is tolerated too (an older
+ * daemon / the def endpoints already emit it).
+ */
+export function normalizeBackend(backend: WireAgentBackend | string): AgentBackend {
+  return backend === "attached" || backend === "channel" ? "channel" : "programmatic";
+}
 
 /** Execution-lifecycle mode — the top-level branch. Rides in `metadata.mode`. */
 export type AgentMode = "single-threaded" | "multi-threaded";
@@ -310,9 +332,21 @@ export interface AgentVaultsResponse {
   vaults: AgentVaultRow[];
 }
 
-/** List every agent across all backends. */
-export function listAgents(): Promise<AgentsResponse> {
-  return getJson<AgentsResponse>("/agents");
+/**
+ * List every agent across all backends. The daemon emits the canonical wire
+ * backend (`"attached"` for a channel agent — `listAttachedAgents` in
+ * `src/daemon.ts`); we NORMALIZE it to the SPA's display vocabulary here, the
+ * single ingestion point, so the pill class + label are consistent everywhere
+ * downstream (#150). Without this an `attached` row rendered with the bare,
+ * unstyled `.pill` fallback and the text "attached" instead of "channel".
+ */
+export async function listAgents(): Promise<AgentsResponse> {
+  const res = await getJson<{ agents: (Omit<AgentRow, "backend"> & { backend: string })[] }>(
+    "/agents",
+  );
+  return {
+    agents: res.agents.map((a) => ({ ...a, backend: normalizeBackend(a.backend) })),
+  };
 }
 
 /** List the vault-native agent definitions. */

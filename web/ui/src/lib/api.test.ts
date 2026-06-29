@@ -26,6 +26,7 @@ import {
   listChannels,
   listMessages,
   messageStreamUrl,
+  normalizeBackend,
   removeAgentSecret,
   removeAgentVault,
   sendMessage,
@@ -58,6 +59,18 @@ function fetchFn(impl: (input: string, init?: RequestInit) => Promise<Response>)
   return vi.fn<(input: string, init?: RequestInit) => Promise<Response>>(impl);
 }
 
+describe("normalizeBackend (#150 — daemon wire value → SPA display)", () => {
+  it("maps the daemon's `attached` to the display `channel`", () => {
+    expect(normalizeBackend("attached")).toBe("channel");
+  });
+  it("passes `channel` through (older daemon / def endpoints)", () => {
+    expect(normalizeBackend("channel")).toBe("channel");
+  });
+  it("maps `programmatic` to `programmatic`", () => {
+    expect(normalizeBackend("programmatic")).toBe("programmatic");
+  });
+});
+
 describe("apiBase", () => {
   it("falls back to /agent/api when the mount isn't an /app sub-path (dev origin root)", () => {
     // In vitest BASE_URL is "/", so the /app match fails → canonical fallback.
@@ -78,6 +91,28 @@ describe("listAgents / listAgentDefs / listAgentVaults", () => {
     const headers = new Headers(init?.headers);
     expect(headers.get("authorization")).toBe("Bearer jwt-tok");
     expect(headers.get("accept")).toBe("application/json");
+  });
+
+  it("normalizes the daemon's `attached` backend → the SPA's `channel` display (#150)", async () => {
+    // The daemon emits `backend: "attached"` for a channel agent (listAttachedAgents
+    // in src/daemon.ts). The SPA must normalize it to `"channel"` at ingestion so the
+    // amber `.pill.backend-channel` styling + the "channel" label both apply — without
+    // it the row fell through to the bare unstyled `.pill` and read "attached".
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(200, {
+          agents: [
+            { name: "eng", session: "eng-agent", workspace: "/w", hasWorkspace: true, backend: "attached", channel: "eng" },
+            { name: "auto", session: "auto-agent", workspace: "/w", hasWorkspace: true, backend: "programmatic" },
+          ],
+        }),
+      ),
+    );
+    const res = await listAgents();
+    expect(res.agents[0]!.backend).toBe("channel");
+    // The programmatic row is untouched.
+    expect(res.agents[1]!.backend).toBe("programmatic");
   });
 
   it("listAgentDefs hits /agent/api/agent-defs and parses defs", async () => {

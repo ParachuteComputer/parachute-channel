@@ -333,6 +333,39 @@ function numFromMeta(v: unknown): number {
 }
 
 /**
+ * Parse a thread note's `metadata.loadout` into an ordered list of note PATHS
+ * (threads-only Phase A — DESIGN-2026-06-29-threads-only.md §9). The model home is an
+ * ARRAY of path strings, but the vault stores metadata flexibly (a real JSON array, a
+ * JSON-encoded array STRING, or — defensively — a single path string), so accept all three:
+ *
+ *  - a real `string[]` → kept (string entries only);
+ *  - a `string` that JSON-parses to an array of strings → that array;
+ *  - any other non-empty `string` → a single-element list (one path);
+ *  - absent / empty / unparseable → `[]` (no loadout — the no-loadout invariant).
+ *
+ * Each entry is trimmed; blank entries are dropped. PURE — no I/O. Exported for unit tests.
+ */
+export function parseLoadoutPaths(v: unknown): string[] {
+  const clean = (arr: unknown[]): string[] =>
+    arr.filter((x): x is string => typeof x === "string").map((s) => s.trim()).filter((s) => s.length > 0);
+  if (Array.isArray(v)) return clean(v);
+  if (typeof v === "string") {
+    const trimmed = v.trim();
+    if (trimmed.length === 0) return [];
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (Array.isArray(parsed)) return clean(parsed);
+      } catch {
+        // Not valid JSON — fall through to treat the whole string as one path.
+      }
+    }
+    return [trimmed];
+  }
+  return [];
+}
+
+/**
  * Build the `#agent/thread` note BODY — the rolling SUMMARY of the thread (design
  * 2026-06-18: "hold a summary of this thread in the content; maybe another agent
  * facilitates that"). The MODULE writes a useful default, STRUCTURED (`## Summary` /
@@ -1136,6 +1169,55 @@ export class VaultTransport implements Transport {
       const detail = await res.text().catch(() => "");
       throw new Error(`vault transport: clear thread session failed (${res.status}) ${detail}`.trim());
     }
+  }
+
+  /**
+   * Read the thread's LOADOUT (threads-only Phase A — DESIGN-2026-06-29-threads-only.md §9):
+   * the `metadata.loadout` array of note PATHS on the thread's `#agent/thread` note, each
+   * resolved to `{ path, content }` (the note's CONTENT only — NEVER its metadata), preserving
+   * the declared ORDER. `subject` resolves the subject-scoped thread note; omitted → the
+   * def-named note (HEAD). The thread note's path math reuses {@link singleThreadedPath}, so
+   * it agrees with writeThread / readThreadSession.
+   *
+   * SKIP-AND-WARN (mirrors the def-load skip discipline `agent-defs.ts` / `registry.ts`): a
+   * loadout path that resolves to no note (404) is SKIPPED with a warn — NEVER thrown — so one
+   * stale path can't brick a turn. A blank-bodied note is RETURNED (the composer skips blank
+   * entries by content). No thread note yet / absent `metadata.loadout` → an empty array.
+   *
+   * Best-effort per path: an UNEXPECTED read error on one path is logged + skipped (the turn
+   * runs with the rest); the thread-note read itself, if it fails non-404, propagates to the
+   * registry's try/catch (which runs the turn with the def body alone).
+   */
+  async readThreadLoadout(
+    channel: string,
+    name: string,
+    subject?: string,
+  ): Promise<{ path: string; content: string }[]> {
+    const thread = await this.readThreadNote(this.singleThreadedPath(channel, name, subject));
+    if (!thread) return []; // no thread note yet (first turn) → empty loadout.
+    const paths = parseLoadoutPaths(thread.metadata?.loadout);
+    if (paths.length === 0) return [];
+    const out: { path: string; content: string }[] = [];
+    for (const path of paths) {
+      let note: { metadata?: Record<string, unknown>; content?: string } | undefined;
+      try {
+        note = await this.readThreadNote(path);
+      } catch (err) {
+        // An unexpected (non-404) read error on ONE loadout note — skip it, run with the rest.
+        console.warn(
+          `parachute-agent: loadout note "${path}" read failed (skipping): ${(err as Error).message}`,
+        );
+        continue;
+      }
+      if (!note) {
+        // 404 — a stale/renamed loadout path. Skip-and-warn (never throw); the def-load discipline.
+        console.warn(`parachute-agent: loadout note "${path}" not found (skipping)`);
+        continue;
+      }
+      // CONTENT only — never the note's metadata. A blank body is returned; the composer skips it.
+      out.push({ path, content: typeof note.content === "string" ? note.content : "" });
+    }
+    return out;
   }
 
   // react / edit / download: vault has no reactions; v1 is reply-only. Omitted.

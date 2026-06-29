@@ -59,7 +59,7 @@ import {
   type WriteCallback,
   type CallbackMeta,
 } from "./backends/registry.ts";
-import type { AgentBackend, AgentHandle, AgentStatus, DeliverResult } from "./backends/types.ts";
+import type { AgentBackend, AgentHandle, AgentStatus, DeliverResult, LoadoutEntry } from "./backends/types.ts";
 import type { AgentSpec } from "./sandbox/types.ts";
 import type { InboundAttachment } from "./transport.ts";
 import { VaultTransport } from "./transports/vault.ts";
@@ -149,7 +149,7 @@ class FakeBackend implements AgentBackend {
     channel: string;
     message: string;
     attachments?: InboundAttachment[];
-    subjectDossier?: string;
+    loadout?: LoadoutEntry[];
   }[] = [];
   resultFor: (message: string) => DeliverResult = (m) => ({ ok: true, reply: "reply:" + m });
   async start(spec: AgentSpec): Promise<AgentHandle> {
@@ -162,14 +162,14 @@ class FakeBackend implements AgentBackend {
     _onInterim?: unknown,
     attachments?: InboundAttachment[],
     _runContext?: unknown,
-    subjectDossier?: string,
+    loadout?: LoadoutEntry[],
   ): Promise<DeliverResult> {
     this.calls.push({
       channel: handle.channel,
       message,
       ...(attachments ? { attachments } : {}),
-      // Record whether a dossier reached deliver (undefined for the null-subject path).
-      subjectDossier,
+      // Record the LOADOUT that reached deliver (empty [] for the no-loadout / weave path).
+      loadout,
     });
     return this.resultFor(message);
   }
@@ -300,8 +300,9 @@ describe("inbound for a programmatic channel → deliver → outbound note", () 
       const res = await inbound(base, "eng", "note-1", "hello there");
       expect(res.status).toBe(200);
       await until(() => rec.calls.length === 1);
-      // deliver invoked with the inbound content.
-      expect(backend.calls).toEqual([{ channel: "eng", message: "hello there" }]);
+      // deliver invoked with the inbound content + an empty loadout (no readLoadout wired —
+      // the no-loadout / weave path; the backend composes the def body alone).
+      expect(backend.calls).toEqual([{ channel: "eng", message: "hello there", loadout: [] }]);
       // reply written as an outbound note, threaded to the inbound note id.
       expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:hello there", inReplyTo: "note-1" }]);
     } finally {
@@ -405,7 +406,7 @@ describe("inbound for an EXPECTED-but-not-yet-registered channel → queued pend
       // The agent registers (instantiation completes) → the pending buffer replays.
       await programmatic.register({ name: "eng", channels: ["eng"], backend: "programmatic" });
       await until(() => rec.calls.length === 1);
-      expect(backend.calls).toEqual([{ channel: "eng", message: "early message" }]);
+      expect(backend.calls).toEqual([{ channel: "eng", message: "early message", loadout: [] }]);
       expect(rec.calls).toEqual([{ channel: "eng", reply: "reply:early message", inReplyTo: "note-1" }]);
       expect(programmatic.pendingCount("eng")).toBe(0);
     } finally {
@@ -843,74 +844,67 @@ describe("contextFor.emit threads reply_to → a callback end-to-end through the
   });
 });
 
-// ── roles×threads NOW slice: subject threads emit → QueuedMessage → drain → deliver dossier ──
-describe("contextFor.emit threads the subject → composed-prompt dossier end-to-end", () => {
-  test("NULL-SUBJECT INVARIANT: an emit with NO subject → deliver receives subjectDossier=undefined (the weave path)", async () => {
+// ── threads-only Phase A: the drain resolves the thread LOADOUT → deliver end-to-end ──
+describe("the drain reads the thread loadout → deliver receives it (threads-only Phase A)", () => {
+  test("NO-LOADOUT / UNWIRED (the weave path): no readLoadout → deliver receives an empty loadout", async () => {
     const backend = new FakeBackend();
     const out = recorder();
-    // A dossier source IS wired — but with no subject it must NEVER be consulted.
-    let dossierReads = 0;
-    const programmatic = new ProgrammaticAgentRegistry({
-      backend,
-      writeOutbound: out.fn,
-      readSubjectDossier: async () => {
-        dossierReads += 1;
-        return "SHOULD NOT BE READ";
-      },
-    });
+    // No readLoadout wired — the back-compat default. deliver gets [] (the def body alone).
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: out.fn });
     await programmatic.register({ name: "worker", channels: ["worker"], backend: "programmatic" });
     const ctx = contextFor(new ClientRegistry(), "worker", new DeliveryState(), programmatic);
 
     ctx.emit({ channel: "worker", content: "plain", meta: { note_id: "n1", source: "vault" }, source: "vault" });
     await until(() => backend.calls.length === 1);
-    expect(backend.calls[0]!.subjectDossier).toBeUndefined();
-    // No subject → the dossier source is never even called (the weave path is untouched).
-    expect(dossierReads).toBe(0);
+    expect(backend.calls[0]!.loadout).toEqual([]);
   });
 
-  test("a subject + a wired dossier source → the dossier reaches deliver (keyed by channel + subject)", async () => {
+  test("a wired readLoadout → the resolved loadout reaches deliver (keyed by channel + name)", async () => {
     const backend = new FakeBackend();
     const out = recorder();
-    const seen: { channel: string; subject: string }[] = [];
+    const seen: { channel: string; name: string; subject?: string }[] = [];
     const programmatic = new ProgrammaticAgentRegistry({
       backend,
       writeOutbound: out.fn,
-      readSubjectDossier: async (channel, subject) => {
-        seen.push({ channel, subject });
-        return `dossier-for:${subject}`;
+      readLoadout: async (channel, name, subject) => {
+        seen.push({ channel, name, ...(subject ? { subject } : {}) });
+        return [
+          { path: "Projects/Surface", content: "project body" },
+          { path: "Packs/GitHub", content: "pack body" },
+        ];
       },
     });
     await programmatic.register({ name: "worker", channels: ["worker"], backend: "programmatic" });
     const ctx = contextFor(new ClientRegistry(), "worker", new DeliveryState(), programmatic);
 
-    ctx.emit({
-      channel: "worker",
-      content: "status please",
-      meta: { note_id: "n1", source: "vault", subject: "launch-blockers" },
-      source: "vault",
-    });
+    ctx.emit({ channel: "worker", content: "go", meta: { note_id: "n1", source: "vault" }, source: "vault" });
     await until(() => backend.calls.length === 1);
-    expect(backend.calls[0]!.subjectDossier).toBe("dossier-for:launch-blockers");
-    expect(seen).toEqual([{ channel: "worker", subject: "launch-blockers" }]);
+    expect(backend.calls[0]!.loadout).toEqual([
+      { path: "Projects/Surface", content: "project body" },
+      { path: "Packs/GitHub", content: "pack body" },
+    ]);
+    // The loader is consulted for EVERY thread (no subject → resolves the def-named note).
+    expect(seen).toEqual([{ channel: "worker", name: "worker" }]);
   });
 
-  test("a subject but NO wired dossier source (the NOW default) → deliver still gets undefined", async () => {
+  test("a readLoadout that THROWS → the turn still runs (deliver gets [] — never strands the queue)", async () => {
     const backend = new FakeBackend();
     const out = recorder();
-    // No readSubjectDossier wired — the NOW default. A subject rides through, but with no
-    // source the composed prompt is role-only (dossier undefined).
-    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: out.fn });
+    const programmatic = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      readLoadout: async () => {
+        throw new Error("vault blip");
+      },
+    });
     await programmatic.register({ name: "worker", channels: ["worker"], backend: "programmatic" });
     const ctx = contextFor(new ClientRegistry(), "worker", new DeliveryState(), programmatic);
 
-    ctx.emit({
-      channel: "worker",
-      content: "go",
-      meta: { note_id: "n1", source: "vault", subject: "some-subject" },
-      source: "vault",
-    });
+    ctx.emit({ channel: "worker", content: "go", meta: { note_id: "n1", source: "vault" }, source: "vault" });
     await until(() => backend.calls.length === 1);
-    expect(backend.calls[0]!.subjectDossier).toBeUndefined();
+    expect(backend.calls[0]!.loadout).toEqual([]);
+    // And the turn completed (the outbound reply was written) — the read failure didn't strand it.
+    await until(() => out.calls.length === 1);
   });
 });
 

@@ -25,7 +25,7 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError, noteAgentKey } from "./vault.ts";
+import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError, noteAgentKey, parseLoadoutPaths } from "./vault.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
 
@@ -2270,5 +2270,136 @@ describe("VaultTransport — setInboundStatus (FIX 3 compare-and-swap claim)", (
     const err = await t.setInboundStatus("n1", "in-flight", "now", "u1").catch((e) => e);
     expect(err).toBeInstanceOf(Error);
     expect(err).not.toBeInstanceOf(InboundClaimConflictError);
+  });
+});
+
+// ── threads-only Phase A: parseLoadoutPaths + readThreadLoadout (DESIGN-2026-06-29-threads-only) ──
+
+describe("parseLoadoutPaths — the metadata.loadout parser", () => {
+  test("a real string[] → kept (trimmed, blanks dropped)", () => {
+    expect(parseLoadoutPaths(["Projects/Surface", "  Packs/GitHub  ", "", "   "])).toEqual([
+      "Projects/Surface",
+      "Packs/GitHub",
+    ]);
+  });
+
+  test("a JSON-encoded array STRING → that array (the vault stores metadata as strings)", () => {
+    expect(parseLoadoutPaths('["a/b","c/d"]')).toEqual(["a/b", "c/d"]);
+  });
+
+  test("a single non-JSON path string → a one-element list", () => {
+    expect(parseLoadoutPaths("Projects/Surface")).toEqual(["Projects/Surface"]);
+  });
+
+  test("absent / empty / non-string → empty", () => {
+    expect(parseLoadoutPaths(undefined)).toEqual([]);
+    expect(parseLoadoutPaths(null)).toEqual([]);
+    expect(parseLoadoutPaths("")).toEqual([]);
+    expect(parseLoadoutPaths("   ")).toEqual([]);
+    expect(parseLoadoutPaths(42)).toEqual([]);
+  });
+
+  test("a malformed array-looking string falls back to one path (never throws)", () => {
+    expect(parseLoadoutPaths("[not json")).toEqual(["[not json"]);
+  });
+
+  test("non-string array members are dropped", () => {
+    expect(parseLoadoutPaths(["ok", 5, null, "ok2"])).toEqual(["ok", "ok2"]);
+  });
+});
+
+describe("VaultTransport — readThreadLoadout (the Phase A loader)", () => {
+  test("reads metadata.loadout off the thread note + resolves each path's CONTENT, in order", async () => {
+    // The thread note carries metadata.loadout = [two paths]; each path resolves to its body.
+    const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string }> = {
+      "Threads/eng/eng": { metadata: { loadout: ["Projects/Surface", "Packs/GitHub"] }, content: "thread summary" },
+      "Projects/Surface": { metadata: { status: "active" }, content: "project body" },
+      "Packs/GitHub": { metadata: {}, content: "pack body" },
+    };
+    const reads: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      const m = /\/api\/notes\/([^?]+)/.exec(u);
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      reads.push(path);
+      const note = noteByPath[path];
+      if (!note) return new Response("not found", { status: 404 });
+      return new Response(JSON.stringify(note), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const loadout = await t.readThreadLoadout("eng", "eng");
+
+    // CONTENT only — never the metadata — in the declared order.
+    expect(loadout).toEqual([
+      { path: "Projects/Surface", content: "project body" },
+      { path: "Packs/GitHub", content: "pack body" },
+    ]);
+    // The thread note is read first, then each loadout path.
+    expect(reads[0]).toBe("Threads/eng/eng");
+    expect(reads).toContain("Projects/Surface");
+    expect(reads).toContain("Packs/GitHub");
+  });
+
+  test("a MISSING loadout path (404) is SKIPPED (never throws); the rest resolve", async () => {
+    const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string }> = {
+      "Threads/eng/eng": { metadata: { loadout: ["Gone/Stale", "Packs/GitHub"] }, content: "x" },
+      "Packs/GitHub": { metadata: {}, content: "pack body" },
+      // "Gone/Stale" intentionally absent → 404 → skipped.
+    };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      const m = /\/api\/notes\/([^?]+)/.exec(u);
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      const note = noteByPath[path];
+      if (!note) return new Response("not found", { status: 404 });
+      return new Response(JSON.stringify(note), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const loadout = await t.readThreadLoadout("eng", "eng");
+    expect(loadout).toEqual([{ path: "Packs/GitHub", content: "pack body" }]);
+  });
+
+  test("no thread note yet (first turn) → empty loadout", async () => {
+    globalThis.fetch = (async () => new Response("not found", { status: 404 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadLoadout("eng", "eng")).toEqual([]);
+  });
+
+  test("thread note exists but NO metadata.loadout → empty loadout (the no-loadout invariant)", async () => {
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("Threads/eng/eng")) {
+        return new Response(JSON.stringify({ metadata: { session: "s1" }, content: "x" }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadLoadout("eng", "eng")).toEqual([]);
+  });
+
+  test("a SUBJECT resolves the subject-scoped thread note (Threads/eng/eng--subj)", async () => {
+    const reads: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      const m = /\/api\/notes\/([^?]+)/.exec(u);
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      reads.push(path);
+      if (path === "Threads/eng/eng--launch-blockers") {
+        return new Response(JSON.stringify({ metadata: { loadout: ["Note/A"] }, content: "x" }), { status: 200 });
+      }
+      if (path === "Note/A") return new Response(JSON.stringify({ content: "A body" }), { status: 200 });
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const loadout = await t.readThreadLoadout("eng", "eng", "launch blockers");
+    expect(loadout).toEqual([{ path: "Note/A", content: "A body" }]);
+    expect(reads[0]).toBe("Threads/eng/eng--launch-blockers");
   });
 });

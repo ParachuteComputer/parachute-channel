@@ -137,6 +137,7 @@ import {
   type QueuedMessage,
   type TurnEventSink,
 } from "./backends/registry.ts";
+import type { LoadoutEntry } from "./backends/types.ts";
 import {
   AttachedQueueRegistry,
   type AttachedQueueStore,
@@ -346,7 +347,7 @@ export function contextFor(
           // `fired-by` (a scheduled `runner:<jobId>` fire vs an interactive/delegated message).
           ...(msg.meta?.sender ? { sender: msg.meta.sender } : {}),
           // roles×threads NOW slice: carry the thread subject through to the drain so the
-          // composed prompt can fold in a subject dossier (and the NEXT slice can route by
+          // composed prompt's loadout can use it (and the NEXT slice can route by
           // it). No routing meaning yet. Absent → unchanged (the weave path is untouched).
           ...(msg.meta?.subject ? { subject: msg.meta.subject } : {}),
         });
@@ -377,7 +378,7 @@ export function contextFor(
           // register() still derives the right run-context `fired-by`.
           ...(msg.meta?.sender ? { sender: msg.meta.sender } : {}),
           // roles×threads NOW slice: carry the thread subject through the pending buffer too,
-          // so a turn that runs on register() still folds in its subject dossier. No routing
+          // so a turn that runs on register() still composes its loadout. No routing
           // meaning yet. Absent → unchanged.
           ...(msg.meta?.subject ? { subject: msg.meta.subject } : {}),
         });
@@ -869,6 +870,26 @@ export function buildClearSession(
 }
 
 /**
+ * Build the {@link ProgrammaticAgentRegistry}'s pre-turn LOADOUT read (threads-only Phase A —
+ * DESIGN-2026-06-29-threads-only.md §9). Resolve the channel's transport and read the thread's
+ * `metadata.loadout` note paths off its `#agent/thread` note, each as a {@link LoadoutEntry}
+ * (`{ path, content }` — CONTENT only). Only the VaultTransport implements `readThreadLoadout`;
+ * other transports omit it → an empty loadout (the def body alone, the no-loadout invariant).
+ * The registry calls this BEFORE a turn so the backend composes the arity-N system prompt.
+ * Mirrors {@link buildReadSession}. (The transport's `{path,content}[]` is structurally
+ * identical to `LoadoutEntry[]` — the transport layer doesn't import the backend layer.)
+ */
+export function buildReadLoadout(
+  channels: Map<string, Channel>,
+): (channel: string, name: string, subject?: string) => Promise<LoadoutEntry[]> {
+  return async (channel, name, subject) => {
+    const ch = channels.get(channel);
+    if (!ch?.transport.readThreadLoadout) return [];
+    return ch.transport.readThreadLoadout(channel, name, subject);
+  };
+}
+
+/**
  * Build the REAL programmatic-agent registry — the {@link ProgrammaticBackend}
  * wired to the env-resolved spawn deps, plus the outbound-write + thread-note +
  * session-read seams over the live `channels`. The session UUID lives on the durable
@@ -927,6 +948,10 @@ export function createDefaultProgrammaticRegistry(
     writeCallback: buildWriteCallback(channels),
     readSession: buildReadSession(channels),
     clearSession: buildClearSession(channels),
+    // threads-only Phase A: resolve the thread's loadout notes (metadata.loadout → content)
+    // so the backend composes the arity-N system prompt. SUPERSEDES the never-wired
+    // subjectDossier seam. Empty loadout (no metadata.loadout) → the def body alone.
+    readLoadout: buildReadLoadout(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }
@@ -3408,7 +3433,7 @@ function main(): void {
         throw new Error(`channel "${job.channel}" is not a live vault channel`);
       }
       // roles×threads NOW slice: thread the job's subject onto the inbound note so the
-      // turn's composed prompt can fold in its dossier. Absent → no subject (the weave
+      // turn's composed prompt/loadout can use it. Absent → no subject (the weave
       // job carries none → byte-identical to HEAD).
       await transport.injectInbound({
         content: job.message,

@@ -122,6 +122,104 @@ export interface RunContext {
 }
 
 /**
+ * One entry in a thread's LOADOUT (threads-only Phase A — DESIGN-2026-06-29-threads-only.md
+ * §1/§9). The composed system prompt is an ORDERED LIST of these — entry 0 is the thread's
+ * "self" entry (the def body, labeled by the def note's PATH), entries 1..N are the notes the
+ * thread loads from its `metadata.loadout` (an array of note PATHS). The composer reads the
+ * note's CONTENT only — NEVER its metadata — and renders each as `# <path>\n\n<content>`.
+ *
+ * This is the arity-N generalization of the rc.13 arity-2 `roleBody [+ subjectDossier]` seam:
+ * a thread that loads no notes (every current agent, incl. the 4am steward weave) composes to
+ * EXACTLY its def body, prefixed by a single `# <path>` header — the only change to a
+ * no-loadout prompt (the no-loadout invariant; design decision #4, accepted).
+ */
+export interface LoadoutEntry {
+  /** The note PATH — rendered as the entry's `# <path>` header AND the dedupe key. */
+  path: string;
+  /** The note CONTENT (body only — NEVER metadata). Blank/whitespace entries are skipped. */
+  content: string;
+}
+
+/**
+ * The total composed-system-prompt BUDGET (bytes, UTF-8). When the composed loadout exceeds
+ * this, the composer truncates the LOADOUT notes (entries 1..N) FIRST — NEVER the self entry
+ * (entry 0, the def body) — with a loud warn (threads-only Phase A, §9.5 / R5).
+ *
+ * Chosen sane cap: 600_000 bytes (~150k tokens at ~4 bytes/token). Claude's context window is
+ * ~200k tokens; this leaves headroom for the turn message, attachments, and tool I/O while
+ * bounding an accreting loadout so it can't silently blow the context (or degrade the steward
+ * mid-tend). The cap is on the composed PROMPT FILE (bytes), not a token count — a sane,
+ * cheap-to-enforce ceiling, documented here as the single source of truth.
+ */
+export const LOADOUT_BUDGET_BYTES = 600_000;
+
+/**
+ * Compose a thread's system prompt from an ORDERED LIST of loaded notes (threads-only Phase A).
+ * The MECHANICAL shape (DESIGN §1):
+ *
+ *   composed = entries
+ *     .filter(dedupe by path)          // first occurrence wins
+ *     .filter(content.trim().length>0) // skip blank/whitespace entries
+ *     .map(`# ${path}\n\n${content}`)  // CONTENT only, path as header
+ *     .join("\n\n---\n\n")
+ *
+ * Then enforce {@link LOADOUT_BUDGET_BYTES}: if the composed byte length exceeds the cap,
+ * drop trailing LOADOUT entries (index ≥ 1) until it fits — the self entry (index 0) is
+ * NEVER truncated. A loud warn fires on truncation (via `onWarn`, defaulting to console.warn).
+ *
+ * The NO-LOADOUT INVARIANT: with exactly one (self) entry whose content is the def body, the
+ * result is `# <path>\n\n<body>` where `<body>` is byte-identical to the def body — the single
+ * header line is the ONLY change to a no-loadout (e.g. the steward weave) prompt.
+ *
+ * PURE (apart from the injectable `onWarn`). The caller resolves the entries (self + loadout
+ * notes) and supplies them in order; this function only dedupes, skips, renders, and budgets.
+ */
+export function composeSystemPrompt(
+  entries: LoadoutEntry[],
+  opts?: { budgetBytes?: number; onWarn?: (msg: string) => void },
+): string {
+  const budget = opts?.budgetBytes ?? LOADOUT_BUDGET_BYTES;
+  const warn = opts?.onWarn ?? ((m: string) => console.warn(m));
+  const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
+
+  // Dedupe by path (first occurrence wins) + skip blank/whitespace content. The self entry
+  // (index 0) is processed exactly like the rest — but it is index 0, so the budget step
+  // below can never drop it (the steward's def body survives any over-budget loadout).
+  const seen = new Set<string>();
+  const kept: LoadoutEntry[] = [];
+  for (const e of entries) {
+    if (seen.has(e.path)) continue;
+    seen.add(e.path);
+    if (e.content.trim().length === 0) continue;
+    kept.push(e);
+  }
+
+  const render = (es: LoadoutEntry[]): string =>
+    es.map((e) => `# ${e.path}\n\n${e.content}`).join("\n\n---\n\n");
+
+  let composed = render(kept);
+  if (byteLen(composed) <= budget) return composed;
+
+  // OVER BUDGET — keep the self entry (index 0) ALWAYS, then keep loadout entries from the
+  // front while they fit and STOP at the first that doesn't (tail-drop: the loadout's order
+  // IS its priority — earlier notes win, the tail is shed first). The self entry survives even
+  // if it alone exceeds the budget.
+  const fit: LoadoutEntry[] = kept.length > 0 ? [kept[0]!] : [];
+  for (let i = 1; i < kept.length; i++) {
+    if (byteLen(render([...fit, kept[i]!])) <= budget) fit.push(kept[i]!);
+    else break;
+  }
+  const dropped = kept.slice(fit.length).map((e) => e.path);
+  composed = render(fit);
+  warn(
+    `parachute-agent: LOADOUT over budget (${byteLen(render(kept))} > ${budget} bytes) — ` +
+      `truncated ${dropped.length} loadout note(s), NEVER the self entry. ` +
+      `Dropped: ${dropped.join(", ")}`,
+  );
+  return composed;
+}
+
+/**
  * An opaque handle to a started agent, returned by {@link AgentBackend.start} and
  * passed back to `deliver`/`stop`/`status`. The only field the seam itself depends
  * on is `channel` (the wake channel a turn/push targets) + the backend's own
@@ -245,20 +343,23 @@ export interface AgentBackend {
    * message so the agent stamps ACCURATE times instead of fabricating them. ADDITIVE — omitted
    * → the turn message is exactly as before.
    *
-   * `subjectDossier` (optional, roles×threads NOW slice) is per-THREAD context for the
-   * agent's CURRENT subject — folded into the SYSTEM prompt (NOT the message): the programmatic
-   * backend writes `roleBody + "\n\n---\n\n" + dossier` to the per-turn `system-prompt.txt` when
-   * present, so the agent's ROLE (the spec's systemPrompt) stays stable across threads while the
-   * subject-specific context layers on top. The run-context preamble is unaffected (it stays on
-   * the MESSAGE). ADDITIVE — omitted/empty → the system prompt is the role body verbatim
-   * (byte-identical to HEAD; the null-subject invariant).
+   * `loadout` (optional, threads-only Phase A — DESIGN-2026-06-29-threads-only.md §9) is the
+   * thread's ORDERED LIST of loaded notes (entries 1..N — the SELF entry is prepended by the
+   * backend from `spec.systemPrompt` + the def note path). The programmatic backend folds them
+   * into the SYSTEM prompt via {@link composeSystemPrompt}: `[self, ...loadout]` deduped by path,
+   * blank-skipped, each rendered `# <path>\n\n<content>`, joined by `\n\n---\n\n`, then budgeted
+   * ({@link LOADOUT_BUDGET_BYTES}, truncating loadout-notes-first, NEVER the self entry). This
+   * SUPERSEDES the rc.13 arity-2 `subjectDossier` string with an arity-N note list. ADDITIVE —
+   * omitted/empty → the system prompt is `# <path>\n\n<def body>`, byte-identical to HEAD APART
+   * FROM the single `# <path>` header (the no-loadout invariant; design decision #4, accepted).
+   * The run-context preamble is unaffected (it stays on the MESSAGE).
    *
    * `subject` (optional, roles×threads NEXT slice #120) is the thread SUBJECT — the programmatic
    * backend keys the agent's PER-THREAD private session workspace off it
    * (`sessions/<name>--<slug(subject)>/`), so concurrent subjects of one multi-threaded agent get
    * ISOLATED per-turn files (`.mcp.json`, `system-prompt.txt`, HOME, attachment staging) and never
    * clobber each other. ADDITIVE — omitted/empty → `sessions/<name>/` (byte-identical to HEAD;
-   * the null-subject invariant). Distinct from `subjectDossier` (which is prompt CONTENT); this is
+   * the null-subject invariant). Distinct from `loadout` (which is prompt CONTENT); this is
    * the workspace IDENTITY.
    */
   deliver(
@@ -268,7 +369,7 @@ export interface AgentBackend {
     onInterim?: InterimSink,
     attachments?: InboundAttachment[],
     runContext?: RunContext,
-    subjectDossier?: string,
+    loadout?: LoadoutEntry[],
     subject?: string,
   ): Promise<DeliverResult>;
 

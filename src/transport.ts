@@ -262,6 +262,21 @@ export interface Transport {
    */
   clearThreadSession?(channel: string, name: string, subject?: string): Promise<void>;
   /**
+   * Optional: read the thread's LOADOUT (threads-only Phase A —
+   * DESIGN-2026-06-29-threads-only.md §9) — the `metadata.loadout` array of note PATHS on the
+   * thread's `#agent/thread` note, resolved to `{ path, content }` entries (note CONTENT only,
+   * NEVER metadata), preserving the declared ORDER. `subject` resolves the subject-scoped note;
+   * omitted → the def-named note (HEAD). Absent `metadata.loadout` → an empty array. A missing
+   * note path is SKIPPED-and-WARNED (never throws — mirrors the def-load skip discipline); a
+   * blank-bodied note is returned and the composer skips it. Only a durable transport (the
+   * VaultTransport) implements it; transports without a durable thread store omit it.
+   */
+  readThreadLoadout?(
+    channel: string,
+    name: string,
+    subject?: string,
+  ): Promise<{ path: string; content: string }[]>;
+  /**
    * Optional: write an agent-to-agent CALLBACK as an INBOUND note on THIS channel (the
    * "reply_to" substrate). A recipient agent's drain, on turn completion, calls this on the
    * SENDER's channel transport to wake the sender with a completion notification. The note

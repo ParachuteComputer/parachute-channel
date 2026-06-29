@@ -44,7 +44,7 @@
 
 import type { AgentSpec, AgentMode } from "../sandbox/types.ts";
 import { normalizeChannel, threadKey } from "../sandbox/types.ts";
-import type { AgentBackend, AgentHandle, InterimTurnEvent, RunContext, TurnSession } from "./types.ts";
+import type { AgentBackend, AgentHandle, InterimTurnEvent, LoadoutEntry, RunContext, TurnSession } from "./types.ts";
 import type { InboundAttachment } from "../transport.ts";
 
 /**
@@ -517,15 +517,22 @@ export class ProgrammaticAgentRegistry {
    */
   private readonly clearSession?: (channel: string, name: string, subject?: string) => Promise<void>;
   /**
-   * Optional pre-turn SUBJECT-DOSSIER read (roles×threads NOW slice) — per-thread
-   * context for the current subject, folded into the composed system prompt (the
-   * programmatic backend's `roleBody + "\n\n---\n\n" + dossier`). Read in {@link drain}
-   * keyed on the inbound message's subject. UNWIRED in the NOW slice (the default registry
-   * does NOT set it — there's no dossier-note convention yet), so every turn composes the
-   * role body verbatim and the null-subject path is byte-identical to HEAD. The seam is
-   * here so a future dossier source threads in without re-plumbing `deliver`.
+   * Optional pre-turn LOADOUT read (threads-only Phase A — DESIGN-2026-06-29-threads-only.md
+   * §9). Resolves the thread's `metadata.loadout` (an array of note PATHS) off its
+   * `#agent/thread` note and returns each as a {@link LoadoutEntry} (`{path, content}` —
+   * CONTENT only, never metadata). Read in {@link drain} and passed to the backend's `deliver`,
+   * which prepends the SELF entry (the def body) and composes the arity-N system prompt. This
+   * SUPERSEDES the rc.13 `readSubjectDossier` (arity-2) seam. UNWIRED → empty loadout, so every
+   * turn composes `# <path>\n\n<def body>` (the no-loadout invariant — byte-identical to HEAD
+   * apart from the path header). Best-effort: a read failure logs + the turn runs with the empty
+   * loadout (self entry only), never strands the queue. Missing paths are skipped-and-warned by
+   * the resolver itself (never throws on a missing note).
    */
-  private readonly readSubjectDossier?: (channel: string, subject: string) => Promise<string | undefined>;
+  private readonly readLoadout?: (
+    channel: string,
+    name: string,
+    subject?: string,
+  ) => Promise<LoadoutEntry[]>;
   /** Base backoff (ms) between outbound retries (FIX 1). Injectable so tests run fast. */
   private readonly outboundRetryBaseMs: number;
 
@@ -547,10 +554,11 @@ export class ProgrammaticAgentRegistry {
      */
     clearSession?: (channel: string, name: string, subject?: string) => Promise<void>;
     /**
-     * Read the per-thread subject dossier (roles×threads NOW slice). Optional + UNWIRED
-     * by default — the composed prompt is the role body verbatim until a dossier source exists.
+     * Read the thread's LOADOUT (threads-only Phase A) — the `metadata.loadout` note paths
+     * resolved to `{path, content}` entries. Optional — UNWIRED → empty loadout (the def body
+     * alone, the no-loadout invariant). `subject` resolves the subject-scoped thread note.
      */
-    readSubjectDossier?: (channel: string, subject: string) => Promise<string | undefined>;
+    readLoadout?: (channel: string, name: string, subject?: string) => Promise<LoadoutEntry[]>;
     /** Override the outbound-retry backoff base (ms). Default {@link OUTBOUND_RETRY_BASE_MS}. */
     outboundRetryBaseMs?: number;
   }) {
@@ -561,7 +569,7 @@ export class ProgrammaticAgentRegistry {
     if (deps.onTurnEvent) this.onTurnEvent = deps.onTurnEvent;
     if (deps.readSession) this.readSession = deps.readSession;
     if (deps.clearSession) this.clearSession = deps.clearSession;
-    if (deps.readSubjectDossier) this.readSubjectDossier = deps.readSubjectDossier;
+    if (deps.readLoadout) this.readLoadout = deps.readLoadout;
     this.outboundRetryBaseMs = deps.outboundRetryBaseMs ?? OUTBOUND_RETRY_BASE_MS;
   }
 
@@ -1047,20 +1055,25 @@ export class ProgrammaticAgentRegistry {
         ...(firedBy ? { firedBy } : {}),
       };
 
-      // SUBJECT DOSSIER (roles×threads NOW slice): when the inbound carries a subject AND a
-      // dossier source is wired, resolve the per-thread context the backend folds into the
-      // composed system prompt. UNWIRED by default (no dossier-note convention yet) and
-      // no-subject always → `undefined`, so the system prompt is the role body verbatim and
-      // the null-subject path is byte-identical to HEAD. Best-effort: a dossier read failure
-      // logs + the turn still runs (role-only), never strands the queue.
-      let subjectDossier: string | undefined;
-      if (msg.subject && this.readSubjectDossier) {
+      // LOADOUT (threads-only Phase A — DESIGN-2026-06-29-threads-only.md §9): resolve the
+      // thread's `metadata.loadout` note paths off its `#agent/thread` note (CONTENT-only,
+      // each → a {path, content} entry). The backend prepends the SELF entry (the def body)
+      // and composes the arity-N system prompt. Read for EVERY thread (single- and
+      // multi-threaded) at its mode-correct note (subject-scoped when a subject narrows the
+      // thread; the def-named note otherwise). UNWIRED → empty loadout, so the system prompt
+      // is the def body alone (the no-loadout invariant — byte-identical to HEAD apart from
+      // the `# <path>` header). Best-effort: a read failure logs + the turn runs with the
+      // empty loadout (self entry only), never strands the queue. Missing paths are
+      // skipped-and-warned inside the resolver (never throws).
+      let loadout: LoadoutEntry[] = [];
+      if (this.readLoadout) {
         try {
-          subjectDossier = await this.readSubjectDossier(handle.channel, msg.subject);
+          loadout = await this.readLoadout(handle.channel, handle.spec.name, turnSubject);
         } catch (err) {
           console.error(
-            `parachute-agent: subject-dossier read for channel "${channel}" ` +
-              `subject "${msg.subject}" failed (turn runs role-only): ${(err as Error).message}`,
+            `parachute-agent: loadout read for channel "${channel}"` +
+              (turnSubject ? ` subject "${turnSubject}"` : "") +
+              ` failed (turn runs with the def body alone): ${(err as Error).message}`,
           );
         }
       }
@@ -1080,9 +1093,10 @@ export class ProgrammaticAgentRegistry {
           msg.attachments,
           // agent#162: the daemon-known runtime context (real clock, new/resumed, fired-by).
           runContext,
-          // roles×threads NOW slice: the per-thread subject dossier, folded into the composed
-          // system prompt. Undefined (no subject / unwired source) → role body verbatim.
-          subjectDossier,
+          // threads-only Phase A: the thread's resolved LOADOUT notes (entries 1..N). The
+          // backend prepends the SELF entry (the def body) and composes the arity-N system
+          // prompt. Empty (unwired / no loadout) → the def body alone (the no-loadout invariant).
+          loadout,
           // roles×threads NEXT slice (#120, G): the thread SUBJECT — the backend keys the
           // PER-THREAD private workspace off it (`sessions/<name>--<subject>/`), so concurrent
           // subjects of one agent never clobber each other's per-turn `.mcp.json` /

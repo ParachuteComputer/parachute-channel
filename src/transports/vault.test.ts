@@ -26,7 +26,7 @@
 
 import { describe, test, expect, afterEach } from "bun:test";
 import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError, noteAgentKey, parseLoadoutPaths } from "./vault.ts";
-import { packPathKey } from "../grants.ts";
+import { rolePathKey } from "../grants.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
 
@@ -1767,8 +1767,14 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     const defBody = JSON.parse(String(def.init.body)) as { parent_names?: string[] };
     expect(defBody.parent_names).toEqual(["agent"]);
 
+    // Role (NEW — roles as the capability layer) — name carries `/`; rolls up to the root.
+    const role = calls[2]!;
+    expect(decodeURIComponent(role.url.split("/api/tags/")[1]!)).toBe("agent/role");
+    const roleBody = JSON.parse(String(role.init.body)) as { parent_names?: string[] };
+    expect(roleBody.parent_names).toEqual(["agent"]);
+
     // Message parent (NEW) — rolls up to the namespace root.
-    const parent = calls[2]!;
+    const parent = calls[3]!;
     expect(parent.url).toBe(
       "http://127.0.0.1:1940/vault/default/api/tags/agent%2Fmessage",
     );
@@ -1784,7 +1790,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     // Inbound child (NEW) — name carries `/`. The vault route matches a
     // single path segment (`[^/]+`) then decodeURIComponent's it, so the `/` MUST
     // be encoded as `%2F` (a bare slash would fail the single-segment match → 404).
-    const inbound = calls[3]!;
+    const inbound = calls[4]!;
     expect(inbound.url).toBe(
       "http://127.0.0.1:1940/vault/default/api/tags/agent%2Fmessage%2Finbound",
     );
@@ -1801,7 +1807,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     );
 
     // Outbound child (NEW) — same encoding, parent declared.
-    const outbound = calls[4]!;
+    const outbound = calls[5]!;
     expect(outbound.url).toBe(
       "http://127.0.0.1:1940/vault/default/api/tags/agent%2Fmessage%2Foutbound",
     );
@@ -1812,21 +1818,22 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(outboundBody.parent_names).toEqual(["agent/message"]);
 
     // Job (NEW) — rolls up to the namespace root.
-    const job = calls[5]!;
+    const job = calls[6]!;
     expect(decodeURIComponent(job.url.split("/api/tags/")[1]!)).toBe("agent/job");
     const jobBody = JSON.parse(String(job.init.body)) as { parent_names?: string[] };
     expect(jobBody.parent_names).toEqual(["agent"]);
   });
 
-  test("schema declares ONLY the #agent/* namespace rollup (CONTRACT dropped interim + legacy, 7 entries)", async () => {
+  test("schema declares ONLY the #agent/* namespace rollup (CONTRACT dropped interim + legacy, 8 entries)", async () => {
     // The `#agent/*` namespace (design 2026-06-17-vault-native-agents) rolls up
-    // definitions, messages, jobs, AND threads to the `#agent` root. The channel→agent
+    // definitions, ROLES, messages, jobs, AND threads to the `#agent` root. The channel→agent
     // CONTRACT dropped the interim flat `#agent-message*` AND legacy `#channel-message*`
-    // schema entries — exactly 7 entries, all under `#agent/*`.
+    // schema entries — exactly 8 entries, all under `#agent/*`.
     const names = AGENT_VAULT_TAG_SCHEMA.map((e) => e.name);
     expect(names).toEqual([
       "agent",
       "agent/definition",
+      "agent/role",
       "agent/message",
       "agent/message/inbound",
       "agent/message/outbound",
@@ -1839,6 +1846,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     // The namespace children all roll up to the `#agent` root (the human rollup).
     const byName = (n: string) => AGENT_VAULT_TAG_SCHEMA.find((e) => e.name === n)!;
     expect(byName("agent/definition").parent_names).toEqual(["agent"]);
+    expect(byName("agent/role").parent_names).toEqual(["agent"]);
     expect(byName("agent/message").parent_names).toEqual(["agent"]);
     expect(byName("agent/job").parent_names).toEqual(["agent"]);
     expect(byName("agent/thread").parent_names).toEqual(["agent"]);
@@ -2309,9 +2317,9 @@ describe("VaultTransport — setInboundStatus (FIX 3 compare-and-swap claim)", (
 
 describe("parseLoadoutPaths — the metadata.loadout parser", () => {
   test("a real string[] → kept (trimmed, blanks dropped)", () => {
-    expect(parseLoadoutPaths(["Projects/Surface", "  Packs/GitHub  ", "", "   "])).toEqual([
+    expect(parseLoadoutPaths(["Projects/Surface", "  Refs/GitHub  ", "", "   "])).toEqual([
       "Projects/Surface",
-      "Packs/GitHub",
+      "Refs/GitHub",
     ]);
   });
 
@@ -2344,9 +2352,9 @@ describe("VaultTransport — readThreadLoadout (the Phase A loader)", () => {
   test("reads metadata.loadout off the thread note + resolves each path's CONTENT, in order", async () => {
     // The thread note carries metadata.loadout = [two paths]; each path resolves to its body.
     const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string }> = {
-      "Threads/eng/eng": { metadata: { loadout: ["Projects/Surface", "Packs/GitHub"] }, content: "thread summary" },
+      "Threads/eng/eng": { metadata: { loadout: ["Projects/Surface", "Refs/GitHub"] }, content: "thread summary" },
       "Projects/Surface": { metadata: { status: "active" }, content: "project body" },
-      "Packs/GitHub": { metadata: {}, content: "pack body" },
+      "Refs/GitHub": { metadata: {}, content: "ref body" },
     };
     const reads: string[] = [];
     globalThis.fetch = (async (url: string | URL | Request) => {
@@ -2366,18 +2374,18 @@ describe("VaultTransport — readThreadLoadout (the Phase A loader)", () => {
     // CONTENT only — never the metadata — in the declared order.
     expect(loadout).toEqual([
       { path: "Projects/Surface", content: "project body" },
-      { path: "Packs/GitHub", content: "pack body" },
+      { path: "Refs/GitHub", content: "ref body" },
     ]);
     // The thread note is read first, then each loadout path.
     expect(reads[0]).toBe("Threads/eng/eng");
     expect(reads).toContain("Projects/Surface");
-    expect(reads).toContain("Packs/GitHub");
+    expect(reads).toContain("Refs/GitHub");
   });
 
   test("a MISSING loadout path (404) is SKIPPED (never throws); the rest resolve", async () => {
     const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string }> = {
-      "Threads/eng/eng": { metadata: { loadout: ["Gone/Stale", "Packs/GitHub"] }, content: "x" },
-      "Packs/GitHub": { metadata: {}, content: "pack body" },
+      "Threads/eng/eng": { metadata: { loadout: ["Gone/Stale", "Refs/GitHub"] }, content: "x" },
+      "Refs/GitHub": { metadata: {}, content: "ref body" },
       // "Gone/Stale" intentionally absent → 404 → skipped.
     };
     globalThis.fetch = (async (url: string | URL | Request) => {
@@ -2392,7 +2400,7 @@ describe("VaultTransport — readThreadLoadout (the Phase A loader)", () => {
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
     const loadout = await t.readThreadLoadout("eng", "eng");
-    expect(loadout).toEqual([{ path: "Packs/GitHub", content: "pack body" }]);
+    expect(loadout).toEqual([{ path: "Refs/GitHub", content: "ref body" }]);
   });
 
   test("no thread note yet (first turn) → empty loadout", async () => {
@@ -2502,12 +2510,12 @@ describe("VaultTransport — readThreadContent (the thread's own authored body, 
   });
 });
 
-// ── threads-only Phase B′: readThreadPackKeys (the pack-detect SECURITY GATE) ──
-describe("VaultTransport — readThreadPackKeys (the Phase B′ pack-grant-key reader)", () => {
-  test("THE GATE: a loaded note with wants but NO #pack tag → IGNORED (no key)", async () => {
+// ── roles as the capability layer: readThreadRoles (content layer ① + the grant gate) ──
+describe("VaultTransport — readThreadRoles (the layer-① content + grant-key reader)", () => {
+  test("THE GATE: a role-listed note with wants but NO #agent/role tag → content loaded, NO grant key", async () => {
     const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
-      "Threads/eng/eng": { metadata: { loadout: ["Refs/leaky"] }, content: "x" },
-      // A plain content note that DECLARES wants but is NOT a pack → its wants are inert.
+      "Threads/eng/eng": { metadata: { roles: ["Refs/leaky"] }, content: "x" },
+      // A plain content note that DECLARES wants but is NOT a role → loaded as context, wants inert.
       "Refs/leaky": { tags: ["reference"], metadata: { wants: "vault:secrets:read, env:github" }, content: "body" },
     };
     globalThis.fetch = (async (url: string | URL | Request) => {
@@ -2520,16 +2528,19 @@ describe("VaultTransport — readThreadPackKeys (the Phase B′ pack-grant-key r
     }) as unknown as typeof fetch;
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
-    // A non-pack note's wants contribute ZERO grant keys — loading context never adds caps.
-    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([]);
+    // Its CONTENT loads (context never escalates) but its wants contribute ZERO grant keys.
+    expect(await t.readThreadRoles("eng", "eng")).toEqual({
+      entries: [{ path: "Refs/leaky", content: "body" }],
+      grantKeys: [],
+    });
   });
 
-  test("a loaded #pack with wants → its slugged-path key; a non-pack sibling stays ignored", async () => {
+  test("a loaded #agent/role with wants → content entry + its slugged-path key; a non-role sibling loads content only", async () => {
     const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
-      "Threads/eng/eng": { metadata: { loadout: ["Packs/github", "Projects/Surface"] }, content: "x" },
-      "Packs/github": { tags: ["pack"], metadata: { wants: "env:github" }, content: "pack body" },
-      // A plain project note (no #pack) — even if it had wants it would be ignored; here it has none.
-      "Projects/Surface": { tags: ["project"], metadata: { status: "active" }, content: "proj body" },
+      "Threads/eng/eng": { metadata: { roles: ["Roles/github", "Roles/Surface"] }, content: "x" },
+      "Roles/github": { tags: ["agent/role"], metadata: { wants: "env:github" }, content: "role body" },
+      // A plain project note (no #agent/role) — loaded as context, but contributes no grant key.
+      "Roles/Surface": { tags: ["project"], metadata: { status: "active" }, content: "proj body" },
     };
     globalThis.fetch = (async (url: string | URL | Request) => {
       const u = String(url);
@@ -2541,14 +2552,20 @@ describe("VaultTransport — readThreadPackKeys (the Phase B′ pack-grant-key r
     }) as unknown as typeof fetch;
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
-    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([packPathKey("Packs/github")]);
+    expect(await t.readThreadRoles("eng", "eng")).toEqual({
+      entries: [
+        { path: "Roles/github", content: "role body" },
+        { path: "Roles/Surface", content: "proj body" },
+      ],
+      grantKeys: [rolePathKey("Roles/github")], // ONLY the real #agent/role
+    });
   });
 
-  test("TWO packs with wants → both path keys (deduped, in loadout order)", async () => {
+  test("TWO roles with wants → both content entries + both grant keys (deduped, in declared order)", async () => {
     const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
-      "Threads/eng/eng": { metadata: { loadout: ["Packs/github", "Packs/research", "Packs/github"] }, content: "x" },
-      "Packs/github": { tags: ["pack"], metadata: { wants: "env:github" }, content: "a" },
-      "Packs/research": { tags: ["pack"], metadata: { wants: "vault:research:read" }, content: "b" },
+      "Threads/eng/eng": { metadata: { roles: ["Roles/github", "Roles/research", "Roles/github"] }, content: "x" },
+      "Roles/github": { tags: ["agent/role"], metadata: { wants: "env:github" }, content: "a" },
+      "Roles/research": { tags: ["agent/role"], metadata: { wants: "vault:research:read" }, content: "b" },
     };
     globalThis.fetch = (async (url: string | URL | Request) => {
       const u = String(url);
@@ -2560,17 +2577,21 @@ describe("VaultTransport — readThreadPackKeys (the Phase B′ pack-grant-key r
     }) as unknown as typeof fetch;
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
-    // Deduped (github listed twice → one key), declared order preserved.
-    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([
-      packPathKey("Packs/github"),
-      packPathKey("Packs/research"),
+    const out = await t.readThreadRoles("eng", "eng");
+    // Content for EVERY resolvable path (github twice → two content entries, declared order).
+    expect(out.entries).toEqual([
+      { path: "Roles/github", content: "a" },
+      { path: "Roles/research", content: "b" },
+      { path: "Roles/github", content: "a" },
     ]);
+    // Grant keys DEDUPED (github listed twice → one key), declared order preserved.
+    expect(out.grantKeys).toEqual([rolePathKey("Roles/github"), rolePathKey("Roles/research")]);
   });
 
-  test("a #pack with NO wants → no key (only capability-declaring packs count)", async () => {
+  test("an #agent/role with NO wants → content entry, no grant key (a context-only role)", async () => {
     const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
-      "Threads/eng/eng": { metadata: { loadout: ["Packs/empty"] }, content: "x" },
-      "Packs/empty": { tags: ["pack"], metadata: {}, content: "a context-only pack" },
+      "Threads/eng/eng": { metadata: { roles: ["Roles/empty"] }, content: "x" },
+      "Roles/empty": { tags: ["agent/role"], metadata: {}, content: "a context-only role" },
     };
     globalThis.fetch = (async (url: string | URL | Request) => {
       const u = String(url);
@@ -2582,20 +2603,23 @@ describe("VaultTransport — readThreadPackKeys (the Phase B′ pack-grant-key r
     }) as unknown as typeof fetch;
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
-    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([]);
+    expect(await t.readThreadRoles("eng", "eng")).toEqual({
+      entries: [{ path: "Roles/empty", content: "a context-only role" }],
+      grantKeys: [],
+    });
   });
 
-  test("LEGACY CONTINUITY: no thread note / no loadout → empty (every current thread)", async () => {
+  test("NO-ROLES INVARIANT: no thread note / no roles → { entries: [], grantKeys: [] } (every current thread)", async () => {
     globalThis.fetch = (async () => new Response("not found", { status: 404 })) as unknown as typeof fetch;
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
-    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([]);
+    expect(await t.readThreadRoles("eng", "eng")).toEqual({ entries: [], grantKeys: [] });
   });
 
-  test("a missing loadout path (404) is skipped (never throws)", async () => {
+  test("a missing role path (404) is skipped (never throws)", async () => {
     const noteByPath: Record<string, { metadata?: Record<string, unknown>; content?: string; tags?: unknown }> = {
-      "Threads/eng/eng": { metadata: { loadout: ["Gone/Stale", "Packs/github"] }, content: "x" },
-      "Packs/github": { tags: ["pack"], metadata: { wants: "env:github" }, content: "a" },
+      "Threads/eng/eng": { metadata: { roles: ["Gone/Stale", "Roles/github"] }, content: "x" },
+      "Roles/github": { tags: ["agent/role"], metadata: { wants: "env:github" }, content: "a" },
     };
     globalThis.fetch = (async (url: string | URL | Request) => {
       const u = String(url);
@@ -2607,6 +2631,10 @@ describe("VaultTransport — readThreadPackKeys (the Phase B′ pack-grant-key r
     }) as unknown as typeof fetch;
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
-    expect(await t.readThreadPackKeys("eng", "eng")).toEqual([packPathKey("Packs/github")]);
+    // The stale path is skipped (not in entries, no key); the real role still resolves.
+    expect(await t.readThreadRoles("eng", "eng")).toEqual({
+      entries: [{ path: "Roles/github", content: "a" }],
+      grantKeys: [rolePathKey("Roles/github")],
+    });
   });
 });

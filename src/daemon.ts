@@ -915,23 +915,27 @@ export function buildReadThreadContent(
 }
 
 /**
- * Build the {@link ProgrammaticAgentRegistry}'s pre-turn loaded-PACK grant-KEY read
- * (threads-only Phase B′ — DESIGN-2026-06-29-threads-only.md §4). Resolves the channel's
- * transport and reads the loaded `#pack` notes' grant keys (the slugged paths of the loadout
- * notes that are `#pack`s declaring `wants:`) off the thread's `#agent/thread` note. The backend
- * UNIONS each pack's APPROVED grants with the def's own (`spec.name`). Only the VaultTransport
- * implements `readThreadPackKeys`; other transports omit it → no pack keys (the def's grants
- * alone — legacy continuity). The SECURITY GATE (a non-pack note's `wants:` is ignored) lives in
- * the transport resolver. Mirrors {@link buildReadLoadout}, but reads METADATA (pack-detection),
- * not content (prompt).
+ * Build the {@link ProgrammaticAgentRegistry}'s pre-turn ROLES read (layer ① —
+ * DESIGN-2026-06-29-threads-roles-context.md). Resolves the channel's transport and reads the
+ * thread's `metadata.roles` notes off its `#agent/thread` note in ONE pass to BOTH the ordered
+ * CONTENT entries (the FIRST prompt layer) AND the grant-holder keys (the slugged paths of the
+ * loaded `#agent/role` notes declaring `wants:`). The backend prepends the entries before the def
+ * and UNIONS each role's APPROVED grants with the def's own (`spec.name`). Only the VaultTransport
+ * implements `readThreadRoles`; other transports omit it → `{ entries: [], grantKeys: [] }` (the
+ * def's body + grants alone — the no-roles invariant). The SECURITY GATE (a non-role note's
+ * `wants:` is ignored) lives in the transport resolver. Mirrors {@link buildReadLoadout}.
  */
-export function buildReadPackKeys(
+export function buildReadRoles(
   channels: Map<string, Channel>,
-): (channel: string, name: string, subject?: string) => Promise<string[]> {
+): (
+  channel: string,
+  name: string,
+  subject?: string,
+) => Promise<{ entries: LoadoutEntry[]; grantKeys: string[] }> {
   return async (channel, name, subject) => {
     const ch = channels.get(channel);
-    if (!ch?.transport.readThreadPackKeys) return [];
-    return ch.transport.readThreadPackKeys(channel, name, subject);
+    if (!ch?.transport.readThreadRoles) return { entries: [], grantKeys: [] };
+    return ch.transport.readThreadRoles(channel, name, subject);
   };
 }
 
@@ -998,8 +1002,9 @@ export function createDefaultProgrammaticRegistry(
     // so the backend composes the arity-N system prompt. SUPERSEDES the never-wired
     // subjectDossier seam. Empty loadout (no metadata.loadout) → the def body alone.
     readLoadout: buildReadLoadout(channels),
-    // threads-only Phase B′: the pre-turn loaded-PACK grant-key read (union pack grants).
-    readPackKeys: buildReadPackKeys(channels),
+    // roles (layer ①): the pre-turn ROLES read — content (composed FIRST) + the union of
+    // each role's grants with the def's own. UNWIRED / no roles → the def alone (no-roles invariant).
+    readRoles: buildReadRoles(channels),
     // thread content (DESIGN-2026-06-29-thread-content-and-skills.md): the pre-turn read of the
     // thread note's own authored body — composed BETWEEN the def and the loadout. The daemon
     // never WRITES it; this only READS it. Undefined / blank → the def + loadout alone.
@@ -3227,17 +3232,17 @@ export function createFetchHandler(
     }
 
     // ---------------------------------------------------------------------
-    // PACK grant-reconcile webhook — POST /api/vault/pack
-    // (threads-only Phase B′, DESIGN-2026-06-29-threads-only.md §4). A vault trigger on a
-    // `#pack` note created/updated POSTs here; we reconcile THAT pack's `wants:` under its
-    // path key (register each + prune its OWN partition). This is the PER-PACK reconcile —
-    // analogous to /api/vault/agent-def but keyed by the pack PATH, and it NEVER touches a
-    // def's grants or another pack's. Mirrors /api/vault/agent-def's auth (hub JWT, scope
-    // agent:send) + uniform-401 + vault resolution. Body: { event?, vault?, note: { id/path,
-    // metadata } }. A non-pack note / dropped-wants / parse-error is handled inside
-    // reconcilePack (prune-to-[] / status:error). Externally `<hub>/agent/api/vault/pack`.
+    // ROLE grant-reconcile webhook — POST /api/vault/role
+    // (roles as the capability layer, DESIGN-2026-06-29-threads-roles-context.md). A vault
+    // trigger on an `#agent/role` note created/updated POSTs here; we reconcile THAT role's
+    // `wants:` under its path key (register each + prune its OWN partition). This is the
+    // PER-ROLE reconcile — analogous to /api/vault/agent-def but keyed by the role PATH, and it
+    // NEVER touches a def's grants or another role's. Mirrors /api/vault/agent-def's auth (hub
+    // JWT, scope agent:send) + uniform-401 + vault resolution. Body: { event?, vault?, note: {
+    // id/path, metadata } }. A non-role note / dropped-wants / parse-error is handled inside
+    // reconcileRole (prune-to-[] / status:error). Externally `<hub>/agent/api/vault/role`.
     // ---------------------------------------------------------------------
-    if (req.method === "POST" && url.pathname === "/api/vault/pack") {
+    if (req.method === "POST" && url.pathname === "/api/vault/role") {
       const denied = await requireScope(req, url, SCOPE_SEND);
       if (denied) return json({ error: "unauthorized" }, 401);
       if (!agentDefs) {
@@ -3282,7 +3287,7 @@ export function createFetchHandler(
         body.event === "created" || body.event === "updated" || body.event === "deleted"
           ? body.event
           : undefined;
-      const result = await agentDefs.reconcilePack(vault, noteId, event);
+      const result = await agentDefs.reconcileRole(vault, noteId, event);
       return json({ ok: true, reconciled: result });
     }
 

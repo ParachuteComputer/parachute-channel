@@ -644,14 +644,14 @@ describe("ProgrammaticBackend.deliver — composed system prompt (threads-only P
 
     await backend.deliver(handle, "go", createSession("sess-CP3"), undefined, undefined, undefined, [
       { path: "Projects/Surface", content: "Project body A." },
-      { path: "Packs/GitHub", content: "Pack body B." },
+      { path: "Roles/GitHub", content: "Role body B." },
     ]);
 
     const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
     expect(readFileSync(promptPath, "utf8")).toBe(
       `# Agents/steward\n\n${ROLE}` +
         `\n\n---\n\n# Projects/Surface\n\nProject body A.` +
-        `\n\n---\n\n# Packs/GitHub\n\nPack body B.`,
+        `\n\n---\n\n# Roles/GitHub\n\nRole body B.`,
     );
   });
 
@@ -664,15 +664,15 @@ describe("ProgrammaticBackend.deliver — composed system prompt (threads-only P
     await backend.deliver(handle, "go", createSession("sess-CP5"), undefined, undefined, undefined, [
       { path: "Projects/Surface", content: "First wins." },
       { path: "Projects/Surface", content: "Duplicate — dropped." },
-      { path: "Packs/Blank", content: "   \n  " }, // whitespace-only → skipped
-      { path: "Packs/GitHub", content: "Kept." },
+      { path: "Roles/Blank", content: "   \n  " }, // whitespace-only → skipped
+      { path: "Roles/GitHub", content: "Kept." },
     ]);
 
     const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
     expect(readFileSync(promptPath, "utf8")).toBe(
       `# Agents/steward\n\n${ROLE}` +
         `\n\n---\n\n# Projects/Surface\n\nFirst wins.` +
-        `\n\n---\n\n# Packs/GitHub\n\nKept.`,
+        `\n\n---\n\n# Roles/GitHub\n\nKept.`,
     );
   });
 
@@ -754,11 +754,130 @@ describe("ProgrammaticBackend.deliver — composed system prompt (threads-only P
     const handle = await backend.start(specWithVault("eng"));
 
     await backend.deliver(handle, "go", createSession("sess-CP4"), undefined, undefined, undefined, [
-      { path: "Packs/GitHub", content: "a note" },
+      { path: "Roles/GitHub", content: "a note" },
     ]);
 
     const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
     expect(existsSync(promptPath)).toBe(false);
+  });
+
+  // ── roles as the layer-① composition (DESIGN-2026-06-29-threads-roles-context.md) ──
+  test("ROLES compose FIRST — before the def (self), each path-headered", async () => {
+    mkDirs("compose-role-first");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-RL1", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/uni", "eng"));
+
+    // roles is the 11th param — leave loadout/subject/roleKeys/threadContent undefined.
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-RL1"),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [{ path: "Roles/PM", content: "You are a project manager." }],
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    // The role leads; the def (self) follows.
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Roles/PM\n\nYou are a project manager.` + `\n\n---\n\n# Agents/uni\n\n${ROLE}`,
+    );
+  });
+
+  test("FULL three-layer order: [...roles, self, thread-content, ...loadout]", async () => {
+    mkDirs("compose-three-layer");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-RL2", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/uni", "eng"));
+
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-RL2"),
+      undefined,
+      undefined,
+      undefined,
+      [{ path: "Skills/Weave", content: "Skill body." }], // loadout (layer ③, 7th param)
+      undefined,
+      undefined,
+      { path: "Threads/eng/uni", content: "This thread's mandate." }, // thread content (layer ②, 10th)
+      [
+        { path: "Roles/PM", content: "PM hat." },
+        { path: "Roles/Editor", content: "Editor hat." },
+      ], // roles (layer ①, 11th)
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Roles/PM\n\nPM hat.` +
+        `\n\n---\n\n# Roles/Editor\n\nEditor hat.` +
+        `\n\n---\n\n# Agents/uni\n\n${ROLE}` +
+        `\n\n---\n\n# Threads/eng/uni\n\nThis thread's mandate.` +
+        `\n\n---\n\n# Skills/Weave\n\nSkill body.`,
+    );
+  });
+
+  test("NO-ROLES INVARIANT: empty roles → [self, ...loadout], byte-identical to the no-roles path", async () => {
+    mkDirs("compose-no-roles");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-RL3", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/uni", "eng"));
+
+    // An explicit EMPTY roles array (the 11th param) + a loadout → composes exactly as before roles.
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-RL3"),
+      undefined,
+      undefined,
+      undefined,
+      [{ path: "Skills/Weave", content: "Skill body." }],
+      undefined,
+      undefined,
+      undefined,
+      [],
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Agents/uni\n\n${ROLE}\n\n---\n\n# Skills/Weave\n\nSkill body.`,
+    );
+  });
+
+  test("BLANK role entries are SKIPPED (the def stays present + the prefix count stays aligned)", async () => {
+    mkDirs("compose-blank-role");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-RL4", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/uni", "eng"));
+
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-RL4"),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [
+        { path: "Roles/Blank", content: "   \n\t  " }, // whitespace-only → skipped
+        { path: "Roles/PM", content: "PM hat." },
+      ],
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    // Only the non-blank role composes (first), then the def.
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Roles/PM\n\nPM hat.` + `\n\n---\n\n# Agents/uni\n\n${ROLE}`,
+    );
   });
 });
 
@@ -1467,7 +1586,7 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// threads-only Phase B′ — pack-keyed grant UNION (DESIGN-2026-06-29-threads-only.md §4)
+// threads-only Phase B′ — role-keyed grant UNION (DESIGN-2026-06-29-threads-only.md §4)
 // ---------------------------------------------------------------------------
 
 /** A per-agent-key fake hub grants API (for union/legacy tests). `byAgent[key]` = that key's
@@ -1493,8 +1612,8 @@ function grantsClientByKey(opts: {
   return new GrantsClient({ hubOrigin: "https://hub.example.com", managerBearer: "MGR", fetchFn });
 }
 
-describe("ProgrammaticBackend.deliver — pack-keyed grant union (Phase B′)", () => {
-  test("LEGACY CONTINUITY: a def with NO packKeys injects EXACTLY listGrants(spec.name) (only spec.name queried)", async () => {
+describe("ProgrammaticBackend.deliver — role-keyed grant union (Phase B′)", () => {
+  test("LEGACY CONTINUITY: a def with NO roleKeys injects EXACTLY listGrants(spec.name) (only spec.name queried)", async () => {
     mkDirs("pk-legacy");
     const listKeys: string[] = [];
     const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
@@ -1506,16 +1625,16 @@ describe("ProgrammaticBackend.deliver — pack-keyed grant union (Phase B′)", 
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
     const handle = await backend.start(specWithVault("eng"));
-    // No packKeys param (undefined) — the no-loadout path every current def agent takes.
+    // No roleKeys param (undefined) — the no-loadout path every current def agent takes.
     await backend.deliver(handle, "hi", freshSession());
     // ONLY the def's own name was queried (= the legacy single-source path).
     expect(listKeys).toEqual(["eng"]);
-    // The def's grant injected; nothing else. Own-vault + the def's GITHUB_TOKEN, no pack entries.
+    // The def's grant injected; nothing else. Own-vault + the def's GITHUB_TOKEN, no role entries.
     expect(calls[0]!.env.GITHUB_TOKEN).toBe("ghp_DEF");
     expect(Object.keys(readMcpServers("eng"))).toEqual([vaultEntryKey("default")]);
   });
 
-  test("an EMPTY packKeys array is byte-identical to the no-packKeys legacy path", async () => {
+  test("an EMPTY roleKeys array is byte-identical to the no-roleKeys legacy path", async () => {
     mkDirs("pk-empty");
     const listKeys: string[] = [];
     const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
@@ -1527,33 +1646,33 @@ describe("ProgrammaticBackend.deliver — pack-keyed grant union (Phase B′)", 
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
     const handle = await backend.start(specWithVault("eng"));
-    // Explicit empty packKeys (a thread with no #pack-with-wants loaded) — same as legacy.
+    // Explicit empty roleKeys (a thread with no #agent/role-with-wants loaded) — same as legacy.
     await backend.deliver(handle, "hi", freshSession(), undefined, undefined, undefined, undefined, undefined, []);
     expect(listKeys).toEqual(["eng"]);
     expect(calls[0]!.env.GITHUB_TOKEN).toBe("ghp_DEF");
     expect(Object.keys(readMcpServers("eng"))).toEqual([vaultEntryKey("default")]);
   });
 
-  test("a loaded pack key → the pack's grants are UNIONED with the def's (def + pack queried)", async () => {
+  test("a loaded role key → the role's grants are UNIONED with the def's (def + role queried)", async () => {
     mkDirs("pk-union");
-    const packKey = "pack--Packs-github";
+    const roleKey = "role--Roles-github";
     const grants = grantsClientByKey({
       byAgent: {
         eng: [{ id: "d1", connection: { kind: "vault", target: "ops", access: "read" }, status: "approved" }],
-        [packKey]: [{ id: "p1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
+        [roleKey]: [{ id: "p1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
       },
       material: {
         d1: { kind: "vault", token: "OPSTOK", mcpUrl: "https://hub/vault/ops/mcp" },
-        p1: { kind: "service", token: "ghp_PACK", inject: ["env"] },
+        p1: { kind: "service", token: "ghp_ROLE", inject: ["env"] },
       },
     });
     const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
     const handle = await backend.start(specWithVault("eng"));
-    // The drain would pass the loaded pack's path key here.
-    await backend.deliver(handle, "hi", freshSession(), undefined, undefined, undefined, undefined, undefined, [packKey]);
-    // The pack's GITHUB_TOKEN (env) AND the def's granted ops vault (MCP) both injected.
-    expect(calls[0]!.env.GITHUB_TOKEN).toBe("ghp_PACK");
+    // The drain would pass the loaded role's path key here.
+    await backend.deliver(handle, "hi", freshSession(), undefined, undefined, undefined, undefined, undefined, [roleKey]);
+    // The role's GITHUB_TOKEN (env) AND the def's granted ops vault (MCP) both injected.
+    expect(calls[0]!.env.GITHUB_TOKEN).toBe("ghp_ROLE");
     const servers = readMcpServers("eng");
     expect(servers[vaultEntryKey("default")]).toBeDefined(); // own def-vault
     expect(servers[grantVaultEntryKey("ops")]!.headers!.Authorization).toBe("Bearer OPSTOK"); // the def's grant

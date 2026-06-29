@@ -290,23 +290,24 @@ export interface Transport {
     subject?: string,
   ): Promise<{ path: string; content: string }[]>;
   /**
-   * Optional: read the thread's loaded-PACK grant KEYS (threads-only Phase B′ —
-   * DESIGN-2026-06-29-threads-only.md §4). Resolves the same `metadata.loadout` paths as
-   * {@link readThreadLoadout}, but reads each note's METADATA (not its content) to find the
-   * loaded notes that are PACKS — i.e. carry the `#pack` tag AND declare a non-empty `wants:`.
-   * Returns each such pack's hub grant-holder key (the slugged PATH, `packPathKey`). This is
-   * the SECURITY GATE: a plain content note's `wants:` is IGNORED (only `#pack` notes
-   * contribute), and the metadata read is DELIBERATELY SEPARATE from the content-only prompt
-   * read (loading a note for context never adds capabilities). The backend unions these with
-   * the def's own `spec.name` grants. `subject` resolves the subject-scoped thread note.
-   * Absent `metadata.loadout` / no pack with `wants:` → an empty array (every current thread).
-   * Only a durable transport (the VaultTransport) implements it; others omit it.
+   * Optional: read the thread's ROLES (layer ① — DESIGN-2026-06-29-threads-roles-context.md).
+   * Resolves the `metadata.roles` array of note PATHS on the thread's `#agent/thread` note in
+   * ONE pass to BOTH (a) the ordered CONTENT entries (`{ path, content }` — note content only)
+   * the backend composes as the FIRST prompt layer, and (b) the grant-holder KEYS (the slugged
+   * PATH, `rolePathKey`) for the loaded notes that are ROLES (carry the `#agent/role` tag AND
+   * declare a non-empty `wants:`). This is the SECURITY GATE: listing a plain content note in
+   * `metadata.roles` loads its content as context but its `wants:` is IGNORED (only `#agent/role`
+   * notes contribute grants) — loading context can never escalate. The backend prepends the
+   * entries before the def (self) and unions the grant keys with the def's own `spec.name` grants.
+   * `subject` resolves the subject-scoped thread note. Absent `metadata.roles` / no role → an
+   * empty `{ entries: [], grantKeys: [] }` (every current thread). Only a durable transport (the
+   * VaultTransport) implements it; others omit it.
    */
-  readThreadPackKeys?(
+  readThreadRoles?(
     channel: string,
     name: string,
     subject?: string,
-  ): Promise<string[]>;
+  ): Promise<{ entries: { path: string; content: string }[]; grantKeys: string[] }>;
   /**
    * Optional: write an agent-to-agent CALLBACK as an INBOUND note on THIS channel (the
    * "reply_to" substrate). A recipient agent's drain, on turn completion, calls this on the

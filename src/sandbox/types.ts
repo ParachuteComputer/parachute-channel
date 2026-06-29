@@ -386,9 +386,10 @@ export function normalizeChannel(ch: AgentChannel): { name: string; access: "rea
  * `[a-zA-Z0-9_-]` becomes `-`. This MIRRORS the channel/name sanitizer used on
  * the vault note paths (`vault.ts:746`, `:822-823`) so a value sanitized here
  * can be used as a path leaf or a `--session-id` segment without re-escaping.
- * Pure + idempotent.
+ * Pure + idempotent. Exported so the NEXT slice (per-thread workspace paths,
+ * spec §G) reuses this exact sanitizer rather than re-implementing it (drift risk).
  */
-function slug(raw: string): string {
+export function slug(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_-]/g, "-");
 }
 

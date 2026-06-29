@@ -1649,7 +1649,7 @@ export class VaultTransport implements Transport {
     // roles×threads NOW slice: persist a non-empty subject; absent → no field (the weave
     // job writes none, so its note is byte-identical to HEAD).
     if (typeof job.subject === "string" && job.subject.trim().length > 0) {
-      metadata.subject = job.subject;
+      metadata.subject = job.subject.trim();
     }
 
     const res = await fetch(`${this.vaultUrl}/vault/${this.vault}/api/notes`, {

@@ -17,6 +17,7 @@ import {
   MAX_DELEGATION_DEPTH,
   isTransientOutboundError,
   outboundThreadId,
+  runFiredBy,
   type WriteOutbound,
   type WriteThread,
   type WriteCallback,
@@ -30,7 +31,9 @@ import type {
   AgentHandle,
   AgentStatus,
   DeliverResult,
+  InboundAttachment,
   InterimSink,
+  RunContext,
   TurnSession,
 } from "./types.ts";
 import type { AgentSpec } from "../sandbox/types.ts";
@@ -52,7 +55,12 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
 class FakeBackend implements AgentBackend {
   readonly kind = "programmatic";
   /** Per-call records, in arrival order — including the caller-resolved {@link TurnSession}. */
-  readonly calls: { channel: string; message: string; session: TurnSession }[] = [];
+  readonly calls: {
+    channel: string;
+    message: string;
+    session: TurnSession;
+    runContext?: RunContext;
+  }[] = [];
   /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial). */
   maxConcurrent = 0;
   private inFlight = 0;
@@ -86,8 +94,10 @@ class FakeBackend implements AgentBackend {
     message: string,
     session: TurnSession,
     onInterim?: InterimSink,
+    _attachments?: InboundAttachment[],
+    runContext?: RunContext,
   ): Promise<DeliverResult> {
-    this.calls.push({ channel: handle.channel, message, session });
+    this.calls.push({ channel: handle.channel, message, session, ...(runContext ? { runContext } : {}) });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);
     try {
@@ -1742,6 +1752,72 @@ describe("ProgrammaticAgentRegistry — agent-to-agent callbacks (reply_to)", ()
     const { meta } = cb.calls[0]!;
     // A bare per-turn UUID fallback — present (never undefined), just not a thread-note path.
     expect(meta.source_thread).toMatch(/^[0-9a-f-]{36}$/);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — run context injection (agent#162)", () => {
+  test("a turn carries run context: a REAL now (ISO), session=new for a fresh turn", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hi" });
+    await until(() => backend.calls.length === 1);
+
+    const rc = backend.calls[0]!.runContext;
+    expect(rc).toBeDefined();
+    // A REAL wall-clock timestamp the headless turn would otherwise lack (parseable ISO).
+    expect(typeof rc!.now).toBe("string");
+    expect(Number.isFinite(Date.parse(rc!.now))).toBe(true);
+    // No prior session (no readSession wired) → a fresh create → session=new.
+    expect(rc!.session).toBe("new");
+  });
+
+  test("session=resumed when the single-threaded turn resumes a prior session", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const readSession = async () => "sess-PRIOR"; // a persisted single-threaded session.
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, readSession });
+    await reg.register(specFor("uni-weaver"));
+
+    reg.enqueue("uni-weaver", { content: "next turn" });
+    await until(() => backend.calls.length === 1);
+
+    expect(backend.calls[0]!.session.resume).toBe(true);
+    expect(backend.calls[0]!.runContext!.session).toBe("resumed");
+  });
+
+  test("fired-by = scheduled-job:<id> for a runner fire; interactive otherwise; absent when no sender", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    // A SCHEDULED job fire (the runner stamps sender = runner:<jobId>).
+    reg.enqueue("eng", { content: "cron tick", sender: "runner:morning-weave" });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.runContext!.firedBy).toBe("scheduled-job:morning-weave");
+
+    // An interactive / human message (a non-runner sender) → interactive.
+    reg.enqueue("eng", { content: "hello", sender: "aaron" });
+    await until(() => backend.calls.length === 2);
+    expect(backend.calls[1]!.runContext!.firedBy).toBe("interactive");
+
+    // No sender → fired-by OMITTED (the run context still carries now + session).
+    reg.enqueue("eng", { content: "no sender" });
+    await until(() => backend.calls.length === 3);
+    expect(backend.calls[2]!.runContext!.firedBy).toBeUndefined();
+  });
+});
+
+describe("runFiredBy — run-context provenance (agent#162)", () => {
+  test("maps runner:<id> → scheduled-job:<id>, other senders → interactive, absent → undefined", () => {
+    expect(runFiredBy("runner:morning-weave")).toBe("scheduled-job:morning-weave");
+    expect(runFiredBy("aaron")).toBe("interactive");
+    expect(runFiredBy("session")).toBe("interactive");
+    expect(runFiredBy(undefined)).toBeUndefined();
+    expect(runFiredBy("")).toBeUndefined();
   });
 });
 

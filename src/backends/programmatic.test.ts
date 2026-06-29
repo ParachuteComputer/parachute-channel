@@ -26,6 +26,7 @@ import { tmpdir } from "node:os";
 import {
   ProgrammaticBackend,
   buildProgrammaticClaudeArgs,
+  renderRunContext,
   PROGRAMMATIC_BACKEND_KIND,
   isTransientTurnError,
   isSessionNotFoundError,
@@ -37,7 +38,7 @@ import {
   type ProgrammaticBackendDeps,
   type ProgrammaticSpawnFn,
 } from "./programmatic.ts";
-import type { TurnSession } from "./types.ts";
+import type { RunContext, TurnSession } from "./types.ts";
 import type { InboundAttachment } from "../transport.ts";
 import type { SandboxEngine } from "../sandbox/index.ts";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
@@ -388,7 +389,71 @@ describe("buildProgrammaticClaudeArgs", () => {
 
 // ---- single-turn runner tests ----------------------------------------------
 
+describe("renderRunContext — daemon-injected runtime preamble (agent#162)", () => {
+  const NOW = "2026-06-28T17:05:42.000Z";
+
+  test("absent runContext → the message is UNCHANGED (additive)", () => {
+    expect(renderRunContext("the real message", undefined)).toBe("the real message");
+  });
+
+  test("prepends a labeled preamble carrying the REAL wall-clock + session, then the message", () => {
+    const out = renderRunContext("write the digest", { now: NOW, session: "resumed" });
+    // The preamble is clearly labeled as daemon-injected runtime context (not the system prompt).
+    expect(out).toContain("Run context");
+    expect(out).toContain("injected by the agent daemon");
+    // It carries the REAL clock (the whole point — the agent stops fabricating timestamps).
+    expect(out).toContain(`now=${NOW}`);
+    expect(out).toContain("session=resumed");
+    // The real message survives, AFTER the preamble (a blank line between).
+    expect(out.endsWith("write the digest")).toBe(true);
+    expect(out.indexOf("now=")).toBeLessThan(out.indexOf("write the digest"));
+  });
+
+  test("includes fired-by + the 1-based turn number when known", () => {
+    const out = renderRunContext("go", {
+      now: NOW,
+      session: "resumed",
+      firedBy: "scheduled-job:morning-weave",
+      priorTurnCount: 24, // 24 completed → this is turn 25.
+    });
+    expect(out).toContain("fired-by=scheduled-job:morning-weave");
+    expect(out).toContain("turn=25");
+  });
+
+  test("omits the optional fields when not provided (only now + session)", () => {
+    const out = renderRunContext("go", { now: NOW, session: "new" });
+    expect(out).toContain("now=" + NOW);
+    expect(out).toContain("session=new");
+    expect(out).not.toContain("fired-by=");
+    expect(out).not.toContain("turn=");
+  });
+});
+
 describe("ProgrammaticBackend.deliver — CREATE turn (--session-id)", () => {
+  test("the assembled turn message carries the injected run-context timestamp (agent#162)", async () => {
+    mkDirs("runctx");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-RC", "ok") });
+    const engine = fakeEngine();
+    const backend = new ProgrammaticBackend(baseDeps(fn, { sandboxEngine: engine }));
+
+    const handle = await backend.start(specWithVault("eng"));
+    const now = "2026-06-28T17:05:42.000Z";
+    const runContext: RunContext = { now, session: "resumed", firedBy: "scheduled-job:weave" };
+    const result = await backend.deliver(handle, "report your status", createSession("sess-RC"), undefined, undefined, runContext);
+
+    expect(result.ok).toBe(true);
+    // The actual `claude -p` invocation (the wrapped command in argv[2]) carries the
+    // daemon-injected run context — the real clock the headless turn otherwise lacks — AND
+    // the original message. This is the issue's core assertion: the turn input carries the
+    // injected timestamp instead of the agent fabricating one.
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain(now);
+    expect(cmd).toContain("Run context");
+    expect(cmd).toContain("session=resumed");
+    expect(cmd).toContain("fired-by=scheduled-job:weave");
+    expect(cmd).toContain("report your status");
+  });
+
   test("a create session → argv has --session-id <id> (NOT --resume); reply + sessionId returned", async () => {
     mkDirs("first");
     const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-FIRST", "the reply text") });

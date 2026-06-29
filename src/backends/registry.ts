@@ -44,7 +44,7 @@
 
 import type { AgentSpec, AgentMode } from "../sandbox/types.ts";
 import { normalizeChannel } from "../sandbox/types.ts";
-import type { AgentBackend, AgentHandle, InterimTurnEvent, TurnSession } from "./types.ts";
+import type { AgentBackend, AgentHandle, InterimTurnEvent, RunContext, TurnSession } from "./types.ts";
 import type { InboundAttachment } from "../transport.ts";
 
 /**
@@ -331,6 +331,20 @@ export function outboundThreadId(
   return threadNoteId ?? turnThreadId;
 }
 
+/**
+ * Derive the run-context `fired-by` provenance (agent#162) from an inbound message's
+ * `sender` (the note's `metadata.sender`). A SCHEDULED job fire stamps `runner:<jobId>`
+ * (the runner's sender provenance) → reported as the job id so the agent knows it's a cron
+ * fire; anything else (a human / a delegated agent message) → `interactive`. Absent sender →
+ * undefined (the run context omits `fired-by`).
+ */
+export function runFiredBy(sender: string | undefined): string | undefined {
+  if (!sender) return undefined;
+  const m = /^runner:(.+)$/.exec(sender);
+  if (m) return `scheduled-job:${m[1]}`;
+  return "interactive";
+}
+
 /** A queued inbound message awaiting its serial turn. */
 export interface QueuedMessage {
   /** The inbound text handed to the `claude -p` turn as the prompt. */
@@ -372,6 +386,13 @@ export interface QueuedMessage {
    * `Read` it. Absent/empty → no attachments (today's behavior unchanged).
    */
   attachments?: InboundAttachment[];
+  /**
+   * WHO/WHAT sent this inbound (the note's `metadata.sender`) — used ONLY to derive the
+   * run-context `fired-by` provenance the daemon injects into the turn (agent#162): a
+   * SCHEDULED job fire stamps `runner:<jobId>`, an interactive/delegated message stamps
+   * something else. Absent → the run context omits `fired-by`. Carries no routing meaning.
+   */
+  sender?: string;
 }
 
 /** A registered programmatic agent's live status (surfaced in /health + the list). */
@@ -855,6 +876,21 @@ export class ProgrammaticAgentRegistry {
       // every path (early failure, ok, outbound-failure) stamps the same resolvable link.
       const outThreadId = outboundThreadId(multiThreaded, turnThreadId, startThreadNoteId);
 
+      // RUN CONTEXT (agent#162): assemble the runtime facts a headless `claude -p` turn can't
+      // know — the REAL wall-clock (`startedAt`), whether this run CONTINUES a prior session
+      // (`turnSession.resume`) or starts fresh, and WHY it fired (a scheduled job vs an
+      // interactive/delegated message, from the inbound sender). The backend prepends these as
+      // a labeled preamble so the agent stamps ACCURATE times instead of fabricating them.
+      // (DEFERRED: `priorTurnCount` — the rolling turn_count lives in the transport's thread
+      // note and isn't surfaced back to the drain; wiring it is a follow-up. Until then the
+      // preamble omits the `turn=N` line — the `now`/session/fired-by trio is the floor.)
+      const firedBy = runFiredBy(msg.sender);
+      const runContext: RunContext = {
+        now: startedAt,
+        session: turnSession.resume ? "resumed" : "new",
+        ...(firedBy ? { firedBy } : {}),
+      };
+
       let result;
       try {
         // Forward each interim event to the streaming-view sink (keyed by channel)
@@ -868,6 +904,8 @@ export class ProgrammaticAgentRegistry {
           // Phase 1: inbound attachments → the programmatic backend stages them into the
           // agent's private workspace so the turn can Read them. Absent/empty → no staging.
           msg.attachments,
+          // agent#162: the daemon-known runtime context (real clock, new/resumed, fired-by).
+          runContext,
         );
       } catch (err) {
         // The backend contract is failure-as-VALUE, never a throw — but defend so a

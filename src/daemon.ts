@@ -342,6 +342,9 @@ export function contextFor(
           // Phase 1: carry inbound file attachments through to the turn (the programmatic
           // backend stages them into the agent's private workspace so the turn can Read them).
           ...(msg.attachments && msg.attachments.length > 0 ? { attachments: msg.attachments } : {}),
+          // agent#162: carry the inbound sender so the drain can derive the run-context
+          // `fired-by` (a scheduled `runner:<jobId>` fire vs an interactive/delegated message).
+          ...(msg.meta?.sender ? { sender: msg.meta.sender } : {}),
         });
         return;
       }
@@ -366,6 +369,9 @@ export function contextFor(
           // Phase 1: carry inbound attachments through the pending buffer too, so a turn
           // that runs on register() still stages them.
           ...(msg.attachments && msg.attachments.length > 0 ? { attachments: msg.attachments } : {}),
+          // agent#162: carry the sender through the pending buffer too, so a turn that runs on
+          // register() still derives the right run-context `fired-by`.
+          ...(msg.meta?.sender ? { sender: msg.meta.sender } : {}),
         });
         if (outcome === "queued") return;
         // outcome === "unknown" — not an expected programmatic channel. It may still be a

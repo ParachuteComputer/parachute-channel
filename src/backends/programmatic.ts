@@ -85,6 +85,7 @@ import type {
   DeliverResult,
   DeliverUsage,
   InterimSink,
+  RunContext,
   TurnSession,
 } from "./types.ts";
 
@@ -327,6 +328,32 @@ export function buildProgrammaticClaudeArgs(opts: {
   return argv;
 }
 
+/**
+ * Render the {@link RunContext} as a concise, clearly-LABELED preamble to PREPEND to a turn's
+ * message (agent#162). A headless `claude -p` turn has no clock + no notion of which run it is,
+ * so the daemon hands it these facts (the real wall-clock, new-vs-resumed, why it fired, the
+ * prior turn count) — the agent then stamps ACCURATE times instead of fabricating them.
+ *
+ * It is a single fenced block clearly marked as daemon-injected runtime context (NOT the
+ * agent's own system prompt — that's untouched), then a blank line, then the real message. The
+ * `now` is always present; the rest are appended only when known. Returns the message UNCHANGED
+ * when `rc` is absent (additive — no behavior change for a caller that doesn't pass one).
+ */
+export function renderRunContext(message: string, rc: RunContext | undefined): string {
+  if (!rc) return message;
+  const parts: string[] = [`now=${rc.now}`, `session=${rc.session}`];
+  if (typeof rc.priorTurnCount === "number" && rc.priorTurnCount >= 0) {
+    // The NUMBER of this turn (1-based) = completed turns + 1 — what an agent stamps as "turn N".
+    parts.push(`turn=${rc.priorTurnCount + 1}`);
+  }
+  if (rc.firedBy) parts.push(`fired-by=${rc.firedBy}`);
+  const preamble =
+    `[Run context — injected by the agent daemon (this is the real runtime state, NOT your ` +
+    `system prompt). Use these for any timestamp/clock or "which run is this" reasoning instead ` +
+    `of guessing: ${parts.join(", ")}]`;
+  return `${preamble}\n\n${message}`;
+}
+
 /** Read the full text of a (possibly null) byte stream; null/error → "". */
 async function drainStream(stream: ReadableStream<Uint8Array> | null): Promise<string> {
   if (!stream) return "";
@@ -414,6 +441,7 @@ export class ProgrammaticBackend implements AgentBackend {
     session: TurnSession,
     onInterim?: InterimSink,
     attachments?: InboundAttachment[],
+    runContext?: RunContext,
   ): Promise<DeliverResult> {
     const spec = handle.spec;
     if (!spec) {
@@ -537,13 +565,18 @@ export class ProgrammaticBackend implements AgentBackend {
     // per-agent even when the working dir is shared. Best-effort + isolated: a single
     // attachment's fetch/stage failure logs + is SKIPPED (the turn still runs with the rest
     // + the text). Absent/empty → no staging, no prompt change (today's behavior exactly).
-    let turnMessage = message;
+    // RUN CONTEXT (agent#162): prepend the daemon-injected runtime preamble (the real
+    // wall-clock + new/resumed + why-it-fired) so the headless turn reads ACCURATE facts
+    // instead of fabricating a clock. Done FIRST so the preamble sits at the very top of the
+    // prompt; attachments append after the (already-prefixed) message. Absent runContext →
+    // the message is unchanged (additive).
+    let turnMessage = renderRunContext(message, runContext);
     if (attachments && attachments.length > 0) {
       const staged = await this.stageAttachments(workspace, attachments, vaultArg);
       if (staged.length > 0) {
         const lines = staged.map((s) => `- ${s.absPath} (${s.mimeType})`);
         turnMessage =
-          `${message}\n\n[Attached files — read them as needed:\n${lines.join("\n")}\n]`;
+          `${turnMessage}\n\n[Attached files — read them as needed:\n${lines.join("\n")}\n]`;
       }
     }
 

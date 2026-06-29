@@ -174,8 +174,16 @@ export interface ThreadNote {
  * per channel, multi-threaded writes one per fire. A write failure is the implementation's
  * to surface (the registry logs whatever it throws); it never re-runs the turn. Optional on
  * the registry — when unwired (no vault-backed channel), a turn still runs, just no note.
+ *
+ * RETURNS the WRITTEN thread-note's id (`{ id }`) so the drain can use it as a RESOLVABLE
+ * `source_thread` on the agent-to-agent callback (agent#124) — for BOTH modes, this is the
+ * actual note an orchestrator can pull with `query-notes { id }` (single-threaded: the
+ * deterministic `Threads/<safeChannel>/<safeName>` note; multi-threaded: the per-fire
+ * `Threads/<safeChannel>/<uuid>` note). `void` is in the union (back-compat) — a transport
+ * with no durable store, or one that can't surface an id, returns it and the drain falls
+ * back to the per-turn id.
  */
-export type WriteThread = (thread: ThreadNote) => Promise<void>;
+export type WriteThread = (thread: ThreadNote) => Promise<{ id?: string } | void>;
 
 /**
  * A callback delivered back to a SENDER's channel when a turn it requested finishes —
@@ -216,15 +224,16 @@ export interface CallbackMeta {
   /** The channel/def whose turn just finished (the recipient) — provenance for the sender. */
   source_channel: string;
   /**
-   * The per-turn thread id the drain minted. RESOLVABILITY DIFFERS BY MODE:
-   *  - multi-threaded: this IS the per-fire note's leaf — the orchestrator can pull the
-   *    thread note at `Threads/<channel>/<source_thread>`.
-   *  - single-threaded: this is a per-turn CORRELATION id, NOT the note leaf (the
-   *    single-threaded note lives at the deterministic `Threads/<channel>/<name>`), so it
-   *    is NOT directly resolvable. Use `source_message` as the reliable pull-link for a
-   *    single-threaded recipient. Making this a resolvable thread id for both modes
-   *    (widen the writeThread seam to return the written note id) is tracked as a
-   *    follow-up (parachute-agent#124).
+   * The WRITTEN thread-note id — RESOLVABLE for BOTH modes (agent#124): an orchestrator can
+   * always pull the recipient's full thread record with `query-notes { id: source_thread }`,
+   * even on an error/empty/tool-only turn (the thread note is written BEFORE the outbound
+   * reply, so its id exists when there's no `source_message`).
+   *  - multi-threaded: the per-fire note id (`Threads/<safeChannel>/<uuid>`).
+   *  - single-threaded: the deterministic note id (`Threads/<safeChannel>/<safeName>`) — NOT
+   *    the per-turn correlation id (the pre-#124 bug: that correlation id wasn't the note leaf
+   *    for single-threaded, so it couldn't be resolved).
+   * The drain sources this from {@link WriteThread}'s returned id; if the seam can't surface
+   * one (no durable store) it falls back to the per-turn id (still a stable provenance token).
    */
   source_thread: string;
   /**
@@ -835,7 +844,7 @@ export class ProgrammaticAgentRegistry {
         // thread note captures the turn outcome, so a failed turn is still a queryable
         // `status:error` (single-threaded upserts the rolling thread; multi-threaded writes
         // a per-fire note).
-        await this.recordThread(handle, msg, "error", reason, startedAt, undefined, {
+        const threadNoteId = await this.recordThread(handle, msg, "error", reason, startedAt, undefined, {
           threadId: turnThreadId,
           phase: "end",
           // No `result` (the backend threw) → NO session to persist. We never write a
@@ -848,8 +857,10 @@ export class ProgrammaticAgentRegistry {
         // no-reply) — best-effort.
         await this.postFailureNote(channel, msg.inReplyTo, turnThreadId, reason);
         // CALLBACK on the failure too — an orchestrator MUST learn its sub-task failed, not
-        // hang waiting forever. No outbound note was produced, so no `source_message`.
-        await this.maybeDeliverCallback(handle, msg, turnThreadId, "error");
+        // hang waiting forever. No outbound note was produced, so no `source_message`; the
+        // RESOLVABLE thread-note id (written above) is `source_thread` so the orchestrator can
+        // still pull the recipient's thread on a no-reply turn (agent#124).
+        await this.maybeDeliverCallback(handle, msg, turnThreadId, "error", undefined, threadNoteId);
         continue;
       }
 
@@ -863,7 +874,7 @@ export class ProgrammaticAgentRegistry {
         // BOTH modes record the failed turn (status:error) on the thread note so a failure
         // always leaves a queryable trace (single-threaded upserts the rolling thread,
         // marking it errored; multi-threaded writes a per-fire status:error note).
-        await this.recordThread(handle, msg, "error", result.error, startedAt, undefined, {
+        const threadNoteId = await this.recordThread(handle, msg, "error", result.error, startedAt, undefined, {
           threadId: turnThreadId,
           phase: "end",
           // Persist ONLY the session claude ECHOED (FIX 2). A turn can fail AFTER
@@ -878,8 +889,9 @@ export class ProgrammaticAgentRegistry {
         // no-reply) — best-effort.
         await this.postFailureNote(channel, msg.inReplyTo, turnThreadId, result.error);
         // CALLBACK on the failure-as-value too (status:error) — the orchestrator learns the
-        // sub-task failed and can react. No delivered reply, so no `source_message`.
-        await this.maybeDeliverCallback(handle, msg, turnThreadId, "error");
+        // sub-task failed and can react. No delivered reply, so no `source_message`; the
+        // RESOLVABLE thread-note id (written above) is `source_thread` (agent#124).
+        await this.maybeDeliverCallback(handle, msg, turnThreadId, "error", undefined, threadNoteId);
         continue;
       }
 
@@ -891,7 +903,11 @@ export class ProgrammaticAgentRegistry {
       // multi-threaded writes the per-fire note. Best-effort: a thread-note failure is
       // logged + the turn still resolves (we never re-run a `claude -p` turn — that would
       // burn quota for a duplicate).
-      await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage, {
+      // Capture the WRITTEN thread-note id — the RESOLVABLE `source_thread` for the callback
+      // (agent#124). The same note id is reused for the outbound-failure re-record below
+      // (sameTurn → same note), so a callback on either terminal path points at a pullable
+      // thread record.
+      let threadNoteId = await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage, {
         threadId: turnThreadId,
         phase: "end",
         // Persist the session claude ECHOED (FIX 2) so the next turn `--resume`s this
@@ -938,7 +954,9 @@ export class ProgrammaticAgentRegistry {
           // `sameTurn` so this updates the note the `ok` record above just wrote (one
           // note, no turn_count double-count) rather than minting a duplicate / advancing
           // the count (the FIX-1 re-record bug the reviewer caught).
-          await this.recordThread(
+          // Re-record returns the SAME note's id (sameTurn upsert / same per-fire note) — use
+          // it as the callback `source_thread` (agent#124), falling back to the ok-record id.
+          threadNoteId = (await this.recordThread(
             handle,
             msg,
             "error",
@@ -955,7 +973,7 @@ export class ProgrammaticAgentRegistry {
               // write failed. Only claude's echoed id (FIX 2), never the passed uuid.
               ...(result.sessionId ? { session: result.sessionId } : {}),
             },
-          );
+          )) ?? threadNoteId;
           this.emitTurnEvent(channel, {
             kind: "error",
             error: `reply produced but not saved: ${delivered.error}`,
@@ -963,8 +981,8 @@ export class ProgrammaticAgentRegistry {
           // CALLBACK as status:error — the reply was produced but NOT delivered, so the
           // turn did not truly succeed; the orchestrator must learn that. No `source_message`
           // (the outbound note never landed); the undelivered text lives in the error thread
-          // note for an operator to recover.
-          await this.maybeDeliverCallback(handle, msg, turnThreadId, "error");
+          // note for an operator to recover — pull it via the RESOLVABLE `source_thread`.
+          await this.maybeDeliverCallback(handle, msg, turnThreadId, "error", undefined, threadNoteId);
           continue;
         }
       }
@@ -976,8 +994,10 @@ export class ProgrammaticAgentRegistry {
       // (empty/tool-only turn → clean resolve, no note expected).
       this.emitTurnEvent(channel, { kind: "done", reply: result.reply ?? "" });
       // CALLBACK on success — the turn finished cleanly (status:ok). `sourceMessage` is the
-      // delivered reply note (when there was one) the orchestrator pulls the full result from.
-      await this.maybeDeliverCallback(handle, msg, turnThreadId, "ok", sourceMessage);
+      // delivered reply note (when there was one) the orchestrator pulls the full result from;
+      // `source_thread` (the WRITTEN thread-note id, agent#124) is the RESOLVABLE pull-link in
+      // both modes, including an empty/tool-only turn where there's no `sourceMessage`.
+      await this.maybeDeliverCallback(handle, msg, turnThreadId, "ok", sourceMessage, threadNoteId);
     }
   }
 
@@ -1013,6 +1033,7 @@ export class ProgrammaticAgentRegistry {
     turnThreadId: string,
     status: "ok" | "error",
     sourceMessage?: string,
+    sourceThreadId?: string,
   ): Promise<void> {
     // Guard 1 + 2: no sink, or this wasn't a delegated request → nothing to call back.
     if (!this.writeCallback) return;
@@ -1041,11 +1062,17 @@ export class ProgrammaticAgentRegistry {
     // source_message are echoed/included only when present. The daemon's WriteCallback
     // wiring writes this as a `#agent/message/inbound` note to `msg.replyTo` and — CRUCIALLY
     // — does NOT stamp a `reply_to` on it (the terminal-callback loop guard).
+    //
+    // `source_thread` is the WRITTEN thread-note id (agent#124) — RESOLVABLE for BOTH modes
+    // (`query-notes { id: source_thread }`), available even on an error/empty/tool-only turn
+    // (the thread note is written before the outbound). Fall back to the per-turn id only when
+    // the thread seam surfaced none (no durable store / a write failure) — still a stable
+    // provenance token, just not a pullable note.
     const meta: CallbackMeta = {
       callback: "true",
       status,
       source_channel: handle.channel,
-      source_thread: turnThreadId,
+      source_thread: sourceThreadId ?? turnThreadId,
       ...(sourceMessage ? { source_message: sourceMessage } : {}),
       ...(msg.correlationId ? { correlation_id: msg.correlationId } : {}),
       delegation_depth: String(incomingDepth + 1),
@@ -1071,6 +1098,11 @@ export class ProgrammaticAgentRegistry {
    * agent name (single-threaded's thread is "named after the definition"). Best-effort: a
    * write failure is LOGGED, never thrown out — a missing thread note must not strand the
    * queue, and the turn is never re-run (it would burn quota for a duplicate `claude -p`).
+   *
+   * RETURNS the WRITTEN thread-note id so the drain can use it as a RESOLVABLE
+   * `source_thread` on the agent-to-agent callback (agent#124), for BOTH modes. `undefined`
+   * when no sink is wired, the write failed, or the seam surfaced no id — the drain then
+   * falls back to the per-turn id.
    */
   private async recordThread(
     handle: ProgrammaticAgentHandle,
@@ -1080,8 +1112,8 @@ export class ProgrammaticAgentRegistry {
     startedAt: string,
     usage: ThreadNote["usage"],
     opts: { threadId?: string; sameTurn?: boolean; phase?: "start" | "end"; session?: string } = {},
-  ): Promise<void> {
-    if (!this.writeThread) return;
+  ): Promise<string | undefined> {
+    if (!this.writeThread) return undefined;
     const thread: ThreadNote = {
       channel: handle.channel,
       name: handle.spec.name,
@@ -1107,12 +1139,18 @@ export class ProgrammaticAgentRegistry {
       ...(opts.phase ? { phase: opts.phase } : {}),
     };
     try {
-      await this.writeThread(thread);
+      // The seam returns the WRITTEN note id (`{ id }`) for a durable transport; `void` for
+      // one with no store. Surface it so the drain can set a RESOLVABLE callback
+      // `source_thread` (agent#124). A missing id → undefined → the drain falls back to the
+      // per-turn id.
+      const written = await this.writeThread(thread);
+      return written?.id;
     } catch (err) {
       console.error(
         `parachute-agent: writing #agent/thread note for channel "${handle.channel}" failed ` +
           `(continuing): ${(err as Error).message}`,
       );
+      return undefined;
     }
   }
 

@@ -152,6 +152,50 @@ function threadRecorder(): {
   };
 }
 
+/**
+ * A recorder WriteThread that RETURNS the written note id — FAITHFUL to the
+ * VaultTransport's path-as-id logic (agent#124), so a test can assert the callback's
+ * `source_thread` equals what `query-notes { id }` would resolve:
+ *  - single-threaded → the DETERMINISTIC id `Threads/<safeChannel>/<safeName>` (NOT the
+ *    per-turn correlation id — the pre-#124 bug).
+ *  - multi-threaded → the per-fire id `Threads/<safeChannel>/<threadId>`.
+ * The sanitization mirrors {@link VaultTransport.singleThreadedPath}. Captures every write
+ * in order; `idFor(thread)` exposes the same derivation so a test can compute the expected id.
+ */
+function threadRecorderWithIds(): {
+  threads: ThreadNote[];
+  ends: () => ThreadNote[];
+  idFor: (thread: ThreadNote) => string;
+  fn: WriteThread;
+} {
+  const slug = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, "-");
+  const idFor = (thread: ThreadNote): string => {
+    const safeChannel = slug(thread.channel);
+    if (thread.mode === "single-threaded") {
+      return `Threads/${safeChannel}/${slug(thread.name ?? thread.channel)}`;
+    }
+    return `Threads/${safeChannel}/${thread.threadId ?? "no-id"}`;
+  };
+  const threads: ThreadNote[] = [];
+  const fn: WriteThread = async (thread) => {
+    threads.push(thread);
+    return { id: idFor(thread) };
+  };
+  return {
+    threads,
+    ends: () => threads.filter((t) => t.phase !== "start"),
+    idFor,
+    fn,
+  };
+}
+
+/** A single-threaded spec (the DEFAULT mode — one upserting thread note per channel). */
+const specSingleThreaded = (name: string, channel = name): AgentSpec => ({
+  name,
+  channels: [channel],
+  mode: "single-threaded",
+});
+
 /** A multi-threaded spec (materializes one `#agent/thread` note per fire). */
 const specMultiThreaded = (name: string, channel = name, definition?: string): AgentSpec => ({
   name,
@@ -1490,5 +1534,150 @@ describe("ProgrammaticAgentRegistry — agent-to-agent callbacks (reply_to)", ()
     expect(out.calls.map((c) => c.reply)).toEqual(
       Array.from({ length: N }, (_, i) => `ack:callback-${i}`),
     );
+  });
+
+  // ── source_thread is a RESOLVABLE thread-note id for BOTH modes (agent#124) ──────────────
+  // The callback's `source_thread` must be the actual written thread-note id (what
+  // `query-notes { id }` resolves), not the per-turn correlation UUID. The faithful
+  // `threadRecorderWithIds` returns the SAME id the VaultTransport would (single-threaded:
+  // the deterministic name path; multi-threaded: the per-fire uuid path), so these tests pin
+  // the end-to-end contract: the id the seam wrote is the id the orchestrator gets back.
+
+  test("source_thread = the WRITTEN single-threaded thread-note id (deterministic path, NOT the per-turn id)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    const out = recorderWithId("reply-note-1");
+    const threads = threadRecorderWithIds();
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeThread: threads.fn,
+      writeCallback: cb.fn,
+    });
+    // DEFAULT mode is single-threaded; be explicit here.
+    await reg.register(specSingleThreaded("worker"));
+
+    reg.enqueue("worker", { content: "sub-task", replyTo: "orchestrator" });
+    await until(() => cb.calls.length === 1);
+
+    const endRecord = threads.ends().at(-1)!;
+    const expectedId = threads.idFor(endRecord); // "Threads/worker/worker" (det. name path).
+    const { meta } = cb.calls[0]!;
+    expect(meta.source_thread).toBe(expectedId); // RESOLVABLE — the written note id.
+    expect(meta.source_thread).toBe("Threads/worker/worker"); // the deterministic leaf,
+    // …and CRUCIALLY not a bare per-turn correlation UUID (the pre-#124 bug).
+    expect(meta.source_thread).not.toMatch(/^[0-9a-f-]{36}$/);
+    // The single-threaded + reply common case still also carries source_message.
+    expect(meta.source_message).toBe("reply-note-1");
+  });
+
+  test("source_thread = the WRITTEN multi-threaded per-fire thread-note id", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    const out = recorderWithId("reply-note-2");
+    const threads = threadRecorderWithIds();
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeThread: threads.fn,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specMultiThreaded("worker"));
+
+    reg.enqueue("worker", { content: "sub-task", replyTo: "orchestrator" });
+    await until(() => cb.calls.length === 1);
+
+    const endRecord = threads.ends().at(-1)!;
+    const expectedId = threads.idFor(endRecord); // "Threads/worker/<per-fire uuid>".
+    const { meta } = cb.calls[0]!;
+    expect(meta.source_thread).toBe(expectedId); // RESOLVABLE — the per-fire note id.
+    expect(meta.source_thread).toMatch(/^Threads\/worker\/[0-9a-f-]{36}$/);
+    expect(meta.source_message).toBe("reply-note-2");
+  });
+
+  test("single-threaded ERROR turn: source_thread is STILL the resolvable thread-note id (no source_message)", async () => {
+    // The narrow edge the issue targets: a single-threaded recipient whose turn produced NO
+    // reply (an error). `source_message` is absent — pre-#124 the orchestrator had only an
+    // unresolvable per-turn UUID. Now `source_thread` is the written (error) thread note id.
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: false, error: "mint refused" });
+    const out = recorderWithId();
+    const threads = threadRecorderWithIds();
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeThread: threads.fn,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specSingleThreaded("worker"));
+
+    reg.enqueue("worker", { content: "do it", replyTo: "orchestrator" });
+    await until(() => cb.calls.length === 1);
+
+    const endRecord = threads.ends().at(-1)!;
+    expect(endRecord.status).toBe("error"); // the recorded turn failed,
+    const { meta } = cb.calls[0]!;
+    expect(meta.status).toBe("error");
+    expect(meta.source_message).toBeUndefined(); // no delivered reply note on an error turn,
+    // …yet source_thread is the RESOLVABLE written thread-note id (the agent#124 fix).
+    expect(meta.source_thread).toBe(threads.idFor(endRecord));
+    expect(meta.source_thread).toBe("Threads/worker/worker");
+    expect(meta.source_thread).not.toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  test("single-threaded EMPTY/tool-only turn (no reply): source_thread is the resolvable thread-note id, no source_message", async () => {
+    // A success turn that produced NO text (tool-only work) → no outbound note → no
+    // source_message. The callback still fires (status:ok) and carries the resolvable
+    // source_thread so the orchestrator can pull the recipient's thread.
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: true, reply: "" }); // empty reply → no outbound note.
+    const out = recorderWithId();
+    const threads = threadRecorderWithIds();
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeThread: threads.fn,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specSingleThreaded("worker"));
+
+    reg.enqueue("worker", { content: "tool-only", replyTo: "orchestrator" });
+    await until(() => cb.calls.length === 1);
+
+    expect(out.calls).toHaveLength(0); // no reply text → no outbound note written.
+    const endRecord = threads.ends().at(-1)!;
+    const { meta } = cb.calls[0]!;
+    expect(meta.status).toBe("ok");
+    expect(meta.source_message).toBeUndefined(); // no reply note to point at,
+    expect(meta.source_thread).toBe(threads.idFor(endRecord)); // but the thread is resolvable.
+    expect(meta.source_thread).toBe("Threads/worker/worker");
+  });
+
+  test("falls back to the per-turn id when the WriteThread seam surfaces no id (e.g. no durable store)", async () => {
+    // Defensive: a transport with no durable store (telegram) returns void from the seam.
+    // The callback still fires with a source_thread — the per-turn id (a stable provenance
+    // token, just not a pullable note). Never undefined.
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    const out = recorderWithId();
+    const voidThread: WriteThread = async () => {}; // returns void — no id.
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      writeThread: voidThread,
+      writeCallback: cb.fn,
+    });
+    await reg.register(specSingleThreaded("worker"));
+
+    reg.enqueue("worker", { content: "x", replyTo: "orchestrator" });
+    await until(() => cb.calls.length === 1);
+    const { meta } = cb.calls[0]!;
+    // A bare per-turn UUID fallback — present (never undefined), just not a thread-note path.
+    expect(meta.source_thread).toMatch(/^[0-9a-f-]{36}$/);
   });
 });

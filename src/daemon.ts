@@ -735,7 +735,7 @@ export function buildWriteThread(channels: Map<string, Channel>): WriteThread {
     }
     // Only a transport with a durable store implements writeThread (the VaultTransport).
     if (!ch.transport.writeThread) return;
-    await ch.transport.writeThread({
+    const written = await ch.transport.writeThread({
       channel: thread.channel,
       ...(thread.name ? { name: thread.name } : {}),
       ...(thread.definition ? { definition: thread.definition } : {}),
@@ -759,6 +759,13 @@ export function buildWriteThread(channels: Map<string, Channel>): WriteThread {
       ...(thread.sameTurn ? { sameTurn: true } : {}),
       ...(thread.phase ? { phase: thread.phase } : {}),
     });
+    // Surface the WRITTEN note id so the drain can set a RESOLVABLE callback `source_thread`
+    // (agent#124). `writeThread` returns `{ sent: [id] }` — the id is the actual note an
+    // orchestrator can pull with `query-notes { id }` for BOTH modes (single-threaded: the
+    // deterministic `Threads/<safeChannel>/<safeName>` note; multi-threaded: the per-fire
+    // `Threads/<safeChannel>/<uuid>` note). Empty/absent → undefined (the drain falls back).
+    const id = written?.sent?.[0];
+    return id ? { id } : undefined;
   };
 }
 

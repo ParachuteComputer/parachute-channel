@@ -345,6 +345,10 @@ export function contextFor(
           // agent#162: carry the inbound sender so the drain can derive the run-context
           // `fired-by` (a scheduled `runner:<jobId>` fire vs an interactive/delegated message).
           ...(msg.meta?.sender ? { sender: msg.meta.sender } : {}),
+          // roles×threads NOW slice: carry the thread subject through to the drain so the
+          // composed prompt can fold in a subject dossier (and the NEXT slice can route by
+          // it). No routing meaning yet. Absent → unchanged (the weave path is untouched).
+          ...(msg.meta?.subject ? { subject: msg.meta.subject } : {}),
         });
         return;
       }
@@ -372,6 +376,10 @@ export function contextFor(
           // agent#162: carry the sender through the pending buffer too, so a turn that runs on
           // register() still derives the right run-context `fired-by`.
           ...(msg.meta?.sender ? { sender: msg.meta.sender } : {}),
+          // roles×threads NOW slice: carry the thread subject through the pending buffer too,
+          // so a turn that runs on register() still folds in its subject dossier. No routing
+          // meaning yet. Absent → unchanged.
+          ...(msg.meta?.subject ? { subject: msg.meta.subject } : {}),
         });
         if (outcome === "queued") return;
         // outcome === "unknown" — not an expected programmatic channel. It may still be a
@@ -1815,7 +1823,12 @@ export function createFetchHandler(
           if (!transport) {
             return json({ error: `job "${id}" targets a non-vault channel "${job.channel}"` }, 400);
           }
-          await transport.injectInbound({ content: job.message, sender: `runner:${job.id}` });
+          // roles×threads NOW slice: thread the job's subject (absent → no subject).
+          await transport.injectInbound({
+            content: job.message,
+            sender: `runner:${job.id}`,
+            ...(job.subject ? { subject: job.subject } : {}),
+          });
           return json({ ok: true, id, status: "ok" });
         } catch (err) {
           return json({ error: `failed to run job: ${(err as Error).message}` }, 502);
@@ -3381,7 +3394,14 @@ function main(): void {
       if (!transport) {
         throw new Error(`channel "${job.channel}" is not a live vault channel`);
       }
-      await transport.injectInbound({ content: job.message, sender: `runner:${job.id}` });
+      // roles×threads NOW slice: thread the job's subject onto the inbound note so the
+      // turn's composed prompt can fold in its dossier. Absent → no subject (the weave
+      // job carries none → byte-identical to HEAD).
+      await transport.injectInbound({
+        content: job.message,
+        sender: `runner:${job.id}`,
+        ...(job.subject ? { subject: job.subject } : {}),
+      });
     },
     // Persist bookkeeping (lastRunAt/lastStatus) back onto the job note (addressed
     // by its vault note id). A job loaded from the store always carries `noteId`.

@@ -3159,11 +3159,12 @@ export function createFetchHandler(
         return json({ error: "invalid JSON body" }, 400);
       }
       const meta = body.note?.metadata ?? {};
-      // The thread-id: the note's `metadata.thread` (the thread address), else its
-      // `metadata.agent` (a def-thread whose id ≡ name), else the note id/path leaf.
-      const threadId =
-        (typeof meta.thread === "string" && meta.thread ? meta.thread : undefined) ??
-        (typeof meta.agent === "string" && meta.agent ? meta.agent : undefined);
+      // The thread-id is the note's EXPLICIT `metadata.thread` address only. We deliberately do
+      // NOT fall back to `metadata.agent`: a def-backed agent (uni/steward/…) is torn down only
+      // via the def-set diff, never this endpoint — so a stray or abusive thread-status POST
+      // naming `agent: steward` can't clear the live heartbeat's queue (reviewer nit). Non-def
+      // threads (the only thing this endpoint archives) always carry `metadata.thread`.
+      const threadId = typeof meta.thread === "string" && meta.thread ? meta.thread : undefined;
       const status = typeof meta.status === "string" ? meta.status.trim().toLowerCase() : "";
       // ARCHIVE terminals — a transition into any of these tears the thread down. Any other
       // status (running/working/etc.) is a benign no-op ack (the trigger may fire on every

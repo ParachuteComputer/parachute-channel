@@ -16,6 +16,8 @@ import {
   PENDING_INBOUND_CAP,
   MAX_DELEGATION_DEPTH,
   isTransientOutboundError,
+  outboundThreadId,
+  runFiredBy,
   type WriteOutbound,
   type WriteThread,
   type WriteCallback,
@@ -29,7 +31,9 @@ import type {
   AgentHandle,
   AgentStatus,
   DeliverResult,
+  InboundAttachment,
   InterimSink,
+  RunContext,
   TurnSession,
 } from "./types.ts";
 import type { AgentSpec } from "../sandbox/types.ts";
@@ -51,7 +55,12 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
 class FakeBackend implements AgentBackend {
   readonly kind = "programmatic";
   /** Per-call records, in arrival order — including the caller-resolved {@link TurnSession}. */
-  readonly calls: { channel: string; message: string; session: TurnSession }[] = [];
+  readonly calls: {
+    channel: string;
+    message: string;
+    session: TurnSession;
+    runContext?: RunContext;
+  }[] = [];
   /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial). */
   maxConcurrent = 0;
   private inFlight = 0;
@@ -85,8 +94,10 @@ class FakeBackend implements AgentBackend {
     message: string,
     session: TurnSession,
     onInterim?: InterimSink,
+    _attachments?: InboundAttachment[],
+    runContext?: RunContext,
   ): Promise<DeliverResult> {
-    this.calls.push({ channel: handle.channel, message, session });
+    this.calls.push({ channel: handle.channel, message, session, ...(runContext ? { runContext } : {}) });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);
     try {
@@ -119,6 +130,24 @@ function recorder(): { calls: { channel: string; reply: string; inReplyTo?: stri
   const calls: { channel: string; reply: string; inReplyTo?: string }[] = [];
   const fn: WriteOutbound = async (channel, reply, inReplyTo) => {
     calls.push({ channel, reply, ...(inReplyTo ? { inReplyTo } : {}) });
+  };
+  return { calls, fn };
+}
+
+/**
+ * A recorder WriteOutbound that ALSO captures the stamped `threadId` (the outbound note's
+ * `metadata.thread`, agent#163) — kept separate from {@link recorder} so the existing
+ * exact-`toEqual` reply assertions stay unaffected. Used to pin that a single-threaded
+ * outbound carries the DETERMINISTIC thread-NOTE id and a multi-threaded one carries the
+ * per-fire id.
+ */
+function recorderWithThreadId(): {
+  calls: { channel: string; reply: string; inReplyTo?: string; threadId?: string }[];
+  fn: WriteOutbound;
+} {
+  const calls: { channel: string; reply: string; inReplyTo?: string; threadId?: string }[] = [];
+  const fn: WriteOutbound = async (channel, reply, inReplyTo, threadId) => {
+    calls.push({ channel, reply, ...(inReplyTo ? { inReplyTo } : {}), ...(threadId ? { threadId } : {}) });
   };
   return { calls, fn };
 }
@@ -1723,5 +1752,194 @@ describe("ProgrammaticAgentRegistry — agent-to-agent callbacks (reply_to)", ()
     const { meta } = cb.calls[0]!;
     // A bare per-turn UUID fallback — present (never undefined), just not a thread-note path.
     expect(meta.source_thread).toMatch(/^[0-9a-f-]{36}$/);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — run context injection (agent#162)", () => {
+  test("a turn carries run context: a REAL now (ISO), session=new for a fresh turn", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hi" });
+    await until(() => backend.calls.length === 1);
+
+    const rc = backend.calls[0]!.runContext;
+    expect(rc).toBeDefined();
+    // A REAL wall-clock timestamp the headless turn would otherwise lack (parseable ISO).
+    expect(typeof rc!.now).toBe("string");
+    expect(Number.isFinite(Date.parse(rc!.now))).toBe(true);
+    // No prior session (no readSession wired) → a fresh create → session=new.
+    expect(rc!.session).toBe("new");
+  });
+
+  test("session=resumed when the single-threaded turn resumes a prior session", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const readSession = async () => "sess-PRIOR"; // a persisted single-threaded session.
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, readSession });
+    await reg.register(specFor("uni-weaver"));
+
+    reg.enqueue("uni-weaver", { content: "next turn" });
+    await until(() => backend.calls.length === 1);
+
+    expect(backend.calls[0]!.session.resume).toBe(true);
+    expect(backend.calls[0]!.runContext!.session).toBe("resumed");
+  });
+
+  test("fired-by = scheduled-job:<id> for a runner fire; interactive otherwise; absent when no sender", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    // A SCHEDULED job fire (the runner stamps sender = runner:<jobId>).
+    reg.enqueue("eng", { content: "cron tick", sender: "runner:morning-weave" });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.runContext!.firedBy).toBe("scheduled-job:morning-weave");
+
+    // An interactive / human message (a non-runner sender) → interactive.
+    reg.enqueue("eng", { content: "hello", sender: "aaron" });
+    await until(() => backend.calls.length === 2);
+    expect(backend.calls[1]!.runContext!.firedBy).toBe("interactive");
+
+    // No sender → fired-by OMITTED (the run context still carries now + session).
+    reg.enqueue("eng", { content: "no sender" });
+    await until(() => backend.calls.length === 3);
+    expect(backend.calls[2]!.runContext!.firedBy).toBeUndefined();
+  });
+});
+
+describe("runFiredBy — run-context provenance (agent#162)", () => {
+  test("maps runner:<id> → scheduled-job:<id>, other senders → interactive, absent → undefined", () => {
+    expect(runFiredBy("runner:morning-weave")).toBe("scheduled-job:morning-weave");
+    expect(runFiredBy("aaron")).toBe("interactive");
+    expect(runFiredBy("session")).toBe("interactive");
+    expect(runFiredBy(undefined)).toBeUndefined();
+    expect(runFiredBy("")).toBeUndefined();
+  });
+});
+
+describe("outboundThreadId — mode-correct, resolvable thread id (agent#163)", () => {
+  test("single-threaded → the resolvable thread-NOTE id; multi-threaded → the per-fire id", () => {
+    // single-threaded: prefer the resolvable note id (the deterministic thread-NOTE path).
+    expect(outboundThreadId(false, "turn-uuid", "Threads/eng/eng")).toBe("Threads/eng/eng");
+    // multi-threaded: ALWAYS the per-fire turn id (which IS that fire's note leaf).
+    expect(outboundThreadId(true, "turn-uuid", "Threads/eng/turn-uuid")).toBe("turn-uuid");
+  });
+
+  test("falls back to the per-turn id when no resolvable note id surfaced (never undefined)", () => {
+    // single-threaded with no durable store / failed thread write → the per-turn id, never undefined.
+    expect(outboundThreadId(false, "turn-uuid", undefined)).toBe("turn-uuid");
+    expect(outboundThreadId(true, "turn-uuid", undefined)).toBe("turn-uuid");
+  });
+});
+
+describe("ProgrammaticAgentRegistry — outbound metadata.thread is the resolvable thread id (agent#163)", () => {
+  test("a SINGLE-THREADED outbound carries the DETERMINISTIC thread-NOTE id (NOT a per-turn UUID)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorderWithThreadId();
+    const threads = threadRecorderWithIds();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+    });
+    // specFor → no mode → single-threaded (the default).
+    await reg.register(specFor("uni-weaver"));
+
+    reg.enqueue("uni-weaver", { content: "hello" });
+    await until(() => rec.calls.length === 1);
+
+    // The stamped `metadata.thread` is the agent's ONE deterministic thread-note id — the
+    // SAME `query-notes { id }` resolves it across every turn (the stable resumed session),
+    // NOT the per-turn correlation UUID that misled an observer into "a fresh session each run".
+    const expected = `Threads/uni-weaver/uni-weaver`;
+    expect(rec.calls[0]!.threadId).toBe(expected);
+    expect(rec.calls[0]!.threadId).not.toMatch(/^[0-9a-f-]{36}$/); // it's a path, not a UUID.
+    // It matches the actual written thread-note's id (faithful to VaultTransport's path-as-id).
+    expect(rec.calls[0]!.threadId).toBe(threads.idFor(threads.ends()[0]!));
+  });
+
+  test("a single-threaded outbound carries the SAME thread id across turns (stable, not per-turn)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorderWithThreadId();
+    const threads = threadRecorderWithIds();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+    });
+    await reg.register(specFor("uni-weaver"));
+
+    reg.enqueue("uni-weaver", { content: "turn 1" });
+    reg.enqueue("uni-weaver", { content: "turn 2" });
+    await until(() => rec.calls.length === 2);
+
+    // The whole point of #163: the stamped thread id is STABLE across turns (the resumed
+    // single-threaded session), unlike the per-turn UUID that changed every run.
+    expect(rec.calls[0]!.threadId).toBe(`Threads/uni-weaver/uni-weaver`);
+    expect(rec.calls[1]!.threadId).toBe(rec.calls[0]!.threadId);
+  });
+
+  test("a MULTI-THREADED outbound carries the PER-FIRE id (distinct per fire — correct there)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorderWithThreadId();
+    const threads = threadRecorderWithIds();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+    });
+    await reg.register(specMultiThreaded("digest", "digest", "Agents/digest"));
+
+    reg.enqueue("digest", { content: "fire 1" });
+    reg.enqueue("digest", { content: "fire 2" });
+    await until(() => rec.calls.length === 2);
+
+    // Multi-threaded: each fire is its own thread, so the per-fire id (the note leaf) is the
+    // right link — and the two fires carry DIFFERENT ids (not collapsed to one).
+    expect(rec.calls[0]!.threadId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(rec.calls[1]!.threadId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(rec.calls[0]!.threadId).not.toBe(rec.calls[1]!.threadId);
+    // The stamped per-fire id is the leaf of that fire's written thread note.
+    const end0 = threads.ends().find((t) => t.input === "fire 1")!;
+    expect(threads.idFor(end0)).toBe(`Threads/digest/${rec.calls[0]!.threadId}`);
+  });
+
+  test("a single-threaded FAILURE note also carries the deterministic thread-note id (agent#163)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = () => ({ ok: false, error: "mint refused" }); // a failed turn → failure note.
+    const rec = recorderWithThreadId();
+    const threads = threadRecorderWithIds();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+    });
+    await reg.register(specFor("uni-weaver"));
+
+    reg.enqueue("uni-weaver", { content: "do it" });
+    await until(() => rec.calls.length === 1);
+
+    // The user-facing failure note (the only outbound on a failed turn) carries the SAME
+    // resolvable, deterministic thread-note id — not a per-turn UUID.
+    expect(rec.calls[0]!.reply).toContain("mint refused");
+    expect(rec.calls[0]!.threadId).toBe(`Threads/uni-weaver/uni-weaver`);
+    expect(rec.calls[0]!.threadId).not.toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  test("with NO durable thread store wired, a single-threaded outbound falls back to a per-turn id (never undefined)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorderWithThreadId();
+    // No writeThread → no resolvable note id → fall back to the per-turn UUID (still stamped).
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hi" });
+    await until(() => rec.calls.length === 1);
+
+    expect(rec.calls[0]!.threadId).toMatch(/^[0-9a-f-]{36}$/); // present, the fallback.
   });
 });

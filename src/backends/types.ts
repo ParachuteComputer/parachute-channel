@@ -85,6 +85,43 @@ export interface TurnSession {
 }
 
 /**
+ * RUN CONTEXT for one turn (agent#162) — the runtime facts a programmatic `claude -p` turn
+ * otherwise has NO way to know, so an agent stops FABRICATING them. A headless `-p` turn has
+ * no clock and no notion of "which run this is": uni-weaver was openly inventing report
+ * timestamps (a fixed `10:05` slot, the date "derived from context") because it couldn't read
+ * a real clock mid-run. The daemon KNOWS these facts at dispatch time, so it injects them into
+ * the turn (a concise, clearly-labeled preamble the agent reads) rather than letting the agent
+ * guess. Cheap, and it removes a whole class of fabricated-time confusion.
+ *
+ * The backend renders this as a SHORT preamble prepended to the turn message — it never
+ * mangles the agent's own system-prompt semantics. ADDITIVE: a caller that omits it leaves the
+ * turn message exactly as before.
+ */
+export interface RunContext {
+  /** The REAL wall-clock at dispatch (ISO 8601) — the authoritative clock the turn lacks. */
+  now: string;
+  /**
+   * Whether this turn CONTINUES a prior conversation (`resumed`, single-threaded turn 2+) or
+   * STARTS a fresh one (`new`, the first turn / every multi-threaded fire) — the cheap "which
+   * run is this" signal the daemon already resolved (`TurnSession.resume`).
+   */
+  session: "new" | "resumed";
+  /**
+   * WHY this turn is running (provenance): a SCHEDULED job fire stamps `runner:<jobId>` (the
+   * runner's sender provenance) → reported as the job id; anything else is an interactive /
+   * delegated message → `interactive`. Lets a scheduled agent know it's a cron fire vs a live
+   * reply. Absent when the inbound carried no sender.
+   */
+  firedBy?: string;
+  /**
+   * The thread's COMPLETED turn count BEFORE this turn (single-threaded's rolling counter;
+   * 0 on the first turn). Best-effort — omitted when the daemon can't cheaply resolve it
+   * (no durable thread store). So the agent can stamp "turn N" accurately.
+   */
+  priorTurnCount?: number;
+}
+
+/**
  * An opaque handle to a started agent, returned by {@link AgentBackend.start} and
  * passed back to `deliver`/`stop`/`status`. The only field the seam itself depends
  * on is `channel` (the wake channel a turn/push targets) + the backend's own
@@ -201,6 +238,12 @@ export interface AgentBackend {
    * a safe basename) before the turn and appends a workspace-relative pointer to the
    * prompt, so the `claude -p` turn can `Read` them. ADDITIVE — absent/empty → no
    * staging, the turn behaves exactly as before.
+   *
+   * `runContext` (optional, agent#162) is the runtime context the daemon knows but a headless
+   * `-p` turn can't (the real wall-clock, whether this run is new vs resumed, why it fired).
+   * The programmatic backend prepends it as a concise, clearly-labeled preamble to the turn
+   * message so the agent stamps ACCURATE times instead of fabricating them. ADDITIVE — omitted
+   * → the turn message is exactly as before.
    */
   deliver(
     handle: AgentHandle,
@@ -208,6 +251,7 @@ export interface AgentBackend {
     session: TurnSession,
     onInterim?: InterimSink,
     attachments?: InboundAttachment[],
+    runContext?: RunContext,
   ): Promise<DeliverResult>;
 
   /**

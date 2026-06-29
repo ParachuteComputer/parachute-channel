@@ -838,11 +838,14 @@ export function buildWriteCallback(channels: Map<string, Channel>): WriteCallbac
  */
 export function buildReadSession(
   channels: Map<string, Channel>,
-): (channel: string, name: string) => Promise<string | undefined> {
-  return async (channel, name) => {
+): (channel: string, name: string, subject?: string) => Promise<string | undefined> {
+  return async (channel, name, subject) => {
     const ch = channels.get(channel);
     if (!ch?.transport.readThreadSession) return undefined;
-    return ch.transport.readThreadSession(channel, name);
+    // roles×threads NEXT slice (#120): pass the subject so a multi-threaded SUBJECT thread
+    // resumes its own subject-scoped note (`Threads/<ch>/<name>--<subject>`). Omitted → the
+    // deterministic def-named note (single-threaded resume, HEAD).
+    return ch.transport.readThreadSession(channel, name, subject);
   };
 }
 
@@ -856,11 +859,12 @@ export function buildReadSession(
  */
 export function buildClearSession(
   channels: Map<string, Channel>,
-): (channel: string, name: string) => Promise<void> {
-  return async (channel, name) => {
+): (channel: string, name: string, subject?: string) => Promise<void> {
+  return async (channel, name, subject) => {
     const ch = channels.get(channel);
     if (!ch?.transport.clearThreadSession) return;
-    await ch.transport.clearThreadSession(channel, name);
+    // roles×threads NEXT slice (#120): a subject clears its own subject-scoped note.
+    await ch.transport.clearThreadSession(channel, name, subject);
   };
 }
 
@@ -1076,6 +1080,15 @@ export async function reregisterProgrammaticAgents(
   }
   let count = 0;
   for (const name of entries) {
+    // PER-THREAD WORKSPACE GUARD (roles×threads NEXT slice #120, G). A subject thread's
+    // workspace dir is `<name>--<slug(subject)>` (the `--` separator). Those are PER-TURN
+    // scratch dirs for a multi-threaded agent's subject threads, NOT agent specs — they hold
+    // no authoritative spec.json (the spec is per-AGENT, persisted only at the name-only
+    // `<name>/` dir). Re-registering one would resurrect a phantom agent keyed on a
+    // subject-leaf name. So a dir name containing `--` is INERT on boot: skip it. The
+    // canonical per-agent spec dir (no `--`) is re-registered as before — byte-identical to
+    // HEAD for every current agent (no current agent's name contains `--`).
+    if (name.includes("--")) continue;
     const workspace = sessionWorkspace(sessionsDirPath, name);
     const spec = readPersistedSpec(workspace);
     // Re-register ONLY specs that explicitly persisted `backend: "programmatic"`.

@@ -43,7 +43,7 @@
  */
 
 import type { AgentSpec, AgentMode } from "../sandbox/types.ts";
-import { normalizeChannel } from "../sandbox/types.ts";
+import { normalizeChannel, threadKey } from "../sandbox/types.ts";
 import type { AgentBackend, AgentHandle, InterimTurnEvent, RunContext, TurnSession } from "./types.ts";
 import type { InboundAttachment } from "../transport.ts";
 
@@ -118,6 +118,14 @@ export interface ThreadNote {
    * transport sanitizes it into the deterministic upsert path). Falls back to the channel.
    */
   name?: string;
+  /**
+   * The thread SUBJECT (roles×threads NEXT slice, #120) — when present, a MULTI-threaded
+   * thread becomes a DETERMINISTIC, upserting note at `threadKey(name, subject)`
+   * (`Threads/<ch>/<name>--<subject>`) carrying a session across fires (per-thread
+   * continuity), instead of a per-fire uuid note. Absent/empty → today's identity
+   * (single-threaded deterministic note / multi-threaded per-fire note), byte-identical to HEAD.
+   */
+  subject?: string;
   /** The `#agent/definition` note id (provenance; plain id string). */
   definition?: string;
   /** The mode the turn ran under — governs thread identity + whether the note upserts. */
@@ -308,26 +316,26 @@ function delay(ms: number): Promise<void> {
 /**
  * The thread id to stamp into an OUTBOUND note's `metadata.thread` (agent#163) — the
  * MODE-CORRECT, RESOLVABLE definition→thread→message link, mirroring the callback
- * `source_thread` fix (agent#124):
+ * `source_thread` fix (agent#124). Keyed on `perFire`:
  *
- *  - SINGLE-THREADED — the resolvable thread-NOTE id (the deterministic
- *    `Threads/<safeChannel>/<safeName>` note), so an observer reading the outbound note's
- *    `metadata.thread` resolves the agent's ONE stable thread with `query-notes { id }`.
- *    The pre-#163 bug stamped the per-turn correlation UUID here, which changed every turn
- *    and resolved to nothing — misleading an observer into "a fresh session each run" when
- *    the single-threaded session is actually stable + resumed across turns.
- *  - MULTI-THREADED — the per-fire id (`turnThreadId`), which IS that fire's thread-note leaf
- *    (`Threads/<safeChannel>/<turnThreadId>`) — correct as-is: each fire is its own thread.
+ *  - DETERMINISTIC thread (`perFire: false`) — single-threaded, OR a multi-threaded SUBJECT
+ *    thread (roles×threads NEXT slice, #120). The note is the resolvable, deterministic
+ *    `Threads/<safeChannel>/<name[--subject]>` note, so an observer reading the outbound's
+ *    `metadata.thread` resolves the agent's stable thread with `query-notes { id }`. Stamp
+ *    the resolvable `threadNoteId`. The pre-#163 bug stamped the per-turn correlation UUID
+ *    here, which changed every turn and resolved to nothing.
+ *  - PER-FIRE thread (`perFire: true`) — a multi-threaded thread with NO subject: each fire is
+ *    its own note at `Threads/<safeChannel>/<turnThreadId>`, so the per-fire id IS the leaf.
  *
  * Falls back to `turnThreadId` when no resolvable note id surfaced (no durable thread store
  * wired, or the thread-note write failed) — never undefined, so the link is always stamped.
  */
 export function outboundThreadId(
-  multiThreaded: boolean,
+  perFire: boolean,
   turnThreadId: string,
   threadNoteId: string | undefined,
 ): string {
-  if (multiThreaded) return turnThreadId;
+  if (perFire) return turnThreadId;
   return threadNoteId ?? turnThreadId;
 }
 
@@ -437,9 +445,25 @@ export class ProgrammaticAgentRegistry {
   private readonly byChannel = new Map<string, ProgrammaticAgentHandle>();
   /** name → channel (the lifecycle index; an agent has exactly one wake channel). */
   private readonly nameToChannel = new Map<string, string>();
-  /** channel → FIFO queue of pending messages. */
+  /**
+   * DRAIN-KEY → FIFO queue of pending messages — the PER-THREAD serial queue
+   * (roles×threads NEXT slice, #120). The drain key is {@link drainKeyFor}:
+   *  - a single-threaded agent, OR a message with NO subject → the bare CHANNEL
+   *    (byte-identical to HEAD — every current agent incl. the weave routes here).
+   *  - a multi-threaded agent WITH a subject → `threadKey(spec.name, subject)`
+   *    (`<name>--<subject>`), so distinct subjects of one agent get distinct queues.
+   * Keying queues + {@link draining} by the SAME drain key is what makes two messages
+   * of the SAME (name, subject) strictly serial while letting two DIFFERENT subjects
+   * of one agent run concurrently — the per-thread serial guarantee (class doc lines 13-20).
+   */
   private readonly queues = new Map<string, QueuedMessage[]>();
-  /** channel → the in-flight drain promise (its presence == a worker is running). */
+  /**
+   * DRAIN-KEY → the in-flight drain promise (its presence == a worker is running for that
+   * thread). One promise per drain key is the structural lock: a second message for the
+   * SAME drain key never starts a second worker (it appends + the running worker picks it
+   * up), so a given (name, subject) thread is NEVER processed by two concurrent `claude -p`.
+   * A DIFFERENT subject is a DIFFERENT key → its own promise → may run concurrently.
+   */
   private readonly draining = new Map<string, Promise<void>>();
   /**
    * channel → FIFO queue of PENDING-INBOUND messages that arrived BEFORE a live
@@ -480,14 +504,18 @@ export class ProgrammaticAgentRegistry {
    * 2+ `--resume`s its prior conversation. Unwired (or no prior) → every turn creates a
    * fresh session. Multi-threaded NEVER consults it (each fire is a fresh thread).
    */
-  private readonly readSession?: (channel: string, name: string) => Promise<string | undefined>;
+  private readonly readSession?: (
+    channel: string,
+    name: string,
+    subject?: string,
+  ) => Promise<string | undefined>;
   /**
    * Optional session CLEAR — wipe a single-threaded agent's persisted thread-note session
    * so its next turn starts a FRESH claude conversation (the per-agent restart). The daemon
    * wires this to the channel transport's `clearThreadSession`. Called by {@link resetSession}.
    * Unwired → reset is a clean no-op beyond returning that the agent exists.
    */
-  private readonly clearSession?: (channel: string, name: string) => Promise<void>;
+  private readonly clearSession?: (channel: string, name: string, subject?: string) => Promise<void>;
   /**
    * Optional pre-turn SUBJECT-DOSSIER read (roles×threads NOW slice) — per-thread
    * context for the current subject, folded into the composed system prompt (the
@@ -507,10 +535,17 @@ export class ProgrammaticAgentRegistry {
     writeThread?: WriteThread;
     writeCallback?: WriteCallback;
     onTurnEvent?: TurnEventSink;
-    /** Read the persisted thread-note session UUID (single-threaded resume). */
-    readSession?: (channel: string, name: string) => Promise<string | undefined>;
-    /** Clear the persisted thread-note session (the per-agent restart / reset). */
-    clearSession?: (channel: string, name: string) => Promise<void>;
+    /**
+     * Read the persisted thread-note session UUID. `subject` (roles×threads NEXT slice, #120)
+     * resolves the SUBJECT-scoped thread note for a multi-threaded subject thread; omitted →
+     * the deterministic def-named note (single-threaded resume, HEAD).
+     */
+    readSession?: (channel: string, name: string, subject?: string) => Promise<string | undefined>;
+    /**
+     * Clear the persisted thread-note session (the per-agent restart / reset). `subject`
+     * resolves the subject-scoped thread note; omitted → the def-named note (HEAD).
+     */
+    clearSession?: (channel: string, name: string, subject?: string) => Promise<void>;
     /**
      * Read the per-thread subject dossier (roles×threads NOW slice). Optional + UNWIRED
      * by default — the composed prompt is the role body verbatim until a dossier source exists.
@@ -550,6 +585,59 @@ export class ProgrammaticAgentRegistry {
       throw new Error(`programmatic registry: spec "${spec.name}" declares no channels`);
     }
     return normalizeChannel(spec.channels[0]!).name;
+  }
+
+  /**
+   * The PER-THREAD serial DRAIN KEY for an inbound message (roles×threads NEXT slice, #120)
+   * — what {@link queues} + {@link draining} are keyed by:
+   *  - SINGLE-threaded agent, OR a message with NO subject → the bare CHANNEL. This is the
+   *    back-compat path: every agent today (incl. the weave) carries no subject, so the key
+   *    is exactly the channel and the queue/drain behavior is byte-identical to HEAD.
+   *  - MULTI-threaded agent WITH a subject → `threadKey(spec.name, subject)` (`<name>--<sub>`),
+   *    so two subjects of one agent get DISTINCT queues + DISTINCT drain promises (concurrent),
+   *    while two messages of the SAME subject share one queue + one promise (strictly serial).
+   *
+   * NOTE: a message can only carry a subject route when a LIVE handle exists for the channel
+   * (enqueue requires byChannel), so we read the mode off that handle. A missing handle (the
+   * caller already returns false) defaults to the channel key.
+   */
+  private drainKeyFor(channel: string, msg: QueuedMessage): string {
+    const handle = this.byChannel.get(channel);
+    if (!handle) return channel;
+    const multiThreaded = (handle.spec.mode ?? "single-threaded") === "multi-threaded";
+    if (!multiThreaded) return channel;
+    // threadKey returns the bare name for no/empty subject — but the channel (not the name)
+    // is the back-compat single-thread key, so only re-key when a subject actually narrows it.
+    const subject = msg.subject?.trim();
+    if (!subject) return channel;
+    return threadKey(handle.spec.name, subject);
+  }
+
+  /**
+   * Drop EVERY per-thread queue + drain promise belonging to a channel — used on
+   * teardown/re-key (deregister, a name moving channels). Because {@link queues} +
+   * {@link draining} are now keyed by the per-thread DRAIN KEY (`<channel>` or
+   * `<channel-name>--<subject>`), deleting only the bare-channel key would orphan a
+   * multi-threaded agent's subject queues. We clear the channel key AND every
+   * `<channel-name>--*` subject key whose threadKey is prefixed by the channel's agent name.
+   * An in-flight subject drain self-terminates on its next loop (it re-reads byChannel,
+   * now empty for that channel); dropping the `draining` entry just stops the map leaking.
+   */
+  private clearChannelQueues(channel: string): void {
+    // The bare-channel key (single-threaded / no-subject path).
+    this.queues.delete(channel);
+    this.draining.delete(channel);
+    // Subject keys are `${spec.name}--${slug(subject)}`. Resolve the agent name for this
+    // channel if a handle is still present; else fall back to the channel as the name prefix
+    // (covers the common case name===channel). Match any key with that `--`-prefixed form.
+    const handle = this.byChannel.get(channel);
+    const namePrefix = `${handle?.spec.name ?? channel}--`;
+    for (const key of [...this.queues.keys()]) {
+      if (key.startsWith(namePrefix)) this.queues.delete(key);
+    }
+    for (const key of [...this.draining.keys()]) {
+      if (key.startsWith(namePrefix)) this.draining.delete(key);
+    }
   }
 
   /** Is a programmatic agent registered for this channel? (the inbound-routing check) */
@@ -618,8 +706,14 @@ export class ProgrammaticAgentRegistry {
       // so a residual mark/buffer would leak (reviewer nit; defense-in-depth — the normal
       // flow only ever expects the NEW channel before this register).
       this.byChannel.delete(priorChannel);
-      this.queues.delete(priorChannel);
-      this.draining.delete(priorChannel);
+      // Clear EVERY per-thread queue/drain for the old channel (bare + subject keys), not
+      // just the bare-channel key — a multi-threaded agent's subject queues would otherwise
+      // leak (roles×threads NEXT slice). clearChannelQueues reads the handle for the name
+      // prefix; do it BEFORE byChannel.delete so the prefix resolves — but byChannel was
+      // already deleted above for priorChannel, so it falls back to the channel-as-name
+      // prefix (correct for name===channel; a residual subject key self-clears on its next
+      // loop regardless, since the drain re-reads byChannel).
+      this.clearChannelQueues(priorChannel);
       this.expectedChannels.delete(priorChannel);
       this.pending.delete(priorChannel);
     }
@@ -740,9 +834,13 @@ export class ProgrammaticAgentRegistry {
     const channel = this.nameToChannel.get(name);
     if (channel === undefined) return false;
     const handle = this.byChannel.get(channel);
+    // Clear every per-thread queue/drain for this channel (bare + subject keys) BEFORE
+    // dropping byChannel, so the handle is still present to resolve the agent-name prefix
+    // for the subject keys (roles×threads NEXT slice). An in-flight subject drain
+    // self-terminates on its next loop (it re-reads byChannel, now empty for the channel).
+    this.clearChannelQueues(channel);
     this.byChannel.delete(channel);
     this.nameToChannel.delete(name);
-    this.queues.delete(channel);
     // Clear the EXPECTED mark + any buffered pending inbound for this channel too —
     // the agent is gone, so a pending message has nothing to drain into and would
     // strand forever (and the next register would replay stale messages). The daemon's
@@ -804,17 +902,26 @@ export class ProgrammaticAgentRegistry {
    */
   enqueue(channel: string, msg: QueuedMessage): boolean {
     if (!this.byChannel.has(channel)) return false;
-    const queue = this.queues.get(channel) ?? [];
+    // PER-THREAD ROUTING (roles×threads NEXT slice, #120): resolve the drain key. A
+    // single-threaded / no-subject message keys by the bare CHANNEL (byte-identical to
+    // HEAD); a multi-threaded agent WITH a subject keys by `threadKey(name, subject)`, so
+    // distinct subjects get distinct queues + distinct drain promises (concurrent), while
+    // the SAME subject shares one queue + one promise (strictly serial). The serial
+    // guarantee is per DRAIN KEY, not per channel.
+    const drainKey = this.drainKeyFor(channel, msg);
+    const queue = this.queues.get(drainKey) ?? [];
     queue.push(msg);
-    this.queues.set(channel, queue);
-    // Start the worker if it isn't already running. The drain promise's PRESENCE in
-    // `draining` is the "a worker is running" flag — set it synchronously before any
-    // await so a second enqueue in the same tick can't start a second worker.
-    if (!this.draining.has(channel)) {
-      const p = this.drain(channel).finally(() => {
-        this.draining.delete(channel);
+    this.queues.set(drainKey, queue);
+    // Start the worker if it isn't already running FOR THIS DRAIN KEY. The drain promise's
+    // PRESENCE in `draining` (keyed by drain key) is the "a worker is running for this
+    // thread" flag — set it synchronously before any await so a second enqueue for the same
+    // drain key in the same tick can't start a second worker (the per-thread serial lock).
+    // A DIFFERENT drain key has its own entry → its own worker → may run concurrently.
+    if (!this.draining.has(drainKey)) {
+      const p = this.drain(drainKey, channel).finally(() => {
+        this.draining.delete(drainKey);
       });
-      this.draining.set(channel, p);
+      this.draining.set(drainKey, p);
     }
     return true;
   }
@@ -833,9 +940,13 @@ export class ProgrammaticAgentRegistry {
    * failure is logged; the turn still counts as drained (the reply is durable-or-not
    * at the transport's discretion; we don't re-run the turn, which would fork).
    */
-  private async drain(channel: string): Promise<void> {
+  private async drain(drainKey: string, channel: string): Promise<void> {
     for (;;) {
-      const queue = this.queues.get(channel);
+      // The FIFO for THIS thread — keyed by the per-thread drain key, NOT the channel. A
+      // single-threaded / no-subject thread's drain key IS the channel (back-compat); a
+      // subject thread's is `threadKey(name, subject)`. Reading the queue by drain key is
+      // what keeps two subjects of one agent independently serial.
+      const queue = this.queues.get(drainKey);
       if (!queue || queue.length === 0) return;
       const handle = this.byChannel.get(channel);
       if (!handle) return; // deregistered mid-drain — stop.
@@ -860,9 +971,23 @@ export class ProgrammaticAgentRegistry {
       // CREATE a fresh session with a new uuid (`--session-id`). The backend just runs the
       // turn with this {@link TurnSession}; it reads no session store.
       const multiThreaded = (handle.spec.mode ?? "single-threaded") === "multi-threaded";
+      // The thread SUBJECT (roles×threads NEXT slice, #120) — trimmed; empty → none.
+      const turnSubject = msg.subject?.trim() ? msg.subject : undefined;
+      // A multi-threaded agent WITH a subject is a NAMED thread: a deterministic note at
+      // `Threads/<ch>/<name>--<subject>` that upserts + carries a session across fires
+      // (turning "fresh thread per fire" into "resume the named thread"). A multi-threaded
+      // agent with NO subject stays fresh-per-fire (HEAD); a single-threaded agent is the
+      // HEAD deterministic def-named note.
+      const hasSubjectThread = multiThreaded && !!turnSubject;
+      // RESUME the persisted session when one exists for this thread note:
+      //  - single-threaded → its deterministic def-named note (HEAD behavior, unchanged).
+      //  - multi-threaded WITH a subject → the subject-scoped note (NEW: per-thread continuity).
+      //  - multi-threaded with NO subject → NEVER resume (each fire is a fresh thread; HEAD).
+      // The leaf is resolved transport-side via `singleThreadedPath(channel, name, subject)`,
+      // so write + read + clear all agree on the path (no leaf math duplicated here).
       let resumeId: string | undefined;
-      if (!multiThreaded && this.readSession) {
-        resumeId = await this.readSession(handle.channel, handle.spec.name);
+      if (this.readSession && (!multiThreaded || hasSubjectThread)) {
+        resumeId = await this.readSession(handle.channel, handle.spec.name, turnSubject);
       }
       const turnSession: TurnSession = resumeId
         ? { id: resumeId, resume: true }
@@ -897,10 +1022,13 @@ export class ProgrammaticAgentRegistry {
         // single-threaded resume turn the prior session is preserved by writeThread anyway.
       });
       // The MODE-CORRECT, RESOLVABLE thread id stamped into outbound + failure notes
-      // (agent#163): single-threaded → the deterministic thread-NOTE id (stable across turns);
-      // multi-threaded → the per-fire `turnThreadId`. Computed once from the start-ensure id so
-      // every path (early failure, ok, outbound-failure) stamps the same resolvable link.
-      const outThreadId = outboundThreadId(multiThreaded, turnThreadId, startThreadNoteId);
+      // (agent#163): a DETERMINISTIC thread (single-threaded OR a multi-threaded subject
+      // thread) → the deterministic thread-NOTE id (stable across turns); a PER-FIRE thread
+      // (multi-threaded, NO subject) → the per-fire `turnThreadId`. `perFire` is multi-threaded
+      // AND no subject. Computed once from the start-ensure id so every path (early failure, ok,
+      // outbound-failure) stamps the same resolvable link.
+      const perFire = multiThreaded && !hasSubjectThread;
+      const outThreadId = outboundThreadId(perFire, turnThreadId, startThreadNoteId);
 
       // RUN CONTEXT (agent#162): assemble the runtime facts a headless `claude -p` turn can't
       // know — the REAL wall-clock (`startedAt`), whether this run CONTINUES a prior session
@@ -953,6 +1081,11 @@ export class ProgrammaticAgentRegistry {
           // roles×threads NOW slice: the per-thread subject dossier, folded into the composed
           // system prompt. Undefined (no subject / unwired source) → role body verbatim.
           subjectDossier,
+          // roles×threads NEXT slice (#120, G): the thread SUBJECT — the backend keys the
+          // PER-THREAD private workspace off it (`sessions/<name>--<subject>/`), so concurrent
+          // subjects of one agent never clobber each other's per-turn `.mcp.json` /
+          // `system-prompt.txt` / HOME. Undefined → `sessions/<name>/` (HEAD, unchanged).
+          turnSubject,
         );
       } catch (err) {
         // The backend contract is failure-as-VALUE, never a throw — but defend so a
@@ -1245,6 +1378,12 @@ export class ProgrammaticAgentRegistry {
     const thread: ThreadNote = {
       channel: handle.channel,
       name: handle.spec.name,
+      // roles×threads NEXT slice (#120): carry the thread SUBJECT so the transport can
+      // resolve a subject-scoped deterministic thread note (`Threads/<ch>/<name>--<subject>`)
+      // that UPSERTS + carries a session across fires (per-thread continuity) instead of a
+      // per-fire uuid note. Absent/empty → no subject → today's identity (single-threaded
+      // deterministic note, or multi-threaded per-fire note) is byte-identical to HEAD.
+      ...(msg.subject?.trim() ? { subject: msg.subject } : {}),
       ...(handle.spec.definition ? { definition: handle.spec.definition } : {}),
       mode: handle.spec.mode ?? "single-threaded",
       status,

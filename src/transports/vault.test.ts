@@ -946,6 +946,127 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(stored!.metadata.session).toBe("sess-ESTABLISHED"); // preserved, not dropped.
   });
 
+  // ── roles×threads NEXT slice (#120) — a MULTI-THREADED SUBJECT thread is a DETERMINISTIC,
+  //    upserting note at `Threads/<ch>/<name>--<subject>` (rolling turn_count + preserved
+  //    session across fires), NOT a per-fire uuid note. ─────────────────────────────────────
+  test("MULTI-THREADED SUBJECT: writeThread() upserts a DETERMINISTIC `<name>--<subject>` note (rolls turn_count, reads back)", async () => {
+    // Per (channel, leaf) store — keyed by the path so distinct subjects are distinct notes.
+    const store = new Map<string, { metadata: Record<string, string>; content: string }>();
+    const patched: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = decodeURIComponent(String(url));
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        const path = u.split("/api/notes/")[1]!;
+        const hit = store.get(path);
+        return hit ? new Response(JSON.stringify(hit), { status: 200 }) : new Response("nf", { status: 404 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { path: string; metadata: Record<string, string>; content: string };
+        store.set(body.path, { metadata: body.metadata, content: body.content });
+        patched.push(body.path);
+        return new Response(JSON.stringify({ id: body.path }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("pm"));
+
+    // Fire 1 of subject "eco-civ" — creates the deterministic subject note, turn_count 1.
+    const r1 = await t.writeThread({
+      channel: "pm", name: "pm", subject: "eco-civ", mode: "multi-threaded", status: "ok",
+      input: "kickoff", output: "ok1", started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z", session: "sess-ECO", phase: "end",
+    });
+    // Fire 2 of the SAME subject — UPSERTS the same note (turn_count 2), proving continuity.
+    const r2 = await t.writeThread({
+      channel: "pm", name: "pm", subject: "eco-civ", mode: "multi-threaded", status: "ok",
+      input: "next", output: "ok2", started_at: "2026-06-18T08:00:00.000Z",
+      ended_at: "2026-06-18T08:00:09.000Z", session: "sess-ECO", phase: "end",
+    });
+
+    // BOTH fires hit the SAME deterministic subject-scoped path (NOT a per-fire uuid).
+    expect(r1.sent[0]).toBe("Threads/pm/pm--eco-civ");
+    expect(r2.sent[0]).toBe("Threads/pm/pm--eco-civ");
+    expect(patched.every((p) => p === "Threads/pm/pm--eco-civ")).toBe(true);
+    const note = store.get("Threads/pm/pm--eco-civ")!;
+    expect(note.metadata.turn_count).toBe("2"); // rolled across fires — per-thread continuity.
+    expect(note.metadata.started_at).toBe("2026-06-18T07:00:00.000Z"); // first fire's, preserved.
+    expect(note.metadata.session).toBe("sess-ECO"); // session carried across fires.
+    expect(note.metadata.mode).toBe("multi-threaded");
+
+    // A DIFFERENT subject of the same agent is a DISTINCT note (distinct leaf).
+    const r3 = await t.writeThread({
+      channel: "pm", name: "pm", subject: "ai-livelihood", mode: "multi-threaded", status: "ok",
+      input: "other", output: "ok3", started_at: "2026-06-18T09:00:00.000Z",
+      ended_at: "2026-06-18T09:00:03.000Z", phase: "end",
+    });
+    expect(r3.sent[0]).toBe("Threads/pm/pm--ai-livelihood");
+    expect(store.get("Threads/pm/pm--ai-livelihood")!.metadata.turn_count).toBe("1"); // its own count.
+    // The eco-civ note is untouched by the ai-livelihood fire (no cross-subject clobber).
+    expect(store.get("Threads/pm/pm--eco-civ")!.metadata.turn_count).toBe("2");
+  });
+
+  test("MULTI-THREADED with NO subject stays a PER-FIRE uuid note (HEAD) — no read-back, turn_count 1", async () => {
+    const patches: string[] = [];
+    let gets = 0;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = decodeURIComponent(String(url));
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") { gets++; return new Response("nf", { status: 404 }); }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        patches.push(u.split("/api/notes/")[1]!);
+        return new Response(JSON.stringify({ id: "x" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("pm"));
+    await t.writeThread({
+      channel: "pm", name: "pm", mode: "multi-threaded", status: "ok", input: "q", output: "a",
+      started_at: "2026-06-18T07:00:00.000Z", ended_at: "2026-06-18T07:00:01.000Z", threadId: "fire-xyz",
+    });
+    // Per-fire uuid leaf, NO read-back (HEAD multi-threaded behavior — byte-identical).
+    expect(gets).toBe(0);
+    expect(patches[0]).toBe("Threads/pm/fire-xyz");
+  });
+
+  test("SUBJECT continuity round-trip: readThreadSession(subject) reads the session written at the subject-scoped note", async () => {
+    const store = new Map<string, { metadata: Record<string, string>; content: string }>();
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = decodeURIComponent(String(url));
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        const path = u.split("/api/notes/")[1]!;
+        const hit = store.get(path);
+        return hit ? new Response(JSON.stringify(hit), { status: 200 }) : new Response("nf", { status: 404 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { path: string; metadata: Record<string, string>; content: string };
+        store.set(body.path, { metadata: body.metadata, content: body.content });
+        return new Response(JSON.stringify({ id: body.path }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("pm"));
+
+    // No subject note yet → undefined.
+    expect(await t.readThreadSession("pm", "pm", "eco-civ")).toBeUndefined();
+    // Write a subject thread carrying a session…
+    await t.writeThread({
+      channel: "pm", name: "pm", subject: "eco-civ", mode: "multi-threaded", status: "ok",
+      input: "q", output: "a", started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z", session: "sess-SUBJECT", phase: "end",
+    });
+    // …readThreadSession(subject) reads it back off the SUBJECT-scoped path.
+    expect(await t.readThreadSession("pm", "pm", "eco-civ")).toBe("sess-SUBJECT");
+    // A different subject (no note) is independent → undefined (no cross-subject leak).
+    expect(await t.readThreadSession("pm", "pm", "other")).toBeUndefined();
+    // The NO-subject read targets the def-named note (different leaf) → undefined here.
+    expect(await t.readThreadSession("pm", "pm")).toBeUndefined();
+  });
+
   test("readThreadSession() round-trips the stored session (the pre-turn resume read)", async () => {
     let stored: { metadata: Record<string, string>; content: string } | undefined;
     const gets: string[] = [];

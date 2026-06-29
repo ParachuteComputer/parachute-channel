@@ -60,14 +60,31 @@ class FakeBackend implements AgentBackend {
     message: string;
     session: TurnSession;
     runContext?: RunContext;
+    /** roles×threads NEXT slice (#120, G): the thread subject the drain threaded in. */
+    subject?: string;
   }[] = [];
-  /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial). */
+  /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial — PER drain key). */
   maxConcurrent = 0;
+  /**
+   * Max concurrent in-flight turns observed PER (channel, subject) thread key — the
+   * per-THREAD serial guarantee (roles×threads NEXT slice #120): two DIFFERENT subjects of
+   * one agent MAY interleave (so the channel-wide max can exceed 1), but each (name, subject)
+   * thread must stay ≤ 1. Keyed by `${channel}::${subject ?? ""}`.
+   */
+  readonly maxConcurrentByThread = new Map<string, number>();
+  private readonly inFlightByThread = new Map<string, number>();
   private inFlight = 0;
   /** Whether `stop` was called, per channel. */
   readonly stopped = new Set<string>();
   /** A gate the next turn waits on (release to let it finish). Reset per use. */
   gate: { promise: Promise<void>; resolve: () => void } | null = null;
+  /**
+   * Per-SUBJECT gates (roles×threads NEXT slice #120) — a turn for subject S blocks on
+   * `gateBySubject.get(S)` if present (else the shared `gate`, else not at all). Lets a test
+   * hold subject A's turn while subject B's turn runs to completion, proving two subjects of
+   * one agent INTERLEAVE while each subject stays serial. Keyed by the raw subject string.
+   */
+  readonly gateBySubject = new Map<string, { promise: Promise<void>; resolve: () => void }>();
   /**
    * The result function — given the message + the turn's session id, returns the
    * DeliverResult to resolve. The DEFAULT ECHOES `sessionId` (mirroring real claude, which
@@ -96,15 +113,36 @@ class FakeBackend implements AgentBackend {
     onInterim?: InterimSink,
     _attachments?: InboundAttachment[],
     runContext?: RunContext,
+    _subjectDossier?: string,
+    subject?: string,
   ): Promise<DeliverResult> {
-    this.calls.push({ channel: handle.channel, message, session, ...(runContext ? { runContext } : {}) });
+    this.calls.push({
+      channel: handle.channel,
+      message,
+      session,
+      ...(runContext ? { runContext } : {}),
+      ...(subject ? { subject } : {}),
+    });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);
+    // Per-THREAD concurrency: key by (channel, subject) so two subjects of one agent are
+    // distinct threads (may interleave) but the SAME (name, subject) must stay serial.
+    const threadKey = `${handle.channel}::${subject ?? ""}`;
+    const cur = (this.inFlightByThread.get(threadKey) ?? 0) + 1;
+    this.inFlightByThread.set(threadKey, cur);
+    this.maxConcurrentByThread.set(
+      threadKey,
+      Math.max(this.maxConcurrentByThread.get(threadKey) ?? 0, cur),
+    );
     try {
       // Emit any configured interim events (mirrors the real backend streaming text +
       // tool_use as the turn runs) so the registry's forwarding can be asserted.
       if (onInterim) for (const e of this.interimToEmit) onInterim(e);
-      if (this.gate) await this.gate.promise;
+      // A per-subject gate (if set for THIS turn's subject) takes precedence over the shared
+      // gate — so a test can release subject B while subject A is still held.
+      const subjectGate = subject !== undefined ? this.gateBySubject.get(subject) : undefined;
+      if (subjectGate) await subjectGate.promise;
+      else if (this.gate) await this.gate.promise;
       if (this.throwOnce) {
         const e = this.throwOnce;
         this.throwOnce = null;
@@ -113,6 +151,7 @@ class FakeBackend implements AgentBackend {
       return this.resultFor(message, session.id);
     } finally {
       this.inFlight--;
+      this.inFlightByThread.set(threadKey, (this.inFlightByThread.get(threadKey) ?? 1) - 1);
     }
   }
 
@@ -978,6 +1017,254 @@ describe("ProgrammaticAgentRegistry — serial queue (the hard invariant)", () =
     gate.resolve();
     await until(() => rec.calls.length === 2);
     expect(reg.statusOf("eng")).toEqual({ state: "idle", queued: 0 });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// roles×threads NEXT slice (#120) — F. subject routing + the PER-THREAD serial guarantee.
+//
+// The load-bearing invariant (registry.ts:13-20, generalized): a given (name, subject) thread
+// is NEVER processed by two concurrent `claude -p` turns, BUT two DIFFERENT subjects of one
+// multi-threaded agent MAY run concurrently. A single-threaded / no-subject agent maps to
+// exactly ONE queue (the bare channel), byte-identical to HEAD.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+describe("ProgrammaticAgentRegistry — F. per-thread serial guarantee (#120)", () => {
+  test("two messages with the SAME (name, subject) are processed ONE AT A TIME, FIFO, never concurrent", async () => {
+    const backend = new FakeBackend();
+    // Hold subject "alpha" so the second alpha message must wait behind the first.
+    const alphaGate = deferred<void>();
+    backend.gateBySubject.set("alpha", { promise: alphaGate.promise, resolve: alphaGate.resolve });
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specMultiThreaded("digest", "digest"));
+
+    reg.enqueue("digest", { content: "a1", subject: "alpha" });
+    await until(() => backend.calls.length === 1);
+    // A SECOND alpha message arrives while the first is held — it must QUEUE behind it.
+    reg.enqueue("digest", { content: "a2", subject: "alpha" });
+    // Still exactly one alpha turn STARTED (the gate holds the first; the second waits serially).
+    expect(backend.calls).toHaveLength(1);
+
+    alphaGate.resolve();
+    await until(() => rec.calls.length === 2);
+    // FIFO + strictly serial: a1 then a2, NEVER concurrent for the (digest, alpha) thread.
+    expect(backend.calls.map((c) => c.message)).toEqual(["a1", "a2"]);
+    expect(backend.maxConcurrentByThread.get("digest::alpha")).toBe(1);
+  });
+
+  test("two DIFFERENT subjects of one agent can run CONCURRENTLY (interleave), each serial", async () => {
+    const backend = new FakeBackend();
+    // Hold subject "alpha" indefinitely; leave "beta" ungated so it runs to completion while
+    // alpha is still in flight — proving the two subject threads interleave.
+    const alphaGate = deferred<void>();
+    backend.gateBySubject.set("alpha", { promise: alphaGate.promise, resolve: alphaGate.resolve });
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specMultiThreaded("digest", "digest"));
+
+    // Start alpha (held), then beta (free). If subjects shared one queue, beta would block
+    // behind the held alpha and NEVER complete; concurrency lets beta finish first.
+    reg.enqueue("digest", { content: "a1", subject: "alpha" });
+    await until(() => backend.calls.length === 1);
+    reg.enqueue("digest", { content: "b1", subject: "beta" });
+    // beta completes WHILE alpha is still held — only possible if the two run concurrently.
+    await until(() => rec.calls.some((c) => c.reply === "reply:b1"));
+    expect(rec.calls.map((c) => c.reply)).toContain("reply:b1");
+    // alpha hasn't been delivered as an outbound yet (its turn is still gated).
+    expect(rec.calls.some((c) => c.reply === "reply:a1")).toBe(false);
+
+    // Release alpha; it now completes too.
+    alphaGate.resolve();
+    await until(() => rec.calls.some((c) => c.reply === "reply:a1"));
+    // Each subject thread stayed serial (≤1 concurrent within a thread) even though the two
+    // threads ran concurrently across the channel.
+    expect(backend.maxConcurrentByThread.get("digest::alpha")).toBe(1);
+    expect(backend.maxConcurrentByThread.get("digest::beta")).toBe(1);
+    // The drain threaded the subject through to the backend (the per-thread workspace key, G).
+    const alphaCall = backend.calls.find((c) => c.message === "a1");
+    const betaCall = backend.calls.find((c) => c.message === "b1");
+    expect(alphaCall?.subject).toBe("alpha");
+    expect(betaCall?.subject).toBe("beta");
+  });
+
+  test("a SINGLE-threaded agent maps every message to ONE queue (the channel), subject ignored for routing", async () => {
+    const backend = new FakeBackend();
+    const gate = deferred<void>();
+    backend.gate = { promise: gate.promise, resolve: gate.resolve };
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng")); // single-threaded (default).
+
+    // Even if messages carry DIFFERENT subjects, a single-threaded agent serializes them ALL
+    // on the one channel queue (the subject is NOT a routing axis for single-threaded).
+    reg.enqueue("eng", { content: "m1", subject: "alpha" });
+    await until(() => backend.calls.length === 1);
+    reg.enqueue("eng", { content: "m2", subject: "beta" });
+    // The second is QUEUED behind the first (one queue) — not started concurrently.
+    expect(backend.calls).toHaveLength(1);
+    expect(reg.statusOf("eng")).toEqual({ state: "queued", queued: 1 });
+
+    gate.resolve();
+    await until(() => rec.calls.length === 2);
+    expect(backend.calls.map((c) => c.message)).toEqual(["m1", "m2"]);
+    // Never two concurrent turns for the single-threaded channel — the HEAD serial guarantee.
+    expect(backend.maxConcurrent).toBe(1);
+  });
+
+  test("a multi-threaded agent with NO subject maps to ONE queue (the channel) — HEAD behavior", async () => {
+    const backend = new FakeBackend();
+    const gate = deferred<void>();
+    backend.gate = { promise: gate.promise, resolve: gate.resolve };
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specMultiThreaded("digest", "digest"));
+
+    // No subject on either fire → both route to the bare channel queue (HEAD), strictly serial.
+    reg.enqueue("digest", { content: "f1" });
+    await until(() => backend.calls.length === 1);
+    reg.enqueue("digest", { content: "f2" });
+    expect(backend.calls).toHaveLength(1);
+
+    gate.resolve();
+    await until(() => rec.calls.length === 2);
+    expect(backend.calls.map((c) => c.message)).toEqual(["f1", "f2"]);
+    expect(backend.maxConcurrent).toBe(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// roles×threads NEXT slice (#120) — F. per-thread session CONTINUITY.
+//
+// A multi-threaded SUBJECT thread reads/writes its session at the SUBJECT-scoped thread note
+// and `--resume`s it (turning "fresh thread per fire" into "resume the named thread"); a
+// multi-threaded agent with NO subject still never resumes (HEAD), and a single-threaded agent
+// resumes its def-named note (HEAD).
+// ─────────────────────────────────────────────────────────────────────────────────────────
+describe("ProgrammaticAgentRegistry — F. per-thread session continuity (#120)", () => {
+  function subjectSessionReader(priorBySubject: Record<string, string | undefined> = {}): {
+    calls: { channel: string; name: string; subject?: string }[];
+    fn: (channel: string, name: string, subject?: string) => Promise<string | undefined>;
+  } {
+    const calls: { channel: string; name: string; subject?: string }[] = [];
+    const fn = async (channel: string, name: string, subject?: string) => {
+      calls.push({ channel, name, ...(subject ? { subject } : {}) });
+      return priorBySubject[subject ?? ""];
+    };
+    return { calls, fn };
+  }
+
+  test("a multi-threaded SUBJECT thread RESUMES the session persisted on its subject-scoped note", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    // A PRIOR session exists for subject "alpha" only.
+    const reader = subjectSessionReader({ alpha: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specMultiThreaded("digest", "digest"));
+
+    reg.enqueue("digest", { content: "second fire", subject: "alpha" });
+    await until(() => backend.calls.length === 1);
+
+    // readSession was consulted with the channel, the DEF NAME, and the SUBJECT (subject-scoped).
+    expect(reader.calls).toEqual([{ channel: "digest", name: "digest", subject: "alpha" }]);
+    // A prior session for this subject → RESUME it (NOT a fresh uuid) — per-thread continuity.
+    expect(backend.calls[0]!.session).toEqual({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      resume: true,
+    });
+    // The thread note carries the SUBJECT so the transport upserts the subject-scoped note.
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.subject).toBe("alpha");
+    expect(threads.ends()[0]!.session).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+  });
+
+  test("a multi-threaded subject with NO prior session CREATES a fresh one (first fire of the named thread)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reader = subjectSessionReader({}); // no prior for any subject.
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specMultiThreaded("digest", "digest"));
+
+    reg.enqueue("digest", { content: "first fire", subject: "alpha" });
+    await until(() => backend.calls.length === 1);
+
+    expect(reader.calls).toEqual([{ channel: "digest", name: "digest", subject: "alpha" }]);
+    // No prior → CREATE (resume:false) with a fresh uuid, persisted onto the subject note.
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    expect(backend.calls[0]!.session.id).toMatch(/^[0-9a-f-]{36}$/);
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.subject).toBe("alpha");
+    expect(threads.ends()[0]!.session).toBe(backend.calls[0]!.session.id);
+  });
+
+  test("a multi-threaded agent with NO subject NEVER consults readSession (fresh per fire — HEAD)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reader = subjectSessionReader({ "": "should-never-be-used" });
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specMultiThreaded("digest", "digest"));
+
+    reg.enqueue("digest", { content: "no-subject fire" });
+    await until(() => backend.calls.length === 1);
+
+    // No subject on a multi-threaded agent → readSession is NEVER consulted (HEAD: each fire
+    // is a fresh thread), and the session is created fresh.
+    expect(reader.calls).toHaveLength(0);
+    expect(backend.calls[0]!.session.resume).toBe(false);
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.subject).toBeUndefined();
+  });
+
+  test("NULL-SUBJECT INVARIANT — a single-threaded agent's path is byte-identical to HEAD (the steward weave)", async () => {
+    // The live steward weave is single-threaded + carries NO subject. This pins that nothing
+    // in F changes its drain: readSession is keyed on (channel, def-name, undefined), the
+    // session resumes the def-named note, the thread note carries NO subject, and the backend
+    // sees NO subject. A regression here breaks the 4am weave.
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reader = subjectSessionReader({ "": "55555555-5555-4555-8555-555555555555" });
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      writeThread: threads.fn,
+      readSession: reader.fn,
+    });
+    await reg.register(specFor("steward")); // single-threaded, no subject.
+
+    reg.enqueue("steward", { content: "weave digest" }); // no subject — the runner fire.
+    await until(() => backend.calls.length === 1);
+
+    // readSession consulted with the def name and NO subject (the deterministic def-named note).
+    expect(reader.calls).toEqual([{ channel: "steward", name: "steward" }]);
+    // Resumes the def-named note's session (HEAD single-threaded behavior).
+    expect(backend.calls[0]!.session).toEqual({
+      id: "55555555-5555-4555-8555-555555555555",
+      resume: true,
+    });
+    // The backend sees NO subject (no per-thread workspace re-key — sessions/<name>/ unchanged).
+    expect(backend.calls[0]!.subject).toBeUndefined();
+    // The thread note carries NO subject (the deterministic def-named upsert, unchanged).
+    await until(() => threads.ends().length === 1);
+    expect(threads.ends()[0]!.subject).toBeUndefined();
+    expect(threads.ends()[0]!.name).toBe("steward");
   });
 });
 

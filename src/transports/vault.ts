@@ -66,6 +66,10 @@ import type {
   CallbackMetadata,
   InboundAttachment,
 } from "../transport.ts";
+// roles×threads NEXT slice (#120): the shared thread-key sanitizer — REUSED here for the
+// subject-scoped deterministic thread-note leaf (`<name>--<slug(subject)>`) so the path
+// math matches the registry's drain key exactly (no drift).
+import { threadKey } from "../sandbox/types.ts";
 
 /** The safe basename of a (possibly path-ful, possibly untrusted) string — the LAST
  *  path segment, with traversal markers stripped. Used to derive a display `filename`
@@ -820,20 +824,33 @@ export class VaultTransport implements Transport {
   }
 
   /**
-   * The DETERMINISTIC path of a single-threaded agent's ONE thread note —
-   * `Threads/<safeChannel>/<safeName>` (named after the def). The single shared
-   * source of truth for that path so {@link writeThread} (the upsert) and
-   * {@link readThreadSession} (the pre-turn session read) can never disagree on
-   * where the note lives. Sanitizes both segments to a flat, predictable slug.
+   * The DETERMINISTIC path of a thread note that UPSERTS in place —
+   * `Threads/<safeChannel>/<leaf>`. The single shared source of truth for that path so
+   * {@link writeThread} (the upsert), {@link readThreadSession} (the pre-turn session read),
+   * and {@link clearThreadSession} (the reset) can never disagree on where the note lives.
+   * Sanitizes the channel segment to a flat, predictable slug.
    *
-   * COLLISION NOTE: two single-threaded agents whose names collapse to the SAME safeName
-   * on the same channel would share this note. Acceptable because the registry enforces
-   * ONE agent per channel (byChannel index), so the collision can't arise in practice.
+   * The LEAF is {@link threadKey}`(name, subject)` (roles×threads NEXT slice, #120):
+   *  - NO subject → the bare def name (`<safeName>`) — the HEAD single-threaded path,
+   *    byte-identical. `threadKey` returns the bare name AND `slug`s it the same way the
+   *    prior inline `replace(/[^a-zA-Z0-9_-]/g, "-")` did, so the path is unchanged.
+   *  - A subject → `<safeName>--<safeSubject>` (the subject thread's deterministic note),
+   *    so a multi-threaded SUBJECT upserts + carries a session across fires.
+   *
+   * COLLISION NOTE: two agents whose (name, subject) collapse to the SAME leaf on the same
+   * channel would share this note. Acceptable: the registry enforces ONE agent per channel
+   * (byChannel index), and distinct subjects produce distinct leaves.
    */
-  private singleThreadedPath(channel: string, name: string): string {
+  private singleThreadedPath(channel: string, name: string, subject?: string): string {
     const safeChannel = channel.replace(/[^a-zA-Z0-9_-]/g, "-");
+    // Slug the NAME segment exactly as HEAD did (the prior inline `replace`), then let
+    // threadKey append `--<slug(subject)>` when a subject narrows the thread. With no
+    // subject threadKey returns the (already-slugged) name verbatim → the leaf is
+    // byte-identical to the HEAD single-threaded path. With a subject the leaf becomes
+    // `<safeName>--<safeSubject>` (both slugged → path-safe, no traversal).
     const safeName = (name ?? channel).replace(/[^a-zA-Z0-9_-]/g, "-");
-    return `${THREAD_PATH_PREFIX}/${safeChannel}/${safeName}`;
+    const leaf = threadKey(safeName, subject);
+    return `${THREAD_PATH_PREFIX}/${safeChannel}/${leaf}`;
   }
 
   /**
@@ -865,32 +882,36 @@ export class VaultTransport implements Transport {
   async writeThread(thread: ThreadRecord): Promise<{ sent: string[] }> {
     const safeChannel = thread.channel.replace(/[^a-zA-Z0-9_-]/g, "-");
     const singleThreaded = thread.mode === "single-threaded";
+    // roles×threads NEXT slice (#120): a thread is DETERMINISTIC (a named, upserting note
+    // that rolls turn_count/usage + carries a session across fires) when it's single-threaded
+    // (HEAD) OR it's a multi-threaded thread that carries a SUBJECT. A subject-scoped
+    // multi-threaded thread turns "fresh note per fire" into "resume the named thread" — its
+    // leaf is `<name>--<subject>`. A multi-threaded thread with NO subject stays a per-fire
+    // uuid note (HEAD), byte-identical for the weave + every current agent.
+    const subject = thread.subject?.trim();
+    const deterministic = singleThreaded || (!singleThreaded && !!subject);
 
-    // IDENTITY by mode (HARD CONSTRAINT 3 — the path leaf IS the thread's identity; no
-    // ambiguous `thread_id` metadata field). single-threaded: a DETERMINISTIC leaf named
-    // after the def (the agent/spec name, sanitized) so the SAME note upserts across turns.
-    // multi-threaded: a fresh uuid per fire (one fire = one thread = one note today).
-    // COLLISION NOTE: two single-threaded agents whose names collapse to the SAME safeName
-    // on the same channel would upsert each other's thread note. Acceptable because the
-    // registry enforces ONE agent per channel (byChannel index), so the collision can't
-    // arise in practice.
-    // Multi-threaded leaf: a per-FIRE id. Reuse the caller's `threadId` when given (a
-    // re-record of the same turn — e.g. the outbound-failure status flip — targets the
-    // SAME per-fire note instead of minting a duplicate); else mint a fresh one. Single-
-    // threaded uses the DETERMINISTIC path (named after the def) so the one-per-channel
-    // note upserts — computed via {@link singleThreadedPath} so writeThread and
-    // readThreadSession agree on exactly where the note lives.
-    const path = singleThreaded
-      ? this.singleThreadedPath(thread.channel, thread.name ?? thread.channel)
+    // IDENTITY (HARD CONSTRAINT 3 — the path leaf IS the thread's identity; no ambiguous
+    // `thread_id` metadata field). A DETERMINISTIC thread upserts at a stable leaf named after
+    // the def (+ subject when present), via {@link singleThreadedPath} so writeThread,
+    // readThreadSession + clearThreadSession all agree on exactly where the note lives. A
+    // non-deterministic (multi-threaded, no-subject) thread is a per-FIRE uuid note — reuse
+    // the caller's `threadId` when given (a re-record of the same turn — the outbound-failure
+    // status flip — targets the SAME per-fire note instead of minting a duplicate); else mint.
+    // COLLISION NOTE: two threads whose (name[, subject]) collapse to the SAME leaf on the
+    // same channel would upsert each other's note. Acceptable: the registry enforces ONE agent
+    // per channel (byChannel index), and distinct subjects produce distinct leaves.
+    const path = deterministic
+      ? this.singleThreadedPath(thread.channel, thread.name ?? thread.channel, subject)
       : `${THREAD_PATH_PREFIX}/${safeChannel}/${thread.threadId ?? crypto.randomUUID()}`;
 
-    // For single-threaded UPSERT, read the existing thread note (by its deterministic
-    // path) to roll up the aggregates. SAFE because the drain is serial per channel and
-    // single-threaded is one-thread-per-channel today (see the method doc) — there's no
-    // concurrent writer to lose an update against.
-    //   WHEN CONTINUATION brings concurrent threads per channel, switch to re-deriving
-    //   aggregates from the #agent/message children or a vault atomic-merge, to avoid
-    //   lost-update.
+    // For a DETERMINISTIC UPSERT (single-threaded OR a multi-threaded subject thread), read
+    // the existing thread note (by its deterministic path) to roll up the aggregates. SAFE
+    // because the drain is serial PER THREAD KEY (registry per-thread serial guarantee) — a
+    // given (name, subject) thread has no concurrent writer to lose an update against.
+    //   WHEN per-channel concurrency across DIFFERENT subjects lands they each have their OWN
+    //   deterministic note (distinct leaf), so no cross-subject lost-update; only same-subject
+    //   would race, and that's serialized by the per-thread drain.
     let priorTurnCount = 0;
     let priorInputTokens = 0;
     let priorOutputTokens = 0;
@@ -898,7 +919,7 @@ export class VaultTransport implements Transport {
     let priorStartedAt: string | undefined;
     let priorLastTurnAt: string | undefined;
     let priorSession: string | undefined;
-    if (singleThreaded) {
+    if (deterministic) {
       const prior = await this.readThreadNote(path);
       if (prior) {
         priorTurnCount = numFromMeta(prior.metadata?.turn_count);
@@ -932,8 +953,8 @@ export class VaultTransport implements Transport {
     const isStart = thread.phase === "start";
     let turnCount: number;
     if (isStart) {
-      turnCount = singleThreaded ? priorTurnCount : 0;
-    } else if (singleThreaded) {
+      turnCount = deterministic ? priorTurnCount : 0;
+    } else if (deterministic) {
       turnCount = thread.sameTurn ? priorTurnCount : priorTurnCount + 1;
     } else {
       turnCount = 1;
@@ -944,13 +965,13 @@ export class VaultTransport implements Transport {
     const startedAt = priorStartedAt ?? thread.started_at;
     const lastTurnAt = isStart ? (priorLastTurnAt ?? "") : thread.ended_at;
 
-    // Cumulative usage: single-threaded SUMS this turn into the prior totals; multi-threaded
-    // carries just this turn's (one fire = one thread).
+    // Cumulative usage: a DETERMINISTIC thread SUMS this turn into the prior totals; a
+    // per-fire (multi-threaded, no-subject) note carries just this turn's (one fire = one thread).
     const inputTokens =
-      (singleThreaded ? priorInputTokens : 0) + (thread.usage?.inputTokens ?? 0);
+      (deterministic ? priorInputTokens : 0) + (thread.usage?.inputTokens ?? 0);
     const outputTokens =
-      (singleThreaded ? priorOutputTokens : 0) + (thread.usage?.outputTokens ?? 0);
-    const costUsd = (singleThreaded ? priorCostUsd : 0) + (thread.usage?.totalCostUsd ?? 0);
+      (deterministic ? priorOutputTokens : 0) + (thread.usage?.outputTokens ?? 0);
+    const costUsd = (deterministic ? priorCostUsd : 0) + (thread.usage?.totalCostUsd ?? 0);
 
     // Indexed string fields (queryable) + the thread-state observability fields. The
     // vault stores metadata as strings; numbers are stringified.
@@ -969,14 +990,14 @@ export class VaultTransport implements Transport {
     if (thread.definition) metadata.definition = thread.definition;
     // The thread≡session record: persist the Claude session UUID onto the note so the
     // NEXT turn can `--resume` it. Prefer the session this write carries; else (a write
-    // with no session, e.g. a start-phase working-ensure) PRESERVE the prior single-
-    // threaded note's session so an upsert never drops continuity. Multi-threaded carries
-    // its own per-fire session each write (no preserve — each fire is a fresh thread).
-    const session = thread.session ?? (singleThreaded ? priorSession : undefined);
+    // with no session, e.g. a start-phase working-ensure) PRESERVE the prior DETERMINISTIC
+    // note's session so an upsert never drops continuity. A per-fire (no-subject multi)
+    // note carries its own per-fire session each write (no preserve — each fire is fresh).
+    const session = thread.session ?? (deterministic ? priorSession : undefined);
     if (session) metadata.session = session;
     // Usage is always present once a turn carried it OR we accumulated any — emit the
     // running totals so a query sees cumulative cost for the thread.
-    if (singleThreaded || thread.usage) {
+    if (deterministic || thread.usage) {
       if (inputTokens) metadata.input_tokens = String(inputTokens);
       if (outputTokens) metadata.output_tokens = String(outputTokens);
       // Round the accumulated cost to 9 decimals before serializing — summing floats
@@ -1088,19 +1109,22 @@ export class VaultTransport implements Transport {
     }
   }
 
-  /** The persisted Claude session UUID for a single-threaded agent's deterministic
-   *  thread note, or undefined if none yet (first turn). Read before a turn so the
-   *  daemon can --resume it. */
-  async readThreadSession(channel: string, name: string): Promise<string | undefined> {
-    const prior = await this.readThreadNote(this.singleThreadedPath(channel, name));
+  /** The persisted Claude session UUID for a thread's deterministic note, or undefined if
+   *  none yet (first turn). Read before a turn so the daemon can --resume it. `subject`
+   *  (roles×threads NEXT slice, #120) resolves the subject-scoped note
+   *  (`Threads/<ch>/<name>--<subject>`) for a multi-threaded subject thread; omitted → the
+   *  def-named note (HEAD). Uses {@link singleThreadedPath} so the path math matches writeThread. */
+  async readThreadSession(channel: string, name: string, subject?: string): Promise<string | undefined> {
+    const prior = await this.readThreadNote(this.singleThreadedPath(channel, name, subject));
     const s = prior?.metadata?.session;
     return typeof s === "string" && s ? s : undefined;
   }
 
-  /** Clear a single-threaded agent's persisted session so its next turn starts a
-   *  fresh Claude conversation (the per-agent restart). No-op if no thread note yet. */
-  async clearThreadSession(channel: string, name: string): Promise<void> {
-    const path = this.singleThreadedPath(channel, name);
+  /** Clear a thread's persisted session so its next turn starts a fresh Claude conversation
+   *  (the per-agent restart). `subject` resolves the subject-scoped note; omitted → the
+   *  def-named note (HEAD). No-op if no thread note yet. */
+  async clearThreadSession(channel: string, name: string, subject?: string): Promise<void> {
+    const path = this.singleThreadedPath(channel, name, subject);
     const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(path)}`;
     const res = await fetch(url, {
       method: "PATCH",

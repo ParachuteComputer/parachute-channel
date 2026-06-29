@@ -80,6 +80,15 @@ export interface ThreadRecord {
    * Omitted falls back to the channel (the 1:1 default, where channel == name).
    */
   name?: string;
+  /**
+   * The thread SUBJECT (roles×threads NEXT slice, #120). When present on a MULTI-threaded
+   * thread, the note becomes a DETERMINISTIC, upserting record at `threadKey(name, subject)`
+   * (`Threads/<safeChannel>/<safeName>--<safeSubject>`) — rolling turn_count + cumulative
+   * usage + a preserved session across fires (per-thread continuity), exactly like the
+   * single-threaded deterministic path but at the subject-scoped leaf. Absent/empty → the
+   * HEAD identity (single-threaded deterministic note / multi-threaded per-fire uuid note).
+   */
+  subject?: string;
   /** The `#agent/definition` note id this thread came from (provenance; plain id string). */
   definition?: string;
   /** The mode the turn ran under — governs thread identity + whether the note upserts. */
@@ -235,20 +244,23 @@ export interface Transport {
    */
   writeThread?(thread: ThreadRecord): Promise<{ sent: string[] }>;
   /**
-   * Optional: read the persisted Claude session UUID for a single-threaded agent's
-   * deterministic `#agent/thread` note (the thread≡session record), or undefined when
-   * none yet (the first turn). The daemon reads this BEFORE a turn so it can `--resume`
-   * the prior conversation. Only a durable transport (the VaultTransport) implements it;
-   * transports without a durable thread store (telegram) omit it.
+   * Optional: read the persisted Claude session UUID for a thread's deterministic
+   * `#agent/thread` note (the thread≡session record), or undefined when none yet (the
+   * first turn). The daemon reads this BEFORE a turn so it can `--resume` the prior
+   * conversation. `subject` (roles×threads NEXT slice, #120) resolves the SUBJECT-scoped
+   * note (`Threads/<ch>/<name>--<subject>`) for a multi-threaded subject thread; omitted →
+   * the def-named note (single-threaded resume, HEAD). Only a durable transport (the
+   * VaultTransport) implements it; transports without a durable thread store (telegram) omit it.
    */
-  readThreadSession?(channel: string, name: string): Promise<string | undefined>;
+  readThreadSession?(channel: string, name: string, subject?: string): Promise<string | undefined>;
   /**
-   * Optional: CLEAR the persisted session on a single-threaded agent's `#agent/thread`
-   * note so its next turn starts a fresh Claude conversation (the per-agent restart /
-   * reset). Only a durable transport (the VaultTransport) implements it; transports
-   * without a durable thread store (telegram) omit it.
+   * Optional: CLEAR the persisted session on a thread's `#agent/thread` note so its next
+   * turn starts a fresh Claude conversation (the per-agent restart / reset). `subject`
+   * resolves the subject-scoped note; omitted → the def-named note (HEAD). Only a durable
+   * transport (the VaultTransport) implements it; transports without a durable thread store
+   * (telegram) omit it.
    */
-  clearThreadSession?(channel: string, name: string): Promise<void>;
+  clearThreadSession?(channel: string, name: string, subject?: string): Promise<void>;
   /**
    * Optional: write an agent-to-agent CALLBACK as an INBOUND note on THIS channel (the
    * "reply_to" substrate). A recipient agent's drain, on turn completion, calls this on the

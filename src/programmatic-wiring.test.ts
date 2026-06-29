@@ -549,6 +549,36 @@ describe("boot re-register", () => {
     );
     expect(count).toBe(0);
   });
+
+  test("roles×threads (#120, G): a per-thread `<name>--<subject>` workspace dir is NOT re-registered on boot", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prog-boot-subject-"));
+    try {
+      const sessionsDir = join(dir, "sessions");
+      // The per-AGENT spec dir (no `--`) carries the authoritative spec → re-registered.
+      persistSpec(sessionWorkspace(sessionsDir, "pm"), { name: "pm", channels: ["pm"], backend: "programmatic" });
+      // A per-THREAD subject workspace dir `pm--eco-civ` is a per-turn scratch dir. Even if it
+      // somehow holds a programmatic spec.json (it normally never does — the spec is per-agent),
+      // the `--` guard makes it INERT on boot: it must NOT resurrect a phantom agent.
+      // Build the subject dir by passing the subject so the leaf is exactly `pm--eco-civ`.
+      persistSpec(sessionWorkspace(sessionsDir, "pm", "eco-civ"), {
+        name: "pm--eco-civ",
+        channels: ["pm"],
+        backend: "programmatic",
+      });
+
+      const backend = new FakeBackend();
+      const rec = recorder();
+      const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+
+      const count = await reregisterProgrammaticAgents(programmatic, liveChannels(["pm"]), sessionsDir);
+      // Exactly the per-AGENT spec was re-registered; the `--` subject dir was skipped.
+      expect(count).toBe(1);
+      expect(programmatic.hasName("pm")).toBe(true);
+      expect(programmatic.hasName("pm--eco-civ")).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("/health + GET /api/agents include programmatic agents", () => {

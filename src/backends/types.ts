@@ -252,6 +252,14 @@ export interface AgentBackend {
    * subject-specific context layers on top. The run-context preamble is unaffected (it stays on
    * the MESSAGE). ADDITIVE — omitted/empty → the system prompt is the role body verbatim
    * (byte-identical to HEAD; the null-subject invariant).
+   *
+   * `subject` (optional, roles×threads NEXT slice #120) is the thread SUBJECT — the programmatic
+   * backend keys the agent's PER-THREAD private session workspace off it
+   * (`sessions/<name>--<slug(subject)>/`), so concurrent subjects of one multi-threaded agent get
+   * ISOLATED per-turn files (`.mcp.json`, `system-prompt.txt`, HOME, attachment staging) and never
+   * clobber each other. ADDITIVE — omitted/empty → `sessions/<name>/` (byte-identical to HEAD;
+   * the null-subject invariant). Distinct from `subjectDossier` (which is prompt CONTENT); this is
+   * the workspace IDENTITY.
    */
   deliver(
     handle: AgentHandle,
@@ -261,6 +269,7 @@ export interface AgentBackend {
     attachments?: InboundAttachment[],
     runContext?: RunContext,
     subjectDossier?: string,
+    subject?: string,
   ): Promise<DeliverResult>;
 
   /**

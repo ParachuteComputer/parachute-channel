@@ -835,6 +835,46 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
 // (.mcp.json / system-prompt.txt / spec.json / seeded CLAUDE_CONFIG_DIR) STAYS in
 // the per-agent sessions/<name> dir, never written into the shared workspace.
 
+// roles×threads NEXT slice (#120) — G. per-thread private workspace.
+// `sessionWorkspace(dir, name, subject?)` → `join(dir, threadKey(name, subject))`. A subject
+// keys an ISOLATED `sessions/<name>--<slug(subject)>/` dir; NO subject is byte-identical to HEAD.
+describe("sessionWorkspace — per-thread private workspace (#120, G)", () => {
+  test("NO subject → sessions/<name>/ — byte-identical to HEAD", () => {
+    expect(sessionWorkspace("/s", "steward")).toBe(join("/s", "steward"));
+  });
+
+  test("empty / whitespace-only subject → falls back to sessions/<name>/ (no subject narrows it)", () => {
+    expect(sessionWorkspace("/s", "steward", "")).toBe(join("/s", "steward"));
+    expect(sessionWorkspace("/s", "steward", "   ")).toBe(join("/s", "steward"));
+  });
+
+  test("a subject → an ISOLATED sessions/<name>--<slug(subject)>/ dir", () => {
+    expect(sessionWorkspace("/s", "pm", "eco-civ")).toBe(join("/s", "pm--eco-civ"));
+  });
+
+  test("DISTINCT subjects of one agent → DISTINCT dirs (per-thread isolation)", () => {
+    const a = sessionWorkspace("/s", "pm", "alpha");
+    const b = sessionWorkspace("/s", "pm", "beta");
+    expect(a).toBe(join("/s", "pm--alpha"));
+    expect(b).toBe(join("/s", "pm--beta"));
+    expect(a).not.toBe(b);
+    // And neither collides with the name-only (per-AGENT spec) dir.
+    expect(a).not.toBe(sessionWorkspace("/s", "pm"));
+  });
+
+  test("an untrusted subject is SLUGGED into the leaf — no path traversal / escape", () => {
+    // `../`, slashes, spaces, NUL all collapse to `-` (the shared slug), so the leaf can never
+    // climb out of the sessions dir.
+    expect(sessionWorkspace("/s", "pm", "../../etc/passwd")).toBe(join("/s", "pm--------etc-passwd"));
+    expect(sessionWorkspace("/s", "pm", "a b/c")).toBe(join("/s", "pm--a-b-c"));
+    expect(sessionWorkspace("/s", "pm", "x y")).toBe(join("/s", "pm--x-y"));
+    // The leaf stays a single path segment under the sessions dir (no extra separators).
+    const ws = sessionWorkspace("/s", "pm", "../escape");
+    expect(ws.startsWith(join("/s") + "/")).toBe(true);
+    expect(ws.slice(join("/s").length + 1).includes("/")).toBe(false);
+  });
+});
+
 describe("resolveAgentCwd — cwd is the workspace when set, else the private dir", () => {
   test("workspace set → that path; the private dir is untouched as the cwd", () => {
     expect(resolveAgentCwd({ name: "a", channels: ["c"], workspace: "/ws/repo" }, "/private/a")).toBe("/ws/repo");

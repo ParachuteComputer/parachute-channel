@@ -443,13 +443,19 @@ export class ProgrammaticBackend implements AgentBackend {
     attachments?: InboundAttachment[],
     runContext?: RunContext,
     subjectDossier?: string,
+    subject?: string,
   ): Promise<DeliverResult> {
     const spec = handle.spec;
     if (!spec) {
       return { ok: false, error: `ProgrammaticBackend.deliver: handle for "${handle.name}" carries no spec` };
     }
     const channel = handle.channel;
-    const workspace = sessionWorkspace(this.deps.sessionsDir, spec.name);
+    // roles×threads NEXT slice (#120, G): the PER-THREAD private workspace. A subject keys
+    // a distinct `sessions/<name>--<slug(subject)>/` dir (its own `.mcp.json` /
+    // `system-prompt.txt` / HOME / attachment staging — see stageAttachments below, which
+    // takes THIS workspace), so concurrent subjects of one multi-threaded agent never clobber
+    // each other's per-turn files. NO subject → `sessions/<name>/` (HEAD, byte-identical).
+    const workspace = sessionWorkspace(this.deps.sessionsDir, spec.name, subject);
 
     // Resolve the Claude OAuth credential keyed on the wake channel. A missing
     // credential throws (CredentialNotConfigured) BEFORE any mint/spawn side effect.

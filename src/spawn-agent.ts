@@ -27,6 +27,7 @@ import { writeFileSync, mkdirSync, chmodSync, existsSync, readFileSync } from "n
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentSpec, BaseBinds } from "./sandbox/types.ts";
+import { threadKey } from "./sandbox/types.ts";
 import { Sandbox, type SandboxEngine, type WrappedCommand } from "./sandbox/index.ts";
 import type { EgressBaseInput } from "./sandbox/egress.ts";
 import { DENYLISTED_ENV } from "./credentials.ts";
@@ -181,9 +182,18 @@ export interface SpawnAgentBaseDeps {
   ripgrep?: { command: string; args?: string[] };
 }
 
-/** Per-session workspace dir under the sessions base. */
-export function sessionWorkspace(sessionsDir: string, specName: string): string {
-  return join(sessionsDir, specName);
+/**
+ * Per-session workspace dir under the sessions base. The leaf is {@link threadKey}`(specName,
+ * subject)` (roles×threads NEXT slice, #120):
+ *  - NO subject → `<sessionsDir>/<specName>` — byte-identical to HEAD (every current agent,
+ *    incl. the weave, and the per-AGENT spec.json / persist callsites which never pass a subject).
+ *  - A subject → `<sessionsDir>/<specName>--<slug(subject)>` — a PER-THREAD private workspace
+ *    (its own `.mcp.json` / `system-prompt.txt` / HOME / staging), so concurrent subjects of one
+ *    multi-threaded agent never clobber each other's per-turn files. `slug` (inside threadKey)
+ *    strips the untrusted subject to a path-safe leaf — no traversal.
+ */
+export function sessionWorkspace(sessionsDir: string, specName: string, subject?: string): string {
+  return join(sessionsDir, threadKey(specName, subject));
 }
 
 /**

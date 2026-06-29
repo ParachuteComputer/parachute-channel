@@ -27,10 +27,10 @@ import {
   grantVaultEntryKey,
   grantServiceEntryKey,
   grantMcpEntryKey,
-  packPathKey,
-  isPackNote,
-  packWants,
-  PACK_TAG,
+  rolePathKey,
+  isRoleNote,
+  roleWants,
+  ROLE_TAG,
   GrantsClient,
   GrantsApiError,
   WantsParseError,
@@ -643,60 +643,61 @@ describe("resolveInjectedGrants", () => {
 });
 
 // ---------------------------------------------------------------------------
-// threads-only Phase B′ — pack-only grants (DESIGN-2026-06-29-threads-only.md §4)
+// roles as the capability layer (DESIGN-2026-06-29-threads-roles-context.md)
 // ---------------------------------------------------------------------------
 
-describe("packPathKey — the pack grant-holder key (slugged path, `pack--` prefixed)", () => {
-  test("slugs the path (non-slug chars → -) under a `pack--` prefix", () => {
-    expect(packPathKey("Uni/Packs/github")).toBe("pack--Uni-Packs-github");
-    expect(packPathKey("Packs/Read.ai")).toBe("pack--Packs-Read-ai");
+describe("rolePathKey — the role grant-holder key (slugged path, `role--` prefixed)", () => {
+  test("slugs the path (non-slug chars → -) under a `role--` prefix", () => {
+    expect(rolePathKey("Uni/Roles/github")).toBe("role--Uni-Roles-github");
+    expect(rolePathKey("Roles/Read.ai")).toBe("role--Roles-Read-ai");
   });
-  test("the pack key namespace can never collide with a bare def name (a slug, no `--`)", () => {
-    // A def `metadata.name` is a `[a-zA-Z0-9_-]+` slug — it has no `--`, so the `pack--`
+  test("the role key namespace can never collide with a bare def name (a slug, no `--`)", () => {
+    // A def `metadata.name` is a `[a-zA-Z0-9_-]+` slug — it has no `--`, so the `role--`
     // prefix partitions the two grant-holder namespaces.
-    expect(packPathKey("steward").startsWith("pack--")).toBe(true);
+    expect(rolePathKey("steward").startsWith("role--")).toBe(true);
     expect("steward").not.toContain("--");
   });
 });
 
-describe("isPackNote / packWants — the SECURITY GATE (wants only from PACKS)", () => {
-  test("PACK_TAG is the bare `pack` tag", () => {
-    expect(PACK_TAG).toBe("pack");
+describe("isRoleNote / roleWants — the SECURITY GATE (wants only from #agent/role)", () => {
+  test("ROLE_TAG is the bare `agent/role` tag", () => {
+    expect(ROLE_TAG).toBe("agent/role");
   });
-  test("isPackNote: true for a `pack`-tagged note (array or string tags, tolerant of `#`)", () => {
-    expect(isPackNote({ tags: ["pack"] })).toBe(true);
-    expect(isPackNote({ tags: ["#pack"] })).toBe(true); // stray leading # tolerated
-    expect(isPackNote({ tags: "foo, pack, bar" })).toBe(true);
-    expect(isPackNote({ tags: ["other"] })).toBe(false);
-    expect(isPackNote({ tags: undefined })).toBe(false);
-    // A substring match must NOT count as `pack` (exact tag, not prefix).
-    expect(isPackNote({ tags: ["packaged"] })).toBe(false);
-    expect(isPackNote({ tags: ["pack/sub"] })).toBe(false);
+  test("isRoleNote: true for an `agent/role`-tagged note (array or string tags, tolerant of `#`)", () => {
+    expect(isRoleNote({ tags: ["agent/role"] })).toBe(true);
+    expect(isRoleNote({ tags: ["#agent/role"] })).toBe(true); // stray leading # tolerated
+    expect(isRoleNote({ tags: "foo, agent/role, bar" })).toBe(true);
+    expect(isRoleNote({ tags: ["other"] })).toBe(false);
+    expect(isRoleNote({ tags: undefined })).toBe(false);
+    // A near-miss must NOT count as `agent/role` (exact tag, not prefix/substring).
+    expect(isRoleNote({ tags: ["agent/roles"] })).toBe(false);
+    expect(isRoleNote({ tags: ["agent/role/sub"] })).toBe(false);
+    expect(isRoleNote({ tags: ["agent"] })).toBe(false);
   });
 
-  test("a `#pack` note WITH wants → parsed specs", () => {
-    const note = { tags: ["pack"], metadata: { wants: "vault:research:read, env:github" } };
-    expect(packWants(note)).toEqual([
+  test("an `#agent/role` note WITH wants → parsed specs", () => {
+    const note = { tags: ["agent/role"], metadata: { wants: "vault:research:read, env:github" } };
+    expect(roleWants(note)).toEqual([
       { kind: "vault", target: "research", access: "read" },
       { kind: "service", target: "github", inject: ["env"] },
     ]);
   });
 
-  test("THE GATE: a NON-pack note with wants → null (its wants are IGNORED/inert)", () => {
+  test("THE GATE: a NON-role note with wants → null (its wants are IGNORED/inert)", () => {
     // A plain content note declaring `wants:` must NOT contribute any capability.
     const note = { tags: ["reference"], metadata: { wants: "vault:research:read, env:github" } };
-    expect(packWants(note)).toBeNull();
-    // Same content, but now tagged `pack` → honored. The ONLY difference is the tag.
-    expect(packWants({ tags: ["pack"], metadata: { wants: "vault:research:read" } })).not.toBeNull();
+    expect(roleWants(note)).toBeNull();
+    // Same content, but now tagged `agent/role` → honored. The ONLY difference is the tag.
+    expect(roleWants({ tags: ["agent/role"], metadata: { wants: "vault:research:read" } })).not.toBeNull();
   });
 
-  test("a pack with NO wants → null; a pack with empty wants → null", () => {
-    expect(packWants({ tags: ["pack"], metadata: {} })).toBeNull();
-    expect(packWants({ tags: ["pack"], metadata: { wants: "" } })).toBeNull();
+  test("a role with NO wants → null; a role with empty wants → null", () => {
+    expect(roleWants({ tags: ["agent/role"], metadata: {} })).toBeNull();
+    expect(roleWants({ tags: ["agent/role"], metadata: { wants: "" } })).toBeNull();
   });
 
-  test("a pack with a MALFORMED wants → null (the reconcile path stamps status:error)", () => {
-    expect(packWants({ tags: ["pack"], metadata: { wants: "garbage-no-colon" } })).toBeNull();
+  test("a role with a MALFORMED wants → null (the reconcile path stamps status:error)", () => {
+    expect(roleWants({ tags: ["agent/role"], metadata: { wants: "garbage-no-colon" } })).toBeNull();
   });
 });
 
@@ -737,8 +738,8 @@ function multiAgentClient(opts: {
   return new GrantsClient({ hubOrigin: HUB, managerBearer: BEARER, fetchFn });
 }
 
-describe("resolveInjectedGrantsUnion — union of def key + pack keys", () => {
-  test("LEGACY CONTINUITY: a single source (no packs) === resolveInjectedGrants(spec.name)", async () => {
+describe("resolveInjectedGrantsUnion — union of def key + role keys", () => {
+  test("LEGACY CONTINUITY: a single source (no roles) === resolveInjectedGrants(spec.name)", async () => {
     const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
     const byAgent = { steward: [{ id: "g1", connection: conn, status: "approved" }] };
     const material = { g1: { kind: "service" as const, token: "GHTOK", inject: ["env" as const] } };
@@ -752,14 +753,14 @@ describe("resolveInjectedGrantsUnion — union of def key + pack keys", () => {
     expect(fromUnion.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
   });
 
-  test("a thread loading ONE pack → def grants UNIONED with the pack's path-keyed grants", async () => {
-    const packKey = packPathKey("Packs/github");
+  test("a thread loading ONE role → def grants UNIONED with the role's path-keyed grants", async () => {
+    const roleKey = rolePathKey("Roles/github");
     const client = multiAgentClient({
       byAgent: {
         steward: [
           { id: "d1", connection: { kind: "vault", target: "ops", access: "read" }, status: "approved" },
         ],
-        [packKey]: [
+        [roleKey]: [
           { id: "p1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" },
         ],
       },
@@ -768,16 +769,16 @@ describe("resolveInjectedGrantsUnion — union of def key + pack keys", () => {
         p1: { kind: "service", token: "GHTOK", inject: ["env"] },
       },
     });
-    const out = await resolveInjectedGrantsUnion(client, ["steward", packKey]);
-    expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" }); // from the pack
+    const out = await resolveInjectedGrantsUnion(client, ["steward", roleKey]);
+    expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" }); // from the role
     expect(out.mcpEntries).toEqual([
       { name: grantVaultEntryKey("ops"), url: "https://hub/vault/ops/mcp", token: "OPSTOK" }, // from the def
     ]);
   });
 
-  test("TWO packs → all three sources unioned (def + pack A + pack B)", async () => {
-    const keyA = packPathKey("Packs/github");
-    const keyB = packPathKey("Packs/research");
+  test("TWO roles → all three sources unioned (def + role A + role B)", async () => {
+    const keyA = rolePathKey("Roles/github");
+    const keyB = rolePathKey("Roles/research");
     const client = multiAgentClient({
       byAgent: {
         steward: [{ id: "d1", connection: { kind: "service", target: "cloudflare", inject: ["env"] }, status: "approved" }],
@@ -811,34 +812,34 @@ describe("resolveInjectedGrantsUnion — union of def key + pack keys", () => {
   });
 
   test("dedupe on collision: first source wins an env-var / MCP-name collision (def first)", async () => {
-    const packKey = packPathKey("Packs/github");
+    const roleKey = rolePathKey("Roles/github");
     const client = multiAgentClient({
       byAgent: {
         steward: [{ id: "d1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
-        [packKey]: [{ id: "p1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
+        [roleKey]: [{ id: "p1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
       },
       material: {
         d1: { kind: "service", token: "DEF-GHTOK", inject: ["env"] },
-        p1: { kind: "service", token: "PACK-GHTOK", inject: ["env"] },
+        p1: { kind: "service", token: "ROLE-GHTOK", inject: ["env"] },
       },
     });
-    const out = await resolveInjectedGrantsUnion(client, ["steward", packKey]);
+    const out = await resolveInjectedGrantsUnion(client, ["steward", roleKey]);
     // The def (first source) wins the GITHUB_TOKEN collision.
     expect(out.env).toEqual({ GITHUB_TOKEN: "DEF-GHTOK" });
   });
 
   test("per-source isolation: ONE source's list failure is skipped, the others still inject", async () => {
-    const packKey = packPathKey("Packs/github");
+    const roleKey = rolePathKey("Roles/github");
     const client = multiAgentClient({
       byAgent: {
         steward: [{ id: "d1", connection: { kind: "service", target: "github", inject: ["env"] }, status: "approved" }],
-        [packKey]: [{ id: "p1", connection: { kind: "vault", target: "x", access: "read" }, status: "approved" }],
+        [roleKey]: [{ id: "p1", connection: { kind: "vault", target: "x", access: "read" }, status: "approved" }],
       },
       material: { d1: { kind: "service", token: "GHTOK", inject: ["env"] } },
-      listStatusByAgent: { [packKey]: 500 }, // the pack's LIST fails
+      listStatusByAgent: { [roleKey]: 500 }, // the role's LIST fails
     });
-    const out = await resolveInjectedGrantsUnion(client, ["steward", packKey]);
-    // The def still injected; the failing pack source is simply absent (never throws).
+    const out = await resolveInjectedGrantsUnion(client, ["steward", roleKey]);
+    // The def still injected; the failing role source is simply absent (never throws).
     expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
     expect(out.mcpEntries).toEqual([]);
   });

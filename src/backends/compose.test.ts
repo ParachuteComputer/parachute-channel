@@ -34,12 +34,12 @@ describe("composeSystemPrompt — arity-N loadout", () => {
     const entries: LoadoutEntry[] = [
       { path: "Agents/steward", content: "self body" },
       { path: "Projects/Surface", content: "project body" },
-      { path: "Packs/GitHub", content: "pack body" },
+      { path: "Refs/GitHub", content: "ref body" },
     ];
     expect(composeSystemPrompt(entries)).toBe(
       "# Agents/steward\n\nself body" +
         "\n\n---\n\n# Projects/Surface\n\nproject body" +
-        "\n\n---\n\n# Packs/GitHub\n\npack body",
+        "\n\n---\n\n# Refs/GitHub\n\nref body",
     );
   });
 
@@ -119,7 +119,36 @@ describe("composeSystemPrompt — byte budget", () => {
   });
 });
 
-describe("composeSystemPrompt — protectedCount (the def + thread-content protected prefix)", () => {
+describe("composeSystemPrompt — protectedCount (the roles + def + thread-content protected prefix)", () => {
+  test("protectedCount=3 protects the WHOLE roles+def+thread prefix; only the layer-③ tail sheds", () => {
+    // The shape the backend builds with one role loaded: [role, self(def), thread-content, ...loadout].
+    const role = { path: "Roles/PM", content: "ROLE-" + "r".repeat(200) };
+    const self = { path: "Agents/uni", content: "DEF-" + "d".repeat(200) };
+    const threadContent = { path: "Threads/eng/uni", content: "THREAD-" + "t".repeat(200) };
+    const big = (p: string) => ({ path: p, content: p + "-" + "x".repeat(400) });
+    const warnings: string[] = [];
+    // Budget fits the three protected entries but not the extra-context loadout notes.
+    const budget = 900;
+    const out = composeSystemPrompt([role, self, threadContent, big("n1"), big("n2")], {
+      budgetBytes: budget,
+      protectedCount: 3,
+      onWarn: (m) => warnings.push(m),
+    });
+    // The role leads, then the def, then the thread content — all three survive whole, in order.
+    expect(out).toBe(
+      `# ${role.path}\n\n${role.content}` +
+        `\n\n---\n\n# ${self.path}\n\n${self.content}` +
+        `\n\n---\n\n# ${threadContent.path}\n\n${threadContent.content}`,
+    );
+    // Only the layer-③ tail was shed; the warn names neither the role, the def, nor the thread.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("n1");
+    expect(warnings[0]).toContain("n2");
+    expect(warnings[0]).not.toContain("Roles/PM");
+    expect(warnings[0]).not.toContain("Agents/uni");
+    expect(warnings[0]).not.toContain("Threads/eng/uni");
+  });
+
   test("protectedCount=2 protects BOTH leading entries (def + thread content), tail-drops only the loadout (index ≥2)", () => {
     // The shape the backend builds: [self(def), thread-content, ...loadout].
     const self = { path: "Agents/uni", content: "DEF-" + "d".repeat(200) };

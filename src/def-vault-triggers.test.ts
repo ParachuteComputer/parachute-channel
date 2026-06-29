@@ -88,27 +88,27 @@ describe("buildDefVaultTriggers — the bare-keyed shapes", () => {
     return t;
   }
 
-  test("emits five triggers: def-watch create/edit, inbound, pack-watch create/edit", () => {
+  test("emits five triggers: def-watch create/edit, inbound, role-watch create/edit", () => {
     expect(triggers.map((t) => t.name)).toEqual([
       "conn_agentdefs-create-default",
       "conn_agentdefs-edit-default",
       "conn_agentinbound-default",
-      // threads-only Phase B′ — the per-pack reconcile triggers.
-      "conn_packs-create-default",
-      "conn_packs-edit-default",
+      // threads-only Phase B′ — the per-role reconcile triggers.
+      "conn_roles-create-default",
+      "conn_roles-edit-default",
     ]);
   });
 
-  test("pack-watch triggers are bare `pack`-keyed and webhook the pack reconcile endpoint", () => {
-    for (const name of ["conn_packs-create-default", "conn_packs-edit-default"]) {
+  test("role-watch triggers are bare `agent/role`-keyed and webhook the role reconcile endpoint", () => {
+    for (const name of ["conn_roles-create-default", "conn_roles-edit-default"]) {
       const t = byName(name);
-      expect(t.when.tags).toEqual(["pack"]);
-      expect(t.action.webhook).toBe(`${HUB}/agent/api/vault/pack`);
+      expect(t.when.tags).toEqual(["agent/role"]);
+      expect(t.action.webhook).toBe(`${HUB}/agent/api/vault/role`);
       expect(t.action.send).toBe("json");
       expect(t.action.auth?.bearer).toBe("BEARER");
     }
-    expect(byName("conn_packs-create-default").events).toEqual(["created"]);
-    expect(byName("conn_packs-edit-default").events).toEqual(["updated"]);
+    expect(byName("conn_roles-create-default").events).toEqual(["created"]);
+    expect(byName("conn_roles-edit-default").events).toEqual(["updated"]);
   });
 
   test("def-watch triggers are BARE-keyed (agent/definition, NOT #agent/definition)", () => {
@@ -179,8 +179,8 @@ describe("registerDefVaultTriggers — the live registration path", () => {
       "conn_agentdefs-create-default",
       "conn_agentdefs-edit-default",
       "conn_agentinbound-default",
-      "conn_packs-create-default",
-      "conn_packs-edit-default",
+      "conn_roles-create-default",
+      "conn_roles-edit-default",
     ]);
     expect(triggerCalls).toHaveLength(5);
     for (const c of triggerCalls) {
@@ -279,6 +279,6 @@ describe("registerAllDefVaultTriggers — fan-out over bindings", () => {
     const names = new Set(triggerCalls.map((c) => c.body.name));
     expect(names.has("conn_agentdefs-create-work")).toBe(true);
     expect(names.has("conn_agentinbound-default")).toBe(true);
-    expect(names.has("conn_packs-create-work")).toBe(true);
+    expect(names.has("conn_roles-create-work")).toBe(true);
   });
 });

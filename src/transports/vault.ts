@@ -70,12 +70,12 @@ import type {
 // subject-scoped deterministic thread-note leaf (`<name>--<slug(subject)>`) so the path
 // math matches the registry's drain key exactly (no drift).
 import { threadKey } from "../sandbox/types.ts";
-// threads-only Phase B′ (§4): the pure pack-detection helpers — `packWants` is the
-// SECURITY GATE (a note's `wants:` is honored only if it is a `#pack`), `packPathKey`
-// derives the hub grant-holder key from the pack's slugged path. The metadata read here
-// is DELIBERATELY SEPARATE from the content-only loadout read (loading a note for context
-// never adds capabilities).
-import { packWants, packPathKey, isPackNote } from "../grants.ts";
+// roles as the capability layer (DESIGN-2026-06-29-threads-roles-context.md): the pure
+// role-detection helpers — `roleWants` is the SECURITY GATE (a note's `wants:` is honored
+// only if it is an `#agent/role`), `rolePathKey` derives the hub grant-holder key from the
+// role's slugged path. A role is read ONCE per turn: its CONTENT becomes the layer-① prompt
+// entry and its (gated) `wants:` becomes the grant keys — see `readThreadRoles`.
+import { roleWants, rolePathKey, isRoleNote } from "../grants.ts";
 
 /** The safe basename of a (possibly path-ful, possibly untrusted) string — the LAST
  *  path segment, with traversal markers stripped. Used to derive a display `filename`
@@ -349,10 +349,11 @@ function numFromMeta(v: unknown): number {
 }
 
 /**
- * Parse a thread note's `metadata.loadout` into an ordered list of note PATHS
- * (threads-only Phase A — DESIGN-2026-06-29-threads-only.md §9). The model home is an
- * ARRAY of path strings, but the vault stores metadata flexibly (a real JSON array, a
- * JSON-encoded array STRING, or — defensively — a single path string), so accept all three:
+ * Parse a thread note's note-path-array metadata field (`metadata.loadout` — the layer-③
+ * extra context; OR `metadata.roles` — the layer-① roles, DESIGN-2026-06-29-threads-roles-context.md)
+ * into an ordered list of note PATHS. The model home is an ARRAY of path strings, but the
+ * vault stores metadata flexibly (a real JSON array, a JSON-encoded array STRING, or —
+ * defensively — a single path string), so accept all three:
  *
  *  - a real `string[]` → kept (string entries only);
  *  - a `string` that JSON-parses to an array of strings → that array;
@@ -397,6 +398,17 @@ export const AGENT_ROOT_TAG = "agent";
  * The module reads these notes from a def-vault and instantiates each as a live agent.
  */
 export const AGENT_DEFINITION_TAG = "agent/definition";
+
+/**
+ * Role tag — a `#agent/role` note (roles as the capability layer,
+ * DESIGN-2026-06-29-threads-roles-context.md). A REUSABLE bundle: its BODY is loaded as the
+ * FIRST system-prompt layer (the "hat") and its `wants:` metadata declares the capabilities
+ * (MCPs / access / grants) a thread that loads it gains. It is the ONLY layer that grants
+ * capability — the security gate (`isRoleNote` / `roleWants` in grants.ts) honors `wants:`
+ * ONLY on a note carrying this tag, so loading plain context can never escalate. The
+ * elevation of the prior (unwired) `#pack`.
+ */
+export const AGENT_ROLE_TAG = "agent/role";
 
 /**
  * Scheduled-job tag — the runner's vault-native job store (design
@@ -445,6 +457,7 @@ const THREAD_PATH_PREFIX = "Threads";
  * declared via the vault's tag-schema API. We declare the full `#agent/*`
  * namespace rollup (design `2026-06-17-vault-native-agents.md`):
  *   - `#agent/definition`        → parent `#agent`
+ *   - `#agent/role`              → parent `#agent`
  *   - `#agent/message`           → parent `#agent`
  *   - `#agent/message/inbound`   → parent `#agent/message`
  *   - `#agent/message/outbound`  → parent `#agent/message`
@@ -487,6 +500,12 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     name: AGENT_DEFINITION_TAG,
     parent_names: [AGENT_ROOT_TAG],
     description: "A vault-native agent definition — body is the system prompt, metadata is the config.",
+  },
+  {
+    name: AGENT_ROLE_TAG,
+    parent_names: [AGENT_ROOT_TAG],
+    description:
+      "A reusable role — body is loaded as the first prompt layer; metadata.wants declares its capabilities (the only capability-granting layer).",
   },
   {
     name: AGENT_MESSAGE_TAG,
@@ -1087,7 +1106,7 @@ export class VaultTransport implements Transport {
     try {
       const parsed = (await res.json()) as unknown;
       // Tolerate a bare note object OR a `{ note: {...} }` envelope OR a 1-element array.
-      // `tags` is carried through (Phase B′ — readThreadPackKeys needs it for pack-detection).
+      // `tags` is carried through (readThreadRoles needs it for the role security gate).
       if (Array.isArray(parsed)) {
         return parsed[0] as { metadata?: Record<string, unknown>; content?: string; tags?: unknown } | undefined;
       }
@@ -1210,33 +1229,40 @@ export class VaultTransport implements Transport {
   }
 
   /**
-   * Read the thread's loaded-PACK grant KEYS (threads-only Phase B′ —
-   * DESIGN-2026-06-29-threads-only.md §4). Resolves the SAME `metadata.loadout` note paths as
-   * {@link readThreadLoadout}, but reads each note's METADATA (+ tags) — NOT its content — to
-   * find the loaded notes that are PACKS: a note carrying the `#pack` tag AND a non-empty,
-   * cleanly-parsing `wants:`. Each such pack contributes its hub grant-holder key (the slugged
-   * PATH via {@link packPathKey}); the backend unions `listGrants(packKey)` for each with the
-   * def's own `listGrants(spec.name)`.
+   * Read the thread's ROLES (layer ① — DESIGN-2026-06-29-threads-roles-context.md): the
+   * `metadata.roles` array of note PATHS on the thread's `#agent/thread` note, resolved in ONE
+   * pass to BOTH (a) the ordered CONTENT entries (`{ path, content }`) the backend composes as
+   * the FIRST prompt layer, and (b) the grant-holder KEYS (the slugged PATH via
+   * {@link rolePathKey}) for the loaded notes that are ROLES declaring `wants:`. The backend
+   * prepends the entries before the def (self) and unions `listGrants(roleKey)` for each grant
+   * key with the def's own `listGrants(spec.name)`.
    *
-   * THE SECURITY GATE: a loaded note's `wants:` is honored ONLY if the note is a `#pack`
-   * (`packWants` returns null for a non-pack note even when it declares `wants:`). So loading
-   * an arbitrary content note for context can NEVER add capabilities. This metadata read is
-   * DELIBERATELY a SEPARATE pass from the content-only {@link readThreadLoadout} (the prompt
-   * composition is unchanged — Phase A content-only), at the cost of re-reading the loadout
-   * notes' metadata.
+   * THE SECURITY GATE: a loaded note's `wants:` is honored ONLY if the note carries the
+   * `#agent/role` tag (`roleWants` returns null for a non-role note even when it declares
+   * `wants:`). So listing an arbitrary content note in `metadata.roles` loads its CONTENT as
+   * context but can NEVER add capabilities — only a real `#agent/role` contributes a grant key.
+   * This is the single read of each role note: content for layer ① + the gated `wants:` →
+   * grants, so a role declares its hat AND its access in one place.
    *
    * Skip-and-warn per path (mirrors the loadout discipline): a 404/renamed path or a read
-   * error on one note is skipped — never thrown — so one stale path can't brick a turn. No
-   * thread note / absent `metadata.loadout` / no pack with `wants:` → an empty array (every
-   * current thread). Keys are deduped (a pack listed twice yields one key). `subject` resolves
-   * the subject-scoped thread note (path math reuses {@link singleThreadedPath}).
+   * error on one note is skipped — never thrown — so one stale path can't brick a turn. A
+   * blank-bodied note is RETURNED in the entries (the composer skips blank entries by content).
+   * No thread note / absent `metadata.roles` → `{ entries: [], grantKeys: [] }` (every current
+   * thread — the no-roles invariant). Grant keys are deduped (a role listed twice yields one
+   * key). `subject` resolves the subject-scoped thread note (path math reuses
+   * {@link singleThreadedPath}, so it agrees with writeThread / readThreadLoadout).
    */
-  async readThreadPackKeys(channel: string, name: string, subject?: string): Promise<string[]> {
+  async readThreadRoles(
+    channel: string,
+    name: string,
+    subject?: string,
+  ): Promise<{ entries: { path: string; content: string }[]; grantKeys: string[] }> {
     const thread = await this.readThreadNote(this.singleThreadedPath(channel, name, subject));
-    if (!thread) return []; // no thread note yet (first turn) → no packs.
-    const paths = parseLoadoutPaths(thread.metadata?.loadout);
-    if (paths.length === 0) return [];
-    const keys: string[] = [];
+    if (!thread) return { entries: [], grantKeys: [] }; // no thread note yet (first turn) → no roles.
+    const paths = parseLoadoutPaths(thread.metadata?.roles);
+    if (paths.length === 0) return { entries: [], grantKeys: [] };
+    const entries: { path: string; content: string }[] = [];
+    const grantKeys: string[] = [];
     const seen = new Set<string>();
     for (const path of paths) {
       let note: { metadata?: Record<string, unknown>; content?: string; tags?: unknown } | undefined;
@@ -1244,38 +1270,45 @@ export class VaultTransport implements Transport {
         note = await this.readThreadNote(path);
       } catch (err) {
         console.warn(
-          `parachute-agent: pack-detect read for loadout note "${path}" failed (skipping): ${(err as Error).message}`,
+          `parachute-agent: role note "${path}" read failed (skipping): ${(err as Error).message}`,
         );
         continue;
       }
-      if (!note) continue; // 404 — a stale/renamed loadout path. Skip (the loadout reader warns).
-      // THE SECURITY GATE: honor `wants:` ONLY when the note is a `#pack`. A non-pack note's
-      // `wants:` returns null here → never contributes a grant source.
-      const wants = packWants(note);
+      if (!note) {
+        // 404 — a stale/renamed role path. Skip-and-warn (never throw); the def-load discipline.
+        console.warn(`parachute-agent: role note "${path}" not found (skipping)`);
+        continue;
+      }
+      // CONTENT (layer ①) — loaded for EVERY resolvable role path. A blank body is returned;
+      // the composer skips it. Loading content never escalates — only the gated `wants:` below does.
+      entries.push({ path, content: typeof note.content === "string" ? note.content : "" });
+      // THE SECURITY GATE: honor `wants:` ONLY when the note is an `#agent/role`. A non-role
+      // note's `wants:` returns null here → contributes context but never a grant source.
+      const wants = roleWants(note);
       if (!wants) {
-        // Observability: a `#pack` note whose `wants:` is present but unparseable contributes
-        // nothing here (it injects nothing this turn). The reconcile path (POST /api/vault/pack)
-        // stamps `status:error` on save — that's the primary surface — but warn here too so an
-        // operator can diagnose "my pack stopped working" from the daemon log. A non-pack note
-        // (the gate) or a pack with no `wants:` is silent (expected, not an error).
+        // Observability: an `#agent/role` note whose `wants:` is present but unparseable
+        // contributes no grants this turn. The reconcile path (POST /api/vault/role) stamps
+        // `status:error` on save — the primary surface — but warn here too so an operator can
+        // diagnose "my role stopped granting" from the daemon log. A non-role note (the gate)
+        // or a role with no `wants:` is silent (expected, not an error).
         if (
           note.metadata?.wants !== undefined &&
           note.metadata?.wants !== null &&
-          isPackNote(note) // only warn for PACKS with bad wants, never plain (gated-out) notes.
+          isRoleNote(note) // only warn for ROLES with bad wants, never plain (gated-out) notes.
         ) {
           console.warn(
-            `parachute-agent: loaded pack "${path}" has an unusable wants: — contributing no grants ` +
-              `this turn (the pack-save reconcile stamps status:error; check the note's wants:).`,
+            `parachute-agent: loaded role "${path}" has an unusable wants: — contributing no grants ` +
+              `this turn (the role-save reconcile stamps status:error; check the note's wants:).`,
           );
         }
         continue;
       }
-      const key = packPathKey(path);
+      const key = rolePathKey(path);
       if (seen.has(key)) continue;
       seen.add(key);
-      keys.push(key);
+      grantKeys.push(key);
     }
-    return keys;
+    return { entries, grantKeys };
   }
 
   // react / edit / download: vault has no reactions; v1 is reply-only. Omitted.

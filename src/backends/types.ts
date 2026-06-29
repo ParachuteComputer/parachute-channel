@@ -122,16 +122,16 @@ export interface RunContext {
 }
 
 /**
- * One entry in a thread's LOADOUT (threads-only Phase A — DESIGN-2026-06-29-threads-only.md
- * §1/§9). The composed system prompt is an ORDERED LIST of these — entry 0 is the thread's
- * "self" entry (the def body, labeled by the def note's PATH), entries 1..N are the notes the
- * thread loads from its `metadata.loadout` (an array of note PATHS). The composer reads the
- * note's CONTENT only — NEVER its metadata — and renders each as `# <path>\n\n<content>`.
+ * One entry in the composed system prompt — a `{ path, content }` pair the composer renders as
+ * `# <path>\n\n<content>` (CONTENT only — NEVER metadata). The composed prompt is an ORDERED
+ * LIST of these, three layers (DESIGN-2026-06-29-threads-roles-context.md): ① the thread's ROLES
+ * (composed FIRST), ② the "self" entry (the def body, labeled by the def note's PATH) then the
+ * thread's own CONTENT, ③ the EXTRA-CONTEXT loadout (`metadata.loadout` note paths). Each layer
+ * is a list of these entries; the backend concatenates them in order.
  *
- * This is the arity-N generalization of the rc.13 arity-2 `roleBody [+ subjectDossier]` seam:
- * a thread that loads no notes (every current agent, incl. the 4am steward weave) composes to
- * EXACTLY its def body, prefixed by a single `# <path>` header — the only change to a
- * no-loadout prompt (the no-loadout invariant; design decision #4, accepted).
+ * A thread that loads NOTHING (no roles, no thread content, no loadout — every current agent,
+ * incl. the 4am steward weave) composes to EXACTLY its def body, prefixed by a single
+ * `# <path>` header — the only change to such a prompt (the no-loadout/no-roles invariant).
  */
 export interface LoadoutEntry {
   /** The note PATH — rendered as the entry's `# <path>` header AND the dedupe key. */
@@ -167,12 +167,13 @@ export const LOADOUT_BUDGET_BYTES = 600_000;
  *
  * Then enforce {@link LOADOUT_BUDGET_BYTES}: if the composed byte length exceeds the cap,
  * drop trailing LOADOUT entries until it fits — the PROTECTED leading entries are NEVER
- * truncated. `protectedCount` (default 1) is how many leading entries are load-bearing: 1
- * protects just the self entry (index 0, the def body) — the no-loadout default; 2 protects
- * the self entry AND the thread-content entry (index 1) once the caller has inserted it
- * (DESIGN-2026-06-29-thread-content-and-skills.md — thread content is load-bearing like the
- * def). Only entries beyond the protected prefix shed (tail-first). A loud warn fires on
- * truncation (via `onWarn`, defaulting to console.warn).
+ * truncated. `protectedCount` (default 1) is how many leading entries are load-bearing — the
+ * caller counts its protected PREFIX: the ROLES (layer ①, composed first), the self entry (the
+ * def body), and the thread-content entry (layer ②) when present
+ * (DESIGN-2026-06-29-threads-roles-context.md). With no roles + no thread content it is 1 (the
+ * self entry alone — the no-loadout default); each role adds one, and thread content adds one.
+ * Only entries beyond the protected prefix (the layer-③ extra-context loadout) shed (tail-first).
+ * A loud warn fires on truncation (via `onWarn`, defaulting to console.warn).
  *
  * The NO-LOADOUT INVARIANT: with exactly one (self) entry whose content is the def body, the
  * result is `# <path>\n\n<body>` where `<body>` is byte-identical to the def body — the single
@@ -355,16 +356,17 @@ export interface AgentBackend {
    * message so the agent stamps ACCURATE times instead of fabricating them. ADDITIVE — omitted
    * → the turn message is exactly as before.
    *
-   * `loadout` (optional, threads-only Phase A — DESIGN-2026-06-29-threads-only.md §9) is the
-   * thread's ORDERED LIST of loaded notes (entries 1..N — the SELF entry is prepended by the
-   * backend from `spec.systemPrompt` + the def note path). The programmatic backend folds them
-   * into the SYSTEM prompt via {@link composeSystemPrompt}: `[self, ...loadout]` deduped by path,
+   * `loadout` (optional, the layer-③ EXTRA CONTEXT — DESIGN-2026-06-29-threads-roles-context.md)
+   * is the thread's ORDERED LIST of extra-context notes (skills, references), composed AFTER the
+   * thread content. The programmatic backend folds them into the SYSTEM prompt via
+   * {@link composeSystemPrompt}: `[...roles, self, thread-content, ...loadout]` deduped by path,
    * blank-skipped, each rendered `# <path>\n\n<content>`, joined by `\n\n---\n\n`, then budgeted
-   * ({@link LOADOUT_BUDGET_BYTES}, truncating loadout-notes-first, NEVER the self entry). This
-   * SUPERSEDES the rc.13 arity-2 `subjectDossier` string with an arity-N note list. ADDITIVE —
-   * omitted/empty → the system prompt is `# <path>\n\n<def body>`, byte-identical to HEAD APART
-   * FROM the single `# <path>` header (the no-loadout invariant; design decision #4, accepted).
-   * The run-context preamble is unaffected (it stays on the MESSAGE).
+   * ({@link LOADOUT_BUDGET_BYTES}, truncating loadout-notes-first, NEVER the protected prefix —
+   * roles + self + thread content). ADDITIVE — omitted/empty + no roles + no thread content → the
+   * system prompt is `# <path>\n\n<def body>`, byte-identical to HEAD APART FROM the single
+   * `# <path>` header (the no-loadout invariant). The run-context preamble is unaffected (it stays
+   * on the MESSAGE). Distinct from `roles`: loadout is CONTENT-only (never grants); roles carry
+   * capability and compose FIRST.
    *
    * `subject` (optional, roles×threads NEXT slice #120) is the thread SUBJECT — the programmatic
    * backend keys the agent's PER-THREAD private session workspace off it
@@ -374,26 +376,34 @@ export interface AgentBackend {
    * the null-subject invariant). Distinct from `loadout` (which is prompt CONTENT); this is
    * the workspace IDENTITY.
    *
-   * `packKeys` (optional, threads-only Phase B′ — DESIGN-2026-06-29-threads-only.md §4) is the
-   * list of hub grant-holder KEYS for the loaded PACKS in this thread's loadout — the slugged
-   * PATH (`packPathKey`) of every loaded note that is a `#pack` declaring `wants:`. The
-   * programmatic backend UNIONS each pack's APPROVED grants with the def's own (`spec.name`),
-   * so a thread that loads a pack gains that pack's capabilities. This is SEPARATE from
-   * `loadout` (prompt content) by design: the SECURITY GATE — a non-pack note's `wants:` is
-   * IGNORED — is enforced where `packKeys` is built (the transport reads the loaded notes'
-   * METADATA, never folding it into the prompt). ADDITIVE — omitted/empty (every current agent;
-   * no thread loads a `#pack` with `wants:` today) → the grant source set is exactly
-   * `[spec.name]`, BYTE-IDENTICAL to the legacy single-source injection (legacy continuity).
+   * `roleKeys` (optional, roles as the capability layer — DESIGN-2026-06-29-threads-roles-context.md)
+   * is the list of hub grant-holder KEYS for the thread's ROLES — the slugged PATH (`rolePathKey`)
+   * of every note in `metadata.roles` that is an `#agent/role` declaring `wants:`. The programmatic
+   * backend UNIONS each role's APPROVED grants with the def's own (`spec.name`), so a thread that
+   * loads a role gains that role's capabilities. The SECURITY GATE — a non-role note's `wants:` is
+   * IGNORED — is enforced where `roleKeys` is built (the transport reads the role notes' METADATA).
+   * ADDITIVE — omitted/empty (every current agent; no thread loads a role with `wants:` today) →
+   * the grant source set is exactly `[spec.name]`, BYTE-IDENTICAL to the legacy single-source
+   * injection (legacy continuity).
    *
-   * `threadContent` (optional, DESIGN-2026-06-29-thread-content-and-skills.md) is THIS thread's
-   * own standing context — the thread note's authored BODY (`{ path, content }`, CONTENT only,
-   * the thread-note path as the header). The programmatic backend composes it as the entry
-   * BETWEEN the self entry and the loadout: `[self, thread-content, ...loadout]`. It is
-   * load-bearing like the def — composed with a protected prefix so an over-budget loadout
-   * sheds its tail but NEVER the def or the thread content. ADDITIVE — omitted, or blank/
-   * whitespace content → the thread-content entry is skipped and the prompt is `[self, ...loadout]`
-   * exactly as before (the no-thread-content invariant). The daemon NEVER writes this content;
-   * a human/agent authors it on the thread note and the backend reads it CONTENT-only each turn.
+   * `threadContent` (optional, the layer-② THREAD content — DESIGN-2026-06-29-threads-roles-context.md)
+   * is THIS thread's own standing context — the thread note's authored BODY (`{ path, content }`,
+   * CONTENT only, the thread-note path as the header). The programmatic backend composes it
+   * BETWEEN the def (self) and the loadout: `[...roles, self, thread-content, ...loadout]`. It is
+   * load-bearing like the def — composed inside the protected prefix so an over-budget loadout
+   * sheds its tail but NEVER the roles, the def, or the thread content. ADDITIVE — omitted, or
+   * blank/whitespace content → the thread-content entry is skipped (the no-thread-content
+   * invariant). The daemon NEVER writes this content; a human/agent authors it on the thread note
+   * and the backend reads it CONTENT-only each turn.
+   *
+   * `roles` (optional, the layer-① ROLES — DESIGN-2026-06-29-threads-roles-context.md) is the
+   * thread's ORDERED LIST of role-note CONTENT entries (`{ path, content }`), composed FIRST —
+   * before the def (self) — as the reusable "hat(s)" the thread wears. The programmatic backend
+   * prepends them: `[...roles, self, thread-content, ...loadout]`, and they sit inside the
+   * PROTECTED prefix (never truncated). Each role's CAPABILITIES ride SEPARATELY on `roleKeys`
+   * (content here, grants there — one role note, read once). ADDITIVE — omitted/empty → the
+   * prompt is `[self, thread-content, ...loadout]` exactly as before this layer (the no-roles
+   * invariant). Blank/whitespace role entries are skipped (the composer skips blank content).
    */
   deliver(
     handle: AgentHandle,
@@ -404,8 +414,9 @@ export interface AgentBackend {
     runContext?: RunContext,
     loadout?: LoadoutEntry[],
     subject?: string,
-    packKeys?: string[],
+    roleKeys?: string[],
     threadContent?: LoadoutEntry,
+    roles?: LoadoutEntry[],
   ): Promise<DeliverResult>;
 
   /**

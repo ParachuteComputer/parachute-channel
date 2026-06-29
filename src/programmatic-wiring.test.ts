@@ -1083,7 +1083,7 @@ describe("the drain reads the thread loadout → deliver receives it (threads-on
         seen.push({ channel, name, ...(subject ? { subject } : {}) });
         return [
           { path: "Projects/Surface", content: "project body" },
-          { path: "Packs/GitHub", content: "pack body" },
+          { path: "Refs/GitHub", content: "ref body" },
         ];
       },
     });
@@ -1094,7 +1094,7 @@ describe("the drain reads the thread loadout → deliver receives it (threads-on
     await until(() => backend.calls.length === 1);
     expect(backend.calls[0]!.loadout).toEqual([
       { path: "Projects/Surface", content: "project body" },
-      { path: "Packs/GitHub", content: "pack body" },
+      { path: "Refs/GitHub", content: "ref body" },
     ]);
     // The loader is consulted for EVERY thread (no subject → resolves the def-named note).
     expect(seen).toEqual([{ channel: "worker", name: "worker" }]);

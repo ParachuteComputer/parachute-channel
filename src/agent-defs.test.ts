@@ -22,7 +22,7 @@ import {
   type DefVaultBinding,
   type InstantiateDeps,
 } from "./agent-defs.ts";
-import { GrantsClient, connectionKey, packPathKey, type ConnectionSpec } from "./grants.ts";
+import { GrantsClient, connectionKey, rolePathKey, type ConnectionSpec } from "./grants.ts";
 import type { AgentSpec } from "./sandbox/types.ts";
 
 const realFetch = globalThis.fetch;
@@ -1530,42 +1530,42 @@ describe("AgentDefRegistry — deleteDef ordering + grant-GC surfacing (FIX 4/5,
 });
 
 // ---------------------------------------------------------------------------
-// AgentDefRegistry.reconcilePack — per-pack grant reconcile (threads-only Phase B′)
+// AgentDefRegistry.reconcileRole — per-role grant reconcile (threads-only Phase B′)
 // ---------------------------------------------------------------------------
 
-describe("AgentDefRegistry — reconcilePack (per-pack grant reconcile, Phase B′)", () => {
-  test("a clean #pack with wants → registers each under the pack PATH key + reconciles that set", async () => {
+describe("AgentDefRegistry — reconcileRole (per-role grant reconcile, Phase B′)", () => {
+  test("a clean #agent/role with wants → registers each under the role PATH key + reconciles that set", async () => {
     const { deps } = recorderDeps();
     const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
     const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ registered, reconciled });
-    // The vault serves the pack note by id (getNote), with the #pack tag + wants.
+    // The vault serves the role note by id (getNote), with the #agent/role tag + wants.
     const fetchFn = vaultFetch({
       byId: {
-        "Packs/github": {
-          id: "Packs/github",
+        "Roles/github": {
+          id: "Roles/github",
           // tags carried through (cast: vaultFetch's byId type omits tags but serializes the object).
-          ...( { tags: ["pack"] } as Record<string, unknown> ),
-          content: "pack body",
+          ...( { tags: ["agent/role"] } as Record<string, unknown> ),
+          content: "role body",
           metadata: { wants: "vault:research:read, env:github" },
         } as never,
       },
     });
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
-    const result = await reg.reconcilePack("default", "Packs/github", "created");
+    const result = await reg.reconcileRole("default", "Roles/github", "created");
     expect(result).toBe("reconciled");
 
-    const expectedKey = packPathKey("Packs/github");
-    // Each want registered UNDER THE PACK PATH KEY (not the thread, not any def name).
+    const expectedKey = rolePathKey("Roles/github");
+    // Each want registered UNDER THE ROLE PATH KEY (not the thread, not any def name).
     expect(registered.every((r) => r.agent === expectedKey)).toBe(true);
     expect(registered.map((r) => r.connection.target).sort()).toEqual(["github", "research"]);
-    // Reconcile sent the live SPECS under the SAME pack key (its OWN partition).
+    // Reconcile sent the live SPECS under the SAME role key (its OWN partition).
     expect(reconciled).toHaveLength(1);
     expect(reconciled[0]!.agent).toBe(expectedKey);
     expect(reconciled[0]!.liveConnections.map((c) => c.target).sort()).toEqual(["github", "research"]);
   });
 
-  test("SECURITY GATE: a loaded note WITHOUT the #pack tag → prune-to-[] (its wants are inert)", async () => {
+  test("SECURITY GATE: a loaded note WITHOUT the #agent/role tag → prune-to-[] (its wants are inert)", async () => {
     const { deps } = recorderDeps();
     const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
     const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
@@ -1574,58 +1574,58 @@ describe("AgentDefRegistry — reconcilePack (per-pack grant reconcile, Phase B�
       byId: {
         "Refs/leaky": {
           id: "Refs/leaky",
-          ...( { tags: ["reference"] } as Record<string, unknown> ), // NOT a pack
+          ...( { tags: ["reference"] } as Record<string, unknown> ), // NOT a role
           content: "body",
           metadata: { wants: "vault:secrets:read" }, // declared but inert
         } as never,
       },
     });
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
-    const result = await reg.reconcilePack("default", "Refs/leaky", "updated");
+    const result = await reg.reconcileRole("default", "Refs/leaky", "updated");
     expect(result).toBe("pruned");
     // NOTHING registered (the gate) — and its partition pruned to [].
     expect(registered).toHaveLength(0);
-    expect(reconciled).toEqual([{ agent: packPathKey("Refs/leaky"), liveConnections: [] }]);
+    expect(reconciled).toEqual([{ agent: rolePathKey("Refs/leaky"), liveConnections: [] }]);
   });
 
-  test("a #pack that DROPPED wants → prune-to-[] for ITS OWN partition only", async () => {
+  test("a #agent/role that DROPPED wants → prune-to-[] for ITS OWN partition only", async () => {
     const { deps } = recorderDeps();
     const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     const fetchFn = vaultFetch({
       byId: {
-        "Packs/github": {
-          id: "Packs/github",
-          ...( { tags: ["pack"] } as Record<string, unknown> ),
+        "Roles/github": {
+          id: "Roles/github",
+          ...( { tags: ["agent/role"] } as Record<string, unknown> ),
           content: "body",
           metadata: {}, // wants removed
         } as never,
       },
     });
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
-    expect(await reg.reconcilePack("default", "Packs/github", "updated")).toBe("pruned");
-    expect(reconciled).toEqual([{ agent: packPathKey("Packs/github"), liveConnections: [] }]);
+    expect(await reg.reconcileRole("default", "Roles/github", "updated")).toBe("pruned");
+    expect(reconciled).toEqual([{ agent: rolePathKey("Roles/github"), liveConnections: [] }]);
   });
 
-  test("a deleted pack → prune-to-[] without a fetch (CONFIRMED removal), its partition only", async () => {
+  test("a deleted role → prune-to-[] without a fetch (CONFIRMED removal), its partition only", async () => {
     const { deps } = recorderDeps();
     const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
     // byId is irrelevant — a delete event prunes without fetching.
     const fetchFn = vaultFetch({ byId: {} });
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
-    expect(await reg.reconcilePack("default", "Packs/github", "deleted")).toBe("pruned");
-    expect(reconciled).toEqual([{ agent: packPathKey("Packs/github"), liveConnections: [] }]);
+    expect(await reg.reconcileRole("default", "Roles/github", "deleted")).toBe("pruned");
+    expect(reconciled).toEqual([{ agent: rolePathKey("Roles/github"), liveConnections: [] }]);
   });
 
-  test("a 404 on the pack note (gone) → prune-to-[] (confirmed removal)", async () => {
+  test("a 404 on the role note (gone) → prune-to-[] (confirmed removal)", async () => {
     const { deps } = recorderDeps();
     const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ reconciled });
-    const fetchFn = vaultFetch({ byId: { "Packs/github": null } }); // 404
+    const fetchFn = vaultFetch({ byId: { "Roles/github": null } }); // 404
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
-    expect(await reg.reconcilePack("default", "Packs/github", "updated")).toBe("pruned");
-    expect(reconciled).toEqual([{ agent: packPathKey("Packs/github"), liveConnections: [] }]);
+    expect(await reg.reconcileRole("default", "Roles/github", "updated")).toBe("pruned");
+    expect(reconciled).toEqual([{ agent: rolePathKey("Roles/github"), liveConnections: [] }]);
   });
 
   test("a MALFORMED wants → status:error stamped, NEVER reconciled (no nuke of approved grants)", async () => {
@@ -1636,19 +1636,19 @@ describe("AgentDefRegistry — reconcilePack (per-pack grant reconcile, Phase B�
     const fetchFn = vaultFetch({
       patches,
       byId: {
-        "Packs/bad": {
-          id: "Packs/bad",
-          ...( { tags: ["pack"] } as Record<string, unknown> ),
+        "Roles/bad": {
+          id: "Roles/bad",
+          ...( { tags: ["agent/role"] } as Record<string, unknown> ),
           content: "body",
           metadata: { wants: "garbage-no-colon" },
         } as never,
       },
     });
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
-    expect(await reg.reconcilePack("default", "Packs/bad", "updated")).toBe("error");
-    // The note is stamped error; NO reconcile happened (a malformed pack must not present a
+    expect(await reg.reconcileRole("default", "Roles/bad", "updated")).toBe("error");
+    // The note is stamped error; NO reconcile happened (a malformed role must not present a
     // stale/empty live set that would prune its approved grants — the safety rule).
-    expect(patches.find((p) => p.id === "Packs/bad")!.status).toBe("error");
+    expect(patches.find((p) => p.id === "Roles/bad")!.status).toBe("error");
     expect(reconciled).toHaveLength(0);
   });
 
@@ -1656,37 +1656,37 @@ describe("AgentDefRegistry — reconcilePack (per-pack grant reconcile, Phase B�
     const { deps } = recorderDeps();
     const fetchFn = vaultFetch({ byId: {} });
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn }); // no grants
-    expect(await reg.reconcilePack("default", "Packs/github", "created")).toBe("skipped");
+    expect(await reg.reconcileRole("default", "Roles/github", "created")).toBe("skipped");
   });
 
   test("an unknown vault → skipped (never throws)", async () => {
     const { deps } = recorderDeps();
     const grants = fakeGrantsClient({});
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn: vaultFetch({}), grants });
-    expect(await reg.reconcilePack("ghost-vault", "Packs/github", "created")).toBe("skipped");
+    expect(await reg.reconcileRole("ghost-vault", "Roles/github", "created")).toBe("skipped");
   });
 
-  test("PARTITION ISOLATION: a pack reconcile never touches a def's grant key", async () => {
+  test("PARTITION ISOLATION: a role reconcile never touches a def's grant key", async () => {
     const { deps } = recorderDeps();
     const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
     const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
     const grants = fakeGrantsClient({ registered, reconciled });
     const fetchFn = vaultFetch({
       byId: {
-        "Packs/github": {
-          id: "Packs/github",
-          ...( { tags: ["pack"] } as Record<string, unknown> ),
+        "Roles/github": {
+          id: "Roles/github",
+          ...( { tags: ["agent/role"] } as Record<string, unknown> ),
           content: "body",
           metadata: { wants: "env:github" },
         } as never,
       },
     });
     const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
-    await reg.reconcilePack("default", "Packs/github", "created");
-    // Every register + reconcile addressed the PACK key — never `steward` or any bare def name.
-    const packKey = packPathKey("Packs/github");
-    expect(registered.every((r) => r.agent === packKey)).toBe(true);
-    expect(reconciled.every((r) => r.agent === packKey)).toBe(true);
+    await reg.reconcileRole("default", "Roles/github", "created");
+    // Every register + reconcile addressed the ROLE key — never `steward` or any bare def name.
+    const roleKey = rolePathKey("Roles/github");
+    expect(registered.every((r) => r.agent === roleKey)).toBe(true);
+    expect(reconciled.every((r) => r.agent === roleKey)).toBe(true);
     // Specifically: no def-name partition was touched.
     expect(registered.some((r) => r.agent === "steward")).toBe(false);
     expect(reconciled.some((r) => r.agent === "steward")).toBe(false);

@@ -53,8 +53,8 @@ import {
   resolveConnectionStatus,
   WantsParseError,
   GrantsClient,
-  isPackNote,
-  packPathKey,
+  isRoleNote,
+  rolePathKey,
   type ConnectionSpec,
 } from "./grants.ts";
 
@@ -592,7 +592,7 @@ export class DefVaultClient {
   }
 
   /** Fetch ONE note by id (for a created/updated reload). Null on 404/miss. `tags` is carried
-   *  through (threads-only Phase B′ — reconcilePack needs it for the `#pack` security gate). */
+   *  through (reconcileRole needs it for the `#agent/role` security gate). */
   async getNote(
     id: string,
   ): Promise<{ id: string; path?: string; content?: string; metadata?: Record<string, unknown>; tags?: unknown } | null> {
@@ -618,7 +618,7 @@ export class DefVaultClient {
       ...(typeof note.path === "string" && note.path ? { path: note.path } : {}),
       content: note.content,
       metadata: note.metadata,
-      // Carry tags for the pack security gate (Phase B′ — reconcilePack reads `#pack`).
+      // Carry tags for the role security gate (reconcileRole reads `#agent/role`).
       ...(note.tags !== undefined ? { tags: note.tags } : {}),
     };
   }
@@ -1322,30 +1322,31 @@ export class AgentDefRegistry {
   }
 
   /**
-   * Reconcile ONE PACK's grants (threads-only Phase B′ — DESIGN-2026-06-29-threads-only.md §4).
-   * Driven by the per-pack vault trigger (`POST /api/vault/pack` → here), NOT by load (load is
-   * per-turn). A pack is the GRANT-DECLARING note; its `wants:` is keyed on the hub by the pack's
-   * slugged PATH ({@link packPathKey}) — its OWN prune partition, so this reconcile can NEVER
-   * touch a def's grants or another pack's (the `feedback_cross_repo_derived_key_divergence`
-   * class is structurally avoided: the live set is trivially this one note's current `wants:`).
+   * Reconcile ONE ROLE's grants (roles as the capability layer —
+   * DESIGN-2026-06-29-threads-roles-context.md). Driven by the per-role vault trigger
+   * (`POST /api/vault/role` → here), NOT by load (load is per-turn). A role is the
+   * GRANT-DECLARING note; its `wants:` is keyed on the hub by the role's slugged PATH
+   * ({@link rolePathKey}) — its OWN prune partition, so this reconcile can NEVER touch a def's
+   * grants or another role's (the `feedback_cross_repo_derived_key_divergence` class is
+   * structurally avoided: the live set is trivially this one note's current `wants:`).
    *
    * Outcomes (mirrors the def-load grant discipline):
    *   - `deleted` event (FORWARD-COMPATIBLE — the vault has no `deleted` trigger today, so the
    *     live delete path is the 404 case below + the 60s loadAll poll; the explicit handling is
    *     kept so a future `deleted` trigger Just Works), OR the note is gone (404), OR it no
-   *     longer carries `#pack`, OR it declares no `wants:`  → PRUNE that pack's partition to []
-   *     (`reconcileGrants(packKey, [])`). Per-pack, so safe.
-   *   - a clean parse of a `#pack` note's `wants:` → REGISTER each connection under `packKey`
+   *     longer carries `#agent/role`, OR it declares no `wants:`  → PRUNE that role's partition to
+   *     [] (`reconcileGrants(roleKey, [])`). Per-role, so safe.
+   *   - a clean parse of an `#agent/role` note's `wants:` → REGISTER each connection under `roleKey`
    *     (idempotent upsert) + RECONCILE to that live set (prune any want it no longer declares).
    *   - a PARSE ERROR on `wants:` → stamp the note `status:error`, NEVER reconcile (a malformed
-   *     pack must not present a stale/empty live set that nukes its approved grants — the same
+   *     role must not present a stale/empty live set that nukes its approved grants — the same
    *     safety rule the def path uses).
    *   - no grants client (hub not provisioned) → no-op (best-effort).
    *
    * Best-effort + non-fatal throughout — a reconcile/registration fault logs + returns; it never
-   * throws out of the webhook path. The pack's PATH is read off the note (fallback: the note id).
+   * throws out of the webhook path. The role's PATH is read off the note (fallback: the note id).
    */
-  async reconcilePack(
+  async reconcileRole(
     vault: string,
     noteId: string,
     event?: "created" | "updated" | "deleted",
@@ -1353,12 +1354,12 @@ export class AgentDefRegistry {
     if (!this.grants) return "skipped"; // hub not provisioned → no grant store to reconcile.
     const client = this.clients.get(vault);
     if (!client) {
-      console.warn(`agent-defs: pack reconcile for unknown vault "${vault}" — ignoring.`);
+      console.warn(`agent-defs: role reconcile for unknown vault "${vault}" — ignoring.`);
       return "skipped";
     }
     // A delete event: the note is gone — prune its partition without a fetch (a CONFIRMED removal).
     if (event === "deleted") {
-      await this.prunePackGrants(packPathKey(noteId));
+      await this.pruneRoleGrants(rolePathKey(noteId));
       return "pruned";
     }
     let note: Awaited<ReturnType<DefVaultClient["getNote"]>>;
@@ -1366,22 +1367,22 @@ export class AgentDefRegistry {
       note = await client.getNote(noteId);
     } catch (err) {
       // A fetch FAILURE is NOT a confirmed removal — never prune from an inconclusive read.
-      console.error(`agent-defs: pack reconcile fetch of ${noteId} from "${vault}" failed: ${(err as Error).message}`);
+      console.error(`agent-defs: role reconcile fetch of ${noteId} from "${vault}" failed: ${(err as Error).message}`);
       return "skipped";
     }
     if (!note) {
-      // 404 — the pack is gone (deleted / no longer visible). CONFIRMED removal → prune its partition.
-      await this.prunePackGrants(packPathKey(noteId));
+      // 404 — the role is gone (deleted / no longer visible). CONFIRMED removal → prune its partition.
+      await this.pruneRoleGrants(rolePathKey(noteId));
       return "pruned";
     }
-    // The grant key is the pack's PATH (slugged), mirroring the slug discipline grantId uses.
+    // The grant key is the role's PATH (slugged), mirroring the slug discipline grantId uses.
     // Fall back to the note id when the vault didn't surface a path.
-    const packPath = typeof note.path === "string" && note.path ? note.path : noteId;
-    const packKey = packPathKey(packPath);
-    // THE SECURITY GATE: only a `#pack` note's `wants:` is honored. A note that lost the pack
-    // tag (or never had it) drops to prune-to-[] for its partition — its `wants:` is inert.
-    if (!isPackNote({ tags: (note as { tags?: unknown }).tags })) {
-      await this.prunePackGrants(packKey);
+    const rolePath = typeof note.path === "string" && note.path ? note.path : noteId;
+    const roleKey = rolePathKey(rolePath);
+    // THE SECURITY GATE: only an `#agent/role` note's `wants:` is honored. A note that lost the
+    // role tag (or never had it) drops to prune-to-[] for its partition — its `wants:` is inert.
+    if (!isRoleNote({ tags: (note as { tags?: unknown }).tags })) {
+      await this.pruneRoleGrants(roleKey);
       return "pruned";
     }
     let wants: ConnectionSpec[];
@@ -1389,52 +1390,52 @@ export class AgentDefRegistry {
       wants = parseWants(note.metadata?.wants);
     } catch (err) {
       // A malformed `wants:` → stamp the note `status:error`, NEVER reconcile (don't present a
-      // stale/empty live set that would nuke this pack's approved grants). Best-effort stamp.
-      console.error(`agent-defs: pack ${noteId} in "${vault}" has a malformed wants: ${(err as Error).message}`);
+      // stale/empty live set that would nuke this role's approved grants). Best-effort stamp.
+      console.error(`agent-defs: role ${noteId} in "${vault}" has a malformed wants: ${(err as Error).message}`);
       await client.patchStatus(noteId, "error").catch(() => {});
       return "error";
     }
     if (wants.length === 0) {
-      // The pack declares no wants (or dropped them) → prune its partition to [] (per-pack, safe).
-      await this.prunePackGrants(packKey);
+      // The role declares no wants (or dropped them) → prune its partition to [] (per-role, safe).
+      await this.pruneRoleGrants(roleKey);
       return "pruned";
     }
-    // REGISTER each want under the pack key (idempotent upsert) + RECONCILE to this live set.
+    // REGISTER each want under the role key (idempotent upsert) + RECONCILE to this live set.
     const grants = this.grants;
     for (const conn of wants) {
       try {
-        await grants.registerGrant(packKey, conn);
+        await grants.registerGrant(roleKey, conn);
       } catch (err) {
         // A single registration fault is non-fatal — the others still register; the operator
         // approves later. (The reconcile below sends the live SPECS, so a missed register
         // doesn't get pruned.)
         console.warn(
-          `agent-defs: registering pack grant for "${packKey}" (${connectionKey(conn)}) failed ` +
+          `agent-defs: registering role grant for "${roleKey}" (${connectionKey(conn)}) failed ` +
             `(continuing): ${(err as Error).message}`,
         );
       }
     }
     try {
-      const { pruned } = await grants.reconcileGrants(packKey, wants);
-      if (pruned > 0) console.log(`agent-defs: pruned ${pruned} stale grant(s) for pack "${packKey}".`);
+      const { pruned } = await grants.reconcileGrants(roleKey, wants);
+      if (pruned > 0) console.log(`agent-defs: pruned ${pruned} stale grant(s) for role "${roleKey}".`);
     } catch (err) {
-      console.warn(`agent-defs: reconciling pack grants for "${packKey}" failed (continuing): ${(err as Error).message}`);
+      console.warn(`agent-defs: reconciling role grants for "${roleKey}" failed (continuing): ${(err as Error).message}`);
     }
     return "reconciled";
   }
 
   /**
-   * Prune a pack's grant partition to [] (`reconcileGrants(packKey, [])`) — the per-pack GC for a
-   * deleted pack / a pack that dropped `wants:` / a note that lost the `#pack` tag. Per-pack, so
-   * it can never touch a def's or another pack's grants. Best-effort: a fault logs + returns.
+   * Prune a role's grant partition to [] (`reconcileGrants(roleKey, [])`) — the per-role GC for a
+   * deleted role / a role that dropped `wants:` / a note that lost the `#agent/role` tag. Per-role,
+   * so it can never touch a def's or another role's grants. Best-effort: a fault logs + returns.
    */
-  private async prunePackGrants(packKey: string): Promise<void> {
+  private async pruneRoleGrants(roleKey: string): Promise<void> {
     if (!this.grants) return;
     try {
-      const { pruned } = await this.grants.reconcileGrants(packKey, []);
-      if (pruned > 0) console.log(`agent-defs: pruned ${pruned} grant(s) for removed pack "${packKey}".`);
+      const { pruned } = await this.grants.reconcileGrants(roleKey, []);
+      if (pruned > 0) console.log(`agent-defs: pruned ${pruned} grant(s) for removed role "${roleKey}".`);
     } catch (err) {
-      console.warn(`agent-defs: pruning pack grants for "${packKey}" failed (continuing): ${(err as Error).message}`);
+      console.warn(`agent-defs: pruning role grants for "${roleKey}" failed (continuing): ${(err as Error).message}`);
     }
   }
 

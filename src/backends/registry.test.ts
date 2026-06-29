@@ -63,10 +63,14 @@ class FakeBackend implements AgentBackend {
     runContext?: RunContext;
     /** roles×threads NEXT slice (#120, G): the thread subject the drain threaded in. */
     subject?: string;
-    /** threads-only Phase A: the resolved LOADOUT entries the drain threaded in. */
+    /** the resolved layer-③ EXTRA-CONTEXT (loadout) entries the drain threaded in. */
     loadout?: LoadoutEntry[];
-    /** thread content: the thread's own authored body the drain threaded in (between def + loadout). */
+    /** thread content (layer ②): the thread's own authored body the drain threaded in. */
     threadContent?: LoadoutEntry;
+    /** roles (layer ①): the resolved ROLE content entries the drain threaded in (composed FIRST). */
+    roles?: LoadoutEntry[];
+    /** the loaded-ROLE grant keys the drain threaded in (capability source). */
+    roleKeys?: string[];
   }[] = [];
   /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial — PER drain key). */
   maxConcurrent = 0;
@@ -120,8 +124,9 @@ class FakeBackend implements AgentBackend {
     runContext?: RunContext,
     loadout?: LoadoutEntry[],
     subject?: string,
-    _packKeys?: string[],
+    roleKeys?: string[],
     threadContent?: LoadoutEntry,
+    roles?: LoadoutEntry[],
   ): Promise<DeliverResult> {
     this.calls.push({
       channel: handle.channel,
@@ -131,6 +136,10 @@ class FakeBackend implements AgentBackend {
       ...(subject ? { subject } : {}),
       ...(loadout ? { loadout } : {}),
       ...(threadContent ? { threadContent } : {}),
+      // Record roles/roleKeys only when NON-EMPTY, so an unwired/no-roles turn (the drain
+      // defaults both to `[]`) reads as absent — the no-roles invariant.
+      ...(roles && roles.length ? { roles } : {}),
+      ...(roleKeys && roleKeys.length ? { roleKeys } : {}),
     });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);
@@ -732,6 +741,69 @@ describe("ProgrammaticAgentRegistry — thread content as context (DESIGN-2026-0
     await until(() => backend.calls.length === 1);
     // The turn ran (the read failure didn't strand it) with no thread content.
     expect(backend.calls[0]!.threadContent).toBeUndefined();
+    expect(rec.calls).toHaveLength(1);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — roles as the capability layer (DESIGN-2026-06-29-threads-roles-context.md)", () => {
+  test("the drain READS roles (readRoles) + PASSES content as `roles` (layer ①) AND keys as `roleKeys`", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const seen: { channel: string; name: string; subject?: string }[] = [];
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      readRoles: async (channel, name, subject) => {
+        seen.push({ channel, name, ...(subject ? { subject } : {}) });
+        return {
+          entries: [{ path: `Roles/PM`, content: "PM hat." }],
+          grantKeys: ["role--Roles-PM"],
+        };
+      },
+    });
+    await reg.register(specFor("eng")); // single-threaded (default).
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+
+    // The drain consulted readRoles with the channel + def name…
+    expect(seen).toEqual([{ channel: "eng", name: "eng" }]);
+    // …and threaded BOTH the content entries (layer ①, composed FIRST) AND the grant keys
+    // (the capability source unioned with the def's own — proved in programmatic.test.ts).
+    expect(backend.calls[0]!.roles).toEqual([{ path: "Roles/PM", content: "PM hat." }]);
+    expect(backend.calls[0]!.roleKeys).toEqual(["role--Roles-PM"]);
+  });
+
+  test("UNWIRED readRoles → deliver receives no roles + no role keys (the no-roles invariant)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+    // The fake records `roles`/`roleKeys` only when non-empty → both absent (the no-roles path).
+    expect(backend.calls[0]!.roles).toBeUndefined();
+    expect(backend.calls[0]!.roleKeys).toBeUndefined();
+  });
+
+  test("a readRoles THROW is swallowed — the turn still runs (best-effort, def body + grants alone)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      readRoles: async () => {
+        throw new Error("vault unreachable");
+      },
+    });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+    // The turn ran (the read failure didn't strand it) with no roles + no role keys.
+    expect(backend.calls[0]!.roles).toBeUndefined();
+    expect(backend.calls[0]!.roleKeys).toBeUndefined();
     expect(rec.calls).toHaveLength(1);
   });
 });

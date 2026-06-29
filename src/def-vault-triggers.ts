@@ -72,13 +72,13 @@ import { AGENT_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 /** The bare def-discriminator tag the def-watch triggers filter on (post-canonicalization). */
 export const DEFINITION_TAG = "agent/definition";
 /**
- * The bare PACK tag the pack-watch triggers filter on (threads-only Phase B′ —
- * DESIGN-2026-06-29-threads-only.md §4). A `#pack` note save fires the pack webhook so the
- * daemon reconciles that pack's `wants:` under its path key (register + prune-its-own-partition).
- * This is the PER-PACK trigger — analogous to the def-watch triggers, NOT fired on every load
- * (load is per-turn). Mirrors {@link PACK_TAG} in grants.ts.
+ * The bare ROLE tag the role-watch triggers filter on (roles as the capability layer —
+ * DESIGN-2026-06-29-threads-roles-context.md). An `#agent/role` note save fires the role webhook
+ * so the daemon reconciles that role's `wants:` under its path key (register + prune-its-own-
+ * partition). This is the PER-ROLE trigger — analogous to the def-watch triggers, NOT fired on
+ * every load (load is per-turn). Mirrors {@link ROLE_TAG} in grants.ts.
  */
-export const PACK_TAG = "pack";
+export const ROLE_TAG = "agent/role";
 /**
  * The inbound trigger's `when` predicate. SOURCED from the existing
  * {@link AGENT_VAULT_TRIGGER_TEMPLATE} (`src/transports/vault.ts`) — the
@@ -141,12 +141,12 @@ export function inboundTriggerName(vault: string): string {
 }
 
 /**
- * The pack-watch trigger name for a (vault, kind) (threads-only Phase B′). Stable so the
- * POST upserts in place. ONE pair (create + edit) per def-vault — they fire the pack webhook
- * for ANY `#pack` note in the vault, which reconciles that pack's `wants:` under its path key.
+ * The role-watch trigger name for a (vault, kind) (roles as the capability layer). Stable so the
+ * POST upserts in place. ONE pair (create + edit) per def-vault — they fire the role webhook
+ * for ANY `#agent/role` note in the vault, which reconciles that role's `wants:` under its path key.
  */
-export function packWatchTriggerName(vault: string, kind: "create" | "edit"): string {
-  return `conn_packs-${kind}-${vault}`;
+export function roleWatchTriggerName(vault: string, kind: "create" | "edit"): string {
+  return `conn_roles-${kind}-${vault}`;
 }
 
 /** Build the webhook URL `<hub-origin>/agent/api/vault/<endpoint>`. */
@@ -167,7 +167,7 @@ export function buildDefVaultTriggers(
 ): VaultTriggerInput[] {
   const defWebhook = buildWebhook(hubOrigin, "/api/vault/agent-def");
   const inboundWebhook = buildWebhook(hubOrigin, "/api/vault/inbound");
-  const packWebhook = buildWebhook(hubOrigin, "/api/vault/pack");
+  const roleWebhook = buildWebhook(hubOrigin, "/api/vault/role");
   const auth = { bearer: webhookBearer };
   return [
     // Def-watch CREATE — a new bare `agent/definition` note instantiates its agent live.
@@ -198,26 +198,26 @@ export function buildDefVaultTriggers(
       },
       action: { webhook: inboundWebhook, send: "json", auth },
     },
-    // PACK-watch CREATE — a new `#pack` note reconciles its `wants:` under its path key
-    // (threads-only Phase B′ §4). This is the PER-PACK reconcile trigger, analogous to the
+    // ROLE-watch CREATE — a new `#agent/role` note reconciles its `wants:` under its path key
+    // (roles as the capability layer). This is the PER-ROLE reconcile trigger, analogous to the
     // def-watch triggers — fired on SAVE, NOT on every load (load is per-turn). The webhook
-    // registers the pack's wants + prunes ONLY that pack's own grant partition.
+    // registers the role's wants + prunes ONLY that role's own grant partition.
     {
-      name: packWatchTriggerName(vault, "create"),
+      name: roleWatchTriggerName(vault, "create"),
       events: ["created"],
-      when: { tags: [PACK_TAG] },
-      action: { webhook: packWebhook, send: "json", auth },
+      when: { tags: [ROLE_TAG] },
+      action: { webhook: roleWebhook, send: "json", auth },
     },
-    // PACK-watch EDIT — an edited `#pack` note re-reconciles (a removed `wants:` prunes that
-    // pack's partition to []). The vault has no `deleted` trigger event (validator allows only
+    // ROLE-watch EDIT — an edited `#agent/role` note re-reconciles (a removed `wants:` prunes that
+    // role's partition to []). The vault has no `deleted` trigger event (validator allows only
     // created/updated), so deletion is handled out-of-band; the create+edit pair covers
-    // save + drop-wants, which is the live reconcile surface. (Each pack is its OWN partition,
-    // so a reconcile can never touch a def's grants or another pack's — §4.)
+    // save + drop-wants, which is the live reconcile surface. (Each role is its OWN partition,
+    // so a reconcile can never touch a def's grants or another role's.)
     {
-      name: packWatchTriggerName(vault, "edit"),
+      name: roleWatchTriggerName(vault, "edit"),
       events: ["updated"],
-      when: { tags: [PACK_TAG] },
-      action: { webhook: packWebhook, send: "json", auth },
+      when: { tags: [ROLE_TAG] },
+      action: { webhook: roleWebhook, send: "json", auth },
     },
   ];
 }
@@ -343,7 +343,7 @@ export async function registerAllDefVaultTriggers(
     if (r.failures.length === 0) {
       console.log(
         `parachute-agent: def-vault "${r.vault}" — auto-registered ${r.registered.length} trigger(s) ` +
-          `(def-watch create/edit + inbound + pack-watch create/edit, bare-keyed).`,
+          `(def-watch create/edit + inbound + role-watch create/edit, bare-keyed).`,
       );
     } else {
       console.warn(

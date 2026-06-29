@@ -180,10 +180,10 @@ export interface ProgrammaticBackendDeps {
    * The LEGACY-def grant KEY — the hub grant-holder string for the def's OWN grants
    * (`GET /admin/grants?agent=<key>`). Defaults to `spec.name` when absent (= the def's
    * `metadata.name`, the legacy continuity key — the 4 live def agents inject exactly
-   * `listGrants(spec.name)`). Renamed from `grantsAgentName` (threads-only Phase B′ —
-   * the locked lexicon drops the "agent" framing). It is the DORMANT per-thread override
-   * escape hatch: the PRIMARY grant path is the loadout-pack UNION (see `deliver` /
-   * resolveInjectedGrantsUnion), NOT this single key. Do NOT set it unless a thread
+   * `listGrants(spec.name)`). Renamed from `grantsAgentName` (the locked lexicon drops the
+   * "agent" framing). It is the DORMANT per-thread override escape hatch: the PRIMARY grant
+   * path is the def + ROLES UNION (see `deliver` / resolveInjectedGrantsUnion), NOT this
+   * single key. Do NOT set it unless a thread
    * genuinely needs creds keyed off something other than its def name (the rare per-thread
    * override + the migration seam) — else you'd fetch the wrong source's grants.
    */
@@ -450,8 +450,9 @@ export class ProgrammaticBackend implements AgentBackend {
     runContext?: RunContext,
     loadout?: LoadoutEntry[],
     subject?: string,
-    packKeys?: string[],
+    roleKeys?: string[],
     threadContent?: LoadoutEntry,
+    roles?: LoadoutEntry[],
   ): Promise<DeliverResult> {
     const spec = handle.spec;
     if (!spec) {
@@ -534,24 +535,24 @@ export class ProgrammaticBackend implements AgentBackend {
     let grantMcpEntries: { name: string; url: string; token: string }[] = [];
     let grantEnv: Record<string, string> = {};
     if (this.deps.grants) {
-      // GRANT INJECTION = UNION OF SOURCES (threads-only Phase B′ — §4). The injected
-      // grants for a turn are the union of:
+      // GRANT INJECTION = UNION OF SOURCES (roles as the capability layer —
+      // DESIGN-2026-06-29-threads-roles-context.md). The injected grants for a turn are the
+      // union of:
       //   1. the LEGACY def key — `grantsKey ?? spec.name` (UNCHANGED): a
       //      `#agent/definition` keeps its grants keyed by its `metadata.name`. For the 4
       //      live def agents (uni/steward/uni-evolve/eco-civilization) this is the only
       //      source. `grantsKey` (was `grantsAgentName`) is the dormant per-thread override
-      //      escape hatch (§"Activate the dormant hook") — today no caller sets it, so it
-      //      falls through to `spec.name`. Do NOT make it the primary path; the primary is
-      //      this union.
-      //   2. each loaded PACK's path key (`packKeys`) — the slugged PATH (packPathKey) of
-      //      every loaded note in the thread's loadout that is a `#pack` declaring `wants:`.
-      //      The SECURITY GATE (a non-pack note's `wants:` is ignored) is enforced UPSTREAM
-      //      where packKeys is built (the transport's readThreadPackKeys), so a plain
-      //      content note's `wants:` never reaches here. Empty packKeys (every current
-      //      agent — no thread loads a `#pack` with `wants:` today) → the union is exactly
-      //      `[spec.name]` → BYTE-IDENTICAL to the legacy single-source path. (legacy continuity)
+      //      escape hatch — today no caller sets it, so it falls through to `spec.name`. Do
+      //      NOT make it the primary path; the primary is this union.
+      //   2. each loaded ROLE's path key (`roleKeys`) — the slugged PATH (rolePathKey) of
+      //      every note in the thread's `metadata.roles` that is an `#agent/role` declaring
+      //      `wants:`. The SECURITY GATE (a non-role note's `wants:` is ignored) is enforced
+      //      UPSTREAM where roleKeys is built (the transport's readThreadRoles), so a plain
+      //      content note's `wants:` never reaches here. Empty roleKeys (every current
+      //      agent — no thread loads a role with `wants:` today) → the union is exactly
+      //      `[spec.name]` → BYTE-IDENTICAL to the legacy single-source path. (no-roles invariant)
       const legacyKey = this.deps.grantsKey ?? spec.name;
-      const sources = [legacyKey, ...(packKeys ?? [])];
+      const sources = [legacyKey, ...(roleKeys ?? [])];
       try {
         const injected = await resolveInjectedGrantsUnion(this.deps.grants, sources);
         grantMcpEntries = injected.mcpEntries;
@@ -562,7 +563,7 @@ export class ProgrammaticBackend implements AgentBackend {
         // throw aborts only the cross-resource injection; the turn still runs with own-vault.
         console.warn(
           `parachute-agent: resolving grants for "${legacyKey}"` +
-            (packKeys && packKeys.length > 0 ? ` (+${packKeys.length} pack source(s))` : "") +
+            (roleKeys && roleKeys.length > 0 ? ` (+${roleKeys.length} role source(s))` : "") +
             ` failed (running this turn WITHOUT cross-resource grants — own-vault unaffected): ` +
             `${(err as Error).message}`,
         );
@@ -618,29 +619,27 @@ export class ProgrammaticBackend implements AgentBackend {
     // robust to long/multiline prompts and keeps the prompt visible-on-disk. Its
     // lifecycle is tied to the workspace (like .mcp.json) — it disappears with it.
     //
-    // COMPOSED PROMPT (threads-only Phase A — DESIGN-2026-06-29-threads-only.md §1/§9; thread
-    // content — DESIGN-2026-06-29-thread-content-and-skills.md): the system prompt is an ORDERED
-    // LIST of loaded notes — a direct arity-N generalization of the rc.13 arity-2 `roleBody
-    // [+ dossier]` seam. Entry 0 is the thread's SELF entry: the spec's `systemPrompt` (the def
-    // body), labeled with the def note's human-legible PATH (`spec.definitionPath`, e.g.
-    // `Agents/steward`; fallback `spec.name`). Entry 1 (when present) is THIS thread's CONTENT —
-    // the thread note's authored body, its per-thread standing mandate. Entries 2..N are the
-    // resolved `loadout` notes (read CONTENT-only, never metadata). composeSystemPrompt dedupes
-    // by path, skips blank entries, renders each as `# <path>\n\n<content>`, joins with
-    // `\n\n---\n\n`, and enforces the byte budget (truncate the LOADOUT TAIL first, NEVER the
-    // def or the thread content — the PROTECTED leading prefix).
+    // COMPOSED PROMPT — three layers, in order (DESIGN-2026-06-29-threads-roles-context.md):
+    //   ① ROLES         — `roles` entries, composed FIRST: the reusable "hat(s)" the thread wears.
+    //   ② SELF + THREAD — the SELF entry (the spec's `systemPrompt`, the def body) then THIS
+    //                     thread's authored CONTENT (`threadContent`, when non-blank).
+    //   ③ EXTRA CONTEXT — the `loadout` notes (skills, references), read CONTENT-only.
+    // composeSystemPrompt dedupes by path, skips blank entries, renders each as
+    // `# <path>\n\n<content>`, joins with `\n\n---\n\n`, and enforces the byte budget — truncating
+    // the layer-③ EXTRA-CONTEXT TAIL first, NEVER the PROTECTED leading prefix (roles + def +
+    // thread content). The self entry is labeled with the def note's human-legible PATH
+    // (`spec.definitionPath`, e.g. `Agents/steward`; fallback `spec.name`).
     //
     // #169 — the self-entry header uses the def note's PATH, NOT its id. The note ID is a
-    // timestamp-slug (`2026-06-20-07-30-56-487050`); the legible loadout path is
-    // `Agents/steward`. `spec.definitionPath` carries the path (set by parseAgentDef from
-    // `note.path`); when absent (a spec not sourced from a def note, or a reader that didn't
-    // surface a path) the header falls back to `spec.name`.
+    // timestamp-slug (`2026-06-20-07-30-56-487050`); the legible path is `Agents/steward`.
+    // `spec.definitionPath` carries the path (set by parseAgentDef from `note.path`); when
+    // absent (a spec not sourced from a def note) the header falls back to `spec.name`.
     //
-    // NO-LOADOUT / NO-THREAD-CONTENT INVARIANT (the live 4am steward weave path): a thread with
-    // NO loadout AND no authored thread content composes to EXACTLY `# <path>\n\n<def body>` —
-    // `<def body>` byte-identical to `spec.systemPrompt`. The single `# <path>` header is the
-    // ONLY change to such a prompt (design decision #4, accepted). The run-context preamble
-    // stays on the MESSAGE.
+    // NO-ROLES / NO-LOADOUT / NO-THREAD-CONTENT INVARIANT (the live 4am steward weave path): a
+    // thread with NO roles, NO loadout AND no authored thread content composes to EXACTLY
+    // `# <path>\n\n<def body>` — `<def body>` byte-identical to `spec.systemPrompt`. The single
+    // `# <path>` header is the ONLY change to such a prompt. The run-context preamble stays on
+    // the MESSAGE.
     let systemPromptFile: string | undefined;
     if (typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0) {
       // Self entry: the def body, labeled by the def note's PATH (`spec.definitionPath`);
@@ -650,21 +649,34 @@ export class ProgrammaticBackend implements AgentBackend {
         typeof spec.definitionPath === "string" && spec.definitionPath.length > 0
           ? spec.definitionPath
           : spec.name;
-      // The thread-content entry sits BETWEEN the self entry and the loadout. Include it only
-      // when it carries real (non-blank) content — a blank thread note is the no-thread-content
-      // case. Gate the inclusion AND the protected-prefix count on the SAME non-blank check, so
-      // composeSystemPrompt's protected prefix (def [+ thread content]) stays exactly aligned
-      // with the entries actually inserted (a blank entry would be skipped, shifting the prefix).
+      // Layer ① ROLES — filter to NON-BLANK content + dedupe by path so the protected-prefix
+      // COUNT below stays exactly aligned with the entries composeSystemPrompt keeps (a blank or
+      // duplicate role would be dropped, shifting the prefix into the layer-③ tail). They lead,
+      // so a later loadout note with a colliding path dedupes against the role (the role wins).
+      const roleEntries: LoadoutEntry[] = [];
+      const seenRolePaths = new Set<string>();
+      for (const r of roles ?? []) {
+        if (typeof r.content !== "string" || r.content.trim().length === 0) continue;
+        if (seenRolePaths.has(r.path)) continue;
+        seenRolePaths.add(r.path);
+        roleEntries.push(r);
+      }
+      // Layer ② thread content sits BETWEEN the self entry and the loadout. Include it only when
+      // it carries real (non-blank) content — a blank thread note is the no-thread-content case.
+      // Gate the inclusion AND the protected-prefix count on the SAME non-blank check.
       const hasThreadContent =
         !!threadContent && typeof threadContent.content === "string" && threadContent.content.trim().length > 0;
+      // Order: ① roles → ② self + thread-content → ③ extra-context loadout.
       const entries: LoadoutEntry[] = [
+        ...roleEntries,
         { path: selfPath, content: spec.systemPrompt },
         ...(hasThreadContent ? [threadContent!] : []),
         ...(loadout ?? []),
       ];
-      // Protect the def (always) and the thread content (when present) from budget truncation —
-      // both are load-bearing; only the loadout tail (entries beyond the prefix) sheds.
-      const composed = composeSystemPrompt(entries, { protectedCount: hasThreadContent ? 2 : 1 });
+      // Protect the WHOLE leading prefix — roles (①) + the def + the thread content (②) — from
+      // budget truncation; only the layer-③ extra-context tail (entries beyond the prefix) sheds.
+      const protectedCount = roleEntries.length + 1 + (hasThreadContent ? 1 : 0);
+      const composed = composeSystemPrompt(entries, { protectedCount });
       systemPromptFile = join(workspace, "system-prompt.txt");
       writeFileSync(systemPromptFile, composed, { mode: 0o600 });
     }

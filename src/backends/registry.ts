@@ -552,21 +552,21 @@ export class ProgrammaticAgentRegistry {
     subject?: string,
   ) => Promise<LoadoutEntry[]>;
   /**
-   * Optional pre-turn loaded-PACK grant-KEY read (threads-only Phase B′ —
-   * DESIGN-2026-06-29-threads-only.md §4). Resolves the SAME `metadata.loadout` paths as
-   * {@link readLoadout}, but reads the loaded notes' METADATA to find the `#pack` notes
-   * declaring `wants:`, returning each such pack's slugged-path grant key (`packPathKey`). Read
-   * in {@link drain} and passed to `deliver`, which UNIONS each pack's APPROVED grants with the
-   * def's own (`spec.name`). The SECURITY GATE (a non-pack note's `wants:` is ignored) lives in
-   * the resolver. SEPARATE from {@link readLoadout} so the prompt composition stays content-only
-   * (Phase A). UNWIRED / no pack with `wants:` → empty → the grant source set is exactly
-   * `[spec.name]` (legacy continuity — byte-identical injection for every current agent).
+   * Optional pre-turn ROLES read (layer ① — DESIGN-2026-06-29-threads-roles-context.md). Resolves
+   * the thread's `metadata.roles` notes in ONE pass to BOTH the ordered CONTENT entries (composed
+   * FIRST, before the def) AND the grant-holder keys (the slugged paths of the loaded `#agent/role`
+   * notes declaring `wants:`, `rolePathKey`). Read in {@link drain}: the entries pass to `deliver`
+   * as `roles` (prompt layer ①) and the grant keys as `roleKeys`, which UNIONS each role's APPROVED
+   * grants with the def's own (`spec.name`). The SECURITY GATE (a non-role note's `wants:` is
+   * ignored) lives in the resolver. UNWIRED / no roles → `{ entries: [], grantKeys: [] }` → the
+   * prompt is the def alone + the grant source set is exactly `[spec.name]` (the no-roles invariant,
+   * byte-identical to HEAD for every current agent).
    */
-  private readonly readPackKeys?: (
+  private readonly readRoles?: (
     channel: string,
     name: string,
     subject?: string,
-  ) => Promise<string[]>;
+  ) => Promise<{ entries: LoadoutEntry[]; grantKeys: string[] }>;
   /**
    * Optional pre-turn THREAD-CONTENT read (DESIGN-2026-06-29-thread-content-and-skills.md). The
    * thread note's own authored BODY (`{ path, content }` — CONTENT only) becomes the prompt entry
@@ -608,12 +608,17 @@ export class ProgrammaticAgentRegistry {
      */
     readLoadout?: (channel: string, name: string, subject?: string) => Promise<LoadoutEntry[]>;
     /**
-     * Read the thread's loaded-PACK grant KEYS (threads-only Phase B′) — the slugged paths of
-     * the loaded `#pack` notes that declare `wants:`. Optional — UNWIRED → no pack keys (the
-     * def's `spec.name` grants alone, legacy continuity). `subject` resolves the subject-scoped
-     * thread note.
+     * Read the thread's ROLES (layer ①) — the `metadata.roles` notes resolved in one pass to the
+     * ordered CONTENT entries (composed FIRST) + the grant keys (the slugged paths of the loaded
+     * `#agent/role` notes that declare `wants:`). Optional — UNWIRED → `{ entries: [], grantKeys: [] }`
+     * (the def alone + the def's `spec.name` grants, the no-roles invariant). `subject` resolves the
+     * subject-scoped thread note.
      */
-    readPackKeys?: (channel: string, name: string, subject?: string) => Promise<string[]>;
+    readRoles?: (
+      channel: string,
+      name: string,
+      subject?: string,
+    ) => Promise<{ entries: LoadoutEntry[]; grantKeys: string[] }>;
     /**
      * Read the thread's own CONTENT (DESIGN-2026-06-29-thread-content-and-skills.md) — the
      * thread note's authored body as `{ path, content }`, composed BETWEEN the def and the
@@ -637,7 +642,7 @@ export class ProgrammaticAgentRegistry {
     if (deps.readSession) this.readSession = deps.readSession;
     if (deps.clearSession) this.clearSession = deps.clearSession;
     if (deps.readLoadout) this.readLoadout = deps.readLoadout;
-    if (deps.readPackKeys) this.readPackKeys = deps.readPackKeys;
+    if (deps.readRoles) this.readRoles = deps.readRoles;
     if (deps.readThreadContent) this.readThreadContent = deps.readThreadContent;
     this.outboundRetryBaseMs = deps.outboundRetryBaseMs ?? OUTBOUND_RETRY_BASE_MS;
   }
@@ -1278,23 +1283,28 @@ export class ProgrammaticAgentRegistry {
         }
       }
 
-      // PACK GRANT KEYS (threads-only Phase B′ — DESIGN-2026-06-29-threads-only.md §4): resolve
-      // the loaded-PACK grant keys (the slugged paths of the loaded `#pack` notes declaring
-      // `wants:`) off the SAME thread note. The backend UNIONS each pack's APPROVED grants with
-      // the def's own (`spec.name`). SEPARATE metadata read from the content-only loadout (so the
-      // prompt composition is unchanged). The SECURITY GATE — a non-pack note's `wants:` is
-      // ignored — lives in the resolver. UNWIRED / no pack with `wants:` (every current thread)
-      // → empty → the grant sources are exactly `[spec.name]` (legacy continuity, byte-identical
-      // injection). Best-effort: a read failure logs + the turn injects the def's grants alone.
-      let packKeys: string[] = [];
-      if (this.readPackKeys) {
+      // ROLES (layer ① — DESIGN-2026-06-29-threads-roles-context.md): resolve the thread's
+      // `metadata.roles` notes off its `#agent/thread` note in ONE pass to BOTH the ordered
+      // CONTENT entries (`roles`, composed FIRST — before the def) AND the grant-holder keys
+      // (`roleKeys`, the slugged paths of the loaded `#agent/role` notes declaring `wants:`). The
+      // backend prepends `roles` and UNIONS each role's APPROVED grants with the def's own
+      // (`spec.name`). The SECURITY GATE — a non-role note's `wants:` is ignored — lives in the
+      // resolver (content loads either way; only a real `#agent/role` contributes a grant key).
+      // UNWIRED / no roles (every current thread) → empty → the prompt is the def alone + the
+      // grant sources are exactly `[spec.name]` (the no-roles invariant, byte-identical). Best-
+      // effort: a read failure logs + the turn runs with the def body + the def's grants alone.
+      let roles: LoadoutEntry[] = [];
+      let roleKeys: string[] = [];
+      if (this.readRoles) {
         try {
-          packKeys = await this.readPackKeys(handle.channel, handle.spec.name, turnSubject);
+          const resolved = await this.readRoles(handle.channel, handle.spec.name, turnSubject);
+          roles = resolved.entries;
+          roleKeys = resolved.grantKeys;
         } catch (err) {
           console.error(
-            `parachute-agent: pack-key read for channel "${channel}"` +
+            `parachute-agent: roles read for channel "${channel}"` +
               (turnSubject ? ` subject "${turnSubject}"` : "") +
-              ` failed (turn injects the def's grants alone): ${(err as Error).message}`,
+              ` failed (turn runs with the def body + the def's grants alone): ${(err as Error).message}`,
           );
         }
       }
@@ -1343,15 +1353,18 @@ export class ProgrammaticAgentRegistry {
           // subjects of one agent never clobber each other's per-turn `.mcp.json` /
           // `system-prompt.txt` / HOME. Undefined → `sessions/<name>/` (HEAD, unchanged).
           turnSubject,
-          // threads-only Phase B′: the loaded-PACK grant keys — the backend unions each pack's
-          // APPROVED grants with the def's own (`spec.name`). Empty (every current thread) →
-          // the grant sources are exactly `[spec.name]` (legacy continuity, byte-identical).
-          packKeys,
-          // thread content (DESIGN-2026-06-29-thread-content-and-skills.md): THIS thread's
-          // authored standing context, composed BETWEEN the def and the loadout (def + thread
-          // content protected from budget truncation). Undefined / blank → the def + loadout
-          // alone (the no-thread-content invariant).
+          // roles (capability layer): the loaded-ROLE grant keys — the backend unions each role's
+          // APPROVED grants with the def's own (`spec.name`). Empty (every current thread) → the
+          // grant sources are exactly `[spec.name]` (the no-roles invariant, byte-identical).
+          roleKeys,
+          // thread content (layer ②): THIS thread's authored standing context, composed BETWEEN
+          // the def and the loadout (inside the protected prefix). Undefined / blank → skipped
+          // (the no-thread-content invariant).
           threadContent,
+          // roles (layer ①): the role-note CONTENT entries — composed FIRST, before the def, as
+          // the reusable hat(s). Empty → the prompt is `[self, thread-content, ...loadout]` exactly
+          // as before this layer (the no-roles invariant). Capabilities ride on `roleKeys` above.
+          roles,
         );
       } catch (err) {
         // The backend contract is failure-as-VALUE, never a throw — but defend so a

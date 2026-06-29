@@ -1214,6 +1214,51 @@ function redirect(location: string): Response {
 }
 
 // ---------------------------------------------------------------------------
+// CORS — the agent daemon SELF-SETS permissive CORS on every response, the same
+// posture as the vault (parachute-vault `module-config.ts` / `mirror-routes.ts`)
+// and the established ecosystem pattern (each module self-sets CORS; the hub
+// reverse proxy passes module CORS headers through). Without this the browser
+// surface's cross-origin reads — notably the "watch it work" turn-events SSE at
+// `/api/channels/<ch>/turn-events` — are CORS-blocked even though the request
+// itself is authorized.
+//
+// `*` is correct here because the browser-facing reads authenticate via a
+// `?token=`/`?ticket=` query param or a Bearer `Authorization` header, NOT
+// cookies — so there's no credentialed CORS, and `*` is valid (matches vault).
+// Allow-Methods/Headers let the surface's Bearer-authenticated POSTs (which the
+// browser preflights) succeed.
+// ---------------------------------------------------------------------------
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type",
+};
+
+/**
+ * Merge the module CORS headers onto an existing Response.
+ *
+ * A streaming (SSE) Response's headers can't be mutated after construction, so
+ * we RECONSTRUCT — `new Response(resp.body, …)` preserves the `text/event-stream`
+ * body while letting us set the headers. We reconstruct uniformly (a null body
+ * for redirects/empty responses passes through cleanly), so the SSE path needs no
+ * special-casing. The daemon never sets `Access-Control-*` itself, so layering
+ * CORS on top of the response's own headers is conflict-free.
+ *
+ * Only ever called with a real `Response` — the websocket-upgrade path returns
+ * `undefined` (the socket is owned by the WS handlers) and is guarded out by the
+ * caller, never decorated.
+ */
+function withCors(resp: Response): Response {
+  const headers = new Headers(resp.headers);
+  for (const [name, value] of Object.entries(CORS_HEADERS)) headers.set(name, value);
+  return new Response(resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Auth gates
 //
 // Both layers share `requireScope` from `auth.ts` (validate a hub-issued JWT
@@ -1518,7 +1563,16 @@ export function createFetchHandler(
     return true;
   }
 
-  return async function fetch(req, server) {
+  // The core router. The returned `fetch` below wraps it to short-circuit the
+  // CORS preflight + merge the module CORS headers onto every Response. Typed
+  // explicitly (it's no longer in the return position, so it loses the contextual
+  // typing the wrapper inherits from createFetchHandler's declared return type).
+  // May return `undefined` on a successful websocket upgrade — the socket then
+  // belongs to the WS handlers and there is no Response to decorate.
+  const route = async function route(
+    req: Request,
+    server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean },
+  ): Promise<Response | undefined> {
     const url = new URL(req.url);
 
     // -------------------------------------------------------------------
@@ -3481,6 +3535,23 @@ export function createFetchHandler(
     }
 
     return json({ error: "not found" }, 404);
+  };
+
+  // The handler returned to Bun.serve: short-circuit the CORS preflight, then
+  // merge the module CORS headers onto whatever Response `route` produced (the
+  // module self-sets CORS — see `CORS_HEADERS` / `withCors`).
+  return async function fetch(req, server) {
+    // CORS preflight — short-circuit OPTIONS with 204 + the CORS headers. A
+    // preflight is never a websocket upgrade, so handling it at the very top
+    // (before `route`) is safe and leaves the WS-upgrade path untouched.
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+    const resp = await route(req, server);
+    // The websocket-upgrade path returns `undefined` (the socket is owned by the
+    // WS handlers) — pass it through UNTOUCHED; only decorate real Responses.
+    if (!(resp instanceof Response)) return resp as unknown as Response;
+    return withCors(resp);
   };
 }
 

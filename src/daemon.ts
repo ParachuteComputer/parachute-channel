@@ -350,6 +350,11 @@ export function contextFor(
           // composed prompt's loadout can use it (and the NEXT slice can route by
           // it). No routing meaning yet. Absent → unchanged (the weave path is untouched).
           ...(msg.meta?.subject ? { subject: msg.meta.subject } : {}),
+          // threads-only Phase B: carry the THREAD-ID (the note's `metadata.thread`, read
+          // FIRST by noteAgentKey) so the drain keys per-thread directly. ADDITIVE + dormant —
+          // nothing writes `metadata.thread` yet, and the 4 live def agents carry only
+          // `metadata.agent` → no thread → the bare-channel drain key (byte-identical to HEAD).
+          ...(msg.meta?.thread ? { thread: msg.meta.thread } : {}),
         });
         return;
       }
@@ -381,6 +386,9 @@ export function contextFor(
           // so a turn that runs on register() still composes its loadout. No routing
           // meaning yet. Absent → unchanged.
           ...(msg.meta?.subject ? { subject: msg.meta.subject } : {}),
+          // threads-only Phase B: carry the THREAD-ID through the pending buffer too, so a
+          // turn that replays on register() keys per-thread. Absent → unchanged (the weave).
+          ...(msg.meta?.thread ? { thread: msg.meta.thread } : {}),
         });
         if (outcome === "queued") return;
         // outcome === "unknown" — not an expected programmatic channel. It may still be a
@@ -1360,6 +1368,18 @@ export function createFetchHandler(
      */
     agentDefs?: AgentDefRegistry;
     /**
+     * Is a `metadata.thread`-addressed inbound for a NOT-YET-LIVE thread RESOLVABLE? —
+     * the resolve-or-create gate (threads-only Phase B, DESIGN-2026-06-29-threads-only.md
+     * §5). The inbound handler consults this ONLY when a thread-addressed inbound finds no
+     * live channel: `true` → OWN the message (buffer via queuePending, replay on register)
+     * instead of 401-dropping; `false`/unwired → behave EXACTLY as today (the genuinely-unknown
+     * 401, no silent-drop change). "Resolvable" means a `#agent/thread` note (or a def) exists
+     * for the thread-id. Injected so tests drive the resolve-or-create path deterministically;
+     * `main` leaves it unset until the Phase-C writer + a thread-note probe land — so Phase B is
+     * DORMANT (nothing writes `metadata.thread` yet, so this is never consulted in production).
+     */
+    threadResolvable?: (threadId: string) => boolean | Promise<boolean>;
+    /**
      * Add a def-vault to the live registry — the `POST /api/agent-vaults` body of work
      * (mint the vault's write token, persist `agent-vaults.json`, `addVault` + `loadAll`
      * for it). Injected so tests exercise the route WITHOUT a live hub mint or a real
@@ -1420,6 +1440,12 @@ export function createFetchHandler(
   // reload webhook is a no-op ack (a daemon with no def-vaults). `main` passes the
   // boot instance so the route reloads the same set the boot instantiated.
   const agentDefs: AgentDefRegistry | undefined = opts?.agentDefs;
+
+  // The resolve-or-create gate for a `metadata.thread`-addressed inbound to a not-yet-live
+  // thread (threads-only Phase B). Unwired → undefined → the inbound handler treats every
+  // not-yet-live thread-addressed inbound as today's UNKNOWN (401, no silent-drop change), so
+  // Phase B is dormant in production until the Phase-C writer + a thread-note probe wire it.
+  const threadResolvable = opts?.threadResolvable;
 
   // Add-a-def-vault (the `POST /api/agent-vaults` body of work). Defaulted to the real
   // mint + persist path so a plain createFetchHandler serves the route; tests inject a
@@ -2933,6 +2959,14 @@ export function createFetchHandler(
       }
       const ch = channels.get(channelName);
       const vt = ch?.transport instanceof VaultTransport ? ch.transport : undefined;
+      // The EXPLICIT thread-id address (threads-only Phase B) — present only when the note
+      // carried `metadata.thread` (`noteAgentKey` reads it FIRST, so `channelName` already
+      // equals it). The 4 live def agents carry `metadata.agent` only → no thread-id → this
+      // is undefined and the path below is byte-identical to HEAD.
+      const threadId =
+        typeof note.metadata?.thread === "string" && note.metadata.thread
+          ? note.metadata.thread
+          : undefined;
 
       // Branch on Authorization-header PRESENCE, not token truthiness. A
       // whitespace-only `Authorization: Bearer   ` (which extractBearer trims to
@@ -2951,7 +2985,45 @@ export function createFetchHandler(
         // vs 403 — fine for the operator-facing config API, but this endpoint
         // stays opaque.)
         const denied = await requireScope(req, url, SCOPE_SEND);
-        if (denied || !vt) {
+        if (denied) {
+          return json({ error: "unauthorized" }, 401);
+        }
+        if (!vt) {
+          // RESOLVE-OR-CREATE (threads-only Phase B, DESIGN-2026-06-29-threads-only.md §5).
+          // No live vault channel for this routing key. The OLD behavior was a flat 401. For a
+          // `metadata.thread`-addressed inbound to a NOT-YET-LIVE thread, OWN the message
+          // (buffer it, replayed when the thread agent registers) instead of dropping it — the
+          // vault trigger acks success on our 200 and never retries, so a 401 would PERMANENTLY
+          // lose the message. Only the modern JWT path serves this (the `?secret=` path is
+          // per-channel and can't authenticate a not-yet-live thread). A genuinely-unknown
+          // target (no thread-id, or no thread note / def for it) still 401s — no silent-drop
+          // change. The token is already validated (denied handled above), so owning the
+          // message is authorized.
+          if (threadId && threadResolvable) {
+            const resolvable = await threadResolvable(threadId);
+            const outcome = programmatic.resolveOrCreateThread(threadId, resolvable);
+            if (outcome !== "unknown") {
+              // "owned" (not yet live) → buffer pending; "live" (a registration raced in) →
+              // enqueue to the live channel. Either way the message is OWNED, not dropped.
+              if (markSeen(note.id)) {
+                const queued: QueuedMessage = {
+                  content: note.content ?? "",
+                  thread: threadId,
+                  ...(note.id ? { inReplyTo: note.id } : {}),
+                  ...(typeof note.metadata?.sender === "string" && note.metadata.sender
+                    ? { sender: note.metadata.sender }
+                    : {}),
+                  ...(typeof note.metadata?.subject === "string" && note.metadata.subject.trim()
+                    ? { subject: note.metadata.subject }
+                    : {}),
+                };
+                const liveChannel = programmatic.channelForThread(threadId);
+                if (liveChannel) programmatic.enqueue(liveChannel, queued);
+                else programmatic.queuePending(threadId, queued);
+              }
+              return json({ ok: true });
+            }
+          }
           return json({ error: "unauthorized" }, 401);
         }
       } else {
@@ -3054,6 +3126,55 @@ export function createFetchHandler(
           : undefined;
       const result = await agentDefs.reload(vault, noteId, event);
       return json({ ok: true, reloaded: result });
+    }
+
+    // ---------------------------------------------------------------------
+    // Thread-status TEARDOWN webhook — POST /api/vault/thread-status
+    // (threads-only Phase B, DESIGN-2026-06-29-threads-only.md §5/§9). A vault
+    // trigger on an `#agent/thread` note whose `status` transitions to an ARCHIVE
+    // terminal (`archived`/`done`/`dropped`/`closed`) POSTs here; we converge the
+    // daemon by clearing that thread's queues + indexes (`archiveThread`). This is
+    // the status-driven replacement for the auto-teardown the def-set diff gave
+    // defs for free — which is GONE for non-def threads. DEFS keep their existing
+    // teardown path (the def-set diff + the reload-delete webhook); this is purely
+    // additive, for thread-addressed threads. Mirrors /api/vault/agent-def's auth
+    // (hub JWT, scope agent:send) + uniform-401. Body: { event?, note: { id/path,
+    // metadata: { thread?, status? } } }. A non-archive status (or no thread-id) is
+    // a clean no-op ack. Externally `<hub>/agent/api/vault/thread-status`.
+    //
+    // The trigger's `when.tags: ["#agent/thread"]` predicate is the PRIMARY guard that this
+    // only fires for thread notes; the daemon's threadId+archive-status checks below are
+    // defense-in-depth (a benign no-op ack for anything that doesn't name an archived thread).
+    // ---------------------------------------------------------------------
+    if (req.method === "POST" && url.pathname === "/api/vault/thread-status") {
+      const denied = await requireScope(req, url, SCOPE_SEND);
+      if (denied) return json({ error: "unauthorized" }, 401);
+      let body: {
+        event?: string;
+        note?: { id?: string; path?: string; metadata?: Record<string, unknown> };
+      };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      const meta = body.note?.metadata ?? {};
+      // The thread-id is the note's EXPLICIT `metadata.thread` address only. We deliberately do
+      // NOT fall back to `metadata.agent`: a def-backed agent (uni/steward/…) is torn down only
+      // via the def-set diff, never this endpoint — so a stray or abusive thread-status POST
+      // naming `agent: steward` can't clear the live heartbeat's queue (reviewer nit). Non-def
+      // threads (the only thing this endpoint archives) always carry `metadata.thread`.
+      const threadId = typeof meta.thread === "string" && meta.thread ? meta.thread : undefined;
+      const status = typeof meta.status === "string" ? meta.status.trim().toLowerCase() : "";
+      // ARCHIVE terminals — a transition into any of these tears the thread down. Any other
+      // status (running/working/etc.) is a benign no-op ack (the trigger may fire on every
+      // status write; only the archive transition converges).
+      const ARCHIVE_STATES = new Set(["archived", "archive", "done", "dropped", "closed"]);
+      if (!threadId || !ARCHIVE_STATES.has(status)) {
+        return json({ ok: true, torn_down: false });
+      }
+      const torn = programmatic.archiveThread(threadId);
+      return json({ ok: true, torn_down: torn });
     }
 
     // One-time SSE ticket mint — POST /api/ui/sse-ticket (agent#25). The chat

@@ -63,7 +63,7 @@ function baseConfig() {
   };
 }
 
-describe("noteAgentKey — the expand-phase dual-read routing key", () => {
+describe("noteAgentKey — the three-level dual-read routing key (thread ?? agent ?? channel)", () => {
   test("returns `agent` when present", () => {
     expect(noteAgentKey({ agent: "eng" })).toBe("eng");
   });
@@ -72,6 +72,21 @@ describe("noteAgentKey — the expand-phase dual-read routing key", () => {
   });
   test("prefers `agent` over `channel` when BOTH are present", () => {
     expect(noteAgentKey({ agent: "eng", channel: "legacy" })).toBe("eng");
+  });
+  // threads-only Phase B — the NEW `thread` read, FIRST in precedence.
+  test("returns `thread` when present (the thread-id address)", () => {
+    expect(noteAgentKey({ thread: "proj-thread" })).toBe("proj-thread");
+  });
+  test("prefers `thread` over `agent` and `channel` (the three-level precedence)", () => {
+    expect(noteAgentKey({ thread: "t1", agent: "eng", channel: "legacy" })).toBe("t1");
+  });
+  test("BACK-COMPAT: a `metadata.agent`-only note (the 4 live def agents) still routes by agent — no `thread` → unchanged", () => {
+    // The steward weave carries `agent: steward`, no `thread` → routes to the def, as today.
+    expect(noteAgentKey({ agent: "steward" })).toBe("steward");
+  });
+  test("an empty/non-string `thread` falls through to `agent` (blank thread can't hijack routing)", () => {
+    expect(noteAgentKey({ thread: "", agent: "eng" })).toBe("eng");
+    expect(noteAgentKey({ thread: 123 as unknown as string, agent: "eng" })).toBe("eng");
   });
   test("returns undefined when neither is present", () => {
     expect(noteAgentKey({})).toBeUndefined();

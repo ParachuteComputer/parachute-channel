@@ -600,12 +600,18 @@ export class ProgrammaticBackend implements AgentBackend {
     // COMPOSED PROMPT (threads-only Phase A — DESIGN-2026-06-29-threads-only.md §1/§9):
     // the system prompt is an ORDERED LIST of loaded notes — a direct arity-N generalization
     // of the rc.13 arity-2 `roleBody [+ dossier]` seam. Entry 0 is the thread's SELF entry:
-    // the spec's `systemPrompt` (the def body), labeled with the def note's PATH
-    // (`spec.definition`, the `#agent/definition` note id which IS its vault path; fallback
-    // `spec.name`). Entries 1..N are the resolved `loadout` notes (read CONTENT-only, never
-    // metadata). composeSystemPrompt dedupes by path, skips blank entries, renders each as
+    // the spec's `systemPrompt` (the def body), labeled with the def note's human-legible
+    // PATH (`spec.definitionPath`, e.g. `Agents/steward`; fallback `spec.name`). Entries
+    // 1..N are the resolved `loadout` notes (read CONTENT-only, never metadata).
+    // composeSystemPrompt dedupes by path, skips blank entries, renders each as
     // `# <path>\n\n<content>`, joins with `\n\n---\n\n`, and enforces the byte budget
     // (truncate loadout-notes-first, NEVER the self entry).
+    //
+    // #169 — the self-entry header uses the def note's PATH, NOT its id. The note ID is a
+    // timestamp-slug (`2026-06-20-07-30-56-487050`); the legible loadout path is
+    // `Agents/steward`. `spec.definitionPath` carries the path (set by parseAgentDef from
+    // `note.path`); when absent (a spec not sourced from a def note, or a reader that didn't
+    // surface a path) the header falls back to `spec.name`.
     //
     // NO-LOADOUT INVARIANT (the live 4am steward weave path): a thread with NO loadout
     // composes to EXACTLY `# <path>\n\n<def body>` — `<def body>` byte-identical to
@@ -613,12 +619,12 @@ export class ProgrammaticBackend implements AgentBackend {
     // prompt (design decision #4, accepted). The run-context preamble stays on the MESSAGE.
     let systemPromptFile: string | undefined;
     if (typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0) {
-      // Self entry: the def body, labeled by the def note's PATH (resolve from the def note
-      // id when available — in a Parachute vault the note id IS the path, e.g.
-      // `Agents/uni-weaver`; acceptable fallback label is the spec name).
+      // Self entry: the def body, labeled by the def note's PATH (`spec.definitionPath`);
+      // fallback the spec name. The note ID (`spec.definition`) is deliberately NOT used —
+      // it's a timestamp-slug, not the legible path the header should read (#169).
       const selfPath =
-        typeof spec.definition === "string" && spec.definition.length > 0
-          ? spec.definition
+        typeof spec.definitionPath === "string" && spec.definitionPath.length > 0
+          ? spec.definitionPath
           : spec.name;
       const entries: LoadoutEntry[] = [
         { path: selfPath, content: spec.systemPrompt },

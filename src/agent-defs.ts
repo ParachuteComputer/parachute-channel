@@ -238,6 +238,13 @@ function nameOfDefNote(note: { metadata?: Record<string, unknown> }): string | u
  */
 export function parseAgentDef(note: {
   id?: string;
+  /**
+   * The note's PATH (e.g. `Agents/steward`) — carried onto `spec.definitionPath` for the
+   * composed-prompt self-entry header (#169). Distinct from the note ID (a timestamp-slug).
+   * Optional: a reader that doesn't surface a path leaves it unset and the header falls back
+   * to the id then the name.
+   */
+  path?: string;
   content?: string;
   metadata?: Record<string, unknown>;
 }, binding: { vault: string }): ParsedAgentDef {
@@ -246,6 +253,7 @@ export function parseAgentDef(note: {
     throw new AgentDefParseError("#agent/definition note has no id");
   }
   const meta = note.metadata ?? {};
+  const notePath = typeof note.path === "string" && note.path ? note.path : undefined;
 
   const name = metaStr(meta.name);
   if (!name) {
@@ -339,6 +347,10 @@ export function parseAgentDef(note: {
     // The def note id — provenance carried into the `#agent/thread` note (BOTH modes;
     // interim plain id string; typed link fields are a future vault feature).
     definition: noteId,
+    // The def note PATH (when the reader surfaced one) — the human-legible loadout path
+    // used for the composed-prompt self-entry header (#169). The note ID above is a
+    // timestamp-slug; the PATH (`Agents/steward`) is what the header should read.
+    ...(notePath ? { definitionPath: notePath } : {}),
     // Own-vault binding (4a): the def-vault, write-scoped. NOT sourced from the note
     // — it's the vault the note LIVES in (passed in by the caller).
     vault: { name: binding.vault, access: "write" },
@@ -538,7 +550,7 @@ export class DefVaultClient {
    * silently-empty agent set.
    */
   async listDefNotes(opts?: { limit?: number }): Promise<
-    Array<{ id: string; content?: string; metadata?: Record<string, unknown> }>
+    Array<{ id: string; path?: string; content?: string; metadata?: Record<string, unknown> }>
   > {
     const limit = opts?.limit ?? DEF_LIST_LIMIT;
     const params = new URLSearchParams();
@@ -557,14 +569,21 @@ export class DefVaultClient {
     } catch (err) {
       throw new Error(`def-vault "${this.vault}": list defs — bad JSON: ${(err as Error).message}`);
     }
-    type RawNote = { id?: string; content?: string; metadata?: Record<string, unknown> };
+    type RawNote = { id?: string; path?: string; content?: string; metadata?: Record<string, unknown> };
     const notes: RawNote[] = Array.isArray(parsed)
       ? (parsed as RawNote[])
       : ((parsed as { notes?: RawNote[] })?.notes ?? []);
-    const out: Array<{ id: string; content?: string; metadata?: Record<string, unknown> }> = [];
+    const out: Array<{ id: string; path?: string; content?: string; metadata?: Record<string, unknown> }> = [];
     for (const n of notes) {
       if (typeof n.id === "string" && n.id) {
-        out.push({ id: n.id, content: n.content, metadata: n.metadata });
+        // Carry the note PATH (when the vault surfaces one) so parseAgentDef can label the
+        // composed-prompt self entry with the human-legible path, not the timestamp-id (#169).
+        out.push({
+          id: n.id,
+          ...(typeof n.path === "string" && n.path ? { path: n.path } : {}),
+          content: n.content,
+          metadata: n.metadata,
+        });
       }
     }
     return out;
@@ -573,7 +592,7 @@ export class DefVaultClient {
   /** Fetch ONE note by id (for a created/updated reload). Null on 404/miss. */
   async getNote(
     id: string,
-  ): Promise<{ id: string; content?: string; metadata?: Record<string, unknown> } | null> {
+  ): Promise<{ id: string; path?: string; content?: string; metadata?: Record<string, unknown> } | null> {
     const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(id)}?include_content=true`;
     const res = await this.fetchFn(url, { headers: { authorization: `Bearer ${this.token}` } });
     if (res.status === 404) return null;
@@ -587,10 +606,16 @@ export class DefVaultClient {
     } catch (err) {
       throw new Error(`def-vault "${this.vault}": get note ${id} — bad JSON: ${(err as Error).message}`);
     }
-    const n = (parsed ?? {}) as { id?: string; note?: { id?: string; content?: string; metadata?: Record<string, unknown> }; content?: string; metadata?: Record<string, unknown> };
+    const n = (parsed ?? {}) as { id?: string; path?: string; note?: { id?: string; path?: string; content?: string; metadata?: Record<string, unknown> }; content?: string; metadata?: Record<string, unknown> };
     const note = n.note ?? n;
     if (typeof note.id !== "string" || !note.id) return null;
-    return { id: note.id, content: note.content, metadata: note.metadata };
+    return {
+      id: note.id,
+      // Carry the note PATH for the self-entry header (#169).
+      ...(typeof note.path === "string" && note.path ? { path: note.path } : {}),
+      content: note.content,
+      metadata: note.metadata,
+    };
   }
 
   /**
@@ -1492,7 +1517,7 @@ export class AgentDefRegistry {
    */
   private async instantiate(
     vault: string,
-    note: { id: string; content?: string; metadata?: Record<string, unknown> },
+    note: { id: string; path?: string; content?: string; metadata?: Record<string, unknown> },
   ): Promise<boolean> {
     const binding = this.bindings.get(vault);
     const client = this.clients.get(vault);

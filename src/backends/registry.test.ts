@@ -1137,6 +1137,179 @@ describe("ProgrammaticAgentRegistry — F. per-thread serial guarantee (#120)", 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────
+// threads-only Phase B — thread registry (byThread) + drain-key-is-the-thread-id +
+// resolve-or-create + status-driven teardown. DESIGN-2026-06-29-threads-only.md §5/§9.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+describe("ProgrammaticAgentRegistry — Phase B: byThread index + thread-id routing", () => {
+  test("register indexes by thread-id; hasThread/channelForThread resolve it (thread-id ≡ name for the live cast)", async () => {
+    const backend = new FakeBackend();
+    const { fn } = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: fn });
+
+    expect(reg.hasThread("steward")).toBe(false);
+    await reg.register(specFor("steward"));
+    // thread-id ≡ name ≡ channel for the live cast: a metadata.thread:steward inbound resolves
+    // the same live agent a metadata.agent:steward inbound does.
+    expect(reg.hasThread("steward")).toBe(true);
+    expect(reg.channelForThread("steward")).toBe("steward");
+
+    // deregister drops the byThread entry too — a thread-addressed inbound stops resolving.
+    await reg.deregister("steward");
+    expect(reg.hasThread("steward")).toBe(false);
+    expect(reg.channelForThread("steward")).toBeUndefined();
+  });
+
+  test("drain key = the thread-id directly: same thread → strictly serial (FIFO, never concurrent)", async () => {
+    const backend = new FakeBackend();
+    const gate = deferred<void>(); // hold ALL turns so we can observe what started.
+    backend.gate = { promise: gate.promise, resolve: gate.resolve };
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    // Two messages for the SAME thread-id on the channel → ONE drain key → strictly serial.
+    reg.enqueue("eng", { content: "t1-a", thread: "t1" });
+    await until(() => backend.calls.length === 1);
+    reg.enqueue("eng", { content: "t1-b", thread: "t1" });
+    // The second waits behind the first (one queue for thread t1) — only one started.
+    expect(backend.calls).toHaveLength(1);
+
+    gate.resolve();
+    await until(() => rec.calls.length === 2);
+    expect(backend.calls.map((c) => c.message)).toEqual(["t1-a", "t1-b"]);
+    expect(backend.maxConcurrent).toBe(1); // never two concurrent for the same thread.
+  });
+
+  test("different thread-ids on ONE channel run CONCURRENTLY (distinct drain keys)", async () => {
+    const backend = new FakeBackend();
+    const gate = deferred<void>(); // hold both turns; if they shared a queue only 1 would start.
+    backend.gate = { promise: gate.promise, resolve: gate.resolve };
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    // Two DIFFERENT thread-ids → two distinct drain keys → two distinct drain promises → BOTH
+    // start while the gate holds them (concurrent). A shared queue would start only one.
+    reg.enqueue("eng", { content: "t1", thread: "t1" });
+    reg.enqueue("eng", { content: "t2", thread: "t2" });
+    await until(() => backend.calls.length === 2);
+    expect(backend.calls).toHaveLength(2); // both in flight concurrently.
+    expect(backend.maxConcurrent).toBe(2);
+
+    gate.resolve();
+    await until(() => rec.calls.length === 2);
+    expect(backend.calls.map((c) => c.message).sort()).toEqual(["t1", "t2"]);
+  });
+
+  test("a def-agent inbound with NO thread + NO subject still maps to ONE queue (the bare channel = HEAD)", async () => {
+    const backend = new FakeBackend();
+    const gate = deferred<void>();
+    backend.gate = { promise: gate.promise, resolve: gate.resolve };
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("steward")); // single-threaded def (the weave shape).
+
+    // The live weave path: no thread, no subject → the bare-channel drain key, strictly serial.
+    reg.enqueue("steward", { content: "weave-1" });
+    await until(() => backend.calls.length === 1);
+    reg.enqueue("steward", { content: "weave-2" });
+    expect(backend.calls).toHaveLength(1);
+    expect(reg.statusOf("steward")).toEqual({ state: "queued", queued: 1 });
+
+    gate.resolve();
+    await until(() => rec.calls.length === 2);
+    expect(backend.calls.map((c) => c.message)).toEqual(["weave-1", "weave-2"]);
+    expect(backend.maxConcurrent).toBe(1);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — Phase B: resolve-or-create (own, don't 401-drop)", () => {
+  test("a LIVE thread → 'live'; the caller routes to its channel", async () => {
+    const backend = new FakeBackend();
+    const { fn } = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: fn });
+    await reg.register(specFor("steward"));
+    expect(reg.resolveOrCreateThread("steward", true)).toBe("live");
+  });
+
+  test("a NOT-YET-LIVE but RESOLVABLE thread → 'owned': marked expected so queuePending BUFFERS (then replays on register)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+
+    // No agent live for "proj-thread" yet, but a thread note exists (resolvable=true).
+    expect(reg.resolveOrCreateThread("proj-thread", true)).toBe("owned");
+    expect(reg.isExpected("proj-thread")).toBe(true);
+
+    // queuePending now OWNS the inbound (it's expected) instead of returning "unknown"/dropping.
+    expect(reg.queuePending("proj-thread", { content: "hello", thread: "proj-thread" })).toBe("queued");
+    expect(reg.pendingCount("proj-thread")).toBe(1);
+
+    // When the thread agent finally registers, the buffered inbound REPLAYS (not lost).
+    await reg.register(specFor("proj-thread"));
+    await until(() => rec.calls.length === 1);
+    expect(rec.calls[0]!.reply).toBe("reply:hello");
+    expect(reg.pendingCount("proj-thread")).toBe(0);
+  });
+
+  test("a genuinely UNKNOWN thread (not live, not resolvable) → 'unknown' (today's 401 path; NOT marked expected)", () => {
+    const backend = new FakeBackend();
+    const { fn } = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: fn });
+    expect(reg.resolveOrCreateThread("ghost", false)).toBe("unknown");
+    // NOT expected → queuePending would return "unknown" (the caller 401s, as today).
+    expect(reg.isExpected("ghost")).toBe(false);
+    expect(reg.queuePending("ghost", { content: "x" })).toBe("unknown");
+  });
+});
+
+describe("ProgrammaticAgentRegistry — Phase B: status-driven teardown (archiveThread)", () => {
+  test("archiveThread clears a thread's queues + indexes (the def-set-diff teardown replacement)", async () => {
+    const backend = new FakeBackend();
+    const gate = deferred<void>(); // hold the turn so a second message sits in the queue.
+    backend.gate = { promise: gate.promise, resolve: gate.resolve };
+    const { fn } = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: fn });
+    await reg.register(specFor("eng"));
+
+    // Build up queue state for thread "t1": one in flight (held), one queued behind it.
+    reg.enqueue("eng", { content: "t1-a", thread: "t1" });
+    await until(() => backend.calls.length === 1);
+    reg.enqueue("eng", { content: "t1-b", thread: "t1" });
+    expect(reg.statusOf("t1")).toEqual({ state: "queued", queued: 1 });
+    expect(reg.hasThread("eng")).toBe(true); // the registered agent's thread-id (eng) resolves.
+
+    // Status transition → archive: tear the thread down. The QUEUED message is dropped, the
+    // byThread entry for the registered agent is cleared.
+    expect(reg.archiveThread("t1")).toBe(true); // had queue state.
+    expect(reg.statusOf("t1")).toEqual({ state: "idle", queued: 0 }); // queue cleared.
+
+    // Tearing down the registered agent's own thread-id stops thread-routing to it.
+    expect(reg.archiveThread("eng")).toBe(true);
+    expect(reg.hasThread("eng")).toBe(false);
+
+    gate.resolve(); // release the in-flight turn (it self-completes; nothing left queued).
+    // A second archive of an unknown thread is a clean no-op false.
+    expect(reg.archiveThread("never-existed")).toBe(false);
+  });
+
+  test("archiveThread drops an EXPECTED-but-not-live thread's pending buffer (owned message can't strand)", () => {
+    const backend = new FakeBackend();
+    const { fn } = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: fn });
+
+    reg.resolveOrCreateThread("proj-thread", true); // expected.
+    reg.queuePending("proj-thread", { content: "buffered", thread: "proj-thread" });
+    expect(reg.pendingCount("proj-thread")).toBe(1);
+    expect(reg.isExpected("proj-thread")).toBe(true);
+
+    expect(reg.archiveThread("proj-thread")).toBe(true);
+    expect(reg.pendingCount("proj-thread")).toBe(0);
+    expect(reg.isExpected("proj-thread")).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
 // roles×threads NEXT slice (#120) — F. per-thread session CONTINUITY.
 //
 // A multi-threaded SUBJECT thread reads/writes its session at the SUBJECT-scoped thread note

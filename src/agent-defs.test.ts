@@ -62,6 +62,32 @@ describe("parseAgentDef", () => {
     expect(resolveDefStatus(def)).toEqual({ status: "enabled" });
   });
 
+  test("#169: note.path → spec.definitionPath; spec.definition stays the (timestamp-slug) id", () => {
+    // In a live vault the note ID is a timestamp-slug, while the PATH is the legible address.
+    const def = parseAgentDef(
+      {
+        id: "2026-06-20-07-30-56-487050", // the note ID (timestamp-slug)
+        path: "Agents/steward", // the legible PATH — the self-entry header source (#169)
+        content: "You are the steward.",
+        metadata: { name: "steward" },
+      },
+      { vault: "default" },
+    );
+    // The ID provenance is unchanged (still the timestamp-slug).
+    expect(def.spec.definition).toBe("2026-06-20-07-30-56-487050");
+    // NEW: the PATH rides onto the spec for the composed-prompt self-entry header.
+    expect(def.spec.definitionPath).toBe("Agents/steward");
+  });
+
+  test("#169: absent note.path → spec.definitionPath undefined (header falls back to name)", () => {
+    const def = parseAgentDef(
+      { id: "2026-06-20-07-30-56-487050", content: "role", metadata: { name: "steward" } },
+      { vault: "default" },
+    );
+    expect(def.spec.definition).toBe("2026-06-20-07-30-56-487050");
+    expect(def.spec.definitionPath).toBeUndefined();
+  });
+
   test("parses the full config knobs (backend, mode, workspace, filesystem, network, egress)", () => {
     const def = parseAgentDef(
       {

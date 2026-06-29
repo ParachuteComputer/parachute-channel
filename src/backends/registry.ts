@@ -411,6 +411,15 @@ export interface QueuedMessage {
    * the weave path is untouched). Carries no routing meaning in NOW.
    */
   subject?: string;
+  /**
+   * The THREAD-ID (threads-only Phase B — DESIGN-2026-06-29-threads-only.md §5/§9) — rides
+   * from the inbound note's `metadata.thread` (read FIRST by {@link noteAgentKey}). When
+   * present it IS the {@link drainKeyFor} drain key directly, so a thread-addressed inbound
+   * serializes per-thread regardless of subject/mode. ADDITIVE + dormant: nothing writes
+   * `metadata.thread` yet (Phase C flips the writer), and the 4 live def agents carry only
+   * `metadata.agent` → no `thread` → the bare-channel drain key (byte-identical to HEAD).
+   */
+  thread?: string;
 }
 
 /** A registered programmatic agent's live status (surfaced in /health + the list). */
@@ -445,6 +454,18 @@ export class ProgrammaticAgentRegistry {
   private readonly byChannel = new Map<string, ProgrammaticAgentHandle>();
   /** name → channel (the lifecycle index; an agent has exactly one wake channel). */
   private readonly nameToChannel = new Map<string, string>();
+  /**
+   * thread-id → channel (the THREAD-ADDRESS index — threads-only Phase B,
+   * DESIGN-2026-06-29-threads-only.md §3/§5). An ADDITIVE parallel index to
+   * {@link nameToChannel}: an inbound carrying `metadata.thread` routes through here.
+   * Populated on {@link register} from {@link threadIdOf} (the spec's thread identity).
+   * For the 4 live def agents the thread-id ≡ name ≡ channel, so this maps `steward → steward`
+   * exactly like `nameToChannel` — the def path is unchanged; this index is just the
+   * additional lookup a `metadata.thread`-addressed inbound consults (a `metadata.agent`
+   * inbound never reads it). It's a CACHE of the live set, rebuildable by listing
+   * `#agent/thread`; the durable record is the thread note.
+   */
+  private readonly byThread = new Map<string, string>();
   /**
    * DRAIN-KEY → FIFO queue of pending messages — the PER-THREAD serial queue
    * (roles×threads NEXT slice, #120). The drain key is {@link drainKeyFor}:
@@ -596,28 +617,53 @@ export class ProgrammaticAgentRegistry {
   }
 
   /**
-   * The PER-THREAD serial DRAIN KEY for an inbound message (roles×threads NEXT slice, #120)
-   * — what {@link queues} + {@link draining} are keyed by:
-   *  - SINGLE-threaded agent, OR a message with NO subject → the bare CHANNEL. This is the
-   *    back-compat path: every agent today (incl. the weave) carries no subject, so the key
-   *    is exactly the channel and the queue/drain behavior is byte-identical to HEAD.
-   *  - MULTI-threaded agent WITH a subject → `threadKey(spec.name, subject)` (`<name>--<sub>`),
-   *    so two subjects of one agent get DISTINCT queues + DISTINCT drain promises (concurrent),
-   *    while two messages of the SAME subject share one queue + one promise (strictly serial).
+   * The THREAD-ID a spec registers under (threads-only Phase B) — the address a
+   * `metadata.thread`-routed inbound resolves through {@link byThread}. For the live cast
+   * the thread-id ≡ the spec name ≡ the channel (the design's "thread-id ≡ agent-name ≡
+   * channel, by construction" — §9), so this is `spec.name`. A future explicit thread record
+   * (Phase C) would override this; today it's the name, which keeps the def path unchanged.
+   */
+  private static threadIdOf(spec: AgentSpec): string {
+    return spec.name;
+  }
+
+  /**
+   * The PER-THREAD serial DRAIN KEY for an inbound message — what {@link queues} +
+   * {@link draining} are keyed by. The per-drain-key serial guarantee (class doc lines
+   * 13-20) holds for ANY of these: same key → strictly serial; different keys → concurrent.
    *
-   * NOTE: a message can only carry a subject route when a LIVE handle exists for the channel
-   * (enqueue requires byChannel), so we read the mode off that handle. A missing handle (the
-   * caller already returns false) defaults to the channel key.
+   * Precedence (threads-only Phase B — DESIGN-2026-06-29-threads-only.md §5):
+   *  1. A thread-addressed message (`msg.thread`, from `metadata.thread`) → that thread-id IS
+   *     the drain key DIRECTLY. This is the Phase-B simplification: the `multiThreaded && subject`
+   *     gate is bypassed — a thread-addressed inbound serializes per-thread independent of
+   *     subject/mode (same thread-id → strictly serial; different thread-ids → concurrent, even
+   *     across one channel's worker, since each thread-id is its own queue + drain promise).
+   *  2. Else a MULTI-threaded agent WITH a subject → `threadKey(spec.name, subject)`
+   *     (`<name>--<subject>`), so two subjects of one agent get DISTINCT queues (concurrent),
+   *     while two messages of the SAME subject share one queue (strictly serial). This is the
+   *     #120 subject-routing path, UNCHANGED (a single-threaded agent's subject is NOT a routing
+   *     axis — it coalesces to the bare channel, as before).
+   *  3. Else (no thread; OR single-threaded; OR no subject) → the bare CHANNEL. The BACK-COMPAT
+   *     path: every live def agent (incl. the steward weave) carries no thread + no subject, so
+   *     the key is exactly the channel and the queue/drain behavior is BYTE-IDENTICAL to HEAD.
+   *
+   * NOTE: a message can only enqueue here when a LIVE handle exists for the channel (enqueue
+   * requires byChannel), so the handle resolves the agent name + mode for the subject key. A
+   * missing handle (the caller already returns false) defaults to the channel key. The thread-id
+   * path (1) does NOT need the handle — the explicit address keys directly.
    */
   private drainKeyFor(channel: string, msg: QueuedMessage): string {
+    // 1. Explicit thread-id address → the drain key directly (per-thread serial), gate-free.
+    const thread = msg.thread?.trim();
+    if (thread) return thread;
     const handle = this.byChannel.get(channel);
     if (!handle) return channel;
+    // 2. The #120 subject path — multi-threaded only (a single-threaded agent's subject is
+    //    not a routing axis; it coalesces to the bare channel, back-compat).
     const multiThreaded = (handle.spec.mode ?? "single-threaded") === "multi-threaded";
     if (!multiThreaded) return channel;
-    // threadKey returns the bare name for no/empty subject — but the channel (not the name)
-    // is the back-compat single-thread key, so only re-key when a subject actually narrows it.
     const subject = msg.subject?.trim();
-    if (!subject) return channel;
+    if (!subject) return channel; // 3. No subject → the bare channel.
     return threadKey(handle.spec.name, subject);
   }
 
@@ -656,6 +702,102 @@ export class ProgrammaticAgentRegistry {
   /** Is a programmatic agent registered under this name? (the mutual-exclusion check) */
   hasName(name: string): boolean {
     return this.nameToChannel.has(name);
+  }
+
+  /**
+   * Is a LIVE programmatic agent registered for this THREAD-ID? (threads-only Phase B —
+   * the thread-address routing check). True when the thread-id resolves to a live channel
+   * via {@link byThread}. For the live cast thread-id ≡ channel, so a `metadata.thread:
+   * steward` inbound finds the same live agent a `metadata.agent: steward` inbound does.
+   */
+  hasThread(threadId: string): boolean {
+    const channel = this.byThread.get(threadId);
+    return channel !== undefined && this.byChannel.has(channel);
+  }
+
+  /** The live channel a thread-id resolves to, or undefined (threads-only Phase B). */
+  channelForThread(threadId: string): string | undefined {
+    const channel = this.byThread.get(threadId);
+    return channel !== undefined && this.byChannel.has(channel) ? channel : undefined;
+  }
+
+  /**
+   * RESOLVE-OR-CREATE a thread for a `metadata.thread`-addressed inbound (threads-only
+   * Phase B — DESIGN-2026-06-29-threads-only.md §5/§9). This GENERALIZES the inbound
+   * handler's old `channels.get → 401-if-absent` lookup into a path that OWNS a message for
+   * a not-yet-instantiated thread instead of dropping it. Returns:
+   *
+   *  - `"live"`    — a live agent already serves this thread (via {@link byThread} →
+   *                  {@link byChannel}); the caller routes/enqueues normally to its channel.
+   *  - `"owned"`   — no live agent YET, but the thread is RESOLVABLE (`resolvable` true — a
+   *                  thread note / def exists for it). We mark the thread-id EXPECTED (so a
+   *                  subsequent {@link queuePending} BUFFERS the inbound, owned + replayed on
+   *                  {@link register}) and return `"owned"`. The caller queues-pending under
+   *                  the thread-id, never 401/drops. This REUSES the agent#121 buffer pattern,
+   *                  generalized from "channel not yet live" to "thread not yet instantiated".
+   *  - `"unknown"` — nothing maps to this thread-id (not live, not resolvable). The caller
+   *                  behaves EXACTLY as today (the inbound handler's existing 401 / no-route
+   *                  semantics — no silent-drop change).
+   *
+   * BACK-COMPAT: a `metadata.agent`-addressed inbound never reaches here (the handler resolves
+   * a live channel for it directly), so the 4 live def agents are untouched.
+   *
+   * PHASE-C INVARIANT (do not break when wiring the writer): the "owned" path marks the
+   * thread-id EXPECTED via {@link expectChannel} (a CHANNEL-keyed set) and the caller buffers
+   * via {@link queuePending}`(threadId, …)`; the replay on {@link register} runs
+   * `drainPending(channel)`. This relies on `threadId ≡ channel` (true today —
+   * {@link threadIdOf} = `spec.name` = the channel). If Phase C introduces a thread-id that
+   * DIFFERS from the channel, the buffered inbound must be replayed under the THREAD-ID key on
+   * register (generalize `drainPending`), or a thread-addressed pending message would silently
+   * never drain. Keep thread-id ≡ channel, or fix the replay key together.
+   */
+  resolveOrCreateThread(threadId: string, resolvable: boolean): "live" | "owned" | "unknown" {
+    if (this.hasThread(threadId)) return "live";
+    if (!resolvable) return "unknown";
+    // Not yet live, but a thread note / def exists → OWN the message: mark the thread-id
+    // expected so queuePending buffers it (replayed when the thread agent registers).
+    this.expectChannel(threadId);
+    return "owned";
+  }
+
+  /**
+   * Tear down a thread on a thread-note `status` transition to ARCHIVE (threads-only Phase B
+   * — DESIGN-2026-06-29-threads-only.md §5/§9). This is the status-driven replacement for the
+   * auto-teardown the def-set diff (`agent-defs.ts`) gave defs for free — which is GONE for
+   * NON-def threads (nothing diffs a set of thread notes). When a thread note's `status` goes
+   * to archived/done, the surface (or a vault trigger) calls this to converge the daemon:
+   *
+   *  - DROP every per-thread queue + drain promise for the thread (reusing the thread-key-aware
+   *    {@link clearChannelQueues} — the drain key for a thread-addressed thread IS the thread-id,
+   *    so the bare-key delete clears exactly this thread's queue. NOTE: a thread-addressed message
+   *    uses the thread-id drain key DIRECTLY (drainKeyFor path 1, bypassing the subject axis), so
+   *    in Phase B there are no `<threadId>--<subject>` sub-keys to orphan; clearChannelQueues'
+   *    prefix-scan is harmless belt-and-suspenders here);
+   *  - DROP the thread-id's EXPECTED mark + any buffered pending inbound (so an archived thread
+   *    can't strand a buffered message or replay stale ones on a future register);
+   *  - DROP the {@link byThread} address entry so a later `metadata.thread` inbound resolves
+   *    as `unknown` (not a torn-down thread).
+   *
+   * Lightweight: a NON-def thread may only be EXPECTED/buffered (never fully registered), so
+   * this does NOT require a backend handle. If a live agent IS registered for the thread, its
+   * deregister (the def path / explicit removal) tears down the backend handle; archiveThread
+   * is the queue/index convergence the status transition drives. Returns whether anything was
+   * cleared (false = the thread-id had no live/expected/buffered state).
+   */
+  archiveThread(threadId: string): boolean {
+    const had =
+      this.queues.has(threadId) ||
+      this.draining.has(threadId) ||
+      this.expectedChannels.has(threadId) ||
+      this.pending.has(threadId) ||
+      this.byThread.has(threadId);
+    // clearChannelQueues clears the bare key (= the thread-id drain key for a thread-addressed
+    // thread) AND any `<threadId>--*` subject sub-keys.
+    this.clearChannelQueues(threadId);
+    this.expectedChannels.delete(threadId);
+    this.pending.delete(threadId);
+    this.byThread.delete(threadId);
+    return had;
   }
 
   /** The registered handle for a channel, or undefined. */
@@ -736,6 +878,11 @@ export class ProgrammaticAgentRegistry {
     };
     this.byChannel.set(channel, handle);
     this.nameToChannel.set(spec.name, channel);
+    // THREAD-ADDRESS index (threads-only Phase B) — map the spec's thread-id → channel so a
+    // `metadata.thread`-routed inbound resolves here. For the live cast thread-id ≡ name ≡
+    // channel (so this is `steward → steward`, mirroring nameToChannel) — additive, the def
+    // path is unchanged.
+    this.byThread.set(ProgrammaticAgentRegistry.threadIdOf(spec), channel);
     // The channel now has a live agent — it's no longer merely "expected" (the gate that
     // let pre-registration inbound queue pending); the live byChannel index is the truth now.
     this.expectedChannels.delete(channel);
@@ -851,6 +998,11 @@ export class ProgrammaticAgentRegistry {
     this.clearChannelQueues(channel);
     this.byChannel.delete(channel);
     this.nameToChannel.delete(name);
+    // Drop the THREAD-ADDRESS index entry (threads-only Phase B). Resolve the thread-id from
+    // the handle's spec when present (it may differ from `name` under a future explicit thread
+    // record); fall back to `name` (today thread-id ≡ name). A `metadata.thread`-routed inbound
+    // must stop resolving to a torn-down agent.
+    this.byThread.delete(handle ? ProgrammaticAgentRegistry.threadIdOf(handle.spec) : name);
     // Clear the EXPECTED mark + any buffered pending inbound for this channel too —
     // the agent is gone, so a pending message has nothing to drain into and would
     // strand forever (and the next register would replay stale messages). The daemon's

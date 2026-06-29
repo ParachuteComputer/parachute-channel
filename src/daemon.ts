@@ -66,6 +66,7 @@ import {
   DEFAULT_HUB_ORIGIN,
 } from "./def-vaults.ts";
 import { mintScopedToken, vaultScope } from "./mint-token.ts";
+import { registerAllDefVaultTriggers } from "./def-vault-triggers.ts";
 import { GrantsClient } from "./grants.ts";
 import { resolveEffectiveEnv } from "./effective-env.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
@@ -3531,6 +3532,29 @@ function main(): void {
     const bindings = await resolveDefVaults({ hubOrigin: getHubOrigin(), managerBearer });
     for (const b of bindings) agentDefs.addVault(b);
     if (bindings.length === 0) return; // nothing bound — vault-native path idle.
+
+    // AUTO-REGISTER the per-def-vault runtime triggers (agent#157) so "define an
+    // agent → it runs" needs NO manual trigger setup + NO restart-to-pick-up:
+    //   - the def-watch create/edit triggers, BARE-keyed (`agent/definition`) so a
+    //     created/edited def auto-fires the rescan — upsert-by-name REPLACES any
+    //     stale `#agent/definition`-keyed `conn_agentdefs-*` row the hub provisioned;
+    //   - the inbound trigger (`agent/message/inbound` + has_metadata:[agent]) so a
+    //     new inbound note wakes the agent without a hand-registered trigger.
+    // Mints the admin (triggers API) + agent:send (webhook bearer) tokens the same
+    // way the hub's Connections engine does (attenuated to the operator bearer).
+    // Best-effort: a mint refusal / unreachable vault is logged, never fatal — the
+    // 60s loadAll poll below stays the correctness floor. Skipped with no operator
+    // bearer (can't mint) — the vault-native path still runs own-vault.
+    if (managerBearer) {
+      await registerAllDefVaultTriggers(bindings, { hubOrigin: getHubOrigin(), managerBearer }).catch(
+        (err) => {
+          console.warn(
+            `parachute-agent: def-vault trigger auto-registration failed (continuing): ${(err as Error).message}`,
+          );
+        },
+      );
+    }
+
     const n = await agentDefs.loadAll();
     console.log(
       `parachute-agent: vault-native agent defs — ${n} instantiated from ${bindings.length} def-vault(s).`,

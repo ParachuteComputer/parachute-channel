@@ -65,6 +65,13 @@ export interface Job {
   lastStatus?: string;
   /** ISO timestamp of the next scheduled fire — COMPUTED IN MEMORY, never persisted. */
   nextRunAt?: string;
+  /**
+   * The THREAD SUBJECT a fire of this job carries (roles×threads NOW slice). When set,
+   * the runner stamps it onto the inbound note (`metadata.subject`) so the turn's composed
+   * prompt + (NEXT) thread routing can read it. Optional; absent → today's behavior (the
+   * weave job carries none — its fire is byte-identical to HEAD).
+   */
+  subject?: string;
 }
 
 /** A slug: alphanumeric, dash, underscore (same shape as channel names). */
@@ -202,6 +209,7 @@ export class VaultJobStore {
           createdAt: n.createdAt ?? "",
           ...(n.lastRunAt ? { lastRunAt: n.lastRunAt } : {}),
           ...(n.lastStatus ? { lastStatus: n.lastStatus } : {}),
+          ...(n.subject ? { subject: n.subject } : {}),
         });
       }
     }
@@ -229,6 +237,7 @@ export class VaultJobStore {
       createdAt: job.createdAt,
       ...(job.lastRunAt ? { lastRunAt: job.lastRunAt } : {}),
       ...(job.lastStatus ? { lastStatus: job.lastStatus } : {}),
+      ...(job.subject ? { subject: job.subject } : {}),
     });
     return { ...job, noteId }; // id stays the slug; noteId addresses the persisted note.
   }

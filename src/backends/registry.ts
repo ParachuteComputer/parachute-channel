@@ -393,6 +393,16 @@ export interface QueuedMessage {
    * something else. Absent → the run context omits `fired-by`. Carries no routing meaning.
    */
   sender?: string;
+  /**
+   * The THREAD SUBJECT (roles×threads NOW slice) — rides from the inbound note's
+   * `metadata.subject`, through `contextFor.emit` (daemon.ts), onto this queue item.
+   * In the NOW slice it carries NO routing meaning — the drain stays per-CHANNEL serial,
+   * NOT per-subject — but it is threaded through so the composed prompt can fold in a
+   * subject dossier and the NEXT slice (#120 thread routing + per-thread session
+   * continuity) can key off it without re-plumbing. Absent → no subject (today's behavior;
+   * the weave path is untouched). Carries no routing meaning in NOW.
+   */
+  subject?: string;
 }
 
 /** A registered programmatic agent's live status (surfaced in /health + the list). */
@@ -478,6 +488,16 @@ export class ProgrammaticAgentRegistry {
    * Unwired → reset is a clean no-op beyond returning that the agent exists.
    */
   private readonly clearSession?: (channel: string, name: string) => Promise<void>;
+  /**
+   * Optional pre-turn SUBJECT-DOSSIER read (roles×threads NOW slice) — per-thread
+   * context for the current subject, folded into the composed system prompt (the
+   * programmatic backend's `roleBody + "\n\n---\n\n" + dossier`). Read in {@link drain}
+   * keyed on the inbound message's subject. UNWIRED in the NOW slice (the default registry
+   * does NOT set it — there's no dossier-note convention yet), so every turn composes the
+   * role body verbatim and the null-subject path is byte-identical to HEAD. The seam is
+   * here so a future dossier source threads in without re-plumbing `deliver`.
+   */
+  private readonly readSubjectDossier?: (channel: string, subject: string) => Promise<string | undefined>;
   /** Base backoff (ms) between outbound retries (FIX 1). Injectable so tests run fast. */
   private readonly outboundRetryBaseMs: number;
 
@@ -491,6 +511,11 @@ export class ProgrammaticAgentRegistry {
     readSession?: (channel: string, name: string) => Promise<string | undefined>;
     /** Clear the persisted thread-note session (the per-agent restart / reset). */
     clearSession?: (channel: string, name: string) => Promise<void>;
+    /**
+     * Read the per-thread subject dossier (roles×threads NOW slice). Optional + UNWIRED
+     * by default — the composed prompt is the role body verbatim until a dossier source exists.
+     */
+    readSubjectDossier?: (channel: string, subject: string) => Promise<string | undefined>;
     /** Override the outbound-retry backoff base (ms). Default {@link OUTBOUND_RETRY_BASE_MS}. */
     outboundRetryBaseMs?: number;
   }) {
@@ -501,6 +526,7 @@ export class ProgrammaticAgentRegistry {
     if (deps.onTurnEvent) this.onTurnEvent = deps.onTurnEvent;
     if (deps.readSession) this.readSession = deps.readSession;
     if (deps.clearSession) this.clearSession = deps.clearSession;
+    if (deps.readSubjectDossier) this.readSubjectDossier = deps.readSubjectDossier;
     this.outboundRetryBaseMs = deps.outboundRetryBaseMs ?? OUTBOUND_RETRY_BASE_MS;
   }
 
@@ -891,6 +917,24 @@ export class ProgrammaticAgentRegistry {
         ...(firedBy ? { firedBy } : {}),
       };
 
+      // SUBJECT DOSSIER (roles×threads NOW slice): when the inbound carries a subject AND a
+      // dossier source is wired, resolve the per-thread context the backend folds into the
+      // composed system prompt. UNWIRED by default (no dossier-note convention yet) and
+      // no-subject always → `undefined`, so the system prompt is the role body verbatim and
+      // the null-subject path is byte-identical to HEAD. Best-effort: a dossier read failure
+      // logs + the turn still runs (role-only), never strands the queue.
+      let subjectDossier: string | undefined;
+      if (msg.subject && this.readSubjectDossier) {
+        try {
+          subjectDossier = await this.readSubjectDossier(handle.channel, msg.subject);
+        } catch (err) {
+          console.error(
+            `parachute-agent: subject-dossier read for channel "${channel}" ` +
+              `subject "${msg.subject}" failed (turn runs role-only): ${(err as Error).message}`,
+          );
+        }
+      }
+
       let result;
       try {
         // Forward each interim event to the streaming-view sink (keyed by channel)
@@ -906,6 +950,9 @@ export class ProgrammaticAgentRegistry {
           msg.attachments,
           // agent#162: the daemon-known runtime context (real clock, new/resumed, fired-by).
           runContext,
+          // roles×threads NOW slice: the per-thread subject dossier, folded into the composed
+          // system prompt. Undefined (no subject / unwired source) → role body verbatim.
+          subjectDossier,
         );
       } catch (err) {
         // The backend contract is failure-as-VALUE, never a throw — but defend so a

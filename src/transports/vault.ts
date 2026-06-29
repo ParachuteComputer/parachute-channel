@@ -161,6 +161,11 @@ export interface JobNote {
   lastRunAt?: string;
   /** "ok" / "error: …" from the most recent fire. */
   lastStatus?: string;
+  /**
+   * The THREAD SUBJECT a fire carries (roles×threads NOW slice) — read back from
+   * `metadata.subject`. Optional; absent → today's behavior (no subject).
+   */
+  subject?: string;
 }
 
 /** The metadata payload written for a job note (all string-typed, per the vault). */
@@ -176,6 +181,13 @@ export interface JobNoteMetadata {
   createdAt: string;
   lastRunAt?: string;
   lastStatus?: string;
+  /**
+   * The THREAD SUBJECT a fire of this job carries (roles×threads NOW slice) — stamped
+   * onto the inbound note the runner injects, so the turn's composed prompt + (NEXT)
+   * thread routing can read it. Optional; absent → today's behavior (the weave job
+   * carries none).
+   */
+  subject?: string;
 }
 
 /**
@@ -1319,8 +1331,21 @@ export class VaultTransport implements Transport {
    * thin wrapper over `writeInbound` so the inbound write path has ONE
    * implementation; only the default sender differs.
    */
-  async injectInbound(opts: { content: string; sender?: string }): Promise<{ id: string }> {
-    return this.writeInbound(opts.content, opts.sender ?? "runner");
+  async injectInbound(opts: {
+    content: string;
+    sender?: string;
+    /**
+     * SUBJECT (roles×threads NOW slice) — the thread axis for a runner-fired turn.
+     * When a job carries a subject, the runner threads it here; it's stamped onto the
+     * inbound note's `metadata.subject` (via {@link writeInbound}'s `extraMeta`) so the
+     * turn's composed prompt + (NEXT) thread routing can read it. Absent/empty → NO
+     * `subject` field on the note (today's behavior exactly — the weave job is unaffected).
+     */
+    subject?: string;
+  }): Promise<{ id: string }> {
+    const subject = opts.subject?.trim();
+    const extraMeta = subject ? { subject } : undefined;
+    return this.writeInbound(opts.content, opts.sender ?? "runner", extraMeta);
   }
 
   /**
@@ -1579,6 +1604,10 @@ export class VaultTransport implements Transport {
       if (typeof m.createdAt === "string") job.createdAt = m.createdAt;
       if (typeof m.lastRunAt === "string") job.lastRunAt = m.lastRunAt;
       if (typeof m.lastStatus === "string") job.lastStatus = m.lastStatus;
+      // roles×threads NOW slice: read the thread subject back (absent/blank → undefined).
+      // Trim-guarded symmetrically with the write side (upsertJobNote) so a whitespace-only
+      // value that somehow landed in the vault can't propagate downstream as a "subject".
+      if (typeof m.subject === "string" && m.subject.trim()) job.subject = m.subject.trim();
       jobs.push(job);
     }
     return jobs;
@@ -1600,6 +1629,8 @@ export class VaultTransport implements Transport {
     createdAt: string;
     lastRunAt?: string;
     lastStatus?: string;
+    /** The thread subject a fire carries (roles×threads NOW slice); absent → no field. */
+    subject?: string;
   }): Promise<{ id: string }> {
     const safeId = job.id.replace(/[^a-zA-Z0-9_-]/g, "-");
     const safeChannel = job.channel.replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -1615,6 +1646,11 @@ export class VaultTransport implements Transport {
     if (job.tz) metadata.tz = job.tz;
     if (job.lastRunAt) metadata.lastRunAt = job.lastRunAt;
     if (job.lastStatus) metadata.lastStatus = job.lastStatus;
+    // roles×threads NOW slice: persist a non-empty subject; absent → no field (the weave
+    // job writes none, so its note is byte-identical to HEAD).
+    if (typeof job.subject === "string" && job.subject.trim().length > 0) {
+      metadata.subject = job.subject.trim();
+    }
 
     const res = await fetch(`${this.vaultUrl}/vault/${this.vault}/api/notes`, {
       method: "POST",
@@ -1772,9 +1808,13 @@ export class VaultTransport implements Transport {
     }
     // Flatten the note's metadata into the inbound meta (string-valued), then
     // stamp our own provenance fields. `source`/`note_id`/`direction` are set
-    // explicitly so they win over anything in the note's metadata.
+    // explicitly so they win over anything in the note's metadata. `subject` is
+    // SKIPPED here and handled explicitly below (normalized to non-empty-or-absent),
+    // so a blank `subject: "   "` can't slip through the raw spread — absent and
+    // whitespace-only must be indistinguishable downstream (the null-subject invariant).
     const flatMeta: Record<string, string> = {};
     for (const [k, v] of Object.entries(meta)) {
+      if (k === "subject") continue;
       flatMeta[k] = typeof v === "string" ? v : String(v);
     }
 
@@ -1788,6 +1828,18 @@ export class VaultTransport implements Transport {
     if (hasInline) {
       attachments = await this.fetchInboundAttachments(note.id);
     }
+
+    // SUBJECT (roles×threads NOW slice). The thread axis: when the inbound note
+    // carries a non-empty string `metadata.subject`, surface it onto the emitted
+    // event meta so it can flow through the queue → composed prompt → (NEXT) thread
+    // routing. ABSENT/empty → no `subject` field on the emitted meta, so the emit is
+    // BYTE-IDENTICAL to HEAD (the null-subject invariant — the weave path is untouched).
+    // `subject` is deliberately SKIPPED in the `flatMeta` spread above and re-added here
+    // ONLY when non-empty, so an empty/whitespace-only value can never leak through —
+    // absent and blank are indistinguishable downstream.
+    const rawSubject = meta.subject;
+    const subject =
+      typeof rawSubject === "string" && rawSubject.trim().length > 0 ? rawSubject : undefined;
 
     this.ctx.emit({
       // `channel` here is the in-memory InboundMessage.channel TS field (NOT serialized
@@ -1803,6 +1855,7 @@ export class VaultTransport implements Transport {
         note_id: note.id,
         sender: typeof meta.sender === "string" ? meta.sender : "",
         direction: "inbound",
+        ...(subject ? { subject } : {}),
       },
       source: "vault",
       ...(attachments.length > 0 ? { attachments } : {}),

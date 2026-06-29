@@ -442,6 +442,7 @@ export class ProgrammaticBackend implements AgentBackend {
     onInterim?: InterimSink,
     attachments?: InboundAttachment[],
     runContext?: RunContext,
+    subjectDossier?: string,
   ): Promise<DeliverResult> {
     const spec = handle.spec;
     if (!spec) {
@@ -587,10 +588,22 @@ export class ProgrammaticBackend implements AgentBackend {
     // Unset → no flag, no file (today's behavior unchanged). The `-file` form is
     // robust to long/multiline prompts and keeps the prompt visible-on-disk. Its
     // lifecycle is tied to the workspace (like .mcp.json) — it disappears with it.
+    //
+    // COMPOSED PROMPT (roles×threads NOW slice): when a `subjectDossier` is handed in,
+    // the agent's stable ROLE (the spec's systemPrompt) is composed with the per-thread
+    // subject context as `roleBody + "\n\n---\n\n" + dossier`. The role stays constant
+    // across a role's threads; the subject-specific dossier layers on top. Absent/empty
+    // dossier → the role body is written VERBATIM (byte-identical to HEAD — the
+    // null-subject invariant; the run-context preamble stays on the MESSAGE, not here).
     let systemPromptFile: string | undefined;
     if (typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0) {
+      const roleBody = spec.systemPrompt;
+      const composed =
+        typeof subjectDossier === "string" && subjectDossier.length > 0
+          ? `${roleBody}\n\n---\n\n${subjectDossier}`
+          : roleBody;
       systemPromptFile = join(workspace, "system-prompt.txt");
-      writeFileSync(systemPromptFile, spec.systemPrompt, { mode: 0o600 });
+      writeFileSync(systemPromptFile, composed, { mode: 0o600 });
     }
 
     // The agent's WORKING dir (design 2026-06-16-agent-filesystem-and-sharing.md):

@@ -244,6 +244,14 @@ export interface AgentBackend {
    * The programmatic backend prepends it as a concise, clearly-labeled preamble to the turn
    * message so the agent stamps ACCURATE times instead of fabricating them. ADDITIVE — omitted
    * → the turn message is exactly as before.
+   *
+   * `subjectDossier` (optional, roles×threads NOW slice) is per-THREAD context for the
+   * agent's CURRENT subject — folded into the SYSTEM prompt (NOT the message): the programmatic
+   * backend writes `roleBody + "\n\n---\n\n" + dossier` to the per-turn `system-prompt.txt` when
+   * present, so the agent's ROLE (the spec's systemPrompt) stays stable across threads while the
+   * subject-specific context layers on top. The run-context preamble is unaffected (it stays on
+   * the MESSAGE). ADDITIVE — omitted/empty → the system prompt is the role body verbatim
+   * (byte-identical to HEAD; the null-subject invariant).
    */
   deliver(
     handle: AgentHandle,
@@ -252,6 +260,7 @@ export interface AgentBackend {
     onInterim?: InterimSink,
     attachments?: InboundAttachment[],
     runContext?: RunContext,
+    subjectDossier?: string,
   ): Promise<DeliverResult>;
 
   /**

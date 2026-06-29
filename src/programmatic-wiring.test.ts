@@ -145,7 +145,12 @@ async function withTempStateDir<T>(fn: (dir: string) => Promise<T> | T): Promise
 /** A controllable fake backend (no `claude -p`). */
 class FakeBackend implements AgentBackend {
   readonly kind = "programmatic";
-  readonly calls: { channel: string; message: string; attachments?: InboundAttachment[] }[] = [];
+  readonly calls: {
+    channel: string;
+    message: string;
+    attachments?: InboundAttachment[];
+    subjectDossier?: string;
+  }[] = [];
   resultFor: (message: string) => DeliverResult = (m) => ({ ok: true, reply: "reply:" + m });
   async start(spec: AgentSpec): Promise<AgentHandle> {
     return { backend: this.kind, channel: spec.channels[0] as string, name: spec.name, spec };
@@ -156,8 +161,16 @@ class FakeBackend implements AgentBackend {
     _session?: unknown,
     _onInterim?: unknown,
     attachments?: InboundAttachment[],
+    _runContext?: unknown,
+    subjectDossier?: string,
   ): Promise<DeliverResult> {
-    this.calls.push({ channel: handle.channel, message, ...(attachments ? { attachments } : {}) });
+    this.calls.push({
+      channel: handle.channel,
+      message,
+      ...(attachments ? { attachments } : {}),
+      // Record whether a dossier reached deliver (undefined for the null-subject path).
+      subjectDossier,
+    });
     return this.resultFor(message);
   }
   async stop(): Promise<void> {}
@@ -797,6 +810,77 @@ describe("contextFor.emit threads reply_to → a callback end-to-end through the
     await until(() => out.calls.length === 1);
     await new Promise<void>((r) => setTimeout(r, 5));
     expect(cb.calls).toHaveLength(0);
+  });
+});
+
+// ── roles×threads NOW slice: subject threads emit → QueuedMessage → drain → deliver dossier ──
+describe("contextFor.emit threads the subject → composed-prompt dossier end-to-end", () => {
+  test("NULL-SUBJECT INVARIANT: an emit with NO subject → deliver receives subjectDossier=undefined (the weave path)", async () => {
+    const backend = new FakeBackend();
+    const out = recorder();
+    // A dossier source IS wired — but with no subject it must NEVER be consulted.
+    let dossierReads = 0;
+    const programmatic = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      readSubjectDossier: async () => {
+        dossierReads += 1;
+        return "SHOULD NOT BE READ";
+      },
+    });
+    await programmatic.register({ name: "worker", channels: ["worker"], backend: "programmatic" });
+    const ctx = contextFor(new ClientRegistry(), "worker", new DeliveryState(), programmatic);
+
+    ctx.emit({ channel: "worker", content: "plain", meta: { note_id: "n1", source: "vault" }, source: "vault" });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.subjectDossier).toBeUndefined();
+    // No subject → the dossier source is never even called (the weave path is untouched).
+    expect(dossierReads).toBe(0);
+  });
+
+  test("a subject + a wired dossier source → the dossier reaches deliver (keyed by channel + subject)", async () => {
+    const backend = new FakeBackend();
+    const out = recorder();
+    const seen: { channel: string; subject: string }[] = [];
+    const programmatic = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: out.fn,
+      readSubjectDossier: async (channel, subject) => {
+        seen.push({ channel, subject });
+        return `dossier-for:${subject}`;
+      },
+    });
+    await programmatic.register({ name: "worker", channels: ["worker"], backend: "programmatic" });
+    const ctx = contextFor(new ClientRegistry(), "worker", new DeliveryState(), programmatic);
+
+    ctx.emit({
+      channel: "worker",
+      content: "status please",
+      meta: { note_id: "n1", source: "vault", subject: "launch-blockers" },
+      source: "vault",
+    });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.subjectDossier).toBe("dossier-for:launch-blockers");
+    expect(seen).toEqual([{ channel: "worker", subject: "launch-blockers" }]);
+  });
+
+  test("a subject but NO wired dossier source (the NOW default) → deliver still gets undefined", async () => {
+    const backend = new FakeBackend();
+    const out = recorder();
+    // No readSubjectDossier wired — the NOW default. A subject rides through, but with no
+    // source the composed prompt is role-only (dossier undefined).
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: out.fn });
+    await programmatic.register({ name: "worker", channels: ["worker"], backend: "programmatic" });
+    const ctx = contextFor(new ClientRegistry(), "worker", new DeliveryState(), programmatic);
+
+    ctx.emit({
+      channel: "worker",
+      content: "go",
+      meta: { note_id: "n1", source: "vault", subject: "some-subject" },
+      source: "vault",
+    });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.subjectDossier).toBeUndefined();
   });
 });
 

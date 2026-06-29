@@ -1,0 +1,77 @@
+/**
+ * Unit tests for the pure agent-spec helpers in `sandbox/types.ts`.
+ *
+ * Focus: `threadKey(specName, subject?)` — the roles×threads NOW slice thread
+ * identity key. It is SECURITY-SENSITIVE: `subject` is untrusted input that later
+ * becomes a vault path leaf + a `--session-id` segment, so the helper MUST strip
+ * path-dangerous characters and treat an empty/whitespace subject as "no subject"
+ * (returning the bare spec name — the back-compat / null-subject path).
+ */
+import { describe, test, expect } from "bun:test";
+import { threadKey, normalizeChannel } from "./types.ts";
+
+describe("threadKey — the (agent, subject) thread identity key", () => {
+  test("no subject → the BARE spec name (back-compat / null-subject path)", () => {
+    expect(threadKey("uni-weaver")).toBe("uni-weaver");
+    expect(threadKey("uni-weaver", undefined)).toBe("uni-weaver");
+  });
+
+  test("empty / whitespace-only subject → the bare spec name (treated as absent)", () => {
+    expect(threadKey("eng", "")).toBe("eng");
+    expect(threadKey("eng", "   ")).toBe("eng");
+    expect(threadKey("eng", "\t\n  ")).toBe("eng");
+  });
+
+  test("a normal subject → `<name>--<slug>` with the `--` separator", () => {
+    expect(threadKey("eng", "launch-blockers")).toBe("eng--launch-blockers");
+    expect(threadKey("pm", "Q3_roadmap")).toBe("pm--Q3_roadmap");
+  });
+
+  test("the subject is TRIMMED before slugging (leading/trailing whitespace dropped)", () => {
+    // Surrounding spaces are trimmed away entirely; they do NOT become `-`.
+    expect(threadKey("eng", "  roadmap  ")).toBe("eng--roadmap");
+  });
+
+  test("SECURITY: `../` and path separators are stripped to `-` (no path traversal)", () => {
+    // A subject that tries to climb the path hierarchy collapses to a flat slug — it
+    // can never escape `Threads/<channel>/<name>--<subject>` into a parent dir.
+    expect(threadKey("eng", "../../etc/passwd")).toBe("eng--------etc-passwd");
+    expect(threadKey("eng", "a/b/c")).toBe("eng--a-b-c");
+    // `..` slugs to `--` (each dot → dash), joined after the `--` separator → `eng----`.
+    expect(threadKey("eng", "..")).toBe("eng----");
+  });
+
+  test("SECURITY: spaces, dots, and other non-[a-zA-Z0-9_-] chars collapse to `-`", () => {
+    expect(threadKey("eng", "my subject here")).toBe("eng--my-subject-here");
+    expect(threadKey("eng", "a.b.c")).toBe("eng--a-b-c");
+    expect(threadKey("eng", "weird!@#$%^&*()chars")).toBe("eng--weird----------chars");
+  });
+
+  test("SECURITY: a NUL byte / control chars are stripped (no path-injection)", () => {
+    expect(threadKey("eng", "x" + String.fromCharCode(0) + "y")).toBe("eng--x-y");
+  });
+
+  test("the result of slugging is path-leaf-safe — only [a-zA-Z0-9_-] and the `--` join remain", () => {
+    const key = threadKey("eng", "../some thing/with.dots & spaces");
+    // Every character is in the safe set (the `--` separator + the slug are all safe chars).
+    expect(key).toMatch(/^[a-zA-Z0-9_-]+$/);
+    expect(key.startsWith("eng--")).toBe(true);
+  });
+
+  test("the bare-name path is byte-identical to the spec name (no separator leaks in)", () => {
+    // Critical for the null-subject invariant: a no-subject threadKey must equal the
+    // name EXACTLY so every downstream path/key is unchanged from HEAD.
+    for (const name of ["uni-weaver", "eng", "pm_bot", "a-b-c"]) {
+      expect(threadKey(name)).toBe(name);
+      expect(threadKey(name).includes("--")).toBe(false);
+    }
+  });
+});
+
+describe("normalizeChannel — regression (unchanged by the NOW slice)", () => {
+  test("a bare string is read+write; the object form honors access", () => {
+    expect(normalizeChannel("eng")).toEqual({ name: "eng", access: "write" });
+    expect(normalizeChannel({ name: "eng", access: "read" })).toEqual({ name: "eng", access: "read" });
+    expect(normalizeChannel({ name: "eng" })).toEqual({ name: "eng", access: "write" });
+  });
+});

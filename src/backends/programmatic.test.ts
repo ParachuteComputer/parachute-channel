@@ -43,6 +43,7 @@ import type { InboundAttachment } from "../transport.ts";
 import type { SandboxEngine } from "../sandbox/index.ts";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { AgentSpec } from "../sandbox/types.ts";
+import { sessionWorkspace } from "../spawn-agent.ts";
 import { vaultEntryKey, channelEntryKey } from "../agent-mcp-config.ts";
 import {
   GrantsClient,
@@ -559,6 +560,72 @@ describe("ProgrammaticBackend.deliver — the backend is a pure function of the 
     const cmd = calls[0]!.argv[2]!;
     expect(cmd).toContain("--resume sess-PRIOR");
     expect(cmd).not.toContain("--session-id");
+  });
+});
+
+describe("ProgrammaticBackend.deliver — composed system prompt (roles×threads NOW slice)", () => {
+  const ROLE = "You are the eng agent. Be terse.";
+
+  test("NO subjectDossier → system-prompt.txt is the role body VERBATIM (null-subject invariant)", async () => {
+    mkDirs("compose-none");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-CP1", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithSystemPrompt(ROLE, undefined, "eng"));
+
+    // deliver WITHOUT the 7th param — exactly today's call shape (the weave path).
+    const result = await backend.deliver(handle, "do the thing", createSession("sess-CP1"));
+    expect(result.ok).toBe(true);
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    // BYTE-IDENTICAL to the role body — no separator, no dossier, no trailing additions.
+    expect(readFileSync(promptPath, "utf8")).toBe(ROLE);
+  });
+
+  test("empty/whitespace subjectDossier → still the role body VERBATIM (treated as absent)", async () => {
+    mkDirs("compose-empty");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-CP2", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithSystemPrompt(ROLE, undefined, "eng"));
+
+    await backend.deliver(handle, "go", createSession("sess-CP2"), undefined, undefined, undefined, "");
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(ROLE);
+  });
+
+  test("a subjectDossier → system-prompt.txt is `role + \"\\n\\n---\\n\\n\" + dossier`", async () => {
+    mkDirs("compose-dossier");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-CP3", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithSystemPrompt(ROLE, undefined, "eng"));
+
+    const dossier = "## Subject: launch-blockers\nFocus only on items tagged P0.";
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-CP3"),
+      undefined,
+      undefined,
+      undefined,
+      dossier,
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(`${ROLE}\n\n---\n\n${dossier}`);
+  });
+
+  test("no spec.systemPrompt + a dossier → NO system-prompt file (the role-less case is unchanged)", async () => {
+    mkDirs("compose-noprompt");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-CP4", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    // specWithVault carries NO systemPrompt — a dossier alone must NOT synthesize a prompt file
+    // (composing onto an empty role is out of scope for NOW; the role gate is unchanged).
+    const handle = await backend.start(specWithVault("eng"));
+
+    await backend.deliver(handle, "go", createSession("sess-CP4"), undefined, undefined, undefined, "a dossier");
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(existsSync(promptPath)).toBe(false);
   });
 });
 

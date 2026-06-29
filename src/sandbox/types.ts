@@ -380,3 +380,41 @@ export function normalizeChannel(ch: AgentChannel): { name: string; access: "rea
   if (typeof ch === "string") return { name: ch, access: "write" };
   return { name: ch.name, access: ch.access ?? "write" };
 }
+
+/**
+ * Collapse a string to a flat, path-safe slug — every char outside
+ * `[a-zA-Z0-9_-]` becomes `-`. This MIRRORS the channel/name sanitizer used on
+ * the vault note paths (`vault.ts:746`, `:822-823`) so a value sanitized here
+ * can be used as a path leaf or a `--session-id` segment without re-escaping.
+ * Pure + idempotent. Exported so the NEXT slice (per-thread workspace paths,
+ * spec §G) reuses this exact sanitizer rather than re-implementing it (drift risk).
+ */
+export function slug(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_-]/g, "-");
+}
+
+/**
+ * The THREAD identity key for one (agent, subject) pair — the roles×threads NOW
+ * slice (design team-vault `Strategy/2026-06-29-agents-roles-threads`).
+ *
+ *  - No subject (absent / empty / whitespace-only) → the BARE `specName`. This is
+ *    the back-compat path: every agent today (incl. the weave) carries no subject,
+ *    so `threadKey` returns exactly the spec name and every downstream
+ *    path/key/workspace is byte-identical to HEAD.
+ *  - A non-empty subject → `${specName}--${slug(subject)}`. The `--` separator and
+ *    the `slug()` sanitize make the key safe to use as a vault path leaf or a
+ *    Claude `--session-id` segment.
+ *
+ * SECURITY: `subject` is UNTRUSTED input that later becomes a path leaf, so it is
+ * run through {@link slug} here — `../`, spaces, slashes, and other path-dangerous
+ * chars collapse to `-`, so a subject can never traverse the path hierarchy.
+ * `specName` is NOT sanitized here (it's already a sanitized agent/channel name
+ * upstream); only the untrusted subject is.
+ *
+ * NOTE: subject is PER-THREAD — it rides on the inbound message, NOT on the
+ * {@link AgentSpec} (which is per-AGENT). Keep it off the spec.
+ */
+export function threadKey(specName: string, subject?: string): string {
+  const trimmed = subject?.trim();
+  return trimmed ? `${specName}--${slug(trimmed)}` : specName;
+}

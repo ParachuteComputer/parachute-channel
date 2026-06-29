@@ -198,6 +198,60 @@ describe("VaultTransport — reply (outbound note write)", () => {
   });
 });
 
+describe("VaultTransport — injectInbound (the runner fire) + subject (roles×threads NOW slice)", () => {
+  /** Capture the note POST body (ignoring the start()→ensureSchema PUTs). */
+  function captureInboundWrite(): { body: () => { content: string; metadata: Record<string, string> } } {
+    let captured: { content: string; metadata: Record<string, string> } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith("/api/notes")) {
+        captured = JSON.parse(String(init?.body));
+      }
+      return new Response(JSON.stringify({ id: "inj-1" }), { status: 201 });
+    }) as typeof fetch;
+    return { body: () => captured! };
+  }
+
+  test("NULL-SUBJECT INVARIANT: injectInbound with NO subject → note metadata has NO `subject` (weave fire byte-identical to HEAD)", async () => {
+    const cap = captureInboundWrite();
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    // Exactly the weave job's fire shape today.
+    await t.injectInbound({ content: "run the weave", sender: "runner:weave" });
+
+    const m = cap.body().metadata;
+    expect(cap.body().content).toBe("run the weave");
+    expect(m.agent).toBe("eng");
+    expect(m.direction).toBe("inbound");
+    expect(m.sender).toBe("runner:weave");
+    expect("subject" in m).toBe(false);
+  });
+
+  test("injectInbound WITH a subject → stamps metadata.subject", async () => {
+    const cap = captureInboundWrite();
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("pm"));
+    await t.injectInbound({ content: "status", sender: "runner:standup", subject: "launch-blockers" });
+    expect(cap.body().metadata.subject).toBe("launch-blockers");
+  });
+
+  test("injectInbound with an EMPTY/whitespace subject → NO `subject` key (trimmed → absent)", async () => {
+    const cap = captureInboundWrite();
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("pm"));
+    await t.injectInbound({ content: "x", sender: "runner:j", subject: "   " });
+    expect("subject" in cap.body().metadata).toBe(false);
+  });
+
+  test("injectInbound still defaults sender to `runner` (unchanged) and stays an inbound note", async () => {
+    const cap = captureInboundWrite();
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.injectInbound({ content: "y" });
+    expect(cap.body().metadata.sender).toBe("runner");
+    expect(cap.body().metadata.direction).toBe("inbound");
+  });
+});
+
 describe("VaultTransport — writeThread (#agent/thread note, the unified model)", () => {
   test("MULTI-THREADED: writeThread() PATCH-upserts (if_missing:create) a fresh-per-fire #agent/thread note with indexed status/definition/mode + timing + Bearer (NO read-back)", async () => {
     const calls: { url: string; init: RequestInit }[] = [];
@@ -1470,6 +1524,52 @@ describe("VaultTransport — ingestInbound", () => {
     expect(m.correlation_id).toBe("corr-1");
     expect(m.delegation_depth).toBe("2"); // string-valued, as the vault stores it.
   });
+
+  // ── roles×threads NOW slice: subject on the inbound carrier ──────────────────
+  test("NULL-SUBJECT INVARIANT: a note with NO subject → emitted meta has NO `subject` key (byte-identical to HEAD)", () => {
+    const t = new VaultTransport(baseConfig());
+    const ctx = fakeCtx("eng");
+    void t.start(ctx);
+    void t.ingestInbound({
+      id: "note-nosubj",
+      content: "the weave digest please",
+      tags: ["agent/message", "agent/message/inbound"],
+      // The weave path: no subject anywhere.
+      metadata: { agent: "eng", direction: "inbound", sender: "runner:weave", ts: "2026-06-28T00:00:00Z" },
+    });
+    expect(ctx.emitted).toHaveLength(1);
+    const m = ctx.emitted[0]!.meta;
+    expect("subject" in m).toBe(false);
+    expect(m.subject).toBeUndefined();
+  });
+
+  test("a note WITH a subject → surfaces it on the emitted meta", () => {
+    const t = new VaultTransport(baseConfig());
+    const ctx = fakeCtx("pm");
+    void t.start(ctx);
+    void t.ingestInbound({
+      id: "note-subj",
+      content: "status on the launch",
+      tags: ["agent/message", "agent/message/inbound"],
+      metadata: { agent: "pm", direction: "inbound", sender: "aaron", subject: "launch-blockers" },
+    });
+    expect(ctx.emitted).toHaveLength(1);
+    expect(ctx.emitted[0]!.meta.subject).toBe("launch-blockers");
+  });
+
+  test("an EMPTY / whitespace subject → NO `subject` key (absent and blank are indistinguishable downstream)", () => {
+    const t = new VaultTransport(baseConfig());
+    const ctx = fakeCtx("pm");
+    void t.start(ctx);
+    void t.ingestInbound({
+      id: "note-blanksubj",
+      content: "x",
+      tags: ["agent/message", "agent/message/inbound"],
+      metadata: { agent: "pm", direction: "inbound", subject: "   " },
+    });
+    expect(ctx.emitted).toHaveLength(1);
+    expect("subject" in ctx.emitted[0]!.meta).toBe(false);
+  });
 });
 
 describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", () => {
@@ -1841,6 +1941,38 @@ describe("VaultTransport — scheduled-job notes (vault-native store)", () => {
     // CONTRACT: routing key under `metadata.agent` ONLY — no `channel`.
     expect(body.metadata.agent).toBe("eng");
     expect(body.metadata.channel).toBeUndefined();
+    // NULL-SUBJECT INVARIANT: a job with no subject writes NO `subject` key (byte-identical to HEAD).
+    expect("subject" in body.metadata).toBe(false);
+  });
+
+  test("upsertJobNote WITH a subject → persists metadata.subject; empty/whitespace → absent (roles×threads NOW slice)", async () => {
+    const bodies: Array<{ metadata: Record<string, string> }> = [];
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ id: "x" }), { status: 201 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.upsertJobNote({ id: "s", message: "go", channel: "eng", cron: "0 9 * * *", enabled: true, createdAt: "t0", subject: "launch-blockers" });
+    expect(bodies[0]!.metadata.subject).toBe("launch-blockers");
+    await t.upsertJobNote({ id: "s2", message: "go", channel: "eng", cron: "0 9 * * *", enabled: true, createdAt: "t0", subject: "   " });
+    expect("subject" in bodies[1]!.metadata).toBe(false);
+  });
+
+  test("listJobNotes reads metadata.subject back when present (roles×threads NOW slice)", async () => {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify([
+          { id: "n-subj", content: "go", metadata: { jobId: "withsubj", agent: "pm", cron: "0 9 * * *", enabled: "true", subject: "launch-blockers" } },
+          { id: "n-nosubj", content: "go", metadata: { jobId: "nosubj", agent: "eng", cron: "0 9 * * *", enabled: "true" } },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    const jobs = await t.listJobNotes();
+    const withSubj = jobs.find((j) => j.id === "withsubj")!;
+    const noSubj = jobs.find((j) => j.id === "nosubj")!;
+    expect(withSubj.subject).toBe("launch-blockers");
+    expect(noSubj.subject).toBeUndefined();
   });
 
   test("patchJobNote sends a PATCH with only the changed metadata", async () => {

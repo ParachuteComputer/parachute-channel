@@ -428,6 +428,22 @@ export function buildAgentChildEnv(
   }
   if (!out.PATH) out.PATH = "/usr/local/bin:/usr/bin:/bin";
 
+  // IS_SANDBOX=1 — signal to claude that it is running INSIDE a sandbox (agent#155).
+  // The programmatic turn always launches inside a bwrap/Seatbelt sandbox (that IS the
+  // containment), so `--dangerously-skip-permissions` is safe — but Claude Code REFUSES
+  // that flag under root/sudo ("cannot be used with root/sudo privileges for security
+  // reasons") UNLESS `IS_SANDBOX` is set, which makes EVERY turn error on a daemon that
+  // runs as root (e.g. the friends/team box). Setting it here makes the fix permanent +
+  // automatic (it was being worked around per-deploy via the env store, which is lost on
+  // reset). It defaults to "1" for every sandboxed turn but honors an explicit operator
+  // value from `channelEnv` (already laid down above) — so an operator who deliberately
+  // sets it can still override. NB: IS_SANDBOX is NOT in SANDBOX_ENV_ALLOWLIST and is not
+  // set by `seedAgentHome`, so it survives `mergeSandboxLaunchEnv` un-clobbered — it can
+  // never be reset to empty by the env-merge layering.
+  if (typeof out.IS_SANDBOX !== "string" || out.IS_SANDBOX.length === 0) {
+    out.IS_SANDBOX = "1";
+  }
+
   // The interactive subscription credential (design §6). Explicitly the ONLY
   // Claude auth var set; ANTHROPIC_API_KEY is intentionally absent. Set LAST so no
   // channel-injected var can ever override the session's managed auth.

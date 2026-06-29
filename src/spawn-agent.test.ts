@@ -233,6 +233,26 @@ describe("buildAgentChildEnv — scrub, inject OAuth, NEVER ANTHROPIC_API_KEY", 
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("tok");
     expect(env.PATH).toBe("/usr/bin");
   });
+
+  test("IS_SANDBOX=1 is set by default (agent#155 — claude -p --dangerously-skip-permissions runs under root)", () => {
+    // The bwrap/Seatbelt sandbox IS the containment, so the child signals it's sandboxed —
+    // otherwise Claude Code refuses --dangerously-skip-permissions under root/sudo and every
+    // turn errors on a daemon running as root.
+    const env = buildAgentChildEnv({ PATH: "/usr/bin", HOME: "/h" }, "tok");
+    expect(env.IS_SANDBOX).toBe("1");
+  });
+
+  test("IS_SANDBOX default applies even with NO parent env (always present for a sandboxed turn)", () => {
+    const env = buildAgentChildEnv({}, "tok");
+    expect(env.IS_SANDBOX).toBe("1");
+  });
+
+  test("IS_SANDBOX: an explicit operator value from the channel env store overrides the default", () => {
+    // An operator who deliberately sets IS_SANDBOX via the env store can still override the
+    // "1" default — but the default still guarantees it's present for every turn otherwise.
+    const env = buildAgentChildEnv({ PATH: "/usr/bin" }, "tok", { IS_SANDBOX: "0" });
+    expect(env.IS_SANDBOX).toBe("0");
+  });
 });
 
 describe("mergeSandboxLaunchEnv — the scrub WINS over the engine's returned env", () => {
@@ -294,6 +314,19 @@ describe("mergeSandboxLaunchEnv — the scrub WINS over the engine's returned en
     expect(SANDBOX_ENV_ALLOWLIST.has("ANTHROPIC_API_KEY")).toBe(false);
     expect(SANDBOX_ENV_ALLOWLIST.has("CLAUDE_API_KEY")).toBe(false);
     expect(SANDBOX_ENV_ALLOWLIST.has("CLAUDE_CODE_OAUTH_TOKEN")).toBe(false);
+  });
+
+  test("IS_SANDBOX=1 SURVIVES the merge un-clobbered (agent#155 — can't be reset to empty by layering)", () => {
+    // IS_SANDBOX is not in SANDBOX_ENV_ALLOWLIST and is not set by seedAgentHome, so neither
+    // the engine's returned env nor homeEnv can overwrite the childEnv's "1" — even if the
+    // daemon's ambient env carried an empty IS_SANDBOX, it would be dropped (not allowlisted).
+    expect(SANDBOX_ENV_ALLOWLIST.has("IS_SANDBOX")).toBe(false);
+    const env = mergeSandboxLaunchEnv(
+      childEnv, // built by buildAgentChildEnv above → carries IS_SANDBOX="1"
+      { ...wrappedEnv, IS_SANDBOX: "" }, // a daemon ambient empty value must NOT clobber it
+      homeEnv,
+    );
+    expect(env.IS_SANDBOX).toBe("1");
   });
 });
 

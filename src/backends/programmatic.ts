@@ -78,6 +78,7 @@ import { buildAgentMcpConfigJson, vaultEntryKey } from "../agent-mcp-config.ts";
 import { resolveClaudeCredential, resolveChannelEnv } from "../credentials.ts";
 import { resolveInjectedGrants, type GrantsClient } from "../grants.ts";
 import { parseStreamJsonStream } from "./stream-json.ts";
+import { composeSystemPrompt } from "./types.ts";
 import type {
   AgentBackend,
   AgentHandle,
@@ -85,6 +86,7 @@ import type {
   DeliverResult,
   DeliverUsage,
   InterimSink,
+  LoadoutEntry,
   RunContext,
   TurnSession,
 } from "./types.ts";
@@ -442,7 +444,7 @@ export class ProgrammaticBackend implements AgentBackend {
     onInterim?: InterimSink,
     attachments?: InboundAttachment[],
     runContext?: RunContext,
-    subjectDossier?: string,
+    loadout?: LoadoutEntry[],
     subject?: string,
   ): Promise<DeliverResult> {
     const spec = handle.spec;
@@ -595,19 +597,34 @@ export class ProgrammaticBackend implements AgentBackend {
     // robust to long/multiline prompts and keeps the prompt visible-on-disk. Its
     // lifecycle is tied to the workspace (like .mcp.json) — it disappears with it.
     //
-    // COMPOSED PROMPT (roles×threads NOW slice): when a `subjectDossier` is handed in,
-    // the agent's stable ROLE (the spec's systemPrompt) is composed with the per-thread
-    // subject context as `roleBody + "\n\n---\n\n" + dossier`. The role stays constant
-    // across a role's threads; the subject-specific dossier layers on top. Absent/empty
-    // dossier → the role body is written VERBATIM (byte-identical to HEAD — the
-    // null-subject invariant; the run-context preamble stays on the MESSAGE, not here).
+    // COMPOSED PROMPT (threads-only Phase A — DESIGN-2026-06-29-threads-only.md §1/§9):
+    // the system prompt is an ORDERED LIST of loaded notes — a direct arity-N generalization
+    // of the rc.13 arity-2 `roleBody [+ dossier]` seam. Entry 0 is the thread's SELF entry:
+    // the spec's `systemPrompt` (the def body), labeled with the def note's PATH
+    // (`spec.definition`, the `#agent/definition` note id which IS its vault path; fallback
+    // `spec.name`). Entries 1..N are the resolved `loadout` notes (read CONTENT-only, never
+    // metadata). composeSystemPrompt dedupes by path, skips blank entries, renders each as
+    // `# <path>\n\n<content>`, joins with `\n\n---\n\n`, and enforces the byte budget
+    // (truncate loadout-notes-first, NEVER the self entry).
+    //
+    // NO-LOADOUT INVARIANT (the live 4am steward weave path): a thread with NO loadout
+    // composes to EXACTLY `# <path>\n\n<def body>` — `<def body>` byte-identical to
+    // `spec.systemPrompt`. The single `# <path>` header is the ONLY change to a no-loadout
+    // prompt (design decision #4, accepted). The run-context preamble stays on the MESSAGE.
     let systemPromptFile: string | undefined;
     if (typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0) {
-      const roleBody = spec.systemPrompt;
-      const composed =
-        typeof subjectDossier === "string" && subjectDossier.length > 0
-          ? `${roleBody}\n\n---\n\n${subjectDossier}`
-          : roleBody;
+      // Self entry: the def body, labeled by the def note's PATH (resolve from the def note
+      // id when available — in a Parachute vault the note id IS the path, e.g.
+      // `Agents/uni-weaver`; acceptable fallback label is the spec name).
+      const selfPath =
+        typeof spec.definition === "string" && spec.definition.length > 0
+          ? spec.definition
+          : spec.name;
+      const entries: LoadoutEntry[] = [
+        { path: selfPath, content: spec.systemPrompt },
+        ...(loadout ?? []),
+      ];
+      const composed = composeSystemPrompt(entries);
       systemPromptFile = join(workspace, "system-prompt.txt");
       writeFileSync(systemPromptFile, composed, { mode: 0o600 });
     }

@@ -137,6 +137,7 @@ import {
   type QueuedMessage,
   type TurnEventSink,
 } from "./backends/registry.ts";
+import type { LoadoutEntry } from "./backends/types.ts";
 import {
   AttachedQueueRegistry,
   type AttachedQueueStore,
@@ -869,6 +870,26 @@ export function buildClearSession(
 }
 
 /**
+ * Build the {@link ProgrammaticAgentRegistry}'s pre-turn LOADOUT read (threads-only Phase A —
+ * DESIGN-2026-06-29-threads-only.md §9). Resolve the channel's transport and read the thread's
+ * `metadata.loadout` note paths off its `#agent/thread` note, each as a {@link LoadoutEntry}
+ * (`{ path, content }` — CONTENT only). Only the VaultTransport implements `readThreadLoadout`;
+ * other transports omit it → an empty loadout (the def body alone, the no-loadout invariant).
+ * The registry calls this BEFORE a turn so the backend composes the arity-N system prompt.
+ * Mirrors {@link buildReadSession}. (The transport's `{path,content}[]` is structurally
+ * identical to `LoadoutEntry[]` — the transport layer doesn't import the backend layer.)
+ */
+export function buildReadLoadout(
+  channels: Map<string, Channel>,
+): (channel: string, name: string, subject?: string) => Promise<LoadoutEntry[]> {
+  return async (channel, name, subject) => {
+    const ch = channels.get(channel);
+    if (!ch?.transport.readThreadLoadout) return [];
+    return ch.transport.readThreadLoadout(channel, name, subject);
+  };
+}
+
+/**
  * Build the REAL programmatic-agent registry — the {@link ProgrammaticBackend}
  * wired to the env-resolved spawn deps, plus the outbound-write + thread-note +
  * session-read seams over the live `channels`. The session UUID lives on the durable
@@ -927,6 +948,10 @@ export function createDefaultProgrammaticRegistry(
     writeCallback: buildWriteCallback(channels),
     readSession: buildReadSession(channels),
     clearSession: buildClearSession(channels),
+    // threads-only Phase A: resolve the thread's loadout notes (metadata.loadout → content)
+    // so the backend composes the arity-N system prompt. SUPERSEDES the never-wired
+    // subjectDossier seam. Empty loadout (no metadata.loadout) → the def body alone.
+    readLoadout: buildReadLoadout(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }

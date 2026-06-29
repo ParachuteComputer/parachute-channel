@@ -563,66 +563,110 @@ describe("ProgrammaticBackend.deliver — the backend is a pure function of the 
   });
 });
 
-describe("ProgrammaticBackend.deliver — composed system prompt (roles×threads NOW slice)", () => {
+describe("ProgrammaticBackend.deliver — composed system prompt (threads-only Phase A: arity-N loadout)", () => {
   const ROLE = "You are the eng agent. Be terse.";
 
-  test("NO subjectDossier → system-prompt.txt is the role body VERBATIM (null-subject invariant)", async () => {
+  /** A spec whose def-note PATH (spec.definition) is set — the self-entry header source. */
+  function specWithDef(prompt: string, definition: string, name = "eng"): AgentSpec {
+    return { ...specWithSystemPrompt(prompt, undefined, name), definition };
+  }
+
+  test("NO-LOADOUT INVARIANT: system-prompt.txt = `# <path>\\n\\n<body>`, body byte-identical (the steward weave path)", async () => {
     mkDirs("compose-none");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-CP1", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
-    const handle = await backend.start(specWithSystemPrompt(ROLE, undefined, "eng"));
+    // def note PATH set → the self entry is labeled with it (resolved from spec.definition).
+    const handle = await backend.start(specWithDef(ROLE, "Agents/steward", "eng"));
 
-    // deliver WITHOUT the 7th param — exactly today's call shape (the weave path).
+    // deliver WITHOUT a loadout — exactly the weave call shape (no 7th param).
     const result = await backend.deliver(handle, "do the thing", createSession("sess-CP1"));
     expect(result.ok).toBe(true);
 
     const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
-    // BYTE-IDENTICAL to the role body — no separator, no dossier, no trailing additions.
-    expect(readFileSync(promptPath, "utf8")).toBe(ROLE);
+    const written = readFileSync(promptPath, "utf8");
+    // EXACTLY the self entry: `# <path>\n\n<body>`. The header line is the ONLY change to a
+    // no-loadout prompt; the body after `# <path>\n\n` is BYTE-IDENTICAL to spec.systemPrompt.
+    expect(written).toBe(`# Agents/steward\n\n${ROLE}`);
+    // And asserted from the other direction: strip the header → the body is the role verbatim.
+    expect(written.slice(`# Agents/steward\n\n`.length)).toBe(ROLE);
   });
 
-  test("empty/whitespace subjectDossier → still the role body VERBATIM (treated as absent)", async () => {
+  test("self-entry PATH falls back to spec.name when spec.definition is absent", async () => {
+    mkDirs("compose-fallback");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-CP1b", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    // No definition set → the self entry header is the spec name.
+    const handle = await backend.start(specWithSystemPrompt(ROLE, undefined, "eng"));
+
+    await backend.deliver(handle, "go", createSession("sess-CP1b"));
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(`# eng\n\n${ROLE}`);
+  });
+
+  test("empty/whitespace loadout → still just the self entry (treated as no loadout)", async () => {
     mkDirs("compose-empty");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-CP2", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
-    const handle = await backend.start(specWithSystemPrompt(ROLE, undefined, "eng"));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/steward", "eng"));
 
-    await backend.deliver(handle, "go", createSession("sess-CP2"), undefined, undefined, undefined, "");
+    await backend.deliver(handle, "go", createSession("sess-CP2"), undefined, undefined, undefined, []);
 
     const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
-    expect(readFileSync(promptPath, "utf8")).toBe(ROLE);
+    expect(readFileSync(promptPath, "utf8")).toBe(`# Agents/steward\n\n${ROLE}`);
   });
 
-  test("a subjectDossier → system-prompt.txt is `role + \"\\n\\n---\\n\\n\" + dossier`", async () => {
-    mkDirs("compose-dossier");
+  test("MULTI-NOTE loadout → [self, ...notes] in order, each path-headered, joined by `---`", async () => {
+    mkDirs("compose-multi");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-CP3", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
-    const handle = await backend.start(specWithSystemPrompt(ROLE, undefined, "eng"));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/steward", "eng"));
 
-    const dossier = "## Subject: launch-blockers\nFocus only on items tagged P0.";
-    await backend.deliver(
-      handle,
-      "go",
-      createSession("sess-CP3"),
-      undefined,
-      undefined,
-      undefined,
-      dossier,
-    );
+    await backend.deliver(handle, "go", createSession("sess-CP3"), undefined, undefined, undefined, [
+      { path: "Projects/Surface", content: "Project body A." },
+      { path: "Packs/GitHub", content: "Pack body B." },
+    ]);
 
     const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
-    expect(readFileSync(promptPath, "utf8")).toBe(`${ROLE}\n\n---\n\n${dossier}`);
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Agents/steward\n\n${ROLE}` +
+        `\n\n---\n\n# Projects/Surface\n\nProject body A.` +
+        `\n\n---\n\n# Packs/GitHub\n\nPack body B.`,
+    );
   });
 
-  test("no spec.systemPrompt + a dossier → NO system-prompt file (the role-less case is unchanged)", async () => {
+  test("loadout DEDUPES by path (first wins) and SKIPS blank-bodied entries", async () => {
+    mkDirs("compose-dedupe");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-CP5", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/steward", "eng"));
+
+    await backend.deliver(handle, "go", createSession("sess-CP5"), undefined, undefined, undefined, [
+      { path: "Projects/Surface", content: "First wins." },
+      { path: "Projects/Surface", content: "Duplicate — dropped." },
+      { path: "Packs/Blank", content: "   \n  " }, // whitespace-only → skipped
+      { path: "Packs/GitHub", content: "Kept." },
+    ]);
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Agents/steward\n\n${ROLE}` +
+        `\n\n---\n\n# Projects/Surface\n\nFirst wins.` +
+        `\n\n---\n\n# Packs/GitHub\n\nKept.`,
+    );
+  });
+
+  test("no spec.systemPrompt + a loadout → NO system-prompt file (the role-less case is unchanged)", async () => {
     mkDirs("compose-noprompt");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-CP4", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
-    // specWithVault carries NO systemPrompt — a dossier alone must NOT synthesize a prompt file
-    // (composing onto an empty role is out of scope for NOW; the role gate is unchanged).
+    // specWithVault carries NO systemPrompt — a loadout alone must NOT synthesize a prompt file
+    // (composing onto an empty self entry is out of scope; the role gate is unchanged).
     const handle = await backend.start(specWithVault("eng"));
 
-    await backend.deliver(handle, "go", createSession("sess-CP4"), undefined, undefined, undefined, "a dossier");
+    await backend.deliver(handle, "go", createSession("sess-CP4"), undefined, undefined, undefined, [
+      { path: "Packs/GitHub", content: "a note" },
+    ]);
 
     const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
     expect(existsSync(promptPath)).toBe(false);
@@ -792,9 +836,10 @@ describe("ProgrammaticBackend.deliver — system prompt (file-backed, per-turn)"
     await backend.deliver(handle, "hello", freshSession());
 
     const promptPath = join(sessionsDir, "eng", "system-prompt.txt");
-    // The file exists, is 0600, and carries the EXACT prompt text.
+    // The file exists, is 0600, and carries the composed prompt: the self entry headered by the
+    // def path (here the spec name `eng`, no spec.definition set) + the role body verbatim.
     expect(statSync(promptPath).mode & 0o777).toBe(0o600);
-    expect(readFileSync(promptPath, "utf8")).toBe("You are the eng release bot.");
+    expect(readFileSync(promptPath, "utf8")).toBe("# eng\n\nYou are the eng release bot.");
     // The wrapped claude command (engine echoes it in argv[2]) carries the -file flag.
     const cmd = calls[0]!.argv[2]!;
     expect(cmd).toContain("--append-system-prompt-file");
@@ -813,7 +858,7 @@ describe("ProgrammaticBackend.deliver — system prompt (file-backed, per-turn)"
     await backend.deliver(handle, "hello", freshSession());
 
     const promptPath = join(sessionsDir, "eng", "system-prompt.txt");
-    expect(readFileSync(promptPath, "utf8")).toBe("Full custom persona.");
+    expect(readFileSync(promptPath, "utf8")).toBe("# eng\n\nFull custom persona.");
     const cmd = calls[0]!.argv[2]!;
     expect(cmd).toContain("--system-prompt-file");
     expect(cmd).not.toContain("--append-system-prompt-file");
@@ -845,8 +890,9 @@ describe("ProgrammaticBackend.deliver — system prompt (file-backed, per-turn)"
     await backend.deliver(handle, "turn two", resumeSession("sess-SP"));
 
     const promptPath = join(sessionsDir, "eng", "system-prompt.txt");
-    // The file is present after the resume turn too (re-written each deliver).
-    expect(readFileSync(promptPath, "utf8")).toBe("Per-turn role.");
+    // The file is present after the resume turn too (re-written each deliver), composed with
+    // the self-entry path header (the spec name `eng`, no spec.definition set).
+    expect(readFileSync(promptPath, "utf8")).toBe("# eng\n\nPer-turn role.");
     // Turn 1: -file flag + --session-id. Turn 2 (resume): -file flag AND --resume.
     const cmd1 = calls[0]!.argv[2]!;
     const cmd2 = calls[1]!.argv[2]!;

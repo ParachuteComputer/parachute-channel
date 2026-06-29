@@ -33,6 +33,7 @@ import type {
   DeliverResult,
   InboundAttachment,
   InterimSink,
+  LoadoutEntry,
   RunContext,
   TurnSession,
 } from "./types.ts";
@@ -62,6 +63,8 @@ class FakeBackend implements AgentBackend {
     runContext?: RunContext;
     /** roles×threads NEXT slice (#120, G): the thread subject the drain threaded in. */
     subject?: string;
+    /** threads-only Phase A: the resolved LOADOUT entries the drain threaded in. */
+    loadout?: LoadoutEntry[];
   }[] = [];
   /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial — PER drain key). */
   maxConcurrent = 0;
@@ -113,7 +116,7 @@ class FakeBackend implements AgentBackend {
     onInterim?: InterimSink,
     _attachments?: InboundAttachment[],
     runContext?: RunContext,
-    _subjectDossier?: string,
+    loadout?: LoadoutEntry[],
     subject?: string,
   ): Promise<DeliverResult> {
     this.calls.push({
@@ -122,6 +125,7 @@ class FakeBackend implements AgentBackend {
       session,
       ...(runContext ? { runContext } : {}),
       ...(subject ? { subject } : {}),
+      ...(loadout ? { loadout } : {}),
     });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);

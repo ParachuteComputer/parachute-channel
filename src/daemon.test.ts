@@ -763,8 +763,10 @@ describe("agent#156 — /health surfaces the dependency preflight when wired", (
     const channels = new Map<string, Channel>();
     const registry = new ClientRegistry();
     // bwrap + claude missing, rg + socat present (a representative partial-fresh box).
-    const preflight = checkProgrammaticDeps((bin) =>
-      bin === "rg" || bin === "socat" ? `/usr/bin/${bin}` : null,
+    // Pin platform to linux so bwrap/socat are in scope (they're linuxOnly).
+    const preflight = checkProgrammaticDeps(
+      (bin) => (bin === "rg" || bin === "socat" ? `/usr/bin/${bin}` : null),
+      "linux",
     );
     const srv = Bun.serve({
       port: 0,

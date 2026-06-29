@@ -29,22 +29,29 @@ interface RequiredDep {
   label: string;
   /** The install hint shown when it's missing. */
   hint: string;
+  /**
+   * True when this dep is only required on LINUX. On macOS the sandbox uses Seatbelt
+   * (built in, no helper binaries), so the bubblewrap egress-proxy deps (`bwrap`,
+   * `socat`) aren't needed — flagging them on a Mac deploy (the documented preferred
+   * self-host path) would be a false-positive that trains operators to ignore the
+   * preflight. So they're checked on Linux only. (`rg` is NOT linux-only: the runtime's
+   * deny-path scan needs a real ripgrep on macOS too. `claude` is needed everywhere.)
+   */
+  linuxOnly?: boolean;
 }
 
 /**
- * The deps a programmatic `claude -p` turn needs. The first three are the Linux
- * sandbox deps the runtime shells out to (`spawn-deps.ts` / the sandbox runtime —
- * bubblewrap is the containment, ripgrep does the deny-path scan, socat bridges the
- * egress proxy); `claude` is the CLI the turn actually runs. On macOS the sandbox
- * uses Seatbelt (built in) so `bwrap`/`socat` aren't required there — but the check
- * is cheap and the warning is advisory, so we report them uniformly and let the
- * operator judge (the live turn's own dep check is platform-accurate). `claude` is
- * required on every platform.
+ * The deps a programmatic `claude -p` turn needs. `bwrap`/`socat` are the LINUX
+ * bubblewrap sandbox deps the runtime shells out to (bubblewrap is the containment,
+ * socat bridges the egress proxy) — not needed under macOS Seatbelt, so `linuxOnly`.
+ * `rg` (ripgrep) does the deny-path scan on EVERY platform (the macOS sandbox needs a
+ * real `rg` too). `claude` is the CLI the turn runs, required everywhere. The platform
+ * filter is applied in {@link checkProgrammaticDeps}.
  */
 export const REQUIRED_DEPS: readonly RequiredDep[] = [
-  { bin: "bwrap", label: "bubblewrap (bwrap)", hint: "apt install bubblewrap" },
+  { bin: "bwrap", label: "bubblewrap (bwrap)", hint: "apt install bubblewrap", linuxOnly: true },
   { bin: "rg", label: "ripgrep (rg)", hint: "apt install ripgrep" },
-  { bin: "socat", label: "socat", hint: "apt install socat" },
+  { bin: "socat", label: "socat", hint: "apt install socat", linuxOnly: true },
   {
     bin: "claude",
     label: "Claude Code CLI (claude)",
@@ -57,6 +64,11 @@ export type WhichFn = (bin: string) => string | null;
 
 /** The default resolver — Bun.which against the daemon's PATH. */
 export const realWhich: WhichFn = (bin) => Bun.which(bin);
+
+/** Which {@link REQUIRED_DEPS} apply on the given platform (drops `linuxOnly` deps off Linux). */
+export function depsForPlatform(platform: NodeJS.Platform = process.platform): RequiredDep[] {
+  return REQUIRED_DEPS.filter((d) => !d.linuxOnly || platform === "linux");
+}
 
 /** The outcome of {@link checkProgrammaticDeps}: which required deps are missing + a ready-to-log warning. */
 export interface PreflightResult {
@@ -73,12 +85,16 @@ export interface PreflightResult {
 }
 
 /**
- * PURE check: resolve each {@link REQUIRED_DEPS} binary via `which` and build the
- * missing-deps result + warning text. No I/O beyond the injected `which`; no logging
- * (the caller logs). Cheap + idempotent — safe to call at boot.
+ * PURE check: resolve each platform-applicable {@link REQUIRED_DEPS} binary via `which`
+ * and build the missing-deps result + warning text. No I/O beyond the injected `which`;
+ * no logging (the caller logs). Cheap + idempotent — safe to call at boot. `platform` is
+ * injectable so a test can assert the macOS filter without running on a Mac.
  */
-export function checkProgrammaticDeps(which: WhichFn = realWhich): PreflightResult {
-  const missing = REQUIRED_DEPS.filter((d) => {
+export function checkProgrammaticDeps(
+  which: WhichFn = realWhich,
+  platform: NodeJS.Platform = process.platform,
+): PreflightResult {
+  const missing = depsForPlatform(platform).filter((d) => {
     try {
       return !which(d.bin);
     } catch {
@@ -102,15 +118,21 @@ export function checkProgrammaticDeps(which: WhichFn = realWhich): PreflightResu
  * surface the missing-deps state elsewhere (e.g. `/health`). Never throws — the daemon
  * keeps booting regardless.
  */
-export function runBootPreflight(which: WhichFn = realWhich): PreflightResult {
+export function runBootPreflight(
+  which: WhichFn = realWhich,
+  platform: NodeJS.Platform = process.platform,
+): PreflightResult {
   let result: PreflightResult;
   try {
-    result = checkProgrammaticDeps(which);
+    result = checkProgrammaticDeps(which, platform);
   } catch (err) {
-    // Defensive: the preflight must never break boot. Treat an unexpected fault as "ok"
-    // (the turn-time check in spawn-deps.ts remains the real guard).
-    console.error(`parachute-agent: boot preflight errored (continuing): ${(err as Error).message}`);
-    return { missing: [], ok: true, warning: null };
+    // Defensive: the preflight must never break boot. An unexpected fault is reported
+    // HONESTLY (ok:false + the error in the warning) rather than a false "all clear" —
+    // but it's still non-fatal; the daemon boots and the turn-time check in
+    // spawn-deps.ts remains the real guard.
+    const msg = `parachute-agent: boot preflight errored (continuing, dependency state UNKNOWN): ${(err as Error).message}`;
+    console.error(msg);
+    return { missing: [], ok: false, warning: msg };
   }
   if (result.warning) console.warn(result.warning);
   return result;

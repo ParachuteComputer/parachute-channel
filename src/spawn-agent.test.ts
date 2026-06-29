@@ -328,6 +328,23 @@ describe("mergeSandboxLaunchEnv — the scrub WINS over the engine's returned en
     );
     expect(env.IS_SANDBOX).toBe("1");
   });
+
+  test("IS_SANDBOX=1: the FINAL homeEnv spread can't clobber it because seedAgentHome never sets it", () => {
+    // The merge ends with `{ ...out, ...homeEnv }` — homeEnv wins LAST. So IS_SANDBOX="1"
+    // survives the real layering ONLY because seedAgentHome's returned env never carries
+    // IS_SANDBOX. Pin that invariant directly: a future homeEnv key would otherwise be the
+    // one path that could reset it. (Use a tmp workspace so the seed writes somewhere safe.)
+    const ws = mkdtempSync(join(tmpdir(), "agent-is-sandbox-home-"));
+    try {
+      const realHomeEnv = seedAgentHome(ws);
+      expect("IS_SANDBOX" in realHomeEnv).toBe(false);
+      // And the full merge with the REAL homeEnv keeps childEnv's "1".
+      const env = mergeSandboxLaunchEnv(childEnv, wrappedEnv, realHomeEnv);
+      expect(env.IS_SANDBOX).toBe("1");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("buildAgentClaudeArgs", () => {

@@ -67,11 +67,27 @@
 import type { DefVaultBinding } from "./agent-defs.ts";
 import { mintScopedToken, vaultScope, MintError } from "./mint-token.ts";
 import { DEFAULT_DEF_VAULT_URL } from "./def-vaults.ts";
+import { AGENT_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 
 /** The bare def-discriminator tag the def-watch triggers filter on (post-canonicalization). */
 export const DEFINITION_TAG = "agent/definition";
-/** The bare inbound-message child tag the inbound trigger fires on. */
-export const INBOUND_TAG = "agent/message/inbound";
+/**
+ * The inbound trigger's `when` predicate. SOURCED from the existing
+ * {@link AGENT_VAULT_TRIGGER_TEMPLATE} (`src/transports/vault.ts`) — the
+ * module-owned shape the hub already substitutes — so the daemon's
+ * auto-registration produces a SEMANTICALLY IDENTICAL trigger to the
+ * hub-Connections path (bare `agent/message/inbound` tag, `has_metadata:[agent]`,
+ * `missing_metadata:[channel_inbound_rendered_at]`). Reusing the one source of
+ * truth keeps the two registration paths from drifting on the field names.
+ *
+ * (The real loop guard is the vault engine's own `<triggerName>_rendered_at`
+ * marker, checked unconditionally regardless of `missing_metadata`. The
+ * `missing_metadata` clause is the module-owned belt — kept identical so both
+ * paths upsert cleanly over the same trigger.)
+ */
+const INBOUND_WHEN = AGENT_VAULT_TRIGGER_TEMPLATE.when;
+/** The bare inbound-message child tag the inbound trigger fires on (from the template). */
+export const INBOUND_TAG = INBOUND_WHEN.tags[0];
 
 /** The `agent:send` scope minted for every webhook `action.auth.bearer`. */
 const WEBHOOK_SCOPE = "agent:send";
@@ -152,13 +168,15 @@ export function buildDefVaultTriggers(
     },
     // INBOUND — a new bare `agent/message/inbound` note (routed by metadata.agent,
     // not yet rendered) wakes the agent. One trigger routes every agent in the vault.
+    // `when` is the module-owned shape from AGENT_VAULT_TRIGGER_TEMPLATE (copied so
+    // the predicate matches the hub-Connections path exactly).
     {
       name: inboundTriggerName(vault),
       events: ["created"],
       when: {
-        tags: [INBOUND_TAG],
-        has_metadata: ["agent"],
-        missing_metadata: ["agent_inbound_rendered_at"],
+        tags: [...INBOUND_WHEN.tags],
+        has_metadata: [...INBOUND_WHEN.has_metadata],
+        missing_metadata: [...INBOUND_WHEN.missing_metadata],
       },
       action: { webhook: inboundWebhook, send: "json", auth },
     },
@@ -200,34 +218,42 @@ export async function registerDefVaultTriggers(
   const fetchFn = deps.fetchFn ?? fetch;
   const result: RegisterTriggersResult = { vault, registered: [], failures: [] };
 
-  // 1. Mint the webhook bearer (agent:send) — the trigger fires this at the daemon.
-  let webhookBearer: string;
-  try {
-    const minted = await mintScopedToken(
-      { scope: WEBHOOK_SCOPE },
-      { hubOrigin: deps.hubOrigin, managerBearer: deps.managerBearer, ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}) },
-    );
-    webhookBearer = minted.token;
-  } catch (err) {
-    const detail = err instanceof MintError ? err.message : (err as Error).message;
-    result.failures.push(`mint ${WEBHOOK_SCOPE}: ${detail}`);
-    return result; // No bearer → no trigger can be registered.
-  }
+  const mintDeps = {
+    hubOrigin: deps.hubOrigin,
+    managerBearer: deps.managerBearer,
+    ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+  };
 
-  // 2. Mint the ADMIN token for the triggers API (the def-vault write token can't
-  //    register triggers — admin-scoped endpoint). If the operator bearer's authority
-  //    doesn't cover admin, the hub returns invalid_scope here — log + skip.
+  // 1. Mint the ADMIN token for the triggers API FIRST (the def-vault write token
+  //    can't register triggers — admin-scoped endpoint). This is the mint most
+  //    likely to be refused (a `vault:<v>:write`-only operator can't mint admin), so
+  //    minting it first short-circuits a restricted install before the second mint.
+  //    On `invalid_scope` the hub refuses here — log + skip, never crash boot.
   let adminToken: string;
   try {
     const minted = await mintScopedToken(
       { scope: vaultScope(vault, "admin"), expiresIn: ADMIN_MINT_TTL_SECONDS },
-      { hubOrigin: deps.hubOrigin, managerBearer: deps.managerBearer, ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}) },
+      mintDeps,
     );
     adminToken = minted.token;
   } catch (err) {
     const detail = err instanceof MintError ? err.message : (err as Error).message;
     result.failures.push(`mint ${vaultScope(vault, "admin")}: ${detail}`);
     return result; // No admin token → can't POST triggers.
+  }
+
+  // 2. Mint the webhook bearer (agent:send) — the trigger fires this at the daemon.
+  //    Long-lived (the hub's default ~90d, matching the hub's own provisioning) since
+  //    it lives in the trigger's persistent `action.auth.bearer`; re-minted on each
+  //    restart's re-registration. A refusal here also skips (no bearer → no trigger).
+  let webhookBearer: string;
+  try {
+    const minted = await mintScopedToken({ scope: WEBHOOK_SCOPE }, mintDeps);
+    webhookBearer = minted.token;
+  } catch (err) {
+    const detail = err instanceof MintError ? err.message : (err as Error).message;
+    result.failures.push(`mint ${WEBHOOK_SCOPE}: ${detail}`);
+    return result; // No bearer → no trigger can be registered.
   }
 
   // 3. POST each trigger (upsert by name).

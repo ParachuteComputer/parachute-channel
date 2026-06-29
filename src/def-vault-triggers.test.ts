@@ -10,6 +10,7 @@ import {
   type VaultTriggerInput,
 } from "./def-vault-triggers.ts";
 import type { DefVaultBinding } from "./agent-defs.ts";
+import { AGENT_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 
 const HUB = "https://hub.example.com";
 
@@ -123,13 +124,17 @@ describe("buildDefVaultTriggers — the bare-keyed shapes", () => {
     }
   });
 
-  test("inbound trigger: bare inbound tag, has_metadata:[agent], missing_metadata:[agent_inbound_rendered_at]", () => {
+  test("inbound trigger: bare inbound tag, has_metadata:[agent], missing_metadata matches the module template", () => {
     const inbound = byName("conn_agentinbound-default");
+    // The shape is sourced from AGENT_VAULT_TRIGGER_TEMPLATE so it matches the
+    // hub-Connections path exactly (same field names — no drift).
     expect(INBOUND_TAG).toBe("agent/message/inbound");
     expect(inbound.events).toEqual(["created"]);
-    expect(inbound.when.tags).toEqual(["agent/message/inbound"]);
-    expect(inbound.when.has_metadata).toEqual(["agent"]);
-    expect(inbound.when.missing_metadata).toEqual(["agent_inbound_rendered_at"]);
+    expect(inbound.when.tags).toEqual([...AGENT_VAULT_TRIGGER_TEMPLATE.when.tags]);
+    expect(inbound.when.has_metadata).toEqual([...AGENT_VAULT_TRIGGER_TEMPLATE.when.has_metadata]);
+    expect(inbound.when.missing_metadata).toEqual([...AGENT_VAULT_TRIGGER_TEMPLATE.when.missing_metadata]);
+    // Concretely (the canonical field name across module.json + the hub + vault.ts):
+    expect(inbound.when.missing_metadata).toEqual(["channel_inbound_rendered_at"]);
   });
 
   test("inbound trigger webhooks /api/vault/inbound with the agent:send bearer", () => {
@@ -177,7 +182,7 @@ describe("registerDefVaultTriggers — the live registration path", () => {
   });
 
   test("an admin-mint refusal (insufficient operator authority) skips registration, no throw", async () => {
-    const { fetchFn, triggerCalls } = fakeFetch({
+    const { fetchFn, mintCalls, triggerCalls } = fakeFetch({
       mintStatus: (scope) =>
         scope.endsWith(":admin")
           ? { status: 400, json: { error: "invalid_scope", error_description: "cannot mint admin" } }
@@ -188,6 +193,8 @@ describe("registerDefVaultTriggers — the live registration path", () => {
       managerBearer: "OP-BEARER",
       fetchFn,
     });
+    // Admin is minted FIRST and short-circuits — the agent:send mint is never attempted.
+    expect(mintCalls.map((c) => c.scope)).toEqual(["vault:default:admin"]);
     expect(triggerCalls).toHaveLength(0);
     expect(result.registered).toEqual([]);
     expect(result.failures).toHaveLength(1);
@@ -207,8 +214,8 @@ describe("registerDefVaultTriggers — the live registration path", () => {
       managerBearer: "OP-BEARER",
       fetchFn,
     });
-    // We never even attempt the admin mint once the webhook bearer fails.
-    expect(mintCalls.map((c) => c.scope)).toEqual(["agent:send"]);
+    // Admin mint succeeds first, then the webhook-bearer mint fails → no triggers.
+    expect(mintCalls.map((c) => c.scope)).toEqual(["vault:default:admin", "agent:send"]);
     expect(triggerCalls).toHaveLength(0);
     expect(result.failures[0]).toContain("agent:send");
   });

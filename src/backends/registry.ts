@@ -672,6 +672,10 @@ export class ProgrammaticAgentRegistry {
    * /health + the agents list to render `programmatic · idle|working|queued:N`.
    */
   statusOf(channel: string): { state: ProgrammaticAgentState; queued: number } {
+    // NOTE (roles×threads NEXT slice): this reads only the BARE-channel drain key, so a
+    // multi-threaded agent whose active work is on subject keys (`name--subject`) reports
+    // `idle` here. Acceptable while multi-threaded agents aren't in production; tracked for
+    // a /health upgrade before they are (the drain key, not the channel, is the unit of work).
     const queued = this.queues.get(channel)?.length ?? 0;
     if (this.draining.has(channel)) {
       // A worker is in flight. If there are messages waiting BEHIND the in-flight
@@ -705,15 +709,13 @@ export class ProgrammaticAgentRegistry {
       // channel's EXPECTED mark + any stranded pending buffer — nothing routes there now,
       // so a residual mark/buffer would leak (reviewer nit; defense-in-depth — the normal
       // flow only ever expects the NEW channel before this register).
-      this.byChannel.delete(priorChannel);
       // Clear EVERY per-thread queue/drain for the old channel (bare + subject keys), not
       // just the bare-channel key — a multi-threaded agent's subject queues would otherwise
-      // leak (roles×threads NEXT slice). clearChannelQueues reads the handle for the name
-      // prefix; do it BEFORE byChannel.delete so the prefix resolves — but byChannel was
-      // already deleted above for priorChannel, so it falls back to the channel-as-name
-      // prefix (correct for name===channel; a residual subject key self-clears on its next
-      // loop regardless, since the drain re-reads byChannel).
+      // leak (roles×threads NEXT slice). clearChannelQueues reads the handle for the subject-key
+      // name prefix, so run it BEFORE byChannel.delete while the handle is still present — that
+      // resolves the REAL agent name even if name !== channel in a future split (reviewer nit).
       this.clearChannelQueues(priorChannel);
+      this.byChannel.delete(priorChannel);
       this.expectedChannels.delete(priorChannel);
       this.pending.delete(priorChannel);
     }

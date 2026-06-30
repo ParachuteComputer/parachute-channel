@@ -745,12 +745,13 @@ describe("ProgrammaticBackend.deliver — composed system prompt (threads-only P
     expect(readFileSync(promptPath, "utf8")).toBe(`# Agents/uni\n\n${ROLE}`);
   });
 
-  test("no spec.systemPrompt + a loadout → NO system-prompt file (the role-less case is unchanged)", async () => {
+  test("no spec.systemPrompt + a loadout → file IS written from the loadout (def DECOUPLED, Phase 2)", async () => {
     mkDirs("compose-noprompt");
     const { fn } = recordingSpawn({ stdout: successTurn("sess-CP4", "ok") });
     const backend = new ProgrammaticBackend(baseDeps(fn));
-    // specWithVault carries NO systemPrompt — a loadout alone must NOT synthesize a prompt file
-    // (composing onto an empty self entry is out of scope; the role gate is unchanged).
+    // specWithVault carries NO systemPrompt (empty def body). Phase 2 DECOUPLES compose from the
+    // def body: the self entry is simply OMITTED, but the loadout (layer ③) still composes into a
+    // prompt file. (Pre-Phase-2 the empty def body suppressed the whole composition → no file.)
     const handle = await backend.start(specWithVault("eng"));
 
     await backend.deliver(handle, "go", createSession("sess-CP4"), undefined, undefined, undefined, [
@@ -758,7 +759,8 @@ describe("ProgrammaticBackend.deliver — composed system prompt (threads-only P
     ]);
 
     const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
-    expect(existsSync(promptPath)).toBe(false);
+    // No self entry (empty def body) → the file is JUST the loadout note, path-headered.
+    expect(readFileSync(promptPath, "utf8")).toBe("# Roles/GitHub\n\na note");
   });
 
   // ── roles as the layer-① composition (DESIGN-2026-06-29-threads-roles-context.md) ──
@@ -877,6 +879,124 @@ describe("ProgrammaticBackend.deliver — composed system prompt (threads-only P
     // Only the non-blank role composes (first), then the def.
     expect(readFileSync(promptPath, "utf8")).toBe(
       `# Roles/PM\n\nPM hat.` + `\n\n---\n\n# Agents/uni\n\n${ROLE}`,
+    );
+  });
+
+  // ── def body DECOUPLED from compose (Phase 2 — the flatten) ───────────────────────────
+  // The def body is now ONE OPTIONAL layer, not the anchor that gates the whole composition.
+  // An EMPTY def body no longer suppresses the prompt: roles (①) / thread content (②) / loadout
+  // (③) still compose + write the file. The file is skipped (CC default) ONLY when EVERY layer is
+  // empty. (Pre-Phase-2 an empty def body silently dropped roles, thread content AND loadout.)
+  test("EMPTY def body + thread content → file IS written, contains the thread content (the key flatten case)", async () => {
+    mkDirs("compose-empty-def-thread");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-ED1", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    // specWithVault carries NO systemPrompt (empty def body) — the thread's IDENTITY lives in ②.
+    const handle = await backend.start(specWithVault("eng"));
+
+    // deliver with a thread content (10th param), no def body, no roles, no loadout.
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-ED1"),
+      undefined,
+      undefined,
+      undefined,
+      undefined, // no loadout
+      undefined,
+      undefined,
+      { path: "Threads/eng/uni", content: "I am this thread. Hold the eco-civ book club." }, // ② thread content
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    // The file IS written (was: dropped pre-Phase-2) and the identity is PRESERVED: NO self entry
+    // (empty def body), just the thread content, path-headered. THIS is the path the flatten needs.
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      "# Threads/eng/uni\n\nI am this thread. Hold the eco-civ book club.",
+    );
+  });
+
+  test("EMPTY def body + roles + thread content + loadout → [roles, thread-content, loadout] in order; file written", async () => {
+    mkDirs("compose-empty-def-roles-thread");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-ED2", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-ED2"),
+      undefined,
+      undefined,
+      undefined,
+      [{ path: "Skills/Weave", content: "Skill body." }], // ③ loadout
+      undefined,
+      undefined,
+      { path: "Threads/eng/uni", content: "Thread mandate." }, // ② thread content
+      [{ path: "Roles/PM", content: "PM hat." }], // ① roles
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    // No self entry (empty def) → roles (①) lead, then thread content (②), then the loadout (③).
+    // The self slot is simply absent — the prefix does NOT drift (no blank entry pushed).
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Roles/PM\n\nPM hat.` +
+        `\n\n---\n\n# Threads/eng/uni\n\nThread mandate.` +
+        `\n\n---\n\n# Skills/Weave\n\nSkill body.`,
+    );
+  });
+
+  test("ALL LAYERS EMPTY (no def, no roles, no thread, no loadout) → NO system-prompt file (CC default)", async () => {
+    mkDirs("compose-all-empty");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-ED3", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    // Empty def body + explicitly-EMPTY loadout AND roles arrays + undefined thread → all layers
+    // empty. The composition is "" → no file written, no `-file` flag (the one remaining no-file case).
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-ED3"),
+      undefined,
+      undefined,
+      undefined,
+      [], // empty loadout
+      undefined,
+      undefined,
+      undefined, // no thread content
+      [], // empty roles
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(existsSync(promptPath)).toBe(false);
+    // And NO system-prompt flag on the turn → CC's default prompt.
+    expect(calls[0]!.argv[2]!).not.toContain("system-prompt-file");
+  });
+
+  test("NON-EMPTY def body is UNCHANGED by Phase 2: [self, thread-content] still composes byte-for-byte", async () => {
+    mkDirs("compose-nonempty-def-unchanged");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-ED5", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithDef(ROLE, "Agents/uni", "eng"));
+
+    // A non-empty def body + thread content → the self entry is present, exactly as before Phase 2.
+    await backend.deliver(
+      handle,
+      "go",
+      createSession("sess-ED5"),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { path: "Threads/eng/uni", content: "Thread mandate." },
+    );
+
+    const promptPath = join(sessionWorkspace(sessionsDir, "eng"), "system-prompt.txt");
+    expect(readFileSync(promptPath, "utf8")).toBe(
+      `# Agents/uni\n\n${ROLE}\n\n---\n\n# Threads/eng/uni\n\nThread mandate.`,
     );
   });
 });

@@ -205,6 +205,34 @@ describe("composeSystemPrompt — protectedCount (the roles + def + thread-conte
     );
   });
 
+  test("def ABSENT (Phase 2): protectedCount=2 over [role, thread-content, ...loadout] → roles+thread protected, only the loadout tail sheds", () => {
+    // The shape the backend builds with an EMPTY def body + one role + thread content: NO self
+    // entry, so protectedCount = roles(1) + def(0) + thread(1) = 2. The role (①) and the thread
+    // content (②) lead; only the layer-③ loadout sheds. This is the def-absent alignment the
+    // backend's `roleEntries.length + selfEntries.length + (hasThreadContent ? 1 : 0)` produces.
+    const role = { path: "Roles/PM", content: "ROLE-" + "r".repeat(200) };
+    const threadContent = { path: "Threads/eng/uni", content: "THREAD-" + "t".repeat(200) };
+    const big = (p: string) => ({ path: p, content: p + "-" + "x".repeat(400) });
+    const warnings: string[] = [];
+    // Budget fits the two protected entries (role + thread) but not the loadout notes.
+    const budget = 600;
+    const out = composeSystemPrompt([role, threadContent, big("n1"), big("n2")], {
+      budgetBytes: budget,
+      protectedCount: 2,
+      onWarn: (m) => warnings.push(m),
+    });
+    // Role first, then thread content — both survive whole, in order, with NO def entry between.
+    expect(out).toBe(
+      `# ${role.path}\n\n${role.content}\n\n---\n\n# ${threadContent.path}\n\n${threadContent.content}`,
+    );
+    // Only the layer-③ loadout tail was shed; the warn names neither the role nor the thread.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("n1");
+    expect(warnings[0]).toContain("n2");
+    expect(warnings[0]).not.toContain("Roles/PM");
+    expect(warnings[0]).not.toContain("Threads/eng/uni");
+  });
+
   test("protectedCount defaults to 1 — only the self entry is protected (the no-thread-content path)", () => {
     const self = { path: "self", content: "S".repeat(500) };
     const big = (p: string) => ({ path: p, content: p + "-" + "x".repeat(400) });

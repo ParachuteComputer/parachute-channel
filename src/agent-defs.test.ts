@@ -14,6 +14,8 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import {
   parseAgentDef,
+  parseThreadSpec,
+  parseDiscoveryMode,
   resolveDefStatus,
   DefVaultClient,
   AgentDefRegistry,
@@ -1690,5 +1692,318 @@ describe("AgentDefRegistry — reconcileRole (per-role grant reconcile, Phase B�
     // Specifically: no def-name partition was touched.
     expect(registered.some((r) => r.agent === "steward")).toBe(false);
     expect(reconciled.some((r) => r.agent === "steward")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseThreadSpec — `#agent/thread` note → AgentSpec (Phase 4a dual-discovery)
+// ---------------------------------------------------------------------------
+
+describe("parseThreadSpec", () => {
+  test("name comes from metadata.agent; systemPrompt is EMPTY (identity composes at turn time)", () => {
+    const parsed = parseThreadSpec(
+      {
+        id: "Threads/uni/uni",
+        path: "Threads/uni/uni",
+        content: "## Summary\nrolling summary — NOT the prompt",
+        metadata: { agent: "uni", backend: "programmatic", model: "claude-opus-4-8" },
+      },
+      { vault: "default" },
+    );
+    expect(parsed.name).toBe("uni");
+    expect(parsed.spec.name).toBe("uni");
+    expect(parsed.spec.channels).toEqual(["uni"]); // wake channel = agent name.
+    // The BODY is the rolling summary — NEVER read as the prompt.
+    expect(parsed.spec.systemPrompt).toBeUndefined();
+    expect(parsed.spec.backend).toBe("programmatic");
+    expect(parsed.spec.model).toBe("claude-opus-4-8");
+    // Own-vault binding, write-scoped (same as a def).
+    expect(parsed.spec.vault).toEqual({ name: "default", access: "write" });
+    // The thread path is the self-entry header source (#169).
+    expect(parsed.spec.definitionPath).toBe("Threads/uni/uni");
+  });
+
+  test("backend/model/mode default safely; sandbox knobs default (absent) safely", () => {
+    const parsed = parseThreadSpec(
+      { id: "Threads/x/x", metadata: { agent: "x" } }, // only the routing key.
+      { vault: "default" },
+    );
+    expect(parsed.spec.backend).toBe("programmatic"); // default
+    expect(parsed.spec.mode).toBe("single-threaded"); // default
+    expect(parsed.spec.model).toBeUndefined();
+    // SAFE DEFAULTS — the live agents run on these (absence is the common case).
+    expect(parsed.spec.workspace).toBeUndefined();
+    expect(parsed.spec.filesystem).toBeUndefined();
+    expect(parsed.spec.network).toBeUndefined();
+    expect(parsed.spec.egress).toBeUndefined();
+    expect(parsed.agentStatus).toBe("enabled"); // default when agent_status absent.
+    expect(parsed.wants).toEqual([]);
+  });
+
+  test("reads backend/mode/sandbox knobs from metadata when present (dual-read channel→attached)", () => {
+    const parsed = parseThreadSpec(
+      {
+        id: "Threads/lab/lab",
+        metadata: {
+          agent: "lab",
+          backend: "channel", // legacy value → attached
+          mode: "multi-threaded",
+          workspace: "/srv/lab",
+          filesystem: "full",
+          network: "restricted",
+          egress: "api.example.com, cdn.example.com",
+        },
+      },
+      { vault: "default" },
+    );
+    expect(parsed.spec.backend).toBe("attached"); // dual-read normalized.
+    expect(parsed.spec.mode).toBe("multi-threaded");
+    expect(parsed.spec.workspace).toBe("/srv/lab");
+    expect(parsed.spec.filesystem).toBe("full");
+    expect(parsed.spec.network).toBe("restricted");
+    expect(parsed.spec.egress).toEqual(["api.example.com", "cdn.example.com"]);
+  });
+
+  test("agent_status:disabled is read onto agentStatus (DISTINCT from metadata.status)", () => {
+    const parsed = parseThreadSpec(
+      {
+        id: "Threads/steward/steward",
+        // metadata.status is the TURN OUTCOME — it must NOT influence agentStatus.
+        metadata: { agent: "steward", agent_status: "disabled", status: "ok" },
+      },
+      { vault: "default" },
+    );
+    expect(parsed.agentStatus).toBe("disabled");
+  });
+
+  test("rejects a thread note with no metadata.agent", () => {
+    expect(() =>
+      parseThreadSpec({ id: "Threads/x/x", metadata: {} }, { vault: "default" }),
+    ).toThrow(/metadata.agent/);
+  });
+
+  test("rejects a non-slug agent + reuses the shared field validation (bad backend)", () => {
+    expect(() =>
+      parseThreadSpec({ id: "n", metadata: { agent: "has spaces" } }, { vault: "v" }),
+    ).toThrow(/slug/);
+    expect(() =>
+      parseThreadSpec({ id: "n", metadata: { agent: "a", backend: "weird" } }, { vault: "v" }),
+    ).toThrow(/backend/);
+  });
+
+  test("does NOT read any secret field off the thread note", () => {
+    const parsed = parseThreadSpec(
+      { id: "n", metadata: { agent: "a", token: "sekret", CLAUDE_CODE_OAUTH_TOKEN: "sekret2" } },
+      { vault: "v" },
+    );
+    expect(JSON.stringify(parsed.spec)).not.toContain("sekret");
+  });
+});
+
+describe("parseDiscoveryMode", () => {
+  test("defaults to both; recognizes thread/def; case-insensitive; junk → both", () => {
+    expect(parseDiscoveryMode(undefined)).toBe("both");
+    expect(parseDiscoveryMode("")).toBe("both");
+    expect(parseDiscoveryMode("both")).toBe("both");
+    expect(parseDiscoveryMode("thread")).toBe("thread");
+    expect(parseDiscoveryMode("DEF")).toBe("def");
+    expect(parseDiscoveryMode(" Thread ")).toBe("thread");
+    expect(parseDiscoveryMode("nonsense")).toBe("both");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DefVaultClient.listThreadNotes — the thread discovery query
+// ---------------------------------------------------------------------------
+
+describe("DefVaultClient.listThreadNotes", () => {
+  test("queries the EXACT #agent/thread tag (encoded), include_content NOT set (body unused)", async () => {
+    let capturedUrl = "";
+    let auth = "";
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      capturedUrl = String(url);
+      auth = (init?.headers as Record<string, string> | undefined)?.authorization ?? "";
+      return new Response(
+        JSON.stringify([
+          { id: "Threads/uni/uni", path: "Threads/uni/uni", metadata: { agent: "uni" } },
+          { id: "", metadata: { agent: "skip" } }, // dropped (no id)
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+    const client = new DefVaultClient(binding);
+    const notes = await client.listThreadNotes();
+    expect(capturedUrl).toContain("tag=agent%2Fthread");
+    expect(capturedUrl).not.toContain("include_content"); // body isn't the prompt.
+    expect(auth).toBe("Bearer write-token");
+    expect(notes.map((n) => n.id)).toEqual(["Threads/uni/uni"]);
+  });
+
+  test("throws on a non-ok vault response", async () => {
+    globalThis.fetch = (async () => new Response("nope", { status: 500 })) as unknown as typeof fetch;
+    const client = new DefVaultClient(binding);
+    await expect(client.listThreadNotes()).rejects.toThrow(/list threads failed \(500\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AgentDefRegistry — dual-discovery (def + thread), toggle, dedup, agent_status
+// ---------------------------------------------------------------------------
+
+/** A fetch serving BOTH a def list AND a thread list, keyed by the tag query. PATCHes ack. */
+function dualFetch(opts: {
+  defs?: Array<{ id: string; content?: string; metadata?: Record<string, unknown> }>;
+  threads?: Array<{ id: string; path?: string; metadata?: Record<string, unknown> }>;
+  byId?: Record<string, { id: string; path?: string; content?: string; metadata?: Record<string, unknown> } | null>;
+}): typeof fetch {
+  return (async (url: string | URL | Request, init?: RequestInit) => {
+    const u = String(url);
+    const method = init?.method ?? "GET";
+    if (method === "PATCH") return new Response(null, { status: 200 });
+    if (u.includes("/api/notes?") && u.includes("tag=agent%2Fdefinition")) {
+      return new Response(JSON.stringify(opts.defs ?? []), { status: 200 });
+    }
+    if (u.includes("/api/notes?") && u.includes("tag=agent%2Fthread")) {
+      return new Response(JSON.stringify(opts.threads ?? []), { status: 200 });
+    }
+    const m = u.match(/\/api\/notes\/([^?]+)/);
+    if (m) {
+      const id = decodeURIComponent(m[1]!);
+      const note = opts.byId?.[id] ?? null;
+      if (!note) return new Response("no", { status: 404 });
+      return new Response(JSON.stringify(note), { status: 200 });
+    }
+    return new Response("[]", { status: 200 });
+  }) as typeof fetch;
+}
+
+describe("AgentDefRegistry — dual-discovery (Phase 4a)", () => {
+  test("BOTH mode: def + thread of the SAME name → ONE agent, deduped, source=def (def wins)", async () => {
+    const { deps, calls } = recorderDeps();
+    const fetchFn = dualFetch({
+      defs: [{ id: "Agents/uni", content: "", metadata: { name: "uni" } }], // EMPTY body (Phase 2).
+      threads: [{ id: "Threads/uni/uni", path: "Threads/uni/uni", metadata: { agent: "uni" } }],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn }); // default = both
+    const n = await reg.loadAll();
+    expect(n).toBe(1); // ONE instantiation — the thread deduped against the def.
+    const detailed = reg.listDetailed();
+    expect(detailed).toHaveLength(1);
+    expect(detailed[0]!.name).toBe("uni");
+    expect(detailed[0]!.source).toBe("def"); // def wins on a name collision in `both`.
+    // Only the def's spec was registered (once).
+    expect(calls.registered.map((s) => s.name)).toEqual(["uni"]);
+  });
+
+  test("THREAD mode: registers from the thread alone, source=thread (defs NOT listed)", async () => {
+    const { deps, calls } = recorderDeps();
+    const fetchFn = dualFetch({
+      defs: [{ id: "Agents/uni", content: "should be ignored", metadata: { name: "uni" } }],
+      threads: [{ id: "Threads/uni/uni", path: "Threads/uni/uni", metadata: { agent: "uni" } }],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, discovery: "thread" });
+    const n = await reg.loadAll();
+    expect(n).toBe(1);
+    const detailed = reg.listDetailed();
+    expect(detailed).toHaveLength(1);
+    expect(detailed[0]!.name).toBe("uni");
+    expect(detailed[0]!.source).toBe("thread");
+    // The registered spec has NO system prompt (identity composes at turn time).
+    expect(calls.registered).toHaveLength(1);
+    expect(calls.registered[0]!.systemPrompt).toBeUndefined();
+  });
+
+  test("DEF mode: threads are NOT a source (today's exact behavior)", async () => {
+    const { deps } = recorderDeps();
+    const fetchFn = dualFetch({
+      defs: [{ id: "Agents/uni", content: "P", metadata: { name: "uni" } }],
+      threads: [{ id: "Threads/ghost/ghost", metadata: { agent: "ghost" } }],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, discovery: "def" });
+    const n = await reg.loadAll();
+    expect(n).toBe(1);
+    const names = reg.listDetailed().map((d) => `${d.name}:${d.source}`);
+    expect(names).toEqual(["uni:def"]); // ghost thread NOT registered.
+  });
+
+  test("thread with agent_status:disabled is NOT registered (the retired-agent skip)", async () => {
+    const { deps, calls } = recorderDeps();
+    const fetchFn = dualFetch({
+      threads: [
+        { id: "Threads/uni/uni", metadata: { agent: "uni" } },
+        { id: "Threads/steward/steward", metadata: { agent: "steward", agent_status: "disabled" } },
+      ],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, discovery: "thread" });
+    const n = await reg.loadAll();
+    expect(n).toBe(1); // only uni — steward skipped.
+    expect(reg.listDetailed().map((d) => d.name)).toEqual(["uni"]);
+    expect(calls.registered.map((s) => s.name)).toEqual(["uni"]);
+  });
+
+  test("THREAD-ONLY agent (no def) registers in both mode (additive — adds what defs don't cover)", async () => {
+    const { deps } = recorderDeps();
+    const fetchFn = dualFetch({
+      defs: [{ id: "Agents/uni", content: "", metadata: { name: "uni" } }],
+      threads: [
+        { id: "Threads/uni/uni", metadata: { agent: "uni" } }, // deduped to the def
+        { id: "Threads/eco/eco", metadata: { agent: "eco" } }, // NO def → registers from thread
+      ],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn }); // both
+    const n = await reg.loadAll();
+    expect(n).toBe(2); // uni (def) + eco (thread).
+    const bySource = Object.fromEntries(reg.listDetailed().map((d) => [d.name, d.source]));
+    expect(bySource).toEqual({ uni: "def", eco: "thread" });
+  });
+
+  test("reloadThread is a no-op in def mode; instantiates in thread mode", async () => {
+    const { deps, calls } = recorderDeps();
+    const byId = {
+      "Threads/uni/uni": { id: "Threads/uni/uni", path: "Threads/uni/uni", metadata: { agent: "uni" } },
+    };
+    const defReg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn: dualFetch({ byId }), discovery: "def" });
+    expect(await defReg.reloadThread("default", "Threads/uni/uni", "created")).toBe("skipped");
+    expect(calls.registered).toHaveLength(0);
+
+    const threadReg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn: dualFetch({ byId }), discovery: "thread" });
+    expect(await threadReg.reloadThread("default", "Threads/uni/uni", "created")).toBe("instantiated");
+    expect(threadReg.listDetailed().map((d) => `${d.name}:${d.source}`)).toEqual(["uni:thread"]);
+  });
+
+  test("reloadThread(deleted) tears down ONLY a thread-sourced agent", async () => {
+    const { deps, calls } = recorderDeps();
+    const byId = {
+      "Threads/uni/uni": { id: "Threads/uni/uni", metadata: { agent: "uni" } },
+    };
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn: dualFetch({ byId }), discovery: "thread" });
+    await reg.reloadThread("default", "Threads/uni/uni", "created");
+    expect(reg.listDetailed()).toHaveLength(1);
+    await reg.reloadThread("default", "Threads/uni/uni", "deleted");
+    expect(reg.listDetailed()).toHaveLength(0);
+    expect(calls.deregistered).toContain("uni");
+  });
+
+  test("the registry exposes its discovery mode", () => {
+    const { deps } = recorderDeps();
+    expect(new AgentDefRegistry(deps).discovery).toBe("both");
+    expect(new AgentDefRegistry(deps, { discovery: "thread" }).discovery).toBe("thread");
+  });
+
+  test("BOTH mode reactive-ordering: a thread registered FIRST is evicted when its def arrives (def wins)", async () => {
+    const { deps } = recorderDeps();
+    const byId = {
+      "Threads/uni/uni": { id: "Threads/uni/uni", metadata: { agent: "uni" } },
+      "Agents/uni": { id: "Agents/uni", path: "Agents/uni", content: "", metadata: { name: "uni" } },
+    };
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn: dualFetch({ byId }) }); // both
+    // The thread shows up first (no def yet) → registers source=thread.
+    await reg.reloadThread("default", "Threads/uni/uni", "created");
+    expect(reg.listDetailed().map((d) => `${d.name}:${d.source}`)).toEqual(["uni:thread"]);
+    // Then the def arrives → def wins; the stale thread-sourced live entry is evicted.
+    await reg.reload("default", "Agents/uni", "created");
+    const detailed = reg.listDetailed();
+    expect(detailed).toHaveLength(1); // name-unique — not two `uni` entries.
+    expect(detailed[0]!.source).toBe("def");
   });
 });

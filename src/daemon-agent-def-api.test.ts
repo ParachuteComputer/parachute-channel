@@ -164,3 +164,85 @@ describe("POST /api/vault/agent-def", () => {
     srv.stop();
   });
 });
+
+/** A registry whose `reloadThread` is recorded (the thread-discovery webhook path). */
+function recordingThreadRegistry(opts?: { vaults?: string[] }) {
+  const reloads: Array<{ vault: string; noteId: string; event?: string }> = [];
+  const noopDeps: InstantiateDeps = {
+    ensureChannel: async () => {},
+    setupAndRegister: async () => {},
+    deregister: async () => true,
+    removeChannel: async () => true,
+  };
+  const reg = new AgentDefRegistry(noopDeps, {
+    bindings: (opts?.vaults ?? ["default"]).map((v) => ({ vault: v, token: "t" })),
+  });
+  reg.reloadThread = (async (vault: string, noteId: string, event?: "created" | "updated" | "deleted") => {
+    reloads.push({ vault, noteId, event });
+    return "instantiated";
+  }) as typeof reg.reloadThread;
+  return { reg, reloads };
+}
+
+describe("POST /api/vault/agent-thread (Phase 4a thread-discovery webhook)", () => {
+  test("no Authorization → 401", async () => {
+    const { reg } = recordingThreadRegistry();
+    const { srv, base } = serverWith(emptyChannels(), reg);
+    const res = await fetch(`${base}/api/vault/agent-thread`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ note: { id: "Threads/uni/uni" } }),
+    });
+    expect(res.status).toBe(401);
+    srv.stop();
+  });
+
+  test("authed created event routes to reloadThread (single-vault default)", async () => {
+    const { reg, reloads } = recordingThreadRegistry();
+    const { srv, base } = serverWith(emptyChannels(), reg);
+    const res = await fetch(`${base}/api/vault/agent-thread`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ event: "created", note: { id: "Threads/uni/uni" } }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; reloaded: string };
+    expect(body.ok).toBe(true);
+    expect(body.reloaded).toBe("instantiated");
+    expect(reloads).toEqual([{ vault: "default", noteId: "Threads/uni/uni", event: "created" }]);
+    srv.stop();
+  });
+
+  test("explicit body.vault is honored; missing note.id → 400", async () => {
+    const { reg, reloads } = recordingThreadRegistry({ vaults: ["default", "research"] });
+    const { srv, base } = serverWith(emptyChannels(), reg);
+    const ok = await fetch(`${base}/api/vault/agent-thread`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ event: "created", vault: "research", note: { id: "Threads/r/r" } }),
+    });
+    expect(ok.status).toBe(200);
+    expect(reloads).toEqual([{ vault: "research", noteId: "Threads/r/r", event: "created" }]);
+
+    const bad = await fetch(`${base}/api/vault/agent-thread`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ event: "created" }),
+    });
+    expect(bad.status).toBe(400);
+    srv.stop();
+  });
+
+  test("no agentDefs configured → clean no-op ack (200, reloaded: skipped)", async () => {
+    const { srv, base } = serverWith(emptyChannels()); // no registry
+    const res = await fetch(`${base}/api/vault/agent-thread`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ note: { id: "Threads/uni/uni" } }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; reloaded: string };
+    expect(body.reloaded).toBe("skipped");
+    srv.stop();
+  });
+});

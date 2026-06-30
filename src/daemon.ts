@@ -55,6 +55,7 @@ import { VaultTransport, AGENT_VAULT_TRIGGER_TEMPLATE, noteAgentKey } from "./tr
 import {
   AgentDefRegistry,
   AgentDefWriteError,
+  parseDiscoveryMode,
   type DefVaultBinding,
   type InstantiateDeps,
 } from "./agent-defs.ts";
@@ -3264,6 +3265,66 @@ export function createFetchHandler(
     }
 
     // ---------------------------------------------------------------------
+    // Vault-native agent THREAD-discovery webhook — POST /api/vault/agent-thread
+    // (Phase 4a dual-discovery, DESIGN-2026-06-29-threads-roles-context.md). A vault
+    // trigger on an `#agent/thread` note created POSTs here; we discover that one agent
+    // from its thread (the reactive analogue of the 60s loadAll poll's thread pass).
+    // The thread analogue of /api/vault/agent-def: same auth (hub JWT, scope agent:send),
+    // same uniform-401 + vault resolution. `reloadThread` is a no-op in `def` discovery
+    // mode, dedups against a def in `both`, and skips a `disabled` thread — so this is
+    // safe + additive. Body: { event?, vault?, note: { id/path } }. Externally
+    // `<hub>/agent/api/vault/agent-thread`.
+    // ---------------------------------------------------------------------
+    if (req.method === "POST" && url.pathname === "/api/vault/agent-thread") {
+      const denied = await requireScope(req, url, SCOPE_SEND);
+      if (denied) return json({ error: "unauthorized" }, 401);
+      if (!agentDefs) {
+        // No def-vaults configured — nothing to discover. Clean ack.
+        return json({ ok: true, reloaded: "skipped" });
+      }
+      let body: {
+        event?: "created" | "updated" | "deleted";
+        vault?: string;
+        note?: { id?: string; path?: string; metadata?: Record<string, unknown> };
+      };
+      try {
+        body = (await req.json()) as typeof body;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      const noteId =
+        typeof body.note?.id === "string" && body.note.id
+          ? body.note.id
+          : typeof body.note?.path === "string"
+            ? body.note.path
+            : undefined;
+      if (!noteId) {
+        return json({ error: "body must include note.id" }, 400);
+      }
+      // Resolve the source vault: the explicit `vault` field, else the sole configured
+      // def-vault (the single-vault default), else 400. (Identical to the agent-def path.)
+      let vault = typeof body.vault === "string" && body.vault ? body.vault : undefined;
+      if (!vault) {
+        const names = agentDefs.list();
+        const distinct = new Set([...names.map((d) => d.vault)]);
+        if (agentDefs.vaultCount === 1) {
+          vault = agentDefs.soleVaultName();
+        } else if (distinct.size === 1) {
+          vault = [...distinct][0];
+        }
+      }
+      if (!vault) {
+        return json({ error: "body.vault is required (multiple def-vaults configured)" }, 400);
+      }
+      const event =
+        body.event === "created" || body.event === "updated" || body.event === "deleted"
+          ? body.event
+          : undefined;
+      const result = await agentDefs.reloadThread(vault, noteId, event);
+      return json({ ok: true, reloaded: result });
+    }
+
+    // ---------------------------------------------------------------------
     // ROLE grant-reconcile webhook — POST /api/vault/role
     // (roles as the capability layer, DESIGN-2026-06-29-threads-roles-context.md). A vault
     // trigger on an `#agent/role` note created/updated POSTs here; we reconcile THAT role's
@@ -3786,16 +3847,19 @@ function main(): void {
     driver: realTickDriver(),
   });
 
-  // The vault-native agent-def registry (design 2026-06-17-vault-native-agents,
-  // Phase 4a). Reads `#agent/definition` notes from the configured def-vaults and
-  // instantiates each as a live agent (a vault channel + a programmatic agent) via
-  // the SAME machinery the create-agent flow uses (buildInstantiateDeps). Constructed
-  // here (empty) so it's shared with the fetch handler's reload webhook; the boot
-  // resolve below (resolveDefVaults → addVault → loadAll) fills it. ADDITIVE to
-  // channels.json — both paths coexist.
+  // The vault-native agent registry (design 2026-06-17-vault-native-agents + the Phase 4a
+  // threads-roles-context flatten). Discovers agents from `#agent/definition` and/or
+  // `#agent/thread` notes (per PARACHUTE_AGENT_DISCOVERY — `both` default) in the configured
+  // def-vaults and instantiates each as a live agent (a vault channel + a programmatic agent)
+  // via the SAME machinery the create-agent flow uses (buildInstantiateDeps). Constructed
+  // here (empty) so it's shared with the fetch handler's reload webhooks; the boot resolve
+  // below (resolveDefVaults → addVault → loadAll) fills it. ADDITIVE to channels.json.
+  const discoveryMode = parseDiscoveryMode(process.env.PARACHUTE_AGENT_DISCOVERY);
   const agentDefs = new AgentDefRegistry(
     buildInstantiateDeps(channels, registry, deliveryState, programmatic, attachedQueue),
+    { discovery: discoveryMode },
   );
+  console.log(`parachute-agent: agent discovery source = ${discoveryMode} (def + thread notes; PARACHUTE_AGENT_DISCOVERY).`);
 
   const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, attachedQueue, turnEvents, jobStore, runner, agentDefs, preflight });
   const server = Bun.serve<TerminalWsData, never>({

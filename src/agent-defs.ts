@@ -46,7 +46,7 @@ import {
   type SystemPromptMode,
   type AgentMount,
 } from "./sandbox/types.ts";
-import { AGENT_DEFINITION_TAG } from "./transports/vault.ts";
+import { AGENT_DEFINITION_TAG, AGENT_THREAD_TAG } from "./transports/vault.ts";
 import {
   parseWants,
   connectionKey,
@@ -90,6 +90,32 @@ export interface DefVaultBinding {
 
 /** The resolved status of a def after instantiation (stamped onto the note). */
 export type AgentDefStatus = "enabled" | "pending" | "error";
+
+/**
+ * Which discovery source registered a live agent (Phase 4a dual-discovery):
+ *  - `def`    — a `#agent/definition` note (the original source).
+ *  - `thread` — a `#agent/thread` note (the flattened model; the def can later be deleted).
+ */
+export type DiscoverySource = "def" | "thread";
+
+/**
+ * The discovery-source toggle (env `PARACHUTE_AGENT_DISCOVERY`) — which note types the
+ * registry discovers agents from. The cutover is a FLAG-FLIP, not a new build:
+ *  - `both`   (DEFAULT) — discover from BOTH `#agent/definition` AND `#agent/thread`, deduped
+ *    by name with the DEF WINNING on a collision. Purely additive: with the def present and
+ *    no `agent_status` set, every live agent registers EXACTLY as today (the def path is
+ *    untouched; threads only ADD agents that have no def).
+ *  - `thread` — discover from `#agent/thread` ONLY. Lets the orchestrator prove thread-
+ *    discovery in isolation (source=thread) before deleting the def notes.
+ *  - `def`    — discover from `#agent/definition` ONLY (today's exact behavior; the escape hatch).
+ */
+export type DiscoveryMode = "both" | "thread" | "def";
+
+/** Parse the `PARACHUTE_AGENT_DISCOVERY` env value to a {@link DiscoveryMode}; default `both`. */
+export function parseDiscoveryMode(raw: string | undefined): DiscoveryMode {
+  const v = (raw ?? "").trim().toLowerCase();
+  return v === "thread" || v === "def" ? v : "both";
+}
 
 /**
  * Per-connection grant info surfaced to the ops UI (the MCP/connections panel) so it
@@ -256,90 +282,24 @@ export function parseAgentDef(note: {
   }
   const meta = note.metadata ?? {};
   const notePath = typeof note.path === "string" && note.path ? note.path : undefined;
+  const defLabel = `#agent/definition note ${noteId}`;
 
   const name = metaStr(meta.name);
   if (!name) {
-    throw new AgentDefParseError(`#agent/definition note ${noteId} has no metadata.name`);
+    throw new AgentDefParseError(`${defLabel} has no metadata.name`);
   }
   if (!NAME_SLUG_RE.test(name)) {
     throw new AgentDefParseError(
-      `#agent/definition note ${noteId}: name "${name}" must be a slug (alphanumeric, dash, underscore)`,
+      `${defLabel}: name "${name}" must be a slug (alphanumeric, dash, underscore)`,
     );
   }
 
-  // Backend — default programmatic (the reliable primary path). A vault-native def
-  // may select EITHER `programmatic` (the daemon runs `claude -p` turns) OR `attached`
-  // (the design 2026-06-18-channel-backend path — the turn is handled by a Claude Code
-  // session the operator connects — "attaches" — to the channel's MCP endpoint; the
-  // daemon runs no turn, the inbound notes accumulate as a durable queue). `interactive`
-  // (the retired tmux path) is REJECTED with a clear message (→ status:error on the
-  // note) rather than silently demoting — `attached` is what it was reaching for, done right.
-  //
-  // DUAL-READ the legacy backend VALUE, mapping silently (no operator-facing break, no
-  // migration of already-authored def notes / spec.json):
-  //   legacy value → canonical value
-  //   ──────────────────────────────
-  //   channel      → attached   (the backend value was renamed `channel` → `attached`;
-  //                              the ROUTING KEY `channel` — metadata.channel, the
-  //                              `/mcp/<channel>` segment — is a SEPARATE concept, untouched)
-  let backend: AgentBackendKind = "programmatic";
-  const rawBackend = metaStr(meta.backend);
-  if (rawBackend !== undefined) {
-    if (rawBackend === "interactive") {
-      throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: the "interactive" backend is retired — use ` +
-          `"programmatic" (daemon-run turns, the default) or "attached" (handled by a Claude ` +
-          `Code session you connect to the channel).`,
-      );
-    }
-    // DUAL-READ: the legacy backend value `"channel"` normalizes to `"attached"`.
-    const normalizedBackend = rawBackend === "channel" ? "attached" : rawBackend;
-    if (normalizedBackend !== "programmatic" && normalizedBackend !== "attached") {
-      throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: backend must be "programmatic" or "attached"`,
-      );
-    }
-    backend = normalizedBackend;
-  }
-
-  // Execution-lifecycle mode (the Phase-3 prerequisite). An agent is SINGLE-THREADED
-  // or MULTI-THREADED. Default `single-threaded` (= today: one persistent session per
-  // channel, resumed + persisted each turn). `multi-threaded` is thread-keyed — today
-  // (no inbound thread id yet) every fire mints a fresh thread (no resume, no persist).
-  // BOTH modes now materialize an `#agent/thread` note (the unified model
-  // `definition -> thread -> message`): single-threaded upserts ONE thread note per
-  // channel (named after the def, rolling summary + turn_count); multi-threaded writes
-  // one thread note per fire.
-  //
-  // DUAL-ACCEPT the legacy aliases, mapping silently (no operator-facing break, no
-  // migration of already-authored notes):
-  //   legacy value   → canonical value
-  //   ─────────────────────────────────
-  //   resident       → single-threaded
-  //   one-shot       → multi-threaded   (one-shot was just multi-threaded's degenerate
-  //                                       first turn — the term retires)
-  //   per-thread     → multi-threaded   (per-thread continuation is the DEFERRED
-  //                                       increment of multi-threaded, not its own mode)
-  //
-  // Any OTHER value is rejected with a clear, actionable error (→ status:error on the
-  // note) rather than silently demoting (which would hide the operator's intent).
-  let mode: AgentMode = "single-threaded";
-  const rawMode = metaStr(meta.mode);
-  if (rawMode !== undefined) {
-    if (rawMode === "single-threaded" || rawMode === "resident") {
-      mode = "single-threaded";
-    } else if (
-      rawMode === "multi-threaded" ||
-      rawMode === "one-shot" ||
-      rawMode === "per-thread"
-    ) {
-      mode = "multi-threaded";
-    } else {
-      throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: mode must be "single-threaded" or "multi-threaded"`,
-      );
-    }
-  }
+  // Backend / mode — parsed by the shared field parsers (same validation the thread-spec
+  // path uses). Backend default `programmatic`; the retired `interactive` is rejected; the
+  // legacy `"channel"` value DUAL-READs to `"attached"`. Mode default `single-threaded`,
+  // dual-accepting the legacy aliases (resident→single; one-shot/per-thread→multi).
+  const backend = parseBackendField(meta, defLabel);
+  const mode = parseModeField(meta, defLabel);
 
   const spec: AgentSpec = {
     name,
@@ -375,34 +335,10 @@ export function parseAgentDef(note: {
   }
 
   // Model (optional) — passed to `claude -p --model` by the programmatic backend.
-  // A CC alias (`opus`/`sonnet`/`haiku`) or a full id (`claude-opus-4-8`). We
-  // validate only the CHARSET (no membership list — models evolve), so a typo'd-
-  // but-wellformed value still reaches `--model` and the turn errors clearly,
-  // while a malformed value (spaces/control chars) fails fast as a def error.
-  const model = metaStr(meta.model);
-  if (model !== undefined && model.length > 0) {
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(model)) {
-      throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: model "${model}" is not a valid model name (letters, numbers, dot, underscore, colon, dash)`,
-      );
-    }
-    spec.model = model;
-  }
+  const model = parseModelField(meta, defLabel);
+  if (model !== undefined) spec.model = model;
 
-  // Working directory (optional absolute host cwd). We do NOT statSync here (parse is
-  // pure + may run on a box where the dir is mounted differently); the spawn path's
-  // own checks apply when the turn runs.
-  const workspace = metaStr(meta.workspace);
-  if (workspace !== undefined) {
-    if (!workspace.startsWith("/")) {
-      throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: workspace must be an absolute path (start with "/")`,
-      );
-    }
-    spec.workspace = workspace;
-  }
-
-  // Filesystem read scope.
+  // Sandbox / containment knobs (workspace / filesystem / network / egress / mounts).
   //
   // NOTE (step-up, agent#80): `filesystem: "full"` is the dangerous, full-disk
   // case. The step-up PIN gate is enforced on the HTTP spawn path only
@@ -412,34 +348,7 @@ export function parseAgentDef(note: {
   // step-up challenge here would gate a capability the caller already had to hold a
   // write credential to reach. If the threat model is ever revisited (e.g. less-
   // trusted note authors), this is the gap to close.
-  const filesystem = metaStr(meta.filesystem);
-  if (filesystem !== undefined) {
-    if (filesystem !== "workspace" && filesystem !== "full") {
-      throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: filesystem must be "workspace" or "full"`,
-      );
-    }
-    spec.filesystem = filesystem;
-  }
-
-  // Network egress mode + (under restricted) the additional host allowlist.
-  const network = metaStr(meta.network);
-  if (network !== undefined) {
-    if (network !== "open" && network !== "restricted") {
-      throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: network must be "open" or "restricted"`,
-      );
-    }
-    spec.network = network;
-  }
-  const egress = metaList(meta.egress);
-  if (egress.length > 0) spec.egress = egress;
-
-  // Filesystem mounts — JSON-encoded array in metadata (the note can't carry a
-  // structured array natively in a string vault), parsed defensively. Optional; a
-  // malformed value is ignored (not fatal — mounts are an advanced knob).
-  const mounts = parseMounts(meta.mounts);
-  if (mounts.length > 0) spec.mounts = mounts;
+  Object.assign(spec, parseSandboxKnobs(meta, defLabel));
 
   // Declared connections beyond the def-vault (the legacy `uses:` field). PARSED +
   // surfaced; never a secret — these are NAMES (`github`, `vault:research:read`).
@@ -490,6 +399,234 @@ function parseMounts(v: unknown): AgentMount[] {
     out.push(mount);
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Shared field parsers — the per-field validation common to a `#agent/definition`
+// note ({@link parseAgentDef}) and a `#agent/thread` note ({@link parseThreadSpec}).
+// Extracted so the two discovery sources validate config IDENTICALLY (one source of
+// truth for the backend/mode/model/sandbox rules); `label` prefixes each error so a
+// def vs a thread is distinguishable in the log. Each is PURE.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the `backend` field. Default `programmatic` (the reliable primary path); the
+ * retired `interactive` (tmux) backend is REJECTED with a clear message (rather than
+ * silently demoting); the legacy backend VALUE `"channel"` DUAL-READs to `"attached"`
+ * (the value rename — the routing-key `channel` is a SEPARATE concept, untouched).
+ */
+function parseBackendField(meta: Record<string, unknown>, label: string): AgentBackendKind {
+  const raw = metaStr(meta.backend);
+  if (raw === undefined) return "programmatic";
+  if (raw === "interactive") {
+    throw new AgentDefParseError(
+      `${label}: the "interactive" backend is retired — use "programmatic" (daemon-run turns, ` +
+        `the default) or "attached" (handled by a Claude Code session you connect to the channel).`,
+    );
+  }
+  // DUAL-READ: the legacy backend value `"channel"` normalizes to `"attached"`.
+  const normalized = raw === "channel" ? "attached" : raw;
+  if (normalized !== "programmatic" && normalized !== "attached") {
+    throw new AgentDefParseError(`${label}: backend must be "programmatic" or "attached"`);
+  }
+  return normalized;
+}
+
+/**
+ * Parse the execution-lifecycle `mode` field. Default `single-threaded`; DUAL-ACCEPTs
+ * the legacy aliases (resident→single-threaded; one-shot/per-thread→multi-threaded),
+ * mapping silently. Any other value is rejected with an actionable error.
+ */
+function parseModeField(meta: Record<string, unknown>, label: string): AgentMode {
+  const raw = metaStr(meta.mode);
+  if (raw === undefined) return "single-threaded";
+  if (raw === "single-threaded" || raw === "resident") return "single-threaded";
+  if (raw === "multi-threaded" || raw === "one-shot" || raw === "per-thread") return "multi-threaded";
+  throw new AgentDefParseError(`${label}: mode must be "single-threaded" or "multi-threaded"`);
+}
+
+/**
+ * Parse the optional `model` field — a CC alias (`opus`) or full id (`claude-opus-4-8`).
+ * Validates only the CHARSET (no membership list — models evolve), so a typo'd-but-
+ * wellformed value still reaches `--model` (the turn errors clearly) while a malformed
+ * value (spaces/control chars) fails fast. Undefined when absent/blank.
+ */
+function parseModelField(meta: Record<string, unknown>, label: string): string | undefined {
+  const model = metaStr(meta.model);
+  if (model === undefined || model.length === 0) return undefined;
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(model)) {
+    throw new AgentDefParseError(
+      `${label}: model "${model}" is not a valid model name (letters, numbers, dot, underscore, colon, dash)`,
+    );
+  }
+  return model;
+}
+
+/**
+ * Parse the sandbox / containment knobs — workspace / filesystem / network / egress /
+ * mounts. All OPTIONAL: absent → omitted (the spawn path's SAFE DEFAULTS apply — the
+ * live agents run on defaults, so absence is the common case). A present-but-malformed
+ * value THROWS (the caller skips that note), mirroring the def discipline. We do NOT
+ * statSync `workspace` here (parse is pure + may run on a box where the dir is mounted
+ * differently); the spawn path's own checks apply when the turn runs.
+ */
+function parseSandboxKnobs(
+  meta: Record<string, unknown>,
+  label: string,
+): Pick<AgentSpec, "workspace" | "filesystem" | "network" | "egress" | "mounts"> {
+  const out: Pick<AgentSpec, "workspace" | "filesystem" | "network" | "egress" | "mounts"> = {};
+  const workspace = metaStr(meta.workspace);
+  if (workspace !== undefined) {
+    if (!workspace.startsWith("/")) {
+      throw new AgentDefParseError(`${label}: workspace must be an absolute path (start with "/")`);
+    }
+    out.workspace = workspace;
+  }
+  const filesystem = metaStr(meta.filesystem);
+  if (filesystem !== undefined) {
+    if (filesystem !== "workspace" && filesystem !== "full") {
+      throw new AgentDefParseError(`${label}: filesystem must be "workspace" or "full"`);
+    }
+    out.filesystem = filesystem;
+  }
+  const network = metaStr(meta.network);
+  if (network !== undefined) {
+    if (network !== "open" && network !== "restricted") {
+      throw new AgentDefParseError(`${label}: network must be "open" or "restricted"`);
+    }
+    out.network = network;
+  }
+  const egress = metaList(meta.egress);
+  if (egress.length > 0) out.egress = egress;
+  // Filesystem mounts — JSON-encoded array in metadata, parsed defensively. A malformed
+  // value is ignored (not fatal — mounts are an advanced knob).
+  const mounts = parseMounts(meta.mounts);
+  if (mounts.length > 0) out.mounts = mounts;
+  return out;
+}
+
+/** The enable/disable axis carried on a `#agent/thread` note's `metadata.agent_status`. */
+export type AgentEnableStatus = "enabled" | "disabled";
+
+/**
+ * The parse of one `#agent/thread` note into an {@link AgentSpec} — the THREAD discovery
+ * source (Phase 4a dual-discovery, DESIGN-2026-06-29-threads-roles-context.md). A thread
+ * IS the agent now: `metadata.agent` is the name/routing-key, the config rides on the
+ * thread, and the IDENTITY composes at TURN TIME from roles ① + thread content ② +
+ * loadout ③ — so {@link spec}'s `systemPrompt` is DELIBERATELY EMPTY here (we never read
+ * the thread BODY as the prompt; the body is the rolling summary).
+ */
+export interface ParsedThreadSpec {
+  /** The thread note id/path (addresses the note + the live-map key). */
+  noteId: string;
+  /** The agent name (= `metadata.agent`, the routing key + wake channel). */
+  name: string;
+  /** The canonical in-memory spec — `systemPrompt` UNSET (composes at turn time). */
+  spec: AgentSpec;
+  /** The enable/disable axis (`metadata.agent_status`, default `enabled`). DISTINCT from
+   *  `metadata.status` (the TURN OUTCOME ok/error/working — never read here). Discovery
+   *  SKIPS a `disabled` thread. */
+  agentStatus: AgentEnableStatus;
+  /**
+   * Structured `wants:` declared on the thread (PARSED + surfaced for parity), if any.
+   * NOT registered as grants in Phase 4a — only a `#agent/role` carries capability (the
+   * security layer, DESIGN §"Roles carry capability"); a thread's `wants:` is
+   * informational. Empty for the live agents.
+   */
+  wants: ConnectionSpec[];
+}
+
+/**
+ * Parse one `#agent/thread` note into a {@link ParsedThreadSpec}. PURE — no I/O.
+ *
+ * Mapping (the flattened model — the thread IS the agent):
+ *   - `metadata.agent`       → `spec.name` (REQUIRED, slug) = the wake channel.
+ *   - `metadata.backend`     → `spec.backend` (default `programmatic`; `"channel"` dual-read).
+ *   - `metadata.model`       → `spec.model` (optional).
+ *   - `metadata.mode`        → `spec.mode` (default `single-threaded`; legacy aliases accepted).
+ *   - `metadata.definition`  → `spec.definition` (provenance; falls back to the thread note id).
+ *   - the thread note PATH   → `spec.definitionPath` (the composed-prompt self-entry header, #169).
+ *   - sandbox knobs (`workspace`/`filesystem`/`network`/`egress`/`mounts`) → read if present,
+ *     else SAFE DEFAULTS (the live agents run on defaults — absence is parsed safely).
+ *   - the def-vault binding  → `spec.vault` (own-vault, `write`) — passed in (a thread never
+ *     names which vault it lives in; it's defined BY being there, same as a def).
+ *   - `metadata.agent_status`→ `agentStatus` (enable/disable; default `enabled`).
+ *
+ * `spec.systemPrompt` is NEVER set — identity composes from roles ① + thread content ② +
+ * loadout ③ at turn time (the thread BODY is the rolling summary, not the prompt). Throws
+ * {@link AgentDefParseError} on a missing/bad `metadata.agent` (the registry skips that note).
+ * SECRETS: a thread declares creds BY REFERENCE only — we never read a token off the note.
+ */
+export function parseThreadSpec(
+  note: { id?: string; path?: string; content?: string; metadata?: Record<string, unknown> },
+  binding: { vault: string },
+): ParsedThreadSpec {
+  const noteId = typeof note.id === "string" ? note.id : "";
+  if (!noteId) {
+    throw new AgentDefParseError("#agent/thread note has no id");
+  }
+  const meta = note.metadata ?? {};
+  const notePath = typeof note.path === "string" && note.path ? note.path : undefined;
+  const label = `#agent/thread note ${noteId}`;
+
+  // The routing key IS the agent name (the channel→agent CONTRACT — `metadata.agent`).
+  const name = metaStr(meta.agent);
+  if (!name) {
+    throw new AgentDefParseError(`${label} has no metadata.agent (the routing key / agent name)`);
+  }
+  if (!NAME_SLUG_RE.test(name)) {
+    throw new AgentDefParseError(
+      `${label}: agent "${name}" must be a slug (alphanumeric, dash, underscore)`,
+    );
+  }
+
+  const backend = parseBackendField(meta, label);
+  const mode = parseModeField(meta, label);
+
+  const spec: AgentSpec = {
+    name,
+    channels: [name], // wake channel = the agent name (agent ≡ channel).
+    backend,
+    mode,
+    // Provenance for the `#agent/thread` note the turn materializes: the thread's own
+    // `metadata.definition` if it carries one (a thread cloned from a def keeps the link),
+    // else the thread note id itself (the thread IS the source now).
+    definition: metaStr(meta.definition) ?? noteId,
+    // The thread note PATH (when surfaced) — the human-legible self-entry header (#169).
+    ...(notePath ? { definitionPath: notePath } : {}),
+    // Own-vault binding (4a): the def-vault, write-scoped. NOT from the note — it's the
+    // vault the thread LIVES in (passed in by the caller).
+    vault: { name: binding.vault, access: "write" },
+  };
+
+  // systemPrompt is DELIBERATELY UNSET — identity composes from roles ① + thread content
+  // ② + loadout ③ at turn time. We never read the thread BODY here.
+
+  const model = parseModelField(meta, label);
+  if (model !== undefined) spec.model = model;
+
+  // Sandbox / containment knobs — present → parsed (+ validated); absent → SAFE DEFAULTS.
+  Object.assign(spec, parseSandboxKnobs(meta, label));
+
+  // `agent_status` — the enable/disable axis. DEFAULT `enabled` when absent; only the
+  // exact string `disabled` disables. DISTINCT from `metadata.status` (the turn outcome),
+  // which we never read here.
+  const rawEnable = metaStr(meta.agent_status);
+  const agentStatus: AgentEnableStatus = rawEnable === "disabled" ? "disabled" : "enabled";
+
+  // `wants:` — PARSED for parity/surfacing, NOT registered as grants in 4a (only a role
+  // grants capability). A malformed value is an ERROR (mirrors the def discipline).
+  let wants: ConnectionSpec[];
+  try {
+    wants = parseWants(meta.wants);
+  } catch (err) {
+    if (err instanceof WantsParseError) {
+      throw new AgentDefParseError(`${label}: ${err.message}`);
+    }
+    throw err;
+  }
+
+  return { noteId, name, spec, agentStatus, wants };
 }
 
 /**
@@ -584,6 +721,49 @@ export class DefVaultClient {
           id: n.id,
           ...(typeof n.path === "string" && n.path ? { path: n.path } : {}),
           content: n.content,
+          metadata: n.metadata,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * List the `#agent/thread` notes in this vault — the THREAD discovery source (Phase 4a
+   * dual-discovery). INDEX-FREE: queries by the exact leaf tag. `include_content=false` —
+   * unlike a def, a thread's BODY is NOT the prompt (it's the rolling summary; identity
+   * composes at turn time), so we fetch only id/path/metadata (lighter than the def list).
+   * Throws on a non-ok vault response (mirrors {@link listDefNotes}).
+   */
+  async listThreadNotes(opts?: { limit?: number }): Promise<
+    Array<{ id: string; path?: string; metadata?: Record<string, unknown> }>
+  > {
+    const limit = opts?.limit ?? DEF_LIST_LIMIT;
+    const params = new URLSearchParams();
+    params.set("tag", AGENT_THREAD_TAG); // URLSearchParams encodes `/`→`%2F`
+    params.set("limit", String(limit));
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes?${params.toString()}`;
+    const res = await this.fetchFn(url, { headers: { authorization: `Bearer ${this.token}` } });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`def-vault "${this.vault}": list threads failed (${res.status}) ${detail}`.trim());
+    }
+    let parsed: unknown;
+    try {
+      parsed = await res.json();
+    } catch (err) {
+      throw new Error(`def-vault "${this.vault}": list threads — bad JSON: ${(err as Error).message}`);
+    }
+    type RawNote = { id?: string; path?: string; metadata?: Record<string, unknown> };
+    const notes: RawNote[] = Array.isArray(parsed)
+      ? (parsed as RawNote[])
+      : ((parsed as { notes?: RawNote[] })?.notes ?? []);
+    const out: Array<{ id: string; path?: string; metadata?: Record<string, unknown> }> = [];
+    for (const n of notes) {
+      if (typeof n.id === "string" && n.id) {
+        out.push({
+          id: n.id,
+          ...(typeof n.path === "string" && n.path ? { path: n.path } : {}),
           metadata: n.metadata,
         });
       }
@@ -798,6 +978,10 @@ interface LiveDef {
   connections: ConnectionInfo[];
   /** The model the programmatic backend runs turns on (from `metadata.model`); unset = CC default. */
   model?: string;
+  /** Which DISCOVERY SOURCE registered this agent — a `#agent/definition` note (`def`) or a
+   *  `#agent/thread` note (`thread`). The observability axis for the Phase 4a cutover (prove
+   *  thread-discovery is registering the agents before deleting the defs). */
+  source: DiscoverySource;
 }
 
 /**
@@ -835,6 +1019,9 @@ export interface AgentDefDetail {
   model?: string;
   /** The wake channel inbound routes to this agent on (== name). */
   channel: string;
+  /** Which DISCOVERY SOURCE registered this agent (`def` | `thread`) — the Phase 4a cutover
+   *  observability axis. Additive (older clients ignore it). */
+  source: DiscoverySource;
 }
 
 /** How many chars of the system prompt the detail preview surfaces. */
@@ -925,15 +1112,79 @@ export class AgentDefRegistry {
    * declared) and never registers, so the vault-native path still runs own-vault.
    */
   private grants: GrantsClient | null;
+  /**
+   * The discovery-source toggle (env `PARACHUTE_AGENT_DISCOVERY`). Gates which note types
+   * {@link loadAll} lists and which reactive reload paths run: `both` (default) lists defs
+   * THEN threads (def wins on a name collision); `thread` lists threads only; `def` lists
+   * defs only (today's behavior). Fixed at construction — the cutover is a restart.
+   */
+  private readonly discoveryMode: DiscoveryMode;
 
   constructor(
     deps: InstantiateDeps,
-    opts?: { bindings?: DefVaultBinding[]; fetchFn?: typeof fetch; grants?: GrantsClient | null },
+    opts?: {
+      bindings?: DefVaultBinding[];
+      fetchFn?: typeof fetch;
+      grants?: GrantsClient | null;
+      discovery?: DiscoveryMode;
+    },
   ) {
     this.deps = deps;
     this.grants = opts?.grants ?? null;
+    this.discoveryMode = opts?.discovery ?? "both";
     for (const b of opts?.bindings ?? []) {
       this.addVault(b, opts?.fetchFn);
+    }
+  }
+
+  /** The active discovery mode (for /health + observability + tests). */
+  get discovery(): DiscoveryMode {
+    return this.discoveryMode;
+  }
+
+  /** Whether `#agent/definition` notes are a discovery source under the active mode. */
+  private defsEnabled(): boolean {
+    return this.discoveryMode !== "thread";
+  }
+
+  /** Whether `#agent/thread` notes are a discovery source under the active mode. */
+  private threadsEnabled(): boolean {
+    return this.discoveryMode !== "def";
+  }
+
+  /**
+   * Whether the agent `name` is ALREADY live in the registry under a DIFFERENT live-map key
+   * — the dedup gate for thread-discovery (a thread whose name a def already registered is
+   * skipped: def wins in `both` mode). `exceptKey` is the candidate's own key, so a thread
+   * re-instantiating itself across polls is NOT seen as a collision with itself.
+   */
+  private isNameLiveElsewhere(name: string, exceptKey: string): boolean {
+    for (const [key, d] of this.live) {
+      if (d.name === name && key !== exceptKey) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Drop any OTHER live-map entry that shares `name` (keeping `keepKey`) — WITHOUT
+   * deregistering the agent. Used after a DEF instantiates so the def WINS on a name
+   * collision with a thread-sourced entry (a thread registered before its def appeared,
+   * a reactive-ordering edge): the channel + programmatic registration are name-keyed and
+   * already replaced-in-place by the def, so this only de-duplicates the live MAP (no
+   * teardown — same name, still a live agent). Keeps the listing name-unique + def-sourced.
+   */
+  private evictOtherLiveByName(name: string, keepKey: string): void {
+    for (const [key, d] of [...this.live]) {
+      // ONLY a THREAD-sourced entry is evicted — a def-over-def same-name collision ACROSS
+      // def-vaults is the existing multi-vault case (both kept in the live map so
+      // {@link findLiveByNote} can flag the #106 ambiguity); evicting one would mask it.
+      if (d.name === name && key !== keepKey && d.source === "thread") {
+        this.live.delete(key);
+        console.log(
+          `agent-defs: '${name}' now sourced from def (${keepKey}); dropped the stale ` +
+            `thread-sourced live entry (${key}) — def wins on a name collision.`,
+        );
+      }
     }
   }
 
@@ -975,12 +1226,19 @@ export class AgentDefRegistry {
   }
 
   /** The live instantiated defs (for /health + the agents list + tests). */
-  list(): ReadonlyArray<{ vault: string; noteId: string; name: string; status: AgentDefStatus }> {
+  list(): ReadonlyArray<{
+    vault: string;
+    noteId: string;
+    name: string;
+    status: AgentDefStatus;
+    source: DiscoverySource;
+  }> {
     return [...this.live.values()].map((d) => ({
       vault: d.vault,
       noteId: d.noteId,
       name: d.name,
       status: d.status,
+      source: d.source,
     }));
   }
 
@@ -1004,6 +1262,7 @@ export class AgentDefRegistry {
         connections: d.connections.map((c) => ({ ...c })),
         ...(d.model ? { model: d.model } : {}),
         channel: d.name, // agent ≡ channel.
+        source: d.source,
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
   }
@@ -1069,6 +1328,7 @@ export class AgentDefRegistry {
       connections: d.connections.map((c) => ({ ...c })),
       ...(d.model ? { model: d.model } : {}),
       channel: d.name,
+      source: d.source,
     };
   }
 
@@ -1134,60 +1394,87 @@ export class AgentDefRegistry {
   }
 
   /**
-   * Read all defs from every bound def-vault + instantiate each. Best-effort per
-   * vault AND per note: a single vault's list failure (or one note's parse/instantiate
-   * failure) is logged and never aborts the others, so one bad def can't sink the set.
-   * Returns the count successfully instantiated.
+   * Read all agents from every bound def-vault + instantiate each. The DISCOVERY MODE
+   * (Phase 4a dual-discovery) selects the source(s): `def`/`both` list `#agent/definition`
+   * notes; `thread`/`both` ALSO list `#agent/thread` notes. In `both`, defs run FIRST so a
+   * thread whose name a def already registered is DEDUPED (def wins). Best-effort per vault
+   * AND per note: a single list failure (or one note's parse/instantiate failure) is logged
+   * and never aborts the others. Returns the count successfully instantiated.
    *
-   * Removed-def convergence: after a CONFIDENT read (a successful, non-truncated list of
-   * the vault's whole def set), diff the prior-known def set against it — any note that
-   * was present and is now GONE has had its `#agent/definition` note deleted, so the agent
-   * is TORN DOWN (deregistered + wake channel removed) and its grants pruned ALL
-   * (`reconcileGrants(agent, [])`). This is the ONLY automatic path for a deletion — there
-   * is no vault `deleted` trigger (see {@link pruneRemovedDefs}). Two guards keep the
-   * teardown safe: a list FAILURE skips the diff (we `continue` BEFORE touching the prior
-   * set) and a TRUNCATED list (>= the page cap) skips it too, so neither a transient vault
-   * outage nor a partial page presents an under-set that wrongly tears down live agents.
+   * Removed-def convergence (DEF source only): after a CONFIDENT read (a successful, non-
+   * truncated list of the vault's whole def set), diff the prior-known def set against it —
+   * any note now GONE has had its `#agent/definition` note deleted, so the agent is TORN
+   * DOWN + grants pruned. This is the ONLY automatic path for a def deletion (no vault
+   * `deleted` trigger — see {@link pruneRemovedDefs}). THREADS have NO such diff here:
+   * thread-discovery is purely ADDITIVE (it never tears down), so a removed/disabled thread
+   * does not auto-deregister via the poll — teardown stays on the thread-status webhook +
+   * the reactive {@link reloadThread} (deleted/404) + a restart. This keeps the load-bearing
+   * weave safe (the poll can never accidentally tear down a live agent from a thread read).
    */
   async loadAll(): Promise<number> {
     let count = 0;
     for (const [vault, client] of this.clients) {
-      let notes: Awaited<ReturnType<DefVaultClient["listDefNotes"]>>;
-      try {
-        notes = await client.listDefNotes({ limit: DEF_LIST_LIMIT });
-      } catch (err) {
-        console.error(`agent-defs: listing defs from vault "${vault}" failed (continuing): ${(err as Error).message}`);
-        // CONFIDENT-SET GUARD: a failed list is NOT a confident read — leave the prior
-        // seen set untouched (no removed-def diff) so a hub/vault blip can't prune grants.
-        continue;
+      // ── DEF source (modes `def` + `both`) — the original path, untouched. ──────────
+      if (this.defsEnabled()) {
+        let notes: Awaited<ReturnType<DefVaultClient["listDefNotes"]>> | undefined;
+        try {
+          notes = await client.listDefNotes({ limit: DEF_LIST_LIMIT });
+        } catch (err) {
+          console.error(`agent-defs: listing defs from vault "${vault}" failed (continuing): ${(err as Error).message}`);
+          // CONFIDENT-SET GUARD: a failed list is NOT a confident read — leave the prior
+          // seen set untouched (NO removed-def diff, NO instantiate) so a hub/vault blip can't
+          // prune grants or tear an agent down. `notes` stays undefined → the block below is
+          // skipped, but the INDEPENDENT thread source still runs (it has its own try/catch).
+        }
+        if (notes !== undefined) {
+          // TRUNCATION GUARD (the second way a read is non-confident): a list at the page cap
+          // may be partial. The removed-def diff now performs a DESTRUCTIVE teardown
+          // (pruneRemovedDefs deregisters), so a truncated read that omits the tail must NOT be
+          // mistaken for deletions. Skip the diff + the seen-set rebuild (rebuilding from a
+          // truncated list would drop the omitted tail and mis-flag it removed next pass); still
+          // (re)instantiate what we got — instantiate only adds/updates, never tears down.
+          // Practically unreachable at today's agent counts; the guard makes the teardown safe
+          // by construction.
+          // `< cap` ⇒ the result fit on one page → it cannot be truncated; `>= cap` is the
+          // (possibly-)truncated case the `else` defers.
+          const confident = notes.length < DEF_LIST_LIMIT;
+          if (confident) {
+            // Detect removed defs by diffing the prior seen set (noteId→name) against the ids
+            // present now, BEFORE we mutate it.
+            const presentIds = new Set(notes.map((n) => n.id));
+            await this.pruneRemovedDefs(vault, presentIds);
+            // Rebuild the seen set from this confident read (carry-forward last-known names for
+            // notes that fail to parse, so a transient parse error doesn't drop them).
+            this.rebuildSeenDefs(vault, notes);
+          } else {
+            console.warn(
+              `agent-defs: def list for "${vault}" returned ${notes.length} notes (>= the ${DEF_LIST_LIMIT} ` +
+                `page cap) — skipping the removed-def reconcile this pass to avoid a truncated-read teardown.`,
+            );
+          }
+          for (const note of notes) {
+            if (await this.instantiate(vault, note)) count++;
+          }
+        }
       }
-      // TRUNCATION GUARD (the second way a read is non-confident): a list at the page cap
-      // may be partial. The removed-def diff now performs a DESTRUCTIVE teardown
-      // (pruneRemovedDefs deregisters), so a truncated read that omits the tail must NOT be
-      // mistaken for deletions. Skip the diff + the seen-set rebuild (rebuilding from a
-      // truncated list would drop the omitted tail and mis-flag it removed next pass); still
-      // (re)instantiate what we got — instantiate only adds/updates, never tears down.
-      // Practically unreachable at today's agent counts; the guard makes the teardown safe
-      // by construction.
-      // `< cap` ⇒ the result fit on one page → it cannot be truncated; `>= cap` is the
-      // (possibly-)truncated case the `else` defers.
-      const confident = notes.length < DEF_LIST_LIMIT;
-      if (confident) {
-        // Detect removed defs by diffing the prior seen set (noteId→name) against the ids
-        // present now, BEFORE we mutate it.
-        const presentIds = new Set(notes.map((n) => n.id));
-        await this.pruneRemovedDefs(vault, presentIds);
-        // Rebuild the seen set from this confident read (carry-forward last-known names for
-        // notes that fail to parse, so a transient parse error doesn't drop them).
-        this.rebuildSeenDefs(vault, notes);
-      } else {
-        console.warn(
-          `agent-defs: def list for "${vault}" returned ${notes.length} notes (>= the ${DEF_LIST_LIMIT} ` +
-            `page cap) — skipping the removed-def reconcile this pass to avoid a truncated-read teardown.`,
-        );
-      }
-      for (const note of notes) {
-        if (await this.instantiate(vault, note)) count++;
+
+      // ── THREAD source (modes `thread` + `both`) — additive dual-discovery. ─────────
+      // Runs AFTER the def loop so a thread whose name a def already registered dedups
+      // against it (def wins in `both`). Purely additive: a list failure / one bad thread
+      // is logged + skipped; NO removed-thread teardown (see the method note above).
+      if (this.threadsEnabled()) {
+        let threads: Awaited<ReturnType<DefVaultClient["listThreadNotes"]>>;
+        try {
+          threads = await client.listThreadNotes({ limit: DEF_LIST_LIMIT });
+        } catch (err) {
+          console.error(
+            `agent-defs: listing threads from vault "${vault}" failed (continuing): ${(err as Error).message}`,
+          );
+          continue;
+        }
+        for (const note of threads) {
+          if (await this.instantiateThread(vault, note)) count++;
+        }
       }
     }
     return count;
@@ -1291,6 +1578,11 @@ export class AgentDefRegistry {
     noteId: string,
     event?: "created" | "updated" | "deleted",
   ): Promise<"instantiated" | "deregistered" | "skipped"> {
+    // DISCOVERY-MODE GATE: in `thread` mode `#agent/definition` notes are NOT a source, so a
+    // def-reload webhook is a clean no-op (registering the def would collide with the thread-
+    // sourced agent). The def-watch triggers may still fire (they're not torn down at cutover);
+    // we simply ignore them. `def`/`both` proceed.
+    if (!this.defsEnabled()) return "skipped";
     const client = this.clients.get(vault);
     if (!client) {
       console.warn(`agent-defs: reload for unknown def-vault "${vault}" — ignoring.`);
@@ -1319,6 +1611,53 @@ export class AgentDefRegistry {
       return "deregistered";
     }
     return (await this.instantiate(vault, note)) ? "instantiated" : "skipped";
+  }
+
+  /**
+   * Reload ONE `#agent/thread` note by id (the reactive THREAD-discovery path — a thread-
+   * watch trigger says this note changed; Phase 4a). The thread analogue of {@link reload},
+   * but ADDITIVE: present + enabled + not-deduped → (re)instantiate; deleted/404 → deregister
+   * ONLY the thread-sourced agent at this note's key (a def-sourced same-name agent keyed by a
+   * DIFFERENT note is left intact). NO grant-GC (threads register no grants — only roles do).
+   *
+   * DISCOVERY-MODE GATE: a no-op in `def` mode (threads aren't a source then). DEDUP: in
+   * `both` mode a thread whose name a def already registered is skipped (def wins). DISABLE:
+   * a thread with `agent_status: disabled` is NOT registered (and if it was thread-sourced-live,
+   * we tear it down so a flip-to-disabled converges reactively too).
+   */
+  async reloadThread(
+    vault: string,
+    noteId: string,
+    event?: "created" | "updated" | "deleted",
+  ): Promise<"instantiated" | "deregistered" | "skipped"> {
+    if (!this.threadsEnabled()) return "skipped";
+    const client = this.clients.get(vault);
+    if (!client) {
+      console.warn(`agent-defs: thread reload for unknown def-vault "${vault}" — ignoring.`);
+      return "skipped";
+    }
+    const key = this.keyOf(vault, noteId);
+    // A delete event: the thread note is gone — tear down ONLY a thread-sourced agent at this
+    // key (deregisterByNote no-ops if this key isn't live, e.g. a def-sourced same-name agent
+    // keyed elsewhere). No fetch needed.
+    if (event === "deleted") {
+      if (this.live.get(key)?.source === "thread") await this.deregisterByNote(vault, noteId);
+      return "deregistered";
+    }
+    let note: Awaited<ReturnType<DefVaultClient["getNote"]>>;
+    try {
+      note = await client.getNote(noteId);
+    } catch (err) {
+      console.error(`agent-defs: thread reload fetch of ${noteId} from "${vault}" failed: ${(err as Error).message}`);
+      // A fetch FAILURE is inconclusive — never tear down (safety). Leave the agent intact.
+      return "skipped";
+    }
+    if (!note) {
+      // 404 — the thread is gone. Tear down ONLY a thread-sourced agent at this key.
+      if (this.live.get(key)?.source === "thread") await this.deregisterByNote(vault, noteId);
+      return "deregistered";
+    }
+    return (await this.instantiateThread(vault, note)) ? "instantiated" : "skipped";
   }
 
   /**
@@ -1677,7 +2016,8 @@ export class AgentDefRegistry {
       fullPrompt.length > SYSTEM_PROMPT_PREVIEW_LEN
         ? fullPrompt.slice(0, SYSTEM_PROMPT_PREVIEW_LEN)
         : fullPrompt;
-    this.live.set(this.keyOf(vault, note.id), {
+    const key = this.keyOf(vault, note.id);
+    this.live.set(key, {
       vault,
       noteId: note.id,
       name: def.name,
@@ -1689,7 +2029,13 @@ export class AgentDefRegistry {
       wants: def.wants.map((c) => connectionKey(c)),
       connections,
       ...(def.spec.model ? { model: def.spec.model } : {}),
+      source: "def",
     });
+    // DEF WINS (Phase 4a dual-discovery): drop any stale THREAD-sourced live entry for the
+    // same name (no teardown — the channel + registration are name-keyed and just replaced
+    // in place by this def). Handles the reactive-ordering edge where a thread registered
+    // before its def appeared; keeps the listing name-unique + def-sourced in `both` mode.
+    this.evictOtherLiveByName(def.name, key);
     // Track this note in the per-vault seen set (a confident, freshly-parsed read) so the
     // removed-def diff (loadAll) and the reload-delete path both address it by name. This
     // covers the reload single-note path where loadAll's rebuild didn't run.
@@ -1707,7 +2053,95 @@ export class AgentDefRegistry {
     // parse/instantiate failure returns above WITHOUT reconciling, so a transient error
     // never presents a stale/empty live set that nukes approved grants.
     await this.reconcileLiveKeys(def);
-    console.log(`agent-defs: instantiated "${def.name}" from ${note.id} in "${vault}" (status=${status}).`);
+    console.log(`agent-defs: instantiated "${def.name}" from def ${note.id} in "${vault}" (status=${status}, source=def).`);
+    return true;
+  }
+
+  /**
+   * Instantiate (or re-instantiate) one `#agent/thread` note as a live agent — the THREAD
+   * discovery source (Phase 4a dual-discovery). Mirrors {@link instantiate} but for the
+   * flattened model, with three differences that keep it ADDITIVE + SAFE:
+   *
+   *   1. DEDUP (def wins): skip when the agent name is ALREADY live under a different key
+   *      (a `#agent/definition` registered it, or another thread did) — so `both` mode is
+   *      byte-identical to today for every def-backed agent (the thread just dedups).
+   *   2. agent_status: skip a thread whose `metadata.agent_status` is `disabled` (and tear
+   *      down a previously thread-sourced-live agent that flips to disabled). DISTINCT from
+   *      `metadata.status` (the turn outcome) — never read here.
+   *   3. NO status stamp + NO grant registration: we never write the thread note's metadata
+   *      (`status` is the turn outcome, owned by the worker) and threads carry no capability
+   *      (only `#agent/role` grants — the security layer). So this is read-only on the vault.
+   *
+   * Returns true on a successful (re)registration. A parse failure / dedup-skip / disabled
+   * thread returns false (logged, no vault write). An instantiate failure leaves any prior
+   * registration intact (we don't tear down a working agent on a transient failure).
+   */
+  private async instantiateThread(
+    vault: string,
+    note: { id: string; path?: string; metadata?: Record<string, unknown> },
+  ): Promise<boolean> {
+    const binding = this.bindings.get(vault);
+    if (!binding) return false;
+
+    let parsed: ParsedThreadSpec;
+    try {
+      parsed = parseThreadSpec(note, { vault });
+    } catch (err) {
+      // A malformed thread note → log + skip. We do NOT stamp the note (status is the turn
+      // outcome, not ours to write); the def path's status-stamp has no thread analogue.
+      console.error(`agent-defs: skipping malformed thread ${note.id} in "${vault}": ${(err as Error).message}`);
+      return false;
+    }
+
+    const key = this.keyOf(vault, note.id);
+
+    // (2) agent_status: a disabled thread is not a discovery source. If it was previously
+    // thread-sourced-live here, tear it down so a flip-to-disabled converges (a def-sourced
+    // same-name agent keyed elsewhere is untouched — def wins).
+    if (parsed.agentStatus === "disabled") {
+      if (this.live.get(key)?.source === "thread") {
+        console.log(`agent-defs: thread '${parsed.name}' (${note.id}) is agent_status=disabled — tearing down.`);
+        await this.deregisterByNote(vault, note.id);
+      }
+      return false;
+    }
+
+    // (1) DEDUP — def (or another thread) already registered this name under a different key.
+    if (this.isNameLiveElsewhere(parsed.name, key)) {
+      console.log(
+        `agent-defs: thread-discovery — '${parsed.name}' (${note.id}) deduped (already live from ` +
+          `another source); NOT registered from this thread (def wins in 'both' mode).`,
+      );
+      return false;
+    }
+
+    try {
+      await this.deps.ensureChannel(parsed.name, binding);
+      await this.deps.setupAndRegister(parsed.spec);
+    } catch (err) {
+      console.error(
+        `agent-defs: instantiating thread "${parsed.name}" (${note.id} in "${vault}") failed: ${(err as Error).message}`,
+      );
+      return false;
+    }
+
+    // A thread-sourced agent has no def status flow → status `enabled` (it's live), no
+    // pending/connections (threads register no grants — roles are the capability layer).
+    this.live.set(key, {
+      vault,
+      noteId: note.id,
+      name: parsed.name,
+      status: "enabled",
+      backend: parsed.spec.backend ?? "programmatic",
+      mode: parsed.spec.mode ?? "single-threaded",
+      systemPromptPreview: "", // identity composes at turn time — no prompt body here.
+      pending: [],
+      wants: parsed.wants.map((c) => connectionKey(c)),
+      connections: [],
+      ...(parsed.spec.model ? { model: parsed.spec.model } : {}),
+      source: "thread",
+    });
+    console.log(`agent-defs: instantiated "${parsed.name}" from thread ${note.id} in "${vault}" (source=thread).`);
     return true;
   }
 

@@ -357,6 +357,7 @@ survives an outbound failure.
 | `PARACHUTE_AGENT_URL` | `http://127.0.0.1:1941` | Bridge → daemon URL |
 | `PARACHUTE_AGENT_STATE_DIR` | `~/.parachute/agent` | Token, access config, inbox |
 | `PARACHUTE_AGENT_SWEEP_MS` | `30000` | **Daemon:** cadence of the attached-backend claim-sweep tick (auto-releases `in-flight` inbound claims older than the 15-min TTL back to `pending`, so a crashed/abandoned session can't strand a channel queue). |
+| `PARACHUTE_AGENT_DISCOVERY` | `both` | **Daemon:** which note types the agent registry discovers agents from (Phase 4a dual-discovery). `both` (default) — `#agent/definition` AND `#agent/thread`, deduped by name with the DEF WINNING on a collision (additive + byte-identical to today for every def-backed agent). `thread` — `#agent/thread` only (prove thread-discovery in isolation before deleting defs). `def` — `#agent/definition` only (the escape hatch / today's behavior). The cutover is a flag-flip + restart, not a new build. |
 | `PARACHUTE_HUB_ORIGIN` | `http://127.0.0.1:1939` | **Daemon:** hub's public origin for JWT `iss` validation. Required on an exposed deployment (the loopback default is dev-only); hub-as-supervisor sets it. |
 | `PARACHUTE_AGENT_TOKEN` | (none) | **Bridge:** hub-issued agent JWT presented as Bearer. The launcher mints + injects it; unset = no auth header (dev only). Default mint TTL is the hub's non-ephemeral default (~90d); re-launch re-mints. |
 

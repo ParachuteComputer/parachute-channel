@@ -80,6 +80,16 @@ export const DEFINITION_TAG = "agent/definition";
  */
 export const ROLE_TAG = "agent/role";
 /**
+ * The bare THREAD tag the thread-watch trigger filters on (Phase 4a dual-discovery —
+ * DESIGN-2026-06-29-threads-roles-context.md). A NEW `#agent/thread` note fires the
+ * agent-thread webhook so a brand-new agent (the flattened "make a thread = set up an
+ * agent" act) comes live reactively. CREATE-ONLY by design: the daemon UPSERTS a thread
+ * note every turn, so an `updated` trigger would churn the registry on every turn —
+ * thread EDITS converge via the 60s loadAll poll instead (and config/content/roles are
+ * read per-turn anyway, so an edit takes effect on the next turn regardless).
+ */
+export const THREAD_TAG = "agent/thread";
+/**
  * The inbound trigger's `when` predicate. SOURCED from the existing
  * {@link AGENT_VAULT_TRIGGER_TEMPLATE} (`src/transports/vault.ts`) — the
  * module-owned shape the hub already substitutes — so the daemon's
@@ -149,6 +159,16 @@ export function roleWatchTriggerName(vault: string, kind: "create" | "edit"): st
   return `conn_roles-${kind}-${vault}`;
 }
 
+/**
+ * The thread-watch trigger name for a vault (Phase 4a dual-discovery). ONE per def-vault
+ * (CREATE-only — see {@link THREAD_TAG}); stable so the POST upserts in place. Fires the
+ * agent-thread webhook for ANY new `#agent/thread` note, which discovers that agent from
+ * its thread (deduped against a def in `both` mode; a no-op in `def` mode).
+ */
+export function threadWatchTriggerName(vault: string): string {
+  return `conn_threads-create-${vault}`;
+}
+
 /** Build the webhook URL `<hub-origin>/agent/api/vault/<endpoint>`. */
 function buildWebhook(hubOrigin: string, endpoint: string): string {
   const origin = hubOrigin.replace(/\/+$/, "");
@@ -168,6 +188,7 @@ export function buildDefVaultTriggers(
   const defWebhook = buildWebhook(hubOrigin, "/api/vault/agent-def");
   const inboundWebhook = buildWebhook(hubOrigin, "/api/vault/inbound");
   const roleWebhook = buildWebhook(hubOrigin, "/api/vault/role");
+  const threadWebhook = buildWebhook(hubOrigin, "/api/vault/agent-thread");
   const auth = { bearer: webhookBearer };
   return [
     // Def-watch CREATE — a new bare `agent/definition` note instantiates its agent live.
@@ -218,6 +239,18 @@ export function buildDefVaultTriggers(
       events: ["updated"],
       when: { tags: [ROLE_TAG] },
       action: { webhook: roleWebhook, send: "json", auth },
+    },
+    // THREAD-watch CREATE — a NEW `#agent/thread` note discovers that agent from its thread
+    // (Phase 4a dual-discovery; the flattened "make a thread = set up an agent" act comes
+    // live reactively). CREATE-ONLY: the daemon upserts a thread note every turn, so an
+    // `updated` trigger would churn the registry per-turn — edits converge via the 60s poll.
+    // The webhook (`reloadThread`) is a no-op in `def` mode + dedups against a def in `both`,
+    // so this is safe + additive on every box.
+    {
+      name: threadWatchTriggerName(vault),
+      events: ["created"],
+      when: { tags: [THREAD_TAG] },
+      action: { webhook: threadWebhook, send: "json", auth },
     },
   ];
 }
@@ -343,7 +376,7 @@ export async function registerAllDefVaultTriggers(
     if (r.failures.length === 0) {
       console.log(
         `parachute-agent: def-vault "${r.vault}" — auto-registered ${r.registered.length} trigger(s) ` +
-          `(def-watch create/edit + inbound + role-watch create/edit, bare-keyed).`,
+          `(def-watch create/edit + inbound + role-watch create/edit + thread-watch create, bare-keyed).`,
       );
     } else {
       console.warn(

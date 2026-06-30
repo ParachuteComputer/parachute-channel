@@ -1378,6 +1378,9 @@ export class ProgrammaticAgentRegistry {
       let effectiveModel = handle.spec.model;
       if (this.readThreadConfig) {
         try {
+          // Reads the thread note — which, on a brand-new thread, the start-ensure above just
+          // wrote seeded with the def config (write-if-absent), so a first turn resolves the
+          // def model (no change); a thread an operator/migration set diverges from the def here.
           const cfg = await this.readThreadConfig(handle.channel, handle.spec.name, turnSubject);
           if (cfg.model) effectiveModel = cfg.model;
         } catch (err) {

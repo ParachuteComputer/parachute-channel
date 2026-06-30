@@ -827,7 +827,8 @@ describe("ProgrammaticAgentRegistry — config THREAD-FIRST (Phase 3, DESIGN-202
 
     reg.enqueue("eng", { content: "go" });
     await until(() => threads.ends().length === 1);
-    // The thread note carries the resolved config (the transport stamps it write-if-absent).
+    // The registry→writeThread hand-off carries the resolved config from the spec onto the
+    // thread record (the transport's write-if-absent stamping is covered in vault.test.ts).
     expect(threads.ends()[0]!.model).toBe("opus");
     expect(threads.ends()[0]!.backend).toBe("programmatic");
   });

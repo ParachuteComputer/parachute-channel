@@ -10,10 +10,10 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { resolveSpawnDeps, SpawnDepsError } from "./spawn-deps.ts";
+import { resolveSpawnDeps, SpawnDepsError, resolveSeccompReadBinds } from "./spawn-deps.ts";
 
 const savedHome = process.env.PARACHUTE_HOME;
 let tmp: string | undefined;
@@ -50,5 +50,41 @@ describe("resolveSpawnDeps", () => {
       expect(deps.claudeBin).toBe(bin);
       expect(deps.runtimeReadOnly).toContain(bin);
     }
+  });
+
+  test("binds the engine's vendored apply-seccomp helper into runtimeReadOnly", () => {
+    tmp = mkdtempSync(join(tmpdir(), "spawn-deps-seccomp-"));
+    process.env.PARACHUTE_HOME = tmp;
+    writeFileSync(join(tmp, "operator.token"), "fake-operator-bearer");
+    const deps = resolveSpawnDeps();
+    // On a supported arch (x64/arm64), the apply-seccomp read binds must be present —
+    // otherwise the home-tree deny tmpfs masks the engine's own helper inside bwrap and
+    // every Linux turn dies with `apply-seccomp: No such file or directory`.
+    const seccompBinds = resolveSeccompReadBinds();
+    for (const b of seccompBinds) expect(deps.runtimeReadOnly).toContain(b);
+  });
+});
+
+describe("resolveSeccompReadBinds — re-expose the engine's vendored apply-seccomp", () => {
+  const supportedArch = ["x64", "x86_64", "arm64", "aarch64"].includes(String(process.arch));
+
+  test("resolves the vendored apply-seccomp binary (the path the engine execs in bwrap)", () => {
+    const binds = resolveSeccompReadBinds();
+    if (!supportedArch) {
+      // No vendored binary for this arch — nothing to bind, by design.
+      expect(binds).toEqual([]);
+      return;
+    }
+    const bin = binds.find((p) => p.endsWith("apply-seccomp"));
+    expect(bin).toBeDefined();
+    // The resolved path must actually exist — a bind to a phantom path wouldn't
+    // re-expose anything and the ENOENT would persist. It must live under the
+    // sandbox-runtime vendor tree (where the engine looks).
+    expect(existsSync(bin!)).toBe(true);
+    expect(bin).toContain(join("@anthropic-ai", "sandbox-runtime", "vendor", "seccomp"));
+    // The CONTAINING dir of the binary is bound too (so an absolute-path exec inside
+    // the namespace resolves), as is the vendor root.
+    expect(binds).toContain(join(bin!, "..")); // .../vendor/seccomp/<arch>
+    expect(binds.some((p) => p.endsWith(join("sandbox-runtime", "vendor")))).toBe(true);
   });
 });

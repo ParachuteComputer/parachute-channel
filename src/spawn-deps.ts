@@ -14,6 +14,7 @@
  */
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { resolve, join, dirname } from "node:path";
 import { type SpawnAgentBaseDeps } from "./spawn-agent.ts";
@@ -103,6 +104,74 @@ function resolveClaudeBin(): { bin: string; reads: string[] } | null {
   return { bin: sym, reads: [...reads] };
 }
 
+/**
+ * Map `process.arch` → the sandbox-runtime vendor dir name, or null if unsupported.
+ * Mirrors the runtime's own `getVendorArchitecture` (incl. its defensive `x86_64`/
+ * `aarch64` aliases) so we resolve the SAME vendor path it does. `arch` is widened to
+ * `string` because Node/Bun's `process.arch` literal type omits those aliases.
+ */
+function seccompVendorArch(): "x64" | "arm64" | null {
+  const arch: string = process.arch;
+  if (arch === "x64" || arch === "x86_64") return "x64";
+  if (arch === "arm64" || arch === "aarch64") return "arm64";
+  // Other arches have no vendored apply-seccomp binary — nothing to bind.
+  return null;
+}
+
+/**
+ * Resolve the read binds the sandbox needs to exec `@anthropic-ai/sandbox-runtime`'s
+ * own vendored `apply-seccomp` helper — the LINUX analogue of {@link resolveClaudeBin}.
+ *
+ * Why this matters (the Linux seccomp ENOENT): on Linux the engine enforces its
+ * unix-socket block by exec'ing its vendored `apply-seccomp` binary INSIDE the bwrap
+ * mount namespace (`<pkgRoot>/vendor/seccomp/<arch>/apply-seccomp`, an absolute host
+ * path). The scoped-read policy DENIES the whole home tree (`/home`) by mounting a
+ * tmpfs over it and re-allows ONLY the declared binds (mounts.ts §4.5). bun/npm install
+ * the package UNDER the home tree (`~/.bun/...`, `~/.npm-global/...`), so the deny tmpfs
+ * MASKS the engine's own helper inside the namespace — the turn dies with
+ * `apply-seccomp: No such file or directory` (an ENOENT for a file that exists on the
+ * host but is hidden in the sandbox). The runtime resolves the helper to an absolute
+ * path but never binds it back when the caller's denyRead covers it, and unlike `claude`
+ * (handled by {@link resolveClaudeBin}) nothing else re-exposes it.
+ *
+ * So we resolve the helper exactly as the runtime does and add it + its dir + the vendor
+ * tree to the read binds, which flow to `allowRead` and get re-bound over the deny
+ * tmpfs. This is a READ-ONLY bind of the engine's OWN static, library-linked helper —
+ * zero weakening of the boundary (it IS the boundary). Outside the home tree the binds
+ * are harmless no-ops (`--ro-bind / /` already exposes them); on macOS apply-seccomp is
+ * unused so the path resolution / bind never matters. Returns `[]` when the helper can't
+ * be located, in which case the engine degrades to its own resolution + the existing
+ * "unix socket access not restricted" warning, exactly as before.
+ */
+export function resolveSeccompReadBinds(): string[] {
+  const arch = seccompVendorArch();
+  if (!arch) return [];
+  try {
+    // Resolve the package ROOT via the module graph (library-resolved, never PATH) so we
+    // bind the same physical install the engine was imported from. `require.resolve` of
+    // the main entry → `<pkgRoot>/dist/index.js`; the root is two dirs up. This mirrors
+    // how the runtime locates the vendor dir (relative to its own dist/).
+    const req = createRequire(import.meta.url);
+    const pkgRoot = dirname(dirname(req.resolve("@anthropic-ai/sandbox-runtime")));
+    const bin = join(pkgRoot, "vendor", "seccomp", arch, "apply-seccomp");
+    if (!existsSync(bin)) return [];
+    const reads = new Set<string>([bin]);
+    try {
+      const real = realpathSync(bin);
+      reads.add(real);
+      reads.add(dirname(real)); // .../vendor/seccomp/<arch>
+      reads.add(dirname(dirname(dirname(real)))); // .../vendor
+    } catch {
+      // Broken symlink — bind the path we built; the dir bind below still applies.
+    }
+    reads.add(dirname(bin));
+    return [...reads];
+  } catch {
+    // Package not resolvable (shouldn't happen — it's a pinned dep) → bind nothing.
+    return [];
+  }
+}
+
 /** Absolute path to the operator token file (for error messages). */
 export function operatorTokenPath(): string {
   return resolve(parachuteHome(), "operator.token");
@@ -139,7 +208,13 @@ export function resolveSpawnDeps(): SpawnAgentBaseDeps {
   // bind (or expose) the operator's real ~/.claude. In TRUSTED mode reads are
   // broad and these binds are harmless no-ops. System paths (/usr,/lib,/opt) stay
   // readable; the per-session workspace (rw) is added by spawnAgent.
-  const runtimeReadOnly = [...(claude?.reads ?? [])];
+  //
+  // PLUS the engine's vendored `apply-seccomp` helper (Linux): the engine execs it
+  // INSIDE the bwrap namespace, but it installs under the home tree (~/.bun, ~/.npm-…)
+  // which confined mode denies via a tmpfs — so it must be re-allowed too, or every
+  // Linux turn dies with `apply-seccomp: No such file or directory`. See
+  // resolveSeccompReadBinds. No-op on macOS / outside the home tree.
+  const runtimeReadOnly = [...(claude?.reads ?? []), ...resolveSeccompReadBinds()];
 
   return {
     hubOrigin: getHubOrigin(),

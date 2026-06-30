@@ -42,7 +42,7 @@
  * `['#agent/thread']` EXACTLY — never a message tag — so it can never wake a session.
  */
 
-import type { AgentSpec, AgentMode } from "../sandbox/types.ts";
+import type { AgentSpec, AgentMode, AgentBackendKind } from "../sandbox/types.ts";
 import { normalizeChannel, threadKey } from "../sandbox/types.ts";
 import type { AgentBackend, AgentHandle, InterimTurnEvent, LoadoutEntry, RunContext, TurnSession } from "./types.ts";
 import type { InboundAttachment } from "../transport.ts";
@@ -130,6 +130,15 @@ export interface ThreadNote {
   definition?: string;
   /** The mode the turn ran under — governs thread identity + whether the note upserts. */
   mode: AgentMode;
+  /**
+   * The thread's CONFIG (Phase 3 — DESIGN-2026-06-29-threads-roles-context.md): the resolved
+   * `model` / `backend` (from the spec) the transport stamps onto the thread note so it
+   * SELF-CARRIES config (write-if-absent — see {@link ThreadRecord}). Absent → the keys aren't
+   * written. (`status`-config is deferred to Phase 4 — the thread's `status` here is the TURN
+   * outcome, never the def's enabled/pending/error.)
+   */
+  model?: string;
+  backend?: AgentBackendKind;
   /**
    * Outcome / lifecycle state after THIS write — `working` (the start-ensure, written
    * BEFORE the turn finishes — the turn has started but not completed), `ok` (success), or
@@ -581,6 +590,21 @@ export class ProgrammaticAgentRegistry {
     name: string,
     subject?: string,
   ) => Promise<{ path: string; content: string } | undefined>;
+  /**
+   * Optional pre-turn CONFIG read (Phase 3 — DESIGN-2026-06-29-threads-roles-context.md). Resolves
+   * the thread note's SELF-CARRIED `model` / `backend` (the daemon wires this to the transport's
+   * `readThreadConfig`). Read in {@link drain} so a turn's config resolves THREAD-FIRST: the
+   * thread's own value wins, the def (`handle.spec`) is the fallback. Only `model` has a per-turn
+   * consumer today (the programmatic backend's `--model`); `backend` is carried for Phase-4 routing
+   * (own-it-don't-route here). UNWIRED / no thread config → the def config entirely (byte-identical
+   * to before Phase 3 — every current agent until a thread carries config). Best-effort: a read
+   * failure logs + the turn runs on the def config.
+   */
+  private readonly readThreadConfig?: (
+    channel: string,
+    name: string,
+    subject?: string,
+  ) => Promise<{ model?: string; backend?: AgentBackendKind }>;
   /** Base backoff (ms) between outbound retries (FIX 1). Injectable so tests run fast. */
   private readonly outboundRetryBaseMs: number;
 
@@ -631,6 +655,17 @@ export class ProgrammaticAgentRegistry {
       name: string,
       subject?: string,
     ) => Promise<{ path: string; content: string } | undefined>;
+    /**
+     * Read the thread's SELF-CARRIED config (Phase 3) — `{ model?, backend? }` off the thread
+     * note. Optional — UNWIRED / no thread config → the def config (`handle.spec`) entirely (the
+     * no-thread-config invariant, byte-identical to before Phase 3). `subject` resolves the
+     * subject-scoped thread note.
+     */
+    readThreadConfig?: (
+      channel: string,
+      name: string,
+      subject?: string,
+    ) => Promise<{ model?: string; backend?: AgentBackendKind }>;
     /** Override the outbound-retry backoff base (ms). Default {@link OUTBOUND_RETRY_BASE_MS}. */
     outboundRetryBaseMs?: number;
   }) {
@@ -644,6 +679,7 @@ export class ProgrammaticAgentRegistry {
     if (deps.readLoadout) this.readLoadout = deps.readLoadout;
     if (deps.readRoles) this.readRoles = deps.readRoles;
     if (deps.readThreadContent) this.readThreadContent = deps.readThreadContent;
+    if (deps.readThreadConfig) this.readThreadConfig = deps.readThreadConfig;
     this.outboundRetryBaseMs = deps.outboundRetryBaseMs ?? OUTBOUND_RETRY_BASE_MS;
   }
 
@@ -1329,13 +1365,47 @@ export class ProgrammaticAgentRegistry {
         }
       }
 
+      // CONFIG (Phase 3 — DESIGN-2026-06-29-threads-roles-context.md): resolve the turn's config
+      // THREAD-FIRST. Read the thread note's SELF-CARRIED `model` (and `backend`, carried for
+      // Phase-4 routing); the thread's value WINS, the def (`handle.spec`) is the fallback. Only
+      // `model` has a per-turn consumer today — the programmatic backend's `--model`, read off
+      // `handle.spec.model` in `deliver` — so we overlay the effective model onto a SHALLOW-CLONED
+      // backend handle (AgentHandle is a plain data object — see ProgrammaticBackend.start) and
+      // hand THAT to deliver. `backend` is NOT overlaid (no per-turn consumer; the routing fork is
+      // def-based until Phase 4 — own-it-don't-route). UNWIRED / no thread model → the def model →
+      // `deliverHandle` is the original backendHandle (byte-identical to before Phase 3, every
+      // current agent). Best-effort: a read failure logs + the turn runs on the def config.
+      let effectiveModel = handle.spec.model;
+      if (this.readThreadConfig) {
+        try {
+          // Reads the thread note — which, on a brand-new thread, the start-ensure above just
+          // wrote seeded with the def config (write-if-absent), so a first turn resolves the
+          // def model (no change); a thread an operator/migration set diverges from the def here.
+          const cfg = await this.readThreadConfig(handle.channel, handle.spec.name, turnSubject);
+          if (cfg.model) effectiveModel = cfg.model;
+        } catch (err) {
+          console.error(
+            `parachute-agent: thread-config read for channel "${channel}"` +
+              (turnSubject ? ` subject "${turnSubject}"` : "") +
+              ` failed (turn runs on the def config): ${(err as Error).message}`,
+          );
+        }
+      }
+      // Hand deliver a handle whose spec carries the thread-first model. Only clone when it
+      // actually differs from the backend handle's spec model (else pass the original object —
+      // the no-thread-config invariant is literally the same handle).
+      const deliverHandle =
+        effectiveModel === handle.backendHandle.spec?.model
+          ? handle.backendHandle
+          : { ...handle.backendHandle, spec: { ...handle.backendHandle.spec, model: effectiveModel } as AgentSpec };
+
       let result;
       try {
         // Forward each interim event to the streaming-view sink (keyed by channel)
         // as the turn runs — the "watch it work" live progress. The sink swallows
         // its own throws (emitTurnEvent), so a dead live stream can't break the turn.
         result = await this.backend.deliver(
-          handle.backendHandle,
+          deliverHandle,
           msg.content,
           turnSession,
           (e) => this.emitTurnEvent(channel, e),
@@ -1664,6 +1734,12 @@ export class ProgrammaticAgentRegistry {
       ...(msg.subject?.trim() ? { subject: msg.subject } : {}),
       ...(handle.spec.definition ? { definition: handle.spec.definition } : {}),
       mode: handle.spec.mode ?? "single-threaded",
+      // Phase 3 (DESIGN-2026-06-29-threads-roles-context.md): carry the resolved config so the
+      // thread note SELF-CARRIES it. The transport stamps these WRITE-IF-ABSENT (an operator's /
+      // the migration's thread-set value wins; the def value only seeds a thread with none yet),
+      // so re-stamping the def value every turn never clobbers a thread that diverged.
+      ...(handle.spec.model ? { model: handle.spec.model } : {}),
+      ...(handle.spec.backend ? { backend: handle.spec.backend } : {}),
       status,
       started_at: startedAt,
       ended_at: new Date().toISOString(),

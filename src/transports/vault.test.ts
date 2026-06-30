@@ -1208,6 +1208,105 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       content: "AUTHORED standing mandate — keep me.",
     });
   });
+
+  // ── Phase 3: the thread SELF-CARRIES config (model/backend) ───────────────────────────
+  test("stamps metadata.model + metadata.backend from the record (config onto the thread)", async () => {
+    const posts: { init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") return new Response("not found", { status: 404 });
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        posts.push({ init: init ?? {} });
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      started_at: "2026-06-29T07:00:00.000Z",
+      ended_at: "2026-06-29T07:00:05.000Z",
+      model: "opus",
+      backend: "programmatic",
+    });
+
+    const sent = JSON.parse(String(posts[0]!.init.body)) as { metadata: Record<string, string> };
+    expect(sent.metadata.model).toBe("opus");
+    expect(sent.metadata.backend).toBe("programmatic");
+    // The turn-outcome `status` is untouched by config (it stays `ok`, NOT the def status).
+    expect(sent.metadata.status).toBe("ok");
+  });
+
+  test("WRITE-IF-ABSENT: an existing thread model/backend is PRESERVED (the def value never clobbers it)", async () => {
+    // The thread note already carries an operator-set / migration-backfilled config.
+    let stored: { metadata: Record<string, string>; content: string } | undefined = {
+      metadata: { model: "sonnet", backend: "programmatic", turn_count: "3", started_at: "2026-06-01T00:00:00.000Z" },
+      content: "",
+    };
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        return stored ? new Response(JSON.stringify(stored), { status: 200 }) : new Response("nf", { status: 404 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    // The turn re-stamps the DEF's model (opus) — but the thread already says sonnet, so sonnet wins.
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      started_at: "2026-06-29T07:00:00.000Z",
+      ended_at: "2026-06-29T07:00:05.000Z",
+      model: "opus",
+      backend: "attached",
+    });
+    expect(stored!.metadata.model).toBe("sonnet"); // preserved, NOT clobbered to opus.
+    expect(stored!.metadata.backend).toBe("programmatic"); // preserved, NOT clobbered to attached.
+  });
+
+  test("no config on the record → no model/backend keys written (byte-identical to pre-Phase-3)", async () => {
+    const posts: { init: RequestInit }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") return new Response("not found", { status: 404 });
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        posts.push({ init: init ?? {} });
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.writeThread({
+      channel: "eng",
+      name: "eng",
+      mode: "single-threaded",
+      status: "ok",
+      started_at: "2026-06-29T07:00:00.000Z",
+      ended_at: "2026-06-29T07:00:05.000Z",
+    });
+    const sent = JSON.parse(String(posts[0]!.init.body)) as { metadata: Record<string, string> };
+    expect("model" in sent.metadata).toBe(false);
+    expect("backend" in sent.metadata).toBe(false);
+  });
 });
 
 describe("VaultTransport — loadTranscript (read the durable store)", () => {
@@ -2506,6 +2605,79 @@ describe("VaultTransport — readThreadContent (the thread's own authored body, 
       path: "Threads/eng/eng--launch-blockers",
       content: "subject mandate",
     });
+    expect(reads[0]).toBe("Threads/eng/eng--launch-blockers");
+  });
+});
+
+describe("VaultTransport — readThreadConfig (the thread's SELF-CARRIED config, Phase 3)", () => {
+  test("returns { model, backend } off the thread note metadata", async () => {
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = decodeURIComponent(String(url));
+      if (u.includes("Threads/eng/eng")) {
+        return new Response(
+          JSON.stringify({ metadata: { model: "opus", backend: "programmatic", session: "s1" } }),
+          { status: 200 },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadConfig("eng", "eng")).toEqual({ model: "opus", backend: "programmatic" });
+  });
+
+  test("no thread note yet (404) → {} (the def config is the fallback)", async () => {
+    globalThis.fetch = (async () => new Response("not found", { status: 404 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadConfig("eng", "eng")).toEqual({});
+  });
+
+  test("a field the note doesn't carry is omitted (per-field def fallback)", async () => {
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = decodeURIComponent(String(url));
+      if (u.includes("Threads/eng/eng")) {
+        return new Response(JSON.stringify({ metadata: { model: "sonnet" } }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadConfig("eng", "eng")).toEqual({ model: "sonnet" });
+  });
+
+  test("DUAL-READ the legacy backend value `channel` → `attached`; an invalid value is dropped", async () => {
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = decodeURIComponent(String(url));
+      if (u.includes("Threads/legacy/legacy")) {
+        return new Response(JSON.stringify({ metadata: { backend: "channel" } }), { status: 200 });
+      }
+      if (u.includes("Threads/bad/bad")) {
+        return new Response(JSON.stringify({ metadata: { backend: "interactive", model: "opus" } }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("legacy"));
+    expect(await t.readThreadConfig("legacy", "legacy")).toEqual({ backend: "attached" });
+    // An unrecognized backend is dropped (→ def fallback); a valid sibling field still resolves.
+    expect(await t.readThreadConfig("bad", "bad")).toEqual({ model: "opus" });
+  });
+
+  test("a SUBJECT resolves the subject-scoped thread note", async () => {
+    const reads: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const m = /\/api\/notes\/([^?]+)/.exec(String(url));
+      const path = m ? decodeURIComponent(m[1]!) : "";
+      reads.push(path);
+      if (path === "Threads/eng/eng--launch-blockers") {
+        return new Response(JSON.stringify({ metadata: { model: "haiku" } }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    expect(await t.readThreadConfig("eng", "eng", "launch blockers")).toEqual({ model: "haiku" });
     expect(reads[0]).toBe("Threads/eng/eng--launch-blockers");
   });
 });

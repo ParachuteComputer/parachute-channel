@@ -71,6 +71,8 @@ class FakeBackend implements AgentBackend {
     roles?: LoadoutEntry[];
     /** the loaded-ROLE grant keys the drain threaded in (capability source). */
     roleKeys?: string[];
+    /** Phase 3: the EFFECTIVE model on the handle the drain handed deliver (thread-first / def fallback). */
+    model?: string;
   }[] = [];
   /** Max concurrent in-flight turns observed (must stay ≤ 1 for serial — PER drain key). */
   maxConcurrent = 0;
@@ -140,6 +142,9 @@ class FakeBackend implements AgentBackend {
       // defaults both to `[]`) reads as absent — the no-roles invariant.
       ...(roles && roles.length ? { roles } : {}),
       ...(roleKeys && roleKeys.length ? { roleKeys } : {}),
+      // Phase 3: the model on the handle deliver actually received — thread-first (effective)
+      // when the drain resolved a thread config, the def's spec.model otherwise.
+      ...(handle.spec?.model ? { model: handle.spec.model } : {}),
     });
     this.inFlight++;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight);
@@ -742,6 +747,90 @@ describe("ProgrammaticAgentRegistry — thread content as context (DESIGN-2026-0
     // The turn ran (the read failure didn't strand it) with no thread content.
     expect(backend.calls[0]!.threadContent).toBeUndefined();
     expect(rec.calls).toHaveLength(1);
+  });
+});
+
+describe("ProgrammaticAgentRegistry — config THREAD-FIRST (Phase 3, DESIGN-2026-06-29-threads-roles-context.md)", () => {
+  test("the thread's model WINS over the def — deliver receives the thread-first model", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const seen: { channel: string; name: string; subject?: string }[] = [];
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      readThreadConfig: async (channel, name, subject) => {
+        seen.push({ channel, name, ...(subject ? { subject } : {}) });
+        return { model: "sonnet" }; // the thread says sonnet…
+      },
+    });
+    await reg.register({ ...specFor("eng"), model: "opus" }); // …the def says opus.
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+
+    // The drain consulted readThreadConfig with the channel + def name…
+    expect(seen).toEqual([{ channel: "eng", name: "eng" }]);
+    // …and handed deliver the THREAD's model (the thread wins; the def is the fallback).
+    expect(backend.calls[0]!.model).toBe("sonnet");
+  });
+
+  test("DEF FALLBACK: no thread model → deliver receives the def's spec.model", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      readThreadConfig: async () => ({}), // the thread carries no model.
+    });
+    await reg.register({ ...specFor("eng"), model: "opus" });
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.model).toBe("opus"); // def fallback, unchanged.
+  });
+
+  test("UNWIRED readThreadConfig → deliver receives the def's spec.model (byte-identical to pre-Phase-3)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register({ ...specFor("eng"), model: "opus" });
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.model).toBe("opus");
+  });
+
+  test("a readThreadConfig THROW is swallowed — the turn runs on the def config", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: rec.fn,
+      readThreadConfig: async () => {
+        throw new Error("vault unreachable");
+      },
+    });
+    await reg.register({ ...specFor("eng"), model: "opus" });
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => backend.calls.length === 1);
+    expect(backend.calls[0]!.model).toBe("opus"); // fell back to the def config.
+    expect(rec.calls).toHaveLength(1);
+  });
+
+  test("recordThread STAMPS the def's model/backend onto the thread note (so it self-carries config)", async () => {
+    const backend = new FakeBackend();
+    const rec = recorder();
+    const threads = threadRecorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeThread: threads.fn });
+    await reg.register({ ...specFor("eng"), model: "opus", backend: "programmatic" });
+
+    reg.enqueue("eng", { content: "go" });
+    await until(() => threads.ends().length === 1);
+    // The registry→writeThread hand-off carries the resolved config from the spec onto the
+    // thread record (the transport's write-if-absent stamping is covered in vault.test.ts).
+    expect(threads.ends()[0]!.model).toBe("opus");
+    expect(threads.ends()[0]!.backend).toBe("programmatic");
   });
 });
 

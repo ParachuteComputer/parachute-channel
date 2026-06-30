@@ -10,7 +10,7 @@
  * so a non-Telegram transport never has to invent Telegram fields.
  */
 
-import type { AgentMode } from "./sandbox/types.ts";
+import type { AgentMode, AgentBackendKind } from "./sandbox/types.ts";
 
 /**
  * A reference to a file attached to an inbound message (Phase 1: inbound file
@@ -93,6 +93,23 @@ export interface ThreadRecord {
   definition?: string;
   /** The mode the turn ran under — governs thread identity + whether the note upserts. */
   mode: AgentMode;
+  /**
+   * The thread's CONFIG (the flattened model — DESIGN-2026-06-29-threads-roles-context.md
+   * Phase 3): the resolved `model` / `backend` for the turn, so the thread note SELF-CARRIES
+   * its config and the `#agent/definition` is no longer needed for it. The transport stamps
+   * these onto `metadata.model` / `metadata.backend` with WRITE-IF-ABSENT semantics — a
+   * deterministic thread PRESERVES an existing value (an operator's or the migration's
+   * thread-set config wins; the def value only SEEDS a thread that has none yet), exactly
+   * like `started_at` / `session`. Absent (a transport that doesn't resolve config, or a
+   * record that carries none) → the keys aren't written (byte-identical to before Phase 3).
+   * `status` is DELIBERATELY NOT carried here: the thread's `metadata.status` already means
+   * the TURN OUTCOME (`ok`/`error`/`working`); the def's enabled/pending/error status is a
+   * discovery-state field that moves to the thread in Phase 4 (with discovery/routing),
+   * owned by `agent-defs.ts`, under a distinct key — never overloading the turn status.
+   */
+  model?: string;
+  /** The thread's resolved backend (see {@link model}). Stamped onto `metadata.backend`, write-if-absent. */
+  backend?: AgentBackendKind;
   /**
    * Outcome / lifecycle state of the thread after THIS write:
    *  - `working` — the turn has STARTED but not finished (the thread-as-container
@@ -251,6 +268,22 @@ export interface Transport {
    * VaultTransport) implements it; transports without a durable thread store (telegram) omit it.
    */
   readThreadSession?(channel: string, name: string, subject?: string): Promise<string | undefined>;
+  /**
+   * Optional: read the thread's CONFIG (the flattened model — Phase 3): the resolved
+   * `model` / `backend` carried on the thread's `#agent/thread` note (`metadata.model` /
+   * `metadata.backend`). The daemon reads this BEFORE a turn so config resolves THREAD-FIRST
+   * (the thread's own value wins), falling back to the def for any field the thread doesn't
+   * carry — the transition-safe path to retiring `#agent/definition` for config. `subject`
+   * resolves the subject-scoped note; omitted → the def-named note (HEAD). Returns the fields
+   * the note carries (each absent when the note doesn't have it / there's no thread note yet).
+   * Only a durable transport (the VaultTransport) implements it; transports without a durable
+   * thread store omit it → the daemon falls back to the def config entirely (today's behavior).
+   */
+  readThreadConfig?(
+    channel: string,
+    name: string,
+    subject?: string,
+  ): Promise<{ model?: string; backend?: AgentBackendKind }>;
   /**
    * Optional: CLEAR the persisted session on a thread's `#agent/thread` note so its next
    * turn starts a fresh Claude conversation (the per-agent restart / reset). `subject`

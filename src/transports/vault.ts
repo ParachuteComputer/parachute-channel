@@ -70,6 +70,7 @@ import type {
 // subject-scoped deterministic thread-note leaf (`<name>--<slug(subject)>`) so the path
 // math matches the registry's drain key exactly (no drift).
 import { threadKey } from "../sandbox/types.ts";
+import type { AgentBackendKind } from "../sandbox/types.ts";
 // roles as the capability layer (DESIGN-2026-06-29-threads-roles-context.md): the pure
 // role-detection helpers — `roleWants` is the SECURITY GATE (a note's `wants:` is honored
 // only if it is an `#agent/role`), `rolePathKey` derives the hub grant-holder key from the
@@ -933,6 +934,12 @@ export class VaultTransport implements Transport {
     let priorStartedAt: string | undefined;
     let priorLastTurnAt: string | undefined;
     let priorSession: string | undefined;
+    // The thread's SELF-CARRIED config (Phase 3 — DESIGN-2026-06-29-threads-roles-context.md).
+    // Preserved across an upsert (WRITE-IF-ABSENT): an operator's / the migration's thread-set
+    // model/backend WINS; the def value only seeds a thread that carries none yet. Same posture
+    // as `started_at` / `session` above — the daemon never clobbers an authored thread value.
+    let priorModel: string | undefined;
+    let priorBackend: string | undefined;
     if (deterministic) {
       const prior = await this.readThreadNote(path);
       if (prior) {
@@ -951,6 +958,13 @@ export class VaultTransport implements Transport {
         // than dropping continuity (the thread≡session record).
         if (typeof prior.metadata?.session === "string" && prior.metadata.session) {
           priorSession = prior.metadata.session;
+        }
+        // Preserve a thread-set config across the upsert (write-if-absent — see above).
+        if (typeof prior.metadata?.model === "string" && prior.metadata.model) {
+          priorModel = prior.metadata.model;
+        }
+        if (typeof prior.metadata?.backend === "string" && prior.metadata.backend) {
+          priorBackend = prior.metadata.backend;
         }
       }
     }
@@ -1009,6 +1023,16 @@ export class VaultTransport implements Transport {
     // note carries its own per-fire session each write (no preserve — each fire is fresh).
     const session = thread.session ?? (deterministic ? priorSession : undefined);
     if (session) metadata.session = session;
+    // The thread's SELF-CARRIED config (Phase 3). WRITE-IF-ABSENT for a DETERMINISTIC thread:
+    // an existing value (operator-set / migration-backfilled) is PRESERVED — the def value
+    // (`thread.model`/`thread.backend`) only seeds a thread with none yet, so the daemon never
+    // clobbers an authored config. A per-fire (multi-threaded, no-subject) note has no prior →
+    // it carries this turn's resolved config. Omitted entirely when neither side supplies one
+    // (e.g. a turn whose def carried no model) → byte-identical to before Phase 3.
+    const model = deterministic ? (priorModel ?? thread.model) : thread.model;
+    if (model) metadata.model = model;
+    const backend = deterministic ? (priorBackend ?? thread.backend) : thread.backend;
+    if (backend) metadata.backend = backend;
     // Usage is always present once a turn carried it OR we accumulated any — emit the
     // running totals so a query sees cumulative cost for the thread.
     if (deterministic || thread.usage) {
@@ -1130,6 +1154,41 @@ export class VaultTransport implements Transport {
     const prior = await this.readThreadNote(this.singleThreadedPath(channel, name, subject));
     const s = prior?.metadata?.session;
     return typeof s === "string" && s ? s : undefined;
+  }
+
+  /**
+   * Read the thread's SELF-CARRIED config (Phase 3 — DESIGN-2026-06-29-threads-roles-context.md):
+   * the `model` / `backend` on the thread's deterministic `#agent/thread` note, so the daemon
+   * resolves config THREAD-FIRST (the thread's own value wins; the def is the fallback). `subject`
+   * resolves the subject-scoped note; omitted → the def-named note (HEAD). Reuses
+   * {@link singleThreadedPath} + {@link readThreadNote}, so the path math agrees with writeThread /
+   * readThreadSession. No thread note yet (404) / a field the note doesn't carry → that field is
+   * undefined, and the caller falls back to the def for it (transition safety — byte-identical to
+   * today until a thread carries config). Best-effort: a network blip surfaces as no config (via
+   * readThreadNote, which logs it); an UNEXPECTED non-404 read error propagates to the caller's
+   * try/catch (the turn then runs on the def config).
+   *
+   * The backend value is DUAL-READ (`"channel"` → `"attached"`), mirroring {@link parseAgentDef},
+   * so a hand-authored legacy value still resolves to the canonical kind. A non-`programmatic`/
+   * `attached` value is dropped (treated as absent → def fallback) rather than passed through.
+   */
+  async readThreadConfig(
+    channel: string,
+    name: string,
+    subject?: string,
+  ): Promise<{ model?: string; backend?: AgentBackendKind }> {
+    const note = await this.readThreadNote(this.singleThreadedPath(channel, name, subject));
+    if (!note) return {};
+    const out: { model?: string; backend?: AgentBackendKind } = {};
+    const model = note.metadata?.model;
+    if (typeof model === "string" && model.trim().length > 0) out.model = model.trim();
+    const rawBackend = note.metadata?.backend;
+    if (typeof rawBackend === "string" && rawBackend.trim().length > 0) {
+      // DUAL-READ the legacy `"channel"` value → canonical `"attached"` (mirrors parseAgentDef).
+      const normalized = rawBackend.trim() === "channel" ? "attached" : rawBackend.trim();
+      if (normalized === "programmatic" || normalized === "attached") out.backend = normalized;
+    }
+    return out;
   }
 
   /** Clear a thread's persisted session so its next turn starts a fresh Claude conversation

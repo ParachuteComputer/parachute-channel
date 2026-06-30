@@ -144,6 +144,7 @@ import {
 } from "./backends/attached-queue.ts";
 import { readPersistedSpec, sessionWorkspace } from "./spawn-agent.ts";
 import { normalizeChannel } from "./sandbox/types.ts";
+import type { AgentBackendKind } from "./sandbox/types.ts";
 import { CredentialNotConfiguredError } from "./credentials.ts";
 import { MintError } from "./mint-token.ts";
 import { validateHubJwt, getHubOrigin } from "./hub-jwt.ts";
@@ -763,6 +764,10 @@ export function buildWriteThread(channels: Map<string, Channel>): WriteThread {
       ...(thread.name ? { name: thread.name } : {}),
       ...(thread.definition ? { definition: thread.definition } : {}),
       mode: thread.mode,
+      // Phase 3 (DESIGN-2026-06-29-threads-roles-context.md): forward the resolved config so the
+      // transport stamps it onto the thread note (write-if-absent). Absent → not forwarded.
+      ...(thread.model ? { model: thread.model } : {}),
+      ...(thread.backend ? { backend: thread.backend } : {}),
       status: thread.status,
       started_at: thread.started_at,
       ended_at: thread.ended_at,
@@ -915,6 +920,29 @@ export function buildReadThreadContent(
 }
 
 /**
+ * Build the {@link ProgrammaticAgentRegistry}'s pre-turn CONFIG read (Phase 3 —
+ * DESIGN-2026-06-29-threads-roles-context.md). Resolve the channel's transport and read the
+ * thread note's SELF-CARRIED `{ model?, backend? }` off its `#agent/thread` note, so a turn's
+ * config resolves THREAD-FIRST (the thread's own value wins; the def is the registry's fallback).
+ * Only the VaultTransport implements `readThreadConfig`; other transports omit it → `{}` (no
+ * thread config → the def config entirely, byte-identical to before Phase 3). Mirrors
+ * {@link buildReadThreadContent}.
+ */
+export function buildReadThreadConfig(
+  channels: Map<string, Channel>,
+): (
+  channel: string,
+  name: string,
+  subject?: string,
+) => Promise<{ model?: string; backend?: AgentBackendKind }> {
+  return async (channel, name, subject) => {
+    const ch = channels.get(channel);
+    if (!ch?.transport.readThreadConfig) return {};
+    return ch.transport.readThreadConfig(channel, name, subject);
+  };
+}
+
+/**
  * Build the {@link ProgrammaticAgentRegistry}'s pre-turn ROLES read (layer ① —
  * DESIGN-2026-06-29-threads-roles-context.md). Resolves the channel's transport and reads the
  * thread's `metadata.roles` notes off its `#agent/thread` note in ONE pass to BOTH the ordered
@@ -1009,6 +1037,10 @@ export function createDefaultProgrammaticRegistry(
     // thread note's own authored body — composed BETWEEN the def and the loadout. The daemon
     // never WRITES it; this only READS it. Undefined / blank → the def + loadout alone.
     readThreadContent: buildReadThreadContent(channels),
+    // config (Phase 3 — DESIGN-2026-06-29-threads-roles-context.md): the pre-turn read of the
+    // thread note's SELF-CARRIED model/backend, so config resolves THREAD-FIRST (def fallback).
+    // UNWIRED / no thread config → the def config entirely (byte-identical to before Phase 3).
+    readThreadConfig: buildReadThreadConfig(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }

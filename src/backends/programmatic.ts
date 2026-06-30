@@ -675,7 +675,9 @@ export class ProgrammaticBackend implements AgentBackend {
     // narrows `spec.systemPrompt`, so the entry is well-typed without a non-null assertion; and
     // `selfEntries.length` (0 or 1) IS the def-present count fed into `protectedCount` below.
     const selfEntries: LoadoutEntry[] =
-      typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0
+      // `.trim()` to match composeSystemPrompt's blank-skip — a whitespace-only def body is
+      // omitted (and not counted), keeping protectedCount aligned (reviewer nit, #176).
+      typeof spec.systemPrompt === "string" && spec.systemPrompt.trim().length > 0
         ? [{ path: selfPath, content: spec.systemPrompt }]
         : [];
     // Thread content sits AFTER the self entry. Include it only when it carries real (non-blank)

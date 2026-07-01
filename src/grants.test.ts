@@ -75,6 +75,17 @@ describe("parseWants — spec forms", () => {
     ]);
   });
 
+  test("surface name is canonicalized to lowercase (matches the hub + git endpoint)", () => {
+    // A mixed-case name lowercases so the agent's status key matches the hub's echoed
+    // (lowercased) target, and the clone/push URL matches a lowercase-registered surface.
+    expect(parseWants("surface:GitCoin-Brain:write")).toEqual([
+      { kind: "surface", target: "gitcoin-brain", access: "write" },
+    ]);
+    expect(connectionKey(parseWants("surface:GitCoin-Brain:write")[0]!)).toBe(
+      "surface:gitcoin-brain:write",
+    );
+  });
+
   test("env:<service> → service inject:[env]", () => {
     expect(parseWants("env:github")).toEqual([
       { kind: "service", target: "github", inject: ["env"] },

@@ -276,6 +276,12 @@ function parseVaultWant(entry: string, rest: string): ConnectionSpec {
  * tag suffix (surfaces have no tag-scope). The verb is REQUIRED + explicit (like
  * vault): `write` = clone+push, `read` = clone only. write ⊇ read at the git
  * endpoint, so a `write` grant needs no separate read grant to clone.
+ *
+ * The name is NORMALIZED to lowercase (the canonical form): the hub lowercases it too
+ * (admin-agent-grants.ts parseConnectionSpec) so both repos' keys agree, and the hub's
+ * `grantId` slug + minted `surface:<name>:<verb>` scope + `/git/<name>` remote are all
+ * lowercase — surfaces are lowercase-kebab by convention (surface-host registers them
+ * lowercase). Validated case-permissively (SURFACE_NAME_SLUG), then lowercased.
  */
 function parseSurfaceWant(entry: string, rest: string): ConnectionSpec {
   const colon = rest.indexOf(":");
@@ -298,7 +304,7 @@ function parseSurfaceWant(entry: string, rest: string): ConnectionSpec {
       `wants: "${entry}" — surface access must be "read" or "write" (got "${verb}").`,
     );
   }
-  return { kind: "surface", target: name, access: verb };
+  return { kind: "surface", target: name.toLowerCase(), access: verb };
 }
 
 /** Parse `env:<service>` / `mcp:<service>` into one service connection. */
@@ -594,8 +600,9 @@ export interface InjectedMcpEntry {
 /**
  * One granted git credential (a surface grant) — the git remote the agent
  * clones/pushes + the scoped hub token that authenticates it. The token is
- * injected into `git` via a per-spawn 0600 GIT_ASKPASS (never `.git/config`), so
- * it never persists on disk beyond the ephemeral workspace (design §6a step 4).
+ * injected into `git` via a per-spawn 0700 GIT_ASKPASS (private + executable — git
+ * execs it; never `.git/config`), so it never persists on disk beyond the ephemeral
+ * workspace (design §6a step 4).
  */
 export interface GitCredential {
   /** The git remote — `<hubOrigin>/git/<name>` (the hub git-transport endpoint). */

@@ -135,7 +135,7 @@ export function parseDiscoveryMode(raw: string | undefined): DiscoveryMode {
  */
 export interface ConnectionInfo {
   key: string;
-  kind: "vault" | "service" | "mcp";
+  kind: "vault" | "service" | "surface" | "mcp";
   target: string;
   status: string;
   grantId?: string;

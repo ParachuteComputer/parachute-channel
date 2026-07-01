@@ -54,14 +54,14 @@ import { DENYLISTED_ENV } from "./credentials.ts";
  * — `access`/`tags` are vault-only; `inject` is service-only (`("env"|"mcp")[]`).
  */
 export interface ConnectionSpec {
-  /** Resource kind. `vault`/`service` are wired in 4b-1; `mcp` is parsed-but-deferred. */
-  kind: "vault" | "service" | "mcp";
+  /** Resource kind. `vault`/`service`/`surface` are wired; `mcp` is parsed-but-deferred. */
+  kind: "vault" | "service" | "surface" | "mcp";
   /**
    * The resource target — a vault name (`research`), a service name (`github`),
-   * or, for `kind:"mcp"`, the remote MCP https URL.
+   * a surface name (`gitcoin-brain`), or, for `kind:"mcp"`, the remote MCP https URL.
    */
   target: string;
-  /** Vault access verb. Vault-only. */
+  /** Access verb. Vault + surface (`surface:<name>:<verb>` — write ⊇ read at the git endpoint). */
   access?: "read" | "write";
   /** Vault tag-scope (one or more `#tag`). Vault-only. */
   tags?: string[];
@@ -84,7 +84,15 @@ export class WantsParseError extends Error {
  *
  *   vault   → `vault:<target>:<access>[#tag…]`   (tags sorted for stability)
  *   service → `<inject-joined>:<target>`          e.g. `env+mcp:github`
+ *   surface → `surface:<target>:<access>`
  *   mcp     → `mcp:<url>`
+ *
+ * NOTE: this key is used ONLY for the agent's OWN status resolution
+ * ({@link resolveConnectionStatus}) — where BOTH sides (the declared spec + the
+ * hub's echoed-back `connection`) run through THIS function, so it's internally
+ * consistent. It is DELIBERATELY NOT sent to the hub for reconcile: the agent
+ * sends SPECS and the hub re-derives keys with its own `connectionKey` (the
+ * cross-repo divergence lesson — agent#96/hub#674).
  */
 export function connectionKey(c: ConnectionSpec): string {
   if (c.kind === "vault") {
@@ -95,6 +103,9 @@ export function connectionKey(c: ConnectionSpec): string {
     const inject = (c.inject && c.inject.length > 0 ? [...c.inject].sort() : ["env"]).join("+");
     return `${inject}:${c.target}`;
   }
+  if (c.kind === "surface") {
+    return `surface:${c.target}:${c.access ?? "read"}`;
+  }
   return `mcp:${c.target}`;
 }
 
@@ -102,6 +113,13 @@ export function connectionKey(c: ConnectionSpec): string {
 const VAULT_NAME_SLUG = /^[a-zA-Z0-9_-]+$/;
 /** A service name slug — `github`, `cloudflare`, … */
 const SERVICE_NAME_SLUG = /^[a-zA-Z0-9_-]+$/;
+/**
+ * A surface name slug — the `<name>` segment in `surface:<name>:<verb>`. MATCHES
+ * the hub's `SURFACE_NAME_RE` (git-registry.ts) so a name this parser accepts is
+ * one the hub's PUT/registry + git-transport URL parser also accept (no slashes
+ * or dots → no path traversal in the git endpoint). Bounded length.
+ */
+const SURFACE_NAME_SLUG = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 
 /**
  * Parse the `wants:` metadata field — a comma-separated list of connection specs —
@@ -196,6 +214,8 @@ function parseOneWant(entry: string): ConnectionSpec {
   switch (prefix) {
     case "vault":
       return parseVaultWant(entry, rest);
+    case "surface":
+      return parseSurfaceWant(entry, rest);
     case "env":
       return parseServiceWant(entry, rest, "env");
     case "mcp":
@@ -206,7 +226,7 @@ function parseOneWant(entry: string): ConnectionSpec {
     default:
       throw new WantsParseError(
         `wants: "${entry}" has unknown kind "${prefix}" — expected one of ` +
-          `vault | env | mcp.`,
+          `vault | surface | env | mcp.`,
       );
   }
 }
@@ -248,6 +268,37 @@ function parseVaultWant(entry: string, rest: string): ConnectionSpec {
     );
   }
   return { kind: "vault", target: name, access: verb, ...(tags ? { tags } : {}) };
+}
+
+/**
+ * Parse `surface:<name>:<read|write>` — a grant to a surface's hub-hosted git repo
+ * (Phase 2 §6a). Mirrors {@link parseVaultWant}'s `<name>:<verb>` split, minus the
+ * tag suffix (surfaces have no tag-scope). The verb is REQUIRED + explicit (like
+ * vault): `write` = clone+push, `read` = clone only. write ⊇ read at the git
+ * endpoint, so a `write` grant needs no separate read grant to clone.
+ */
+function parseSurfaceWant(entry: string, rest: string): ConnectionSpec {
+  const colon = rest.indexOf(":");
+  if (colon < 0) {
+    throw new WantsParseError(
+      `wants: "${entry}" is malformed — a surface connection needs a verb: ` +
+        `"surface:<name>:<read|write>".`,
+    );
+  }
+  const name = rest.slice(0, colon);
+  const verb = rest.slice(colon + 1).trim();
+  if (!SURFACE_NAME_SLUG.test(name)) {
+    throw new WantsParseError(
+      `wants: "${entry}" — surface name "${name}" must be a slug ` +
+        `(alphanumeric, dash, underscore; no slashes or dots).`,
+    );
+  }
+  if (verb !== "read" && verb !== "write") {
+    throw new WantsParseError(
+      `wants: "${entry}" — surface access must be "read" or "write" (got "${verb}").`,
+    );
+  }
+  return { kind: "surface", target: name, access: verb };
 }
 
 /** Parse `env:<service>` / `mcp:<service>` into one service connection. */
@@ -317,6 +368,7 @@ export interface GrantRecord {
 export type GrantMaterial =
   | { kind: "vault"; token: string; mcpUrl: string }
   | { kind: "service"; token: string; inject: ("env" | "mcp")[] }
+  | { kind: "surface"; token: string; remoteUrl: string }
   | { kind: "mcp"; token: string; mcpUrl: string };
 
 /** A failed grants-API call — carries the HTTP status for the caller to branch on. */
@@ -539,12 +591,32 @@ export interface InjectedMcpEntry {
   token: string;
 }
 
+/**
+ * One granted git credential (a surface grant) — the git remote the agent
+ * clones/pushes + the scoped hub token that authenticates it. The token is
+ * injected into `git` via a per-spawn 0600 GIT_ASKPASS (never `.git/config`), so
+ * it never persists on disk beyond the ephemeral workspace (design §6a step 4).
+ */
+export interface GitCredential {
+  /** The git remote — `<hubOrigin>/git/<name>` (the hub git-transport endpoint). */
+  remoteUrl: string;
+  /** The scoped `surface:<name>:<verb>` JWT (Basic `x-access-token:<jwt>` / Bearer). */
+  token: string;
+}
+
 /** The result of resolving an agent's approved grants into spawn-injectable bits. */
 export interface InjectedGrants {
   /** MCP servers to ADD to the existing per-spawn `.mcp.json` (vault + service-mcp). */
   mcpEntries: InjectedMcpEntry[];
   /** Env vars to set for the agent's shell tools (service env injections). */
   env: Record<string, string>;
+  /**
+   * Granted git credentials (surface grants) — the backend wires each into a
+   * per-spawn GIT_ASKPASS + a `PARACHUTE_SURFACE_<NAME>_REMOTE` env var so the
+   * agent can `git clone`/`git push` the surface's repo. Empty for an agent with
+   * no surface grants (today's behavior — no git wiring at all).
+   */
+  gitCredentials: GitCredential[];
 }
 
 /**
@@ -559,6 +631,10 @@ export interface InjectedGrants {
  *   - service material, inject includes `"mcp"`     → the service's MCP server entry
  *       (known-service→URL map; a service with no known MCP logs + SKIPS the mcp
  *       inject, keeping the env one).
+ *   - surface material (`{token, remoteUrl}`)        → a {@link GitCredential} (the
+ *       agent clones/pushes the surface's hub-hosted git repo). NOT an MCP entry +
+ *       NOT an env var — the backend wires it into a per-spawn GIT_ASKPASS + a
+ *       remote-URL env var.
  *   - mcp material (`{token, mcpUrl}`, 4b-2)         → an MCP server entry (the agent
  *       reaches the remote MCP / OAuth resource). An UNAPPROVED mcp grant has no
  *       material — `getMaterial` returns null (404/409), so it's simply absent.
@@ -578,6 +654,7 @@ export async function resolveInjectedGrants(
 ): Promise<InjectedGrants> {
   const mcpEntries: InjectedMcpEntry[] = [];
   const env: Record<string, string> = {};
+  const gitCredentials: GitCredential[] = [];
 
   const grants = await client.listGrants(agent); // throws → caller spawns without grants
   for (const g of grants) {
@@ -617,6 +694,15 @@ export async function resolveInjectedGrants(
       continue;
     }
 
+    if (material.kind === "surface") {
+      // Surface git grant (Phase 2 §6a): the material carries the scoped token +
+      // the git remote. The backend wires it into a per-spawn GIT_ASKPASS + a
+      // `PARACHUTE_SURFACE_<NAME>_REMOTE` env var — NEVER an MCP entry + NEVER
+      // `.git/config`. Just carry it through as a git credential.
+      gitCredentials.push({ remoteUrl: material.remoteUrl, token: material.token });
+      continue;
+    }
+
     if (material.kind === "service") {
       // service material — inject env and/or mcp per the material's `inject` list.
       const service = g.connection.target;
@@ -653,7 +739,7 @@ export async function resolveInjectedGrants(
     );
   }
 
-  return { mcpEntries, env };
+  return { mcpEntries, env, gitCredentials };
 }
 
 /**
@@ -670,8 +756,9 @@ export async function resolveInjectedGrants(
  *     role into a thread unions that role's path-keyed APPROVED grants in.
  *
  * Dedupe rule: MCP entries are deduped by their entry `name` (first source wins);
- * env vars are deduped by var name (first source wins). The legacy `spec.name` source
- * is conventionally first, so a def's own grant wins a name collision with a role's.
+ * env vars are deduped by var name (first source wins); git credentials are deduped
+ * by `remoteUrl` (first source wins). The legacy `spec.name` source is conventionally
+ * first, so a def's own grant wins a collision with a role's.
  *
  * Keys are deduped + processed in order; a duplicate key (e.g. the same role twice in the
  * roles list, or a role key that happens to equal `spec.name`) is fetched ONCE. A single
@@ -686,6 +773,7 @@ export async function resolveInjectedGrantsUnion(
 ): Promise<InjectedGrants> {
   const mcpByName = new Map<string, InjectedMcpEntry>();
   const env: Record<string, string> = {};
+  const gitByRemote = new Map<string, GitCredential>();
   const seenKeys = new Set<string>();
 
   for (const key of keys) {
@@ -710,9 +798,130 @@ export async function resolveInjectedGrantsUnion(
     for (const [varName, value] of Object.entries(injected.env)) {
       if (!(varName in env)) env[varName] = value;
     }
+    for (const cred of injected.gitCredentials) {
+      if (!gitByRemote.has(cred.remoteUrl)) gitByRemote.set(cred.remoteUrl, cred);
+    }
   }
 
-  return { mcpEntries: [...mcpByName.values()], env };
+  return {
+    mcpEntries: [...mcpByName.values()],
+    env,
+    gitCredentials: [...gitByRemote.values()],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Surface git injection — the GIT_ASKPASS credential channel (design §6a step 4)
+// ---------------------------------------------------------------------------
+
+/** POSIX single-quote-escape (for embedding a value inside `'…'` in the script). */
+function shSingleQuoteBody(s: string): string {
+  return s.replace(/'/g, `'\\''`);
+}
+
+/** The git URL path (`/git/<name>`) of a surface remote — used to disambiguate
+ *  tokens when an agent holds grants to MULTIPLE surfaces on the one hub host. */
+function gitRemotePath(remoteUrl: string): string {
+  try {
+    return new URL(remoteUrl).pathname;
+  } catch {
+    return remoteUrl;
+  }
+}
+
+/** The surface name (last `/git/<name>` segment) of a remote, or null. */
+export function surfaceNameFromRemoteUrl(remoteUrl: string): string | null {
+  const segs = gitRemotePath(remoteUrl).split("/").filter((s) => s.length > 0);
+  const last = segs[segs.length - 1];
+  return last && last.length > 0 ? last : null;
+}
+
+/** The `PARACHUTE_SURFACE_<NAME>_REMOTE` env var name for a surface remote. */
+export function surfaceRemoteEnvVar(remoteUrl: string): string | null {
+  const name = surfaceNameFromRemoteUrl(remoteUrl);
+  if (!name) return null;
+  return `PARACHUTE_SURFACE_${name.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_REMOTE`;
+}
+
+/**
+ * Build the per-spawn GIT_ASKPASS script that feeds a surface-scoped hub token to
+ * `git` on demand — so the token authenticates `git clone`/`git push` WITHOUT ever
+ * landing in `.git/config` or a URL (design §6a step 4). Git invokes the askpass as
+ * `askpass "<prompt>"`; the script answers on stdout:
+ *   - a `Username` prompt → the sentinel `x-access-token` (the hub accepts Basic
+ *     `x-access-token:<jwt>`, GitHub's compat form — see git-transport.ts extractToken);
+ *   - a `Password` prompt → the surface's token.
+ *
+ * SINGLE surface (the common case): any password prompt echoes the one token —
+ * host-keyed, unambiguous. MULTIPLE surfaces share the ONE hub host, so the caller
+ * sets `credential.useHttpPath=true` (see {@link buildSurfaceGitEnv}) which puts the
+ * repo PATH in the prompt; this script then path-matches `…/git/<name>…` to return
+ * the right token (falling back to the first token if no path matches — a graceful,
+ * debuggable 403 rather than a wrong-surface push, never a security hole).
+ *
+ * PURE + testable. The token is single-quoted (a JWT is `[A-Za-z0-9._-]` — never a
+ * quote — but we escape defensively). Empty `creds` → a no-op script (never wired).
+ */
+export function buildGitAskpassScript(creds: GitCredential[]): string {
+  const head = [
+    "#!/bin/sh",
+    "# Parachute surface git credentials — GIT_ASKPASS (per-spawn, 0700, ephemeral).",
+    "# The surface-scoped hub token is echoed on demand only — it NEVER lands in",
+    "# .git/config or a remote URL. Git invokes: askpass \"<prompt>\".",
+    'case "$1" in',
+    "  Username*|username*) printf %s 'x-access-token' ;;",
+    "  *)",
+  ];
+  const tail = ["esac", ""];
+  if (creds.length <= 1) {
+    const tok = creds[0]?.token ?? "";
+    return [...head, `    printf %s '${shSingleQuoteBody(tok)}' ;;`, ...tail].join("\n");
+  }
+  // Multi-surface: match the repo path in the prompt (needs credential.useHttpPath).
+  const inner = ['    case "$1" in'];
+  for (const c of creds) {
+    const path = gitRemotePath(c.remoteUrl);
+    inner.push(`      *'${shSingleQuoteBody(path)}'*) printf %s '${shSingleQuoteBody(c.token)}' ;;`);
+  }
+  inner.push(`      *) printf %s '${shSingleQuoteBody(creds[0]!.token)}' ;;`);
+  inner.push("    esac", "    ;;");
+  return [...head, ...inner, ...tail].join("\n");
+}
+
+/**
+ * Build the env vars that wire a surface-grant holder's `git` to the per-spawn
+ * askpass (design §6a step 4). Returns `{}` for no surface grants (no git wiring —
+ * today's behavior). For ≥1:
+ *   - `GIT_ASKPASS` → the askpass script path; `GIT_TERMINAL_PROMPT=0` (fail closed,
+ *     never block on an interactive prompt);
+ *   - `PARACHUTE_SURFACE_<NAME>_REMOTE` per surface → the clone/push URL, so the
+ *     agent DISCOVERS where to clone (the clone-per-turn model — the agent runs the
+ *     clone itself in its cwd; the daemon pre-clones nothing);
+ *   - for ≥2 surfaces (same hub host, distinct scoped tokens) → `credential.useHttpPath`
+ *     via GIT_CONFIG_* so git includes the repo PATH in the askpass prompt and the
+ *     script can return the RIGHT token per surface. None of these are secrets (the
+ *     token lives only in the askpass file) and none collide with the Claude-auth
+ *     denylist, so they ride the ordinary child-env path.
+ */
+export function buildSurfaceGitEnv(
+  creds: GitCredential[],
+  askpassPath: string,
+): Record<string, string> {
+  if (creds.length === 0) return {};
+  const env: Record<string, string> = {
+    GIT_ASKPASS: askpassPath,
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  for (const c of creds) {
+    const varName = surfaceRemoteEnvVar(c.remoteUrl);
+    if (varName) env[varName] = c.remoteUrl;
+  }
+  if (creds.length >= 2) {
+    env.GIT_CONFIG_COUNT = "1";
+    env.GIT_CONFIG_KEY_0 = "credential.useHttpPath";
+    env.GIT_CONFIG_VALUE_0 = "true";
+  }
+  return env;
 }
 
 /**

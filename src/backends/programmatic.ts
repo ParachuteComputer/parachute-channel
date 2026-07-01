@@ -54,7 +54,7 @@
  * it is handed.
  */
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSpec } from "../sandbox/types.ts";
 import type { InboundAttachment } from "../transport.ts";
@@ -76,7 +76,13 @@ import {
 } from "../mint-token.ts";
 import { buildAgentMcpConfigJson, vaultEntryKey } from "../agent-mcp-config.ts";
 import { resolveClaudeCredential, resolveChannelEnv } from "../credentials.ts";
-import { resolveInjectedGrantsUnion, type GrantsClient } from "../grants.ts";
+import {
+  buildGitAskpassScript,
+  buildSurfaceGitEnv,
+  resolveInjectedGrantsUnion,
+  type GitCredential,
+  type GrantsClient,
+} from "../grants.ts";
 import { parseStreamJsonStream } from "./stream-json.ts";
 import { composeSystemPrompt } from "./types.ts";
 import type {
@@ -534,6 +540,7 @@ export class ProgrammaticBackend implements AgentBackend {
     // in 4b-1 (no OAuth) → getMaterial returns null for them → never injected.
     let grantMcpEntries: { name: string; url: string; token: string }[] = [];
     let grantEnv: Record<string, string> = {};
+    let grantGitCredentials: GitCredential[] = [];
     if (this.deps.grants) {
       // GRANT INJECTION = UNION OF SOURCES (roles as the capability layer —
       // DESIGN-2026-06-29-threads-roles-context.md). The injected grants for a turn are the
@@ -557,6 +564,7 @@ export class ProgrammaticBackend implements AgentBackend {
         const injected = await resolveInjectedGrantsUnion(this.deps.grants, sources);
         grantMcpEntries = injected.mcpEntries;
         grantEnv = injected.env;
+        grantGitCredentials = injected.gitCredentials;
       } catch (err) {
         // resolveInjectedGrantsUnion is per-source best-effort (each source's list failure
         // is logged + skipped inside it), so this catch is defense-in-depth — a surprise
@@ -585,6 +593,27 @@ export class ProgrammaticBackend implements AgentBackend {
     mkdirSync(workspace, { recursive: true });
     const mcpConfigPath = join(workspace, ".mcp.json");
     writeFileSync(mcpConfigPath, mcpConfigJson, { mode: 0o600 });
+
+    // ── SURFACE GIT GRANTS (Phase 2 §6a step 4) ────────────────────────────────────
+    // A surface grant carries a scoped `surface:<name>:write` token + the git remote.
+    // We wire it into `git` via a per-spawn GIT_ASKPASS script + env vars — so the
+    // agent can `git clone`/`git push` the surface's hub-hosted repo WITHOUT the token
+    // ever landing in `.git/config` or a URL. Written into the PRIVATE session
+    // workspace (like `.mcp.json`), 0700 (private + EXECUTABLE — git EXECs the askpass,
+    // so it needs the exec bit; the token inside makes it private). The clone itself is
+    // the AGENT's job in its cwd (clone-per-turn — the daemon pre-clones nothing), fed
+    // the remote via `PARACHUTE_SURFACE_<NAME>_REMOTE`. Absent surface grants → no git
+    // wiring at all (byte-identical to today). The token is fetched fresh per turn (via
+    // the grant material above), so a revoked surface grant stops working next turn.
+    let surfaceGitEnv: Record<string, string> = {};
+    if (grantGitCredentials.length > 0) {
+      const askpassPath = join(workspace, "git-askpass.sh");
+      writeFileSync(askpassPath, buildGitAskpassScript(grantGitCredentials), { mode: 0o700 });
+      // `mode` on writeFileSync only applies at CREATE; chmod unconditionally so an
+      // existing askpass from a prior turn is (re)tightened to 0700 (private + +x).
+      chmodSync(askpassPath, 0o700);
+      surfaceGitEnv = buildSurfaceGitEnv(grantGitCredentials, askpassPath);
+    }
 
     // ── INBOUND FILE ATTACHMENTS (Phase 1) ─────────────────────────────────────────
     // Stage each attached file into the agent's PRIVATE session workspace (under a SAFE
@@ -725,14 +754,21 @@ export class ProgrammaticBackend implements AgentBackend {
     );
     const homeEnv = seedAgentHome(workspace, { mcpServers: mcpServerNames, projectRoot: cwd });
 
-    // Merge the granted-service env (GITHUB_TOKEN, …) with the operator-scoped
-    // per-channel env. The per-channel store wins on a key collision (it's the
-    // explicit operator override); both go in at the SAME (lowest) precedence layer of
-    // buildAgentChildEnv — which then applies its denylist (ANTHROPIC_API_KEY /
-    // CLAUDE_API_KEY / CLAUDE_CODE_OAUTH_TOKEN can NEVER be set from either source) and
-    // sets CLAUDE_CODE_OAUTH_TOKEN LAST, so a granted var can never clobber the
-    // session's managed auth or the subscription-billing guarantee.
-    const mergedChannelEnv: Record<string, string> = { ...grantEnv, ...channelEnv };
+    // Merge the granted-service env (GITHUB_TOKEN, …) + the surface git env
+    // (GIT_ASKPASS / GIT_TERMINAL_PROMPT / PARACHUTE_SURFACE_*_REMOTE) with the
+    // operator-scoped per-channel env. The per-channel store wins on a key collision
+    // (it's the explicit operator override); all three go in at the SAME (lowest)
+    // precedence layer of buildAgentChildEnv — which then applies its denylist
+    // (ANTHROPIC_API_KEY / CLAUDE_API_KEY / CLAUDE_CODE_OAUTH_TOKEN can NEVER be set
+    // from any source) and sets CLAUDE_CODE_OAUTH_TOKEN LAST, so a granted var can
+    // never clobber the session's managed auth or the subscription-billing guarantee.
+    // None of the surface git vars are denylisted or in SANDBOX_ENV_ALLOWLIST, so they
+    // survive the scrub + the sandbox env merge intact.
+    const mergedChannelEnv: Record<string, string> = {
+      ...grantEnv,
+      ...surfaceGitEnv,
+      ...channelEnv,
+    };
 
     // Layer the scrubbed agent env UNDER the sandbox wrapper's env; the HOME/config/
     // temp vars layer LAST so they win. CLAUDE_CODE_OAUTH_TOKEN injected;

@@ -34,7 +34,12 @@ import {
   GrantsClient,
   GrantsApiError,
   WantsParseError,
+  buildGitAskpassScript,
+  buildSurfaceGitEnv,
+  surfaceNameFromRemoteUrl,
+  surfaceRemoteEnvVar,
   type ConnectionSpec,
+  type GitCredential,
   type GrantMaterial,
 } from "./grants.ts";
 
@@ -58,6 +63,15 @@ describe("parseWants — spec forms", () => {
     ]);
     expect(parseWants("vault:research:read#published#wip")).toEqual([
       { kind: "vault", target: "research", access: "read", tags: ["#published", "#wip"] },
+    ]);
+  });
+
+  test("surface:<name>:<verb> → kind surface", () => {
+    expect(parseWants("surface:gitcoin-brain:write")).toEqual([
+      { kind: "surface", target: "gitcoin-brain", access: "write" },
+    ]);
+    expect(parseWants("surface:gitcoin-brain:read")).toEqual([
+      { kind: "surface", target: "gitcoin-brain", access: "read" },
     ]);
   });
 
@@ -141,6 +155,15 @@ describe("parseWants — malformed → WantsParseError", () => {
   test("service with a non-slug name", () => {
     expect(() => parseWants("env:bad.name")).toThrow(/slug/);
   });
+  test("surface without a verb", () => {
+    expect(() => parseWants("surface:gitcoin-brain")).toThrow(/needs a verb/);
+  });
+  test("surface with a bad verb", () => {
+    expect(() => parseWants("surface:gitcoin-brain:admin")).toThrow(/read.*write/);
+  });
+  test("surface with a non-slug name (slash → path traversal risk)", () => {
+    expect(() => parseWants("surface:bad/name:write")).toThrow(/slug/);
+  });
   test("mcp with a non-http(s) url-looking target is treated as a service slug → bad slug", () => {
     // "ftp://x" doesn't match http(s) → treated as a service name → not a slug.
     expect(() => parseWants("mcp:ftp://x")).toThrow(/slug/);
@@ -175,6 +198,14 @@ describe("connectionKey", () => {
     );
     expect(connectionKey({ kind: "vault", target: "ops", access: "write" })).toBe("vault:ops:write");
     expect(connectionKey({ kind: "mcp", target: "https://x/mcp" })).toBe("mcp:https://x/mcp");
+  });
+  test("surface key reflects the verb", () => {
+    expect(connectionKey({ kind: "surface", target: "gitcoin-brain", access: "write" })).toBe(
+      "surface:gitcoin-brain:write",
+    );
+    expect(connectionKey({ kind: "surface", target: "gitcoin-brain", access: "read" })).toBe(
+      "surface:gitcoin-brain:read",
+    );
   });
 });
 
@@ -459,6 +490,34 @@ describe("resolveInjectedGrants", () => {
     expect(out.env).toEqual({});
   });
 
+  test("approved surface grant → a gitCredential, NO mcp entry, NO env var", async () => {
+    const conn: ConnectionSpec = { kind: "surface", target: "gitcoin-brain", access: "write" };
+    const client = injectionClient({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: {
+        g1: { kind: "surface", token: "STOK", remoteUrl: "https://hub/git/gitcoin-brain" },
+      },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.gitCredentials).toEqual([
+      { remoteUrl: "https://hub/git/gitcoin-brain", token: "STOK" },
+    ]);
+    expect(out.mcpEntries).toEqual([]);
+    expect(out.env).toEqual({});
+  });
+
+  test("a PENDING surface grant → no credential (never grantable pre-approval)", async () => {
+    const conn: ConnectionSpec = { kind: "surface", target: "gitcoin-brain", access: "write" };
+    // status pending → resolveInjectedGrants skips it (only approved grants inject);
+    // even if material were somehow fetched, a pending grant's /material 409s → null.
+    const client = injectionClient({
+      grants: [{ id: "g1", connection: conn, status: "pending" }],
+      material: { g1: "409" },
+    });
+    const out = await resolveInjectedGrants(client, "a");
+    expect(out.gitCredentials).toEqual([]);
+  });
+
   test("approved service grant (env) → an env var, no MCP entry", async () => {
     const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
     const client = injectionClient({
@@ -696,6 +755,18 @@ describe("isRoleNote / roleWants — the SECURITY GATE (wants only from #agent/r
     expect(roleWants({ tags: ["agent/role"], metadata: { wants: "" } })).toBeNull();
   });
 
+  test("THE GATE holds for surface: a non-role note's surface want is inert", () => {
+    // A plain note declaring a surface push want gains NO git capability — only a
+    // role's wants are honored (the note-can-only-REQUEST invariant, extended to surface).
+    expect(
+      roleWants({ tags: ["reference"], metadata: { wants: "surface:gitcoin-brain:write" } }),
+    ).toBeNull();
+    // The SAME wants on an `#agent/role` note → parsed.
+    expect(
+      roleWants({ tags: ["agent/role"], metadata: { wants: "surface:gitcoin-brain:write" } }),
+    ).toEqual([{ kind: "surface", target: "gitcoin-brain", access: "write" }]);
+  });
+
   test("a role with a MALFORMED wants → null (the reconcile path stamps status:error)", () => {
     expect(roleWants({ tags: ["agent/role"], metadata: { wants: "garbage-no-colon" } })).toBeNull();
   });
@@ -798,6 +869,33 @@ describe("resolveInjectedGrantsUnion — union of def key + role keys", () => {
     ]);
   });
 
+  test("surface grants union across sources; dedupe by remoteUrl (first source wins)", async () => {
+    const roleKey = rolePathKey("Roles/surfacer");
+    const client = multiAgentClient({
+      byAgent: {
+        steward: [
+          { id: "d1", connection: { kind: "surface", target: "brain-a", access: "write" }, status: "approved" },
+          // a duplicate remote also on the def — first-seen wins
+          { id: "d2", connection: { kind: "surface", target: "brain-a", access: "read" }, status: "approved" },
+        ],
+        [roleKey]: [
+          { id: "p1", connection: { kind: "surface", target: "brain-b", access: "write" }, status: "approved" },
+        ],
+      },
+      material: {
+        d1: { kind: "surface", token: "TOK-A-WRITE", remoteUrl: "https://hub/git/brain-a" },
+        d2: { kind: "surface", token: "TOK-A-READ", remoteUrl: "https://hub/git/brain-a" },
+        p1: { kind: "surface", token: "TOK-B", remoteUrl: "https://hub/git/brain-b" },
+      },
+    });
+    const out = await resolveInjectedGrantsUnion(client, ["steward", roleKey]);
+    // brain-a deduped to the first (write) token; brain-b from the role.
+    expect(out.gitCredentials).toEqual([
+      { remoteUrl: "https://hub/git/brain-a", token: "TOK-A-WRITE" },
+      { remoteUrl: "https://hub/git/brain-b", token: "TOK-B" },
+    ]);
+  });
+
   test("dedupe: a key appearing twice (or equal to spec.name) is fetched ONCE", async () => {
     const calls: string[] = [];
     const conn: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
@@ -842,5 +940,104 @@ describe("resolveInjectedGrantsUnion — union of def key + role keys", () => {
     // The def still injected; the failing role source is simply absent (never throws).
     expect(out.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
     expect(out.mcpEntries).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Surface git injection — the GIT_ASKPASS channel (design §6a step 4)
+// ---------------------------------------------------------------------------
+
+describe("surfaceNameFromRemoteUrl / surfaceRemoteEnvVar", () => {
+  test("extracts the surface name + the env var name", () => {
+    expect(surfaceNameFromRemoteUrl("https://hub.test/git/gitcoin-brain")).toBe("gitcoin-brain");
+    expect(surfaceRemoteEnvVar("https://hub.test/git/gitcoin-brain")).toBe(
+      "PARACHUTE_SURFACE_GITCOIN_BRAIN_REMOTE",
+    );
+    // loopback + a name with an underscore
+    expect(surfaceRemoteEnvVar("http://127.0.0.1:1939/git/my_surface")).toBe(
+      "PARACHUTE_SURFACE_MY_SURFACE_REMOTE",
+    );
+  });
+});
+
+describe("buildGitAskpassScript", () => {
+  const cred = (name: string, token: string): GitCredential => ({
+    remoteUrl: `https://hub.test/git/${name}`,
+    token,
+  });
+
+  test("single surface: any Password prompt echoes the one token; Username → sentinel", () => {
+    const script = buildGitAskpassScript([cred("brain", "STOK")]);
+    expect(script.startsWith("#!/bin/sh")).toBe(true);
+    // sentinel user for the hub's x-access-token Basic form
+    expect(script).toContain("printf %s 'x-access-token'");
+    // the token is present (single-quoted)
+    expect(script).toContain("printf %s 'STOK'");
+    // single-surface needs no path matching
+    expect(script).not.toContain("/git/brain'*");
+  });
+
+  test("multi surface: path-matches each surface's token + falls back to the first", () => {
+    const script = buildGitAskpassScript([cred("brain-a", "TOK-A"), cred("brain-b", "TOK-B")]);
+    expect(script).toContain("*'/git/brain-a'*) printf %s 'TOK-A' ;;");
+    expect(script).toContain("*'/git/brain-b'*) printf %s 'TOK-B' ;;");
+    // fallback (no path match) → the first token
+    expect(script).toContain("*) printf %s 'TOK-A' ;;");
+  });
+
+  test("the script actually returns the right token when RUN by /bin/sh", async () => {
+    // Prove the generated shell is VALID + selects correctly (not just string-matching).
+    // `sh -s <arg>` runs the script from stdin with $1=<arg> — exactly how git invokes
+    // GIT_ASKPASS (prompt as the single positional arg).
+    const script = buildGitAskpassScript([cred("brain-a", "TOK-A"), cred("brain-b", "TOK-B")]);
+    const run = async (prompt: string): Promise<string> => {
+      const proc = Bun.spawn(["/bin/sh", "-s", prompt], {
+        stdin: new TextEncoder().encode(script),
+        stdout: "pipe",
+      });
+      return (await new Response(proc.stdout).text()).trim();
+    };
+    // Username prompt → sentinel
+    expect(await run("Username for 'https://hub.test'")).toBe("x-access-token");
+    // Password prompt carrying brain-b's path → TOK-B
+    expect(await run("Password for 'https://x-access-token@hub.test/git/brain-b'")).toBe("TOK-B");
+    // Password prompt carrying brain-a's path → TOK-A
+    expect(await run("Password for 'https://x-access-token@hub.test/git/brain-a'")).toBe("TOK-A");
+    // An unknown path → the first token (graceful fallback, never a crash)
+    expect(await run("Password for 'https://x-access-token@hub.test/git/unknown'")).toBe("TOK-A");
+  });
+});
+
+describe("buildSurfaceGitEnv", () => {
+  const cred = (name: string, token: string): GitCredential => ({
+    remoteUrl: `https://hub.test/git/${name}`,
+    token,
+  });
+
+  test("no surface grants → no git env (byte-identical to today)", () => {
+    expect(buildSurfaceGitEnv([], "/w/git-askpass.sh")).toEqual({});
+  });
+
+  test("single surface: askpass + terminal-prompt-off + the remote env; NO useHttpPath", () => {
+    const env = buildSurfaceGitEnv([cred("brain", "STOK")], "/w/git-askpass.sh");
+    expect(env.GIT_ASKPASS).toBe("/w/git-askpass.sh");
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(env.PARACHUTE_SURFACE_BRAIN_REMOTE).toBe("https://hub.test/git/brain");
+    // No path-scoping needed for a single surface.
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    // The token is NEVER in the env (it lives only in the askpass file).
+    expect(Object.values(env)).not.toContain("STOK");
+  });
+
+  test("multi surface: sets credential.useHttpPath so the askpass can disambiguate", () => {
+    const env = buildSurfaceGitEnv(
+      [cred("brain-a", "TOK-A"), cred("brain-b", "TOK-B")],
+      "/w/git-askpass.sh",
+    );
+    expect(env.PARACHUTE_SURFACE_BRAIN_A_REMOTE).toBe("https://hub.test/git/brain-a");
+    expect(env.PARACHUTE_SURFACE_BRAIN_B_REMOTE).toBe("https://hub.test/git/brain-b");
+    expect(env.GIT_CONFIG_COUNT).toBe("1");
+    expect(env.GIT_CONFIG_KEY_0).toBe("credential.useHttpPath");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("true");
   });
 });

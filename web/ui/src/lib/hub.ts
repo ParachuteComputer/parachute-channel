@@ -256,7 +256,7 @@ export async function ensureDefReloadConnections(
 export interface GrantListing {
   id: string;
   agent: string;
-  connection: { kind: "vault" | "service" | "mcp"; target: string };
+  connection: { kind: "vault" | "service" | "surface" | "mcp"; target: string };
   status: "pending" | "approved" | "revoked" | "needs_consent";
   reason?: string;
   approvedAt?: string;

@@ -1658,6 +1658,65 @@ describe("ProgrammaticBackend.deliver — grant injection (4b)", () => {
     expect(Object.keys(servers)).toEqual([vaultEntryKey("default")]);
   });
 
+  test("approved SURFACE grant → a 0700 GIT_ASKPASS + git env; token NEVER in the env", async () => {
+    mkDirs("grant-surface");
+    const conn: ConnectionSpec = { kind: "surface", target: "gitcoin-brain", access: "write" };
+    const grants = grantsClientFor({
+      grants: [{ id: "g1", connection: conn, status: "approved" }],
+      material: {
+        g1: { kind: "surface", token: "STOK", remoteUrl: "https://hub.example.com/git/gitcoin-brain" },
+      },
+    });
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "hi", freshSession());
+
+    // The askpass script exists in the PRIVATE session workspace, is 0700
+    // (private + EXECUTABLE — git execs it), and carries the token.
+    const askpassPath = join(sessionsDir, "eng", "git-askpass.sh");
+    expect(existsSync(askpassPath)).toBe(true);
+    expect(statSync(askpassPath).mode & 0o777).toBe(0o700);
+    expect(readFileSync(askpassPath, "utf8")).toContain("STOK");
+
+    // The launch env points git at the askpass + carries the discovery remote —
+    // but NEVER the token itself (it lives only in the 0700 askpass file).
+    const env = calls[0]!.env;
+    expect(env.GIT_ASKPASS).toBe(askpassPath);
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(env.PARACHUTE_SURFACE_GITCOIN_BRAIN_REMOTE).toBe(
+      "https://hub.example.com/git/gitcoin-brain",
+    );
+    expect(Object.values(env)).not.toContain("STOK");
+    // A single surface needs no path-scoping.
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    // The managed Claude auth is untouched.
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("OAUTH-CRED-PLACEHOLDER");
+    // No MCP entry + no env var for a surface grant (git-only injection).
+    expect(readMcpServers("eng")[vaultEntryKey("default")]).toBeDefined();
+  });
+
+  test("NO surface grant → no git-askpass.sh + no GIT_ASKPASS (byte-identical to today)", async () => {
+    mkDirs("grant-no-surface");
+    const grants = grantsClientFor({
+      grants: [
+        {
+          id: "g1",
+          connection: { kind: "service", target: "github", inject: ["env"] },
+          status: "approved",
+        },
+      ],
+      material: { g1: { kind: "service", token: "ghp_X", inject: ["env"] } },
+    });
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("s", "ok") });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { grants }));
+    const handle = await backend.start(specWithVault("eng"));
+    await backend.deliver(handle, "hi", freshSession());
+
+    expect(existsSync(join(sessionsDir, "eng", "git-askpass.sh"))).toBe(false);
+    expect(calls[0]!.env.GIT_ASKPASS).toBeUndefined();
+  });
+
   test("material is fetched FRESH each spawn (revocation takes effect next turn — no cache)", async () => {
     mkDirs("grant-fresh");
     const called: string[] = [];

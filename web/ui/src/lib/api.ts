@@ -276,7 +276,7 @@ export type AgentDefStatus = "enabled" | "pending" | "error" | string;
  */
 export interface ConnectionInfoRow {
   key: string;
-  kind: "vault" | "service" | "mcp";
+  kind: "vault" | "service" | "surface" | "mcp";
   target: string;
   status: "pending" | "approved" | "revoked" | "needs_consent" | string;
   grantId?: string;

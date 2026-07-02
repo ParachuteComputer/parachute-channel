@@ -59,11 +59,103 @@ export interface AccessConfig {
   pending: Record<string, unknown>;
 }
 
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((x) => typeof x === "string");
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function isDmPolicy(v: unknown): v is AccessConfig["dmPolicy"] {
+  return v === "open" || v === "pairing" || v === "allowlist";
+}
+
+/**
+ * Shape-validate a parsed access.json object into an AccessConfig, or return
+ * the reason it isn't one (the caller fails closed and logs the reason). The
+ * GATING fields must match the schema exactly — a missing/mistyped `dmPolicy`,
+ * `allowFrom`, or `allowInChats` means the operator's intent can't be trusted,
+ * and letting it through as a bare cast would surface later as a raw TypeError
+ * inside `isAllowedFor` (caught by the poll loop → a retry-loop of stack
+ * traces) instead of a clean fail-closed. The INERT bookkeeping fields
+ * (`groups` / `pending` — read for official-plugin file compatibility, never
+ * acted on here) default to `{}` when absent: their absence can't create a
+ * gating hazard, so a hand-written minimal file isn't punished for omitting
+ * them.
+ */
+function toAccessConfig(
+  parsed: Record<string, unknown>,
+): { ok: true; access: AccessConfig } | { ok: false; reason: string } {
+  const { dmPolicy, allowFrom, allowInChats, groups, pending } = parsed;
+  if (!isDmPolicy(dmPolicy)) {
+    return {
+      ok: false,
+      reason: `dmPolicy must be "open" | "pairing" | "allowlist", got ${JSON.stringify(dmPolicy)}`,
+    };
+  }
+  if (!isStringArray(allowFrom)) {
+    return { ok: false, reason: "allowFrom must be an array of strings" };
+  }
+  if (allowInChats !== undefined && !isStringArray(allowInChats)) {
+    return { ok: false, reason: "allowInChats, when present, must be an array of strings" };
+  }
+  if (groups !== undefined && !isPlainObject(groups)) {
+    return { ok: false, reason: "groups, when present, must be an object" };
+  }
+  if (pending !== undefined && !isPlainObject(pending)) {
+    return { ok: false, reason: "pending, when present, must be an object" };
+  }
+  return {
+    ok: true,
+    access: { dmPolicy, allowFrom, allowInChats, groups: groups ?? {}, pending: pending ?? {} },
+  };
+}
+
+/**
+ * Load access.json with asymmetric failure handling:
+ *
+ *   - **Missing file (ENOENT)** → OPEN. A fresh install has no access.json yet;
+ *     open-by-default matches the official plugin's out-of-the-box behavior.
+ *   - **Existing file that can't be read, parsed, or shape-validated** → FAIL
+ *     CLOSED. An operator who wrote an access.json expressed an intent to gate;
+ *     silently falling back to `dmPolicy: "open"` on a corrupt file would
+ *     disable ALL gating exactly when the operator believes it's on. We return
+ *     an empty allowlist (nobody allowed) and log loudly so the breakage is
+ *     visible, not silent.
+ */
 export function loadAccess(accessFile: string): AccessConfig {
+  const failClosed: AccessConfig = { dmPolicy: "allowlist", allowFrom: [], groups: {}, pending: {} };
+  let raw: string;
   try {
-    return JSON.parse(readFileSync(accessFile, "utf8"));
-  } catch {
-    return { dmPolicy: "open", allowFrom: [], groups: {}, pending: {} };
+    raw = readFileSync(accessFile, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      // No access.json — fresh install, open by design.
+      return { dmPolicy: "open", allowFrom: [], groups: {}, pending: {} };
+    }
+    console.error(
+      `parachute-agent: access.json at ${accessFile} EXISTS but could not be read — ` +
+        `FAILING CLOSED (allowlist, no users). Fix the file to restore access.`,
+      err,
+    );
+    return failClosed;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!isPlainObject(parsed)) {
+      throw new Error(`expected a JSON object, got ${Array.isArray(parsed) ? "array" : typeof parsed}`);
+    }
+    const shaped = toAccessConfig(parsed);
+    if (!shaped.ok) throw new Error(shaped.reason);
+    return shaped.access;
+  } catch (err) {
+    console.error(
+      `parachute-agent: access.json at ${accessFile} is corrupt (invalid JSON, or not a valid access config) — ` +
+        `FAILING CLOSED (allowlist, no users). Fix or delete the file to restore access.`,
+      err,
+    );
+    return failClosed;
   }
 }
 

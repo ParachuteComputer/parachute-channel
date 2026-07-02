@@ -53,7 +53,7 @@
         "event": "note.created",
         "filter": {
           "tags": ["agent/message/inbound"],
-          "has_metadata": ["channel"],
+          "has_metadata": ["agent"],
           "missing_metadata": ["channel_inbound_rendered_at"]
         }
       },

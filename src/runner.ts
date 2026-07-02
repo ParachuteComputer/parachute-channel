@@ -36,6 +36,7 @@
 
 import { nextRunAfter } from "./cron.ts";
 import type { Job } from "./jobs.ts";
+import { Backoff, type BackoffConfig } from "./backoff.ts";
 
 /** Load the current jobs (the vault-native store queries the vault). Async. */
 export type LoadJobsFn = () => Promise<Job[]>;
@@ -66,6 +67,15 @@ export interface RunnerOptions {
   intervalMs?: number;
   /** Log sink (errors per job/tick never throw out). Default `console`. */
   log?: { warn: (msg: string) => void; error: (msg: string) => void };
+  /**
+   * Circuit-breaker tuning for the `loadJobs` failure loop (agent#187). When
+   * `loadJobs` keeps failing (auth broke underneath the daemon, vault unreachable),
+   * the fixed tick otherwise re-hits it every interval forever; this widens the retry
+   * exponentially (base → cap) instead. `now` is overridden to the runner's own clock
+   * so a fake-clock test drives the breaker in lockstep with the tick. Sane defaults —
+   * no config required.
+   */
+  loadBackoff?: BackoffConfig;
 }
 
 /** A real `setInterval`-backed tick driver (the daemon uses this; tests don't). */
@@ -100,6 +110,8 @@ export class Runner {
   /** Job ids currently mid-fire — skipped by an interleaving tick (overlap guard). */
   private readonly inFlight = new Set<string>();
   private handle: { cancel: () => void } | undefined;
+  /** Circuit breaker for the `loadJobs` failure loop (agent#187). */
+  private readonly loadBackoff: Backoff;
 
   constructor(opts: RunnerOptions) {
     this.loadJobs = opts.loadJobs;
@@ -112,6 +124,12 @@ export class Runner {
       warn: (m) => console.warn(m),
       error: (m) => console.error(m),
     };
+    // Share the runner's clock so the breaker and the tick advance together (tests step
+    // one fake clock). Caller-supplied base/cap/jitter still apply; `now` is authoritative.
+    this.loadBackoff = new Backoff({
+      ...opts.loadBackoff,
+      now: () => this.now().getTime(),
+    });
   }
 
   /**
@@ -160,12 +178,23 @@ export class Runner {
    */
   async tick(): Promise<void> {
     const at = this.now();
+    // BACKOFF GATE (agent#187): while the breaker is open (loadJobs has been failing), most
+    // ticks are a cheap no-op — we don't re-hit the failing dependency every interval.
+    if (!this.loadBackoff.ready()) return;
     let jobs: Job[];
     try {
       jobs = await this.loadJobs();
     } catch (err) {
-      this.log.error(`runner: loadJobs failed (skipping this tick): ${(err as Error).message}`);
+      const delay = this.loadBackoff.fail();
+      this.log.error(
+        `runner: loadJobs failed (skipping this tick; backing off ${Math.round(delay / 1000)}s after ` +
+          `${this.loadBackoff.consecutiveFailures} consecutive failure(s)): ${(err as Error).message}`,
+      );
       return;
+    }
+    // A clean load closes the breaker; log once on an actual recovery (was widened).
+    if (this.loadBackoff.succeed()) {
+      this.log.warn(`runner: loadJobs recovered — resuming normal ${Math.round(this.intervalMs / 1000)}s cadence.`);
     }
 
     // Prune horizons for jobs that no longer exist (deleted), so the map can't grow.

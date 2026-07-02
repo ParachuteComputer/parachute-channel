@@ -628,6 +628,22 @@ export const AGENT_DEF_VAULT_TRIGGER_TEMPLATE = {
   },
 } as const;
 
+/**
+ * Process-wide set of vault identities (`vaultKey()` = origin::vault) whose `#agent/*`
+ * tag schema has been SUCCESSFULLY declared this daemon lifetime (agent#187). The
+ * reconciler rebuilds a channel's transport (stop → new → start) on every pass, and
+ * `start()` fires `ensureSchema` (8 tag-schema PUTs); without this guard that is ~8
+ * PUTs × every channel × every 60s poll — ~40K PUTs over the 2026-07-02 incident.
+ * All channels pointing at the SAME vault dedup together (keyed by vault identity, not
+ * transport instance). Mark-on-success only, so a transient boot failure still retries.
+ */
+const schemaEnsuredVaults = new Set<string>();
+
+/** Test hook: clear the process-wide schema-ensured guard between tests. */
+export function __resetSchemaEnsuredGuard(): void {
+  schemaEnsuredVaults.clear();
+}
+
 export class VaultTransport implements Transport {
   readonly kind = "vault";
 
@@ -688,7 +704,25 @@ export class VaultTransport implements Transport {
     // Suppressible via `declareSchemaOnStart: false` — tests with a fake token
     // set this so `start()` doesn't 401 against the live vault (benign warn noise,
     // #32). The write floor makes the declaration optional anyway.
-    if (this.declareSchemaOnStart) void this.ensureSchema();
+    //
+    // ONCE-PER-VAULT (agent#187): dedup by vault identity so a channel rebuild on every
+    // reconcile pass doesn't re-PUT all 8 tag schemas each time. The FIRST start() for a
+    // vault declares; later ones skip. (The public `ensureSchema()` is unguarded — a direct
+    // caller / test always re-declares.)
+    if (this.declareSchemaOnStart) void this.ensureSchemaOnce();
+  }
+
+  /**
+   * Fire {@link ensureSchema} at most ONCE per (origin, vault) per daemon lifetime
+   * (agent#187), marking the vault ensured only on a fully-successful pass so a transient
+   * boot failure (vault unreachable) still retries on the next `start()`. The tag-both
+   * write floor is the correctness fallback meanwhile, so a missed declaration is cosmetic.
+   */
+  private async ensureSchemaOnce(): Promise<void> {
+    const key = this.vaultKey();
+    if (schemaEnsuredVaults.has(key)) return;
+    const allOk = await this.ensureSchemaReporting();
+    if (allOk) schemaEnsuredVaults.add(key);
   }
 
   // -------------------------------------------------------------------------
@@ -713,6 +747,17 @@ export class VaultTransport implements Transport {
    * never thrown — the tag-both write floor is the fallback.
    */
   async ensureSchema(): Promise<void> {
+    await this.ensureSchemaReporting();
+  }
+
+  /**
+   * The schema-upsert loop. Returns whether EVERY entry's PUT succeeded — the signal the
+   * once-per-vault guard ({@link ensureSchemaOnce}) uses to mark the vault ensured only on a
+   * clean pass (agent#187). Best-effort + non-fatal by contract: every failure is caught and
+   * `console.warn`'d, never thrown — the tag-both write floor is the fallback.
+   */
+  private async ensureSchemaReporting(): Promise<boolean> {
+    let allOk = true;
     for (const entry of AGENT_VAULT_TAG_SCHEMA) {
       try {
         // Single-segment, percent-encoded name: `agent/message/inbound` →
@@ -736,6 +781,7 @@ export class VaultTransport implements Transport {
           body: JSON.stringify(body),
         });
         if (!res.ok) {
+          allOk = false;
           const detail = await res.text().catch(() => "");
           console.warn(
             `vault transport: tag-schema upsert for ${entry.name} failed (${res.status}) ${detail}`.trim(),
@@ -743,11 +789,13 @@ export class VaultTransport implements Transport {
         }
       } catch (err) {
         // Vault unreachable / fetch rejected — non-fatal, the tag-both floor covers us.
+        allOk = false;
         console.warn(
           `vault transport: tag-schema upsert for ${entry.name} errored: ${(err as Error).message}`,
         );
       }
     }
+    return allOk;
   }
 
   async stop(): Promise<void> {

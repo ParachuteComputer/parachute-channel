@@ -57,8 +57,39 @@ import {
   rolePathKey,
   type ConnectionSpec,
 } from "./grants.ts";
+import { Backoff, type BackoffConfig } from "./backoff.ts";
 
 const DEFAULT_DEF_VAULT_URL = "http://127.0.0.1:1940";
+
+/**
+ * A stable, order-independent string fingerprint of a value (canonical JSON with
+ * sorted object keys). Used by the reconciler's change-detection memo (agent#187):
+ * two calls with structurally-equal inputs produce byte-identical strings, so an
+ * unchanged def/thread is recognized and its re-instantiation is skipped.
+ */
+function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+  const obj = v as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
+}
+
+/**
+ * The instantiation fingerprint of a def/thread: a precise digest of ONLY the fields
+ * that affect instantiation — the resolved spawn spec + the declared `wants:` (+ a
+ * thread's `agent_status`/name). It DELIBERATELY excludes every derived/bookkeeping
+ * field the module (or the worker) stamps back onto the note — `status`, `pending`
+ * for a def; `status`, `usage`, `session`, `turn_count`, `last_turn_at`, … for a
+ * thread — because those live OUTSIDE the parsed spec. So a status-only write (the
+ * reconciler's own patchStatus, or a worker's per-turn thread bookkeeping) does NOT
+ * change the fingerprint, and the reconciler skips a needless re-instantiate; a REAL
+ * edit (system prompt, backend, mode, model, wants) DOES change it and re-instantiates.
+ * (agent#187 — kills the no-diff re-instantiation churn + the self-trigger loop.)
+ */
+function instantiationFingerprint(parts: unknown): string {
+  return stableStringify(parts);
+}
 
 /**
  * Page cap for a def-vault list. The poll's removed-def diff now DEREGISTERS (a
@@ -1125,6 +1156,25 @@ export class AgentDefRegistry {
    * confident live set"). Keyed `vault → (noteId → agentName)`.
    */
   private readonly seenDefs = new Map<string, Map<string, string>>();
+  /**
+   * Per-note instantiation fingerprint (agent#187 change-detection memo). Keyed by the
+   * live-map key (`${vault} ${noteId}`) → the {@link instantiationFingerprint} of the
+   * def/thread that was LAST SUCCESSFULLY instantiated at that key. A reconcile pass whose
+   * note fingerprint MATCHES the memo AND is already live skips the expensive re-instantiate
+   * (channel rebuild + spawn register + schema PUTs + grant reconcile) — it only re-resolves
+   * status (so a hub grant approval still propagates) and diff-writes. Cleared on teardown so
+   * a re-created note re-instantiates fully.
+   */
+  private readonly instantiatedFingerprints = new Map<string, string>();
+  /**
+   * Per-vault circuit breaker for the LIST calls in {@link loadAll} (agent#187 backoff).
+   * A def-vault whose def/thread listing keeps failing (e.g. a 401 when auth breaks
+   * underneath the daemon) is skipped for a widening cooldown instead of being re-listed
+   * every 60s poll — so a broken dependency isn't hammered. Reset on the first success.
+   */
+  private readonly listBackoffs = new Map<string, Backoff>();
+  /** Backoff tuning (base/cap) + injectable clock/RNG for the listing breakers (tests). */
+  private readonly backoffCfg: BackoffConfig;
   private readonly deps: InstantiateDeps;
   /**
    * The hub grants client (4b) — used to REGISTER each def's `wants:` connections as
@@ -1149,14 +1199,27 @@ export class AgentDefRegistry {
       fetchFn?: typeof fetch;
       grants?: GrantsClient | null;
       discovery?: DiscoveryMode;
+      /** Listing-backoff tuning + injectable clock/RNG (agent#187; tests inject a fake clock). */
+      backoff?: BackoffConfig;
     },
   ) {
     this.deps = deps;
     this.grants = opts?.grants ?? null;
     this.discoveryMode = opts?.discovery ?? "both";
+    this.backoffCfg = opts?.backoff ?? {};
     for (const b of opts?.bindings ?? []) {
       this.addVault(b, opts?.fetchFn);
     }
+  }
+
+  /** Get (lazily create) the per-vault listing circuit breaker. */
+  private listBackoffFor(vault: string): Backoff {
+    let b = this.listBackoffs.get(vault);
+    if (!b) {
+      b = new Backoff(this.backoffCfg);
+      this.listBackoffs.set(vault, b);
+    }
+    return b;
   }
 
   /** The active discovery mode (for /health + observability + tests). */
@@ -1202,6 +1265,8 @@ export class AgentDefRegistry {
       // {@link findLiveByNote} can flag the #106 ambiguity); evicting one would mask it.
       if (d.name === name && key !== keepKey && d.source === "thread") {
         this.live.delete(key);
+        // Drop its memo too so the evicted thread re-instantiates if it reappears (agent#187).
+        this.instantiatedFingerprints.delete(key);
         console.log(
           `agent-defs: '${name}' now sourced from def (${keepKey}); dropped the stale ` +
             `thread-sourced live entry (${key}) — def wins on a name collision.`,
@@ -1233,6 +1298,7 @@ export class AgentDefRegistry {
     this.clients.delete(vault);
     this.bindings.delete(vault);
     this.seenDefs.delete(vault);
+    this.listBackoffs.delete(vault);
   }
 
   /** The number of def-vaults bound (for /health + tests). */
@@ -1436,12 +1502,19 @@ export class AgentDefRegistry {
   async loadAll(): Promise<number> {
     let count = 0;
     for (const [vault, client] of this.clients) {
+      // BACKOFF GATE (agent#187): a def-vault whose LIST keeps failing (e.g. a 401 when auth
+      // breaks underneath the daemon) is skipped for a widening cooldown instead of being
+      // re-listed every 60s poll — so a broken dependency isn't hammered. Reset on success.
+      const backoff = this.listBackoffFor(vault);
+      if (!backoff.ready()) continue; // breaker open — skip this vault's listing this pass.
+      let listFailed = false;
       // ── DEF source (modes `def` + `both`) — the original path, untouched. ──────────
       if (this.defsEnabled()) {
         let notes: Awaited<ReturnType<DefVaultClient["listDefNotes"]>> | undefined;
         try {
           notes = await client.listDefNotes({ limit: DEF_LIST_LIMIT });
         } catch (err) {
+          listFailed = true;
           console.error(`agent-defs: listing defs from vault "${vault}" failed (continuing): ${(err as Error).message}`);
           // CONFIDENT-SET GUARD: a failed list is NOT a confident read — leave the prior
           // seen set untouched (NO removed-def diff, NO instantiate) so a hub/vault blip can't
@@ -1485,18 +1558,33 @@ export class AgentDefRegistry {
       // against it (def wins in `both`). Purely additive: a list failure / one bad thread
       // is logged + skipped; NO removed-thread teardown (see the method note above).
       if (this.threadsEnabled()) {
-        let threads: Awaited<ReturnType<DefVaultClient["listThreadNotes"]>>;
+        let threads: Awaited<ReturnType<DefVaultClient["listThreadNotes"]>> | undefined;
         try {
           threads = await client.listThreadNotes({ limit: DEF_LIST_LIMIT });
         } catch (err) {
+          listFailed = true;
           console.error(
             `agent-defs: listing threads from vault "${vault}" failed (continuing): ${(err as Error).message}`,
           );
-          continue;
         }
-        for (const note of threads) {
-          if (await this.instantiateThread(vault, note)) count++;
+        if (threads !== undefined) {
+          for (const note of threads) {
+            if (await this.instantiateThread(vault, note)) count++;
+          }
         }
+      }
+
+      // BACKOFF BOOKKEEPING (agent#187): a LIST failure this pass widens the vault's cooldown
+      // (logged so operators SEE the breaker open); a clean pass closes it. A vault with no
+      // enabled source (neither defs nor threads) never lists → treated as success (no-op).
+      if (listFailed) {
+        const delay = backoff.fail();
+        console.warn(
+          `agent-defs: def-vault "${vault}" listing failing — backing off ${Math.round(delay / 1000)}s ` +
+            `(${backoff.consecutiveFailures} consecutive; the poll retries after the cooldown).`,
+        );
+      } else if (backoff.succeed()) {
+        console.log(`agent-defs: def-vault "${vault}" listing recovered — resuming normal poll cadence.`);
       }
     }
     return count;
@@ -2025,6 +2113,22 @@ export class AgentDefRegistry {
       return false;
     }
 
+    const key = this.keyOf(vault, note.id);
+    const fingerprint = instantiationFingerprint({ spec: def.spec, wants: def.wants });
+
+    // CHANGE-DETECTION FAST PATH (agent#187). This def's instantiation-relevant content
+    // (spawn spec + wants) is UNCHANGED since we last instantiated it AND the agent is
+    // already live → SKIP the expensive re-instantiate: no channel teardown+rebuild, no
+    // spawn re-register, no tag-schema re-PUT, no grant reconcile, no "instantiated" log.
+    // We STILL re-resolve status (a hub grant approval flips pending→enabled with NO note
+    // change — that only converges via this poll) and diff-write it, so correctness holds.
+    // This is what kills the 15K "instantiated" lines + ~40K schema PUTs of chronic churn.
+    if (this.live.get(key) && this.instantiatedFingerprints.get(key) === fingerprint) {
+      await this.refreshDefStatus(vault, note, def, key);
+      this.recordSeen(vault, note.id, def.name);
+      return true;
+    }
+
     try {
       await this.deps.ensureChannel(def.name, binding);
       await this.deps.setupAndRegister(def.spec);
@@ -2046,7 +2150,6 @@ export class AgentDefRegistry {
       fullPrompt.length > SYSTEM_PROMPT_PREVIEW_LEN
         ? fullPrompt.slice(0, SYSTEM_PROMPT_PREVIEW_LEN)
         : fullPrompt;
-    const key = this.keyOf(vault, note.id);
     this.live.set(key, {
       vault,
       noteId: note.id,
@@ -2061,6 +2164,9 @@ export class AgentDefRegistry {
       ...(def.spec.model ? { model: def.spec.model } : {}),
       source: "def",
     });
+    // Memoize the instantiation fingerprint AFTER a successful instantiate so the next
+    // reconcile pass takes the fast path above when this def is unchanged (agent#187).
+    this.instantiatedFingerprints.set(key, fingerprint);
     // DEF WINS (Phase 4a dual-discovery): drop any stale THREAD-sourced live entry for the
     // same name (no teardown — the channel + registration are name-keyed and just replaced
     // in place by this def). Handles the reactive-ordering edge where a thread registered
@@ -2070,12 +2176,11 @@ export class AgentDefRegistry {
     // removed-def diff (loadAll) and the reload-delete path both address it by name. This
     // covers the reload single-note path where loadAll's rebuild didn't run.
     this.recordSeen(vault, note.id, def.name);
-    // Stamp status — best-effort: a failed stamp doesn't unmake the running agent.
-    try {
-      await client.patchStatus(note.id, status, pending);
-    } catch (err) {
-      console.warn(`agent-defs: status stamp for "${def.name}" failed (continuing): ${(err as Error).message}`);
-    }
+    // Stamp status — best-effort, and DIFF-BEFORE-WRITE (agent#187): only PATCH when the
+    // resolved status/pending actually differ from what's already on the note. A status-only
+    // write is what fires the def-watch EDIT trigger → webhook → reload → instantiate →
+    // patchStatus → … self-sustaining loop; writing nothing when nothing changed breaks it.
+    await this.maybePatchStatus(client, note, status, pending, def.name);
     // Grant-GC (#96): a CLEAN successful load is a confident live set, so prune any grant
     // the agent no longer declares — e.g. a `wants:` entry removed from the def. We send
     // the CURRENTLY-declared connection SPECS; the hub re-derives the keys with its own
@@ -2085,6 +2190,58 @@ export class AgentDefRegistry {
     await this.reconcileLiveKeys(def);
     console.log(`agent-defs: instantiated "${def.name}" from def ${note.id} in "${vault}" (status=${status}, source=def).`);
     return true;
+  }
+
+  /**
+   * The reconciler fast-path status refresh (agent#187): re-resolve a def's status
+   * WITHOUT re-instantiating it, update the live record in place, and diff-write the
+   * status onto the note. Called when the def's instantiation fingerprint is unchanged
+   * but the poll must still detect a hub grant-approval flip (pending→enabled) — the
+   * only path that propagates it (approval happens on the hub, not the vault, so the
+   * note itself never changes). No channel rebuild, no spawn re-register, no grant
+   * reconcile (the wants are unchanged), no "instantiated" log.
+   */
+  private async refreshDefStatus(
+    vault: string,
+    note: { id: string; metadata?: Record<string, unknown> },
+    def: ParsedAgentDef,
+    key: string,
+  ): Promise<void> {
+    const client = this.clients.get(vault);
+    if (!client) return;
+    const { status, pending, connections } = await this.resolveStatusWithGrants(def);
+    const rec = this.live.get(key);
+    if (rec) {
+      rec.status = status;
+      rec.pending = pending ?? [];
+      rec.connections = connections;
+    }
+    await this.maybePatchStatus(client, note, status, pending, def.name);
+  }
+
+  /**
+   * Stamp a def note's status ONLY when it actually changed (agent#187 diff-before-write).
+   * Compares the resolved `status`/`pending` against what's already on the note; a match is
+   * a NO-OP (no vault PATCH → no `updated` event → the def-watch EDIT trigger doesn't fire →
+   * the reconciler self-trigger loop is broken). A real change writes once and logs on failure.
+   */
+  private async maybePatchStatus(
+    client: DefVaultClient,
+    note: { id: string; metadata?: Record<string, unknown> },
+    status: AgentDefStatus,
+    pending: string[] | undefined,
+    name: string,
+  ): Promise<void> {
+    const meta = note.metadata ?? {};
+    const curStatus = typeof meta.status === "string" ? meta.status : undefined;
+    const curPending = typeof meta.pending === "string" ? meta.pending : "";
+    const wantPending = pending && pending.length > 0 ? pending.join(", ") : "";
+    if (curStatus === status && curPending === wantPending) return; // unchanged → no write, no trigger.
+    try {
+      await client.patchStatus(note.id, status, pending);
+    } catch (err) {
+      console.warn(`agent-defs: status stamp for "${name}" failed (continuing): ${(err as Error).message}`);
+    }
   }
 
   /**
@@ -2131,6 +2288,27 @@ export class AgentDefRegistry {
     }
 
     const key = this.keyOf(vault, note.id);
+    const fingerprint = instantiationFingerprint({
+      spec: parsed.spec,
+      wants: parsed.wants,
+      agentStatus: parsed.agentStatus,
+      name: parsed.name,
+    });
+
+    // CHANGE-DETECTION FAST PATH (agent#187): this thread is ALREADY live from THIS note and
+    // its instantiation-relevant content is unchanged → skip the rebuild (no channel teardown,
+    // no spawn re-register, no grant reconcile, no "instantiated" log — the per-turn thread
+    // bookkeeping the worker stamps is excluded from the fingerprint, so a normal turn never
+    // forces a re-instantiate). We STILL re-resolve status so a hub grant approval propagates.
+    // A flip to agent_status=disabled or a wants change alters the fingerprint → the full path
+    // below runs, where the disabled/dedup gates + teardown live.
+    if (
+      this.live.get(key)?.source === "thread" &&
+      this.instantiatedFingerprints.get(key) === fingerprint
+    ) {
+      await this.refreshThreadStatus(parsed, key);
+      return true;
+    }
 
     // (2) agent_status: a disabled thread is not a discovery source. If it was previously
     // thread-sourced-live here, tear it down so a flip-to-disabled converges (a def-sourced
@@ -2191,6 +2369,10 @@ export class AgentDefRegistry {
       ...(parsed.spec.model ? { model: parsed.spec.model } : {}),
       source: "thread",
     });
+    // Memoize the instantiation fingerprint so the next reconcile pass takes the fast path
+    // above when this thread is unchanged — the per-turn bookkeeping the worker stamps on the
+    // note (status/usage/session/turn_count) is excluded, so a normal turn won't churn (agent#187).
+    this.instantiatedFingerprints.set(key, fingerprint);
     // Grant-GC (#96): a CLEAN successful thread load is a CONFIDENT live set, so prune any
     // grant the thread no longer declares (e.g. a `wants:` entry removed on a later turn).
     // SAFETY: only reached AFTER a successful parse + setup AND only when this thread
@@ -2201,6 +2383,27 @@ export class AgentDefRegistry {
     await this.reconcileLiveKeys(threadAgent);
     console.log(`agent-defs: instantiated "${parsed.name}" from thread ${note.id} in "${vault}" (status=${status}, source=thread).`);
     return true;
+  }
+
+  /**
+   * The reconciler fast-path status refresh for a THREAD (agent#187): re-resolve its
+   * grant-derived status without re-instantiating, and update the live record in place.
+   * No vault write (a thread's `status` metadata is the worker-owned turn outcome — the
+   * module never stamps it), no channel rebuild, no grant reconcile (wants unchanged).
+   */
+  private async refreshThreadStatus(parsed: ParsedThreadSpec, key: string): Promise<void> {
+    const threadAgent: GrantBearingSpec = {
+      name: parsed.name,
+      wants: parsed.wants,
+      declaredConnections: [],
+    };
+    const { status, pending, connections } = await this.resolveStatusWithGrants(threadAgent);
+    const rec = this.live.get(key);
+    if (rec) {
+      rec.status = status;
+      rec.pending = pending ?? [];
+      rec.connections = connections;
+    }
   }
 
   /** Record a note in the per-vault seen set (noteId → agent name) — a confident read. */
@@ -2331,6 +2534,8 @@ export class AgentDefRegistry {
     const rec = this.live.get(key);
     if (!rec) return; // never instantiated (a delete for a note we don't track) — no-op.
     this.live.delete(key);
+    // Drop the change-detection memo so a re-created note re-instantiates fully (agent#187).
+    this.instantiatedFingerprints.delete(key);
     try {
       await this.deps.deregister(rec.name);
     } catch (err) {

@@ -1260,10 +1260,11 @@ describe("AgentDefRegistry — grant-GC reconcile (#96)", () => {
     // The removed agent gets a prune-ALL reconcile.
     const removal = reconciled.find((r) => r.agent === "researcher");
     expect(removal).toEqual({ agent: "researcher", liveConnections: [] });
-    // uni (still present, no wants) reconciles with [] too — that's its clean-load prune,
-    // NOT a removal; distinguished by the agent name.
-    expect(reconciled.find((r) => r.agent === "uni")).toEqual({ agent: "uni", liveConnections: [] });
-    // AND it's torn down (not just grant-pruned): the only auto path for a delete.
+    // uni (still present, UNCHANGED) takes the change-detection fast path on the second load
+    // (agent#187) — it is NOT re-reconciled every cycle (that pointless per-cycle grant prune
+    // was the churn this fix removes). It reconciled once on the first load; that's enough.
+    expect(reconciled.find((r) => r.agent === "uni")).toBeUndefined();
+    // AND researcher is torn down (not just grant-pruned): the only auto path for a delete.
     expect(calls.deregistered).toEqual(["researcher"]);
     expect(calls.removed).toEqual(["researcher"]);
   });
@@ -2159,5 +2160,152 @@ describe("AgentDefRegistry — thread grant registration + reconcile-GC", () => 
     expect(registered).toContainEqual({ agent: roleKey, connection: GH });
     expect(reconciled).toContainEqual({ agent: "eco", liveConnections: [SURFACE] });
     expect(reconciled).toContainEqual({ agent: roleKey, liveConnections: [GH] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AgentDefRegistry — reconciler change-detection + status-diff (agent#187)
+// The P0 port-exhaustion engine: no-diff re-instantiation churn + a self-triggering
+// status-write loop. These assert BOTH directions (unchanged → skip, changed → run)
+// and that a status-only write is a NO-OP (so it can't fire the def-watch EDIT trigger).
+// ---------------------------------------------------------------------------
+
+/**
+ * A vault fetch whose PATCH MUTATES the served notes in place (like the real vault: a
+ * stamped status persists and comes back on the next list), records ensureChannel /
+ * setupAndRegister side-effects, and captures each PATCH. Lets a test drive two
+ * reconcile passes and observe whether the second re-instantiates / re-stamps.
+ */
+function reconcilerFetch(defs: Array<{ id: string; content?: string; metadata?: Record<string, unknown> }>) {
+  const patches: Array<{ id: string; status?: string; pending?: string }> = [];
+  const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
+    const u = String(url);
+    const method = init?.method ?? "GET";
+    if (method === "PATCH") {
+      const id = decodeURIComponent(u.split("/api/notes/")[1]!.split("?")[0]!);
+      const meta = JSON.parse(String(init?.body)).metadata as Record<string, string>;
+      patches.push({ id, status: meta.status, pending: meta.pending });
+      // Reflect the stamp back onto the served note so the NEXT list read sees it (real vault).
+      const note = defs.find((d) => d.id === id);
+      if (note) note.metadata = { ...(note.metadata ?? {}), ...meta };
+      return new Response(null, { status: 200 });
+    }
+    if (u.includes("/api/notes?") && u.includes("tag=agent%2Fdefinition")) {
+      return new Response(JSON.stringify(defs), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    const m = u.match(/\/api\/notes\/([^?]+)/);
+    if (m) {
+      const id = decodeURIComponent(m[1]!);
+      const note = defs.find((d) => d.id === id);
+      return note ? new Response(JSON.stringify(note), { status: 200 }) : new Response("no", { status: 404 });
+    }
+    return new Response("[]", { status: 200 });
+  }) as typeof fetch;
+  return { fetchFn, patches };
+}
+
+describe("AgentDefRegistry — change-detection (agent#187)", () => {
+  test("UNCHANGED def on the second poll → NO re-instantiate (fast path), NO redundant status write", async () => {
+    const { deps, calls } = recorderDeps();
+    const defs = [{ id: "Agents/uni", content: "system prompt", metadata: { name: "uni" } }];
+    const { fetchFn, patches } = reconcilerFetch(defs);
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+
+    await reg.loadAll(); // first pass — full instantiate + one status stamp (undefined→enabled)
+    expect(calls.ensured).toEqual(["uni"]);
+    expect(calls.registered.map((s) => s.name)).toEqual(["uni"]);
+    expect(patches).toHaveLength(1);
+    expect(patches[0]).toMatchObject({ id: "Agents/uni", status: "enabled" });
+
+    await reg.loadAll(); // second pass — UNCHANGED → fast path
+    // No second ensureChannel / setupAndRegister — the expensive rebuild is skipped.
+    expect(calls.ensured).toEqual(["uni"]);
+    expect(calls.registered.map((s) => s.name)).toEqual(["uni"]);
+    // And NO second status write (the note already carries status=enabled) — this is what
+    // breaks the self-trigger loop: a status-only PATCH is what fires the def-watch EDIT trigger.
+    expect(patches).toHaveLength(1);
+    // Still live + reported.
+    expect(reg.list().map((d) => d.name)).toEqual(["uni"]);
+  });
+
+  test("EDITED def (content changed) on the second poll → DOES re-instantiate", async () => {
+    const { deps, calls } = recorderDeps();
+    const defs = [{ id: "Agents/uni", content: "prompt v1", metadata: { name: "uni" } }];
+    const { fetchFn } = reconcilerFetch(defs);
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+
+    await reg.loadAll();
+    expect(calls.registered).toHaveLength(1);
+
+    // A REAL edit — the system prompt body changed → the fingerprint changes.
+    defs[0]!.content = "prompt v2 — materially different";
+    await reg.loadAll();
+    // Re-instantiated: ensureChannel + setupAndRegister ran again.
+    expect(calls.ensured).toEqual(["uni", "uni"]);
+    expect(calls.registered).toHaveLength(2);
+  });
+
+  test("EDITED def (wants changed) on the second poll → DOES re-instantiate", async () => {
+    const { deps, calls } = recorderDeps();
+    const defs = [{ id: "Agents/uni", content: "p", metadata: { name: "uni" } as Record<string, unknown> }];
+    const { fetchFn } = reconcilerFetch(defs);
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+
+    await reg.loadAll();
+    expect(calls.registered).toHaveLength(1);
+
+    // Add a `wants:` — the declared connections changed → the fingerprint changes.
+    defs[0]!.metadata = { name: "uni", wants: "vault:research:read" };
+    await reg.loadAll();
+    expect(calls.registered).toHaveLength(2);
+  });
+
+  test("a STATUS-ONLY note change does NOT re-instantiate (fingerprint excludes status/pending)", async () => {
+    const { deps, calls } = recorderDeps();
+    const defs = [{ id: "Agents/uni", content: "p", metadata: { name: "uni" } as Record<string, unknown> }];
+    const { fetchFn } = reconcilerFetch(defs);
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+
+    await reg.loadAll();
+    expect(calls.registered).toHaveLength(1);
+
+    // Simulate an external status-only write on the note (the very echo the reconciler used
+    // to make): status/pending change, spec + wants untouched → fingerprint unchanged.
+    defs[0]!.metadata = { name: "uni", status: "pending", pending: "something" };
+    await reg.loadAll();
+    // NOT re-instantiated — the change-detection memo ignores status/pending.
+    expect(calls.registered).toHaveLength(1);
+  });
+});
+
+describe("AgentDefRegistry — status diff-before-write (agent#187)", () => {
+  test("resolved status EQUALS the note's stamped status → NO PATCH (no trigger fire)", async () => {
+    const { deps } = recorderDeps();
+    // The note ALREADY carries status=enabled/pending="" (a no-wants def resolves to exactly that).
+    const defs = [{ id: "Agents/uni", content: "p", metadata: { name: "uni", status: "enabled", pending: "" } }];
+    const { fetchFn, patches } = reconcilerFetch(defs);
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+
+    await reg.loadAll();
+    // Instantiated, but NOT re-stamped — the resolved status matches what's on the note, so the
+    // module writes nothing (this is the write that would otherwise fire the def-watch EDIT trigger).
+    expect(patches).toHaveLength(0);
+    expect(reg.list().map((d) => d.name)).toEqual(["uni"]);
+  });
+
+  test("resolved status DIFFERS from the stamped status → exactly ONE PATCH to the new value", async () => {
+    const { deps } = recorderDeps();
+    // Stale stamp (pending/"stale") on a no-wants def that resolves to enabled/"" → one corrective write.
+    const defs = [{ id: "Agents/uni", content: "p", metadata: { name: "uni", status: "pending", pending: "stale" } }];
+    const { fetchFn, patches } = reconcilerFetch(defs);
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+
+    await reg.loadAll();
+    expect(patches).toHaveLength(1);
+    expect(patches[0]).toMatchObject({ id: "Agents/uni", status: "enabled", pending: "" });
+
+    // A SECOND poll now finds the corrected note → matches → no further write (loop stays dead).
+    await reg.loadAll();
+    expect(patches).toHaveLength(1);
   });
 });

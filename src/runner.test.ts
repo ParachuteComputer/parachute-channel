@@ -246,6 +246,60 @@ describe("Runner.tick — load failure is a no-op tick", () => {
   });
 });
 
+describe("Runner.tick — loadJobs backoff / circuit breaker (agent#187)", () => {
+  test("repeated loadJobs failures WIDEN the retry — subsequent ticks skip until the cooldown elapses", async () => {
+    const clock = fakeClock("2026-06-17T10:00:00Z");
+    let loadCalls = 0;
+    let failing = true;
+    const r = new Runner({
+      loadJobs: async () => {
+        loadCalls++;
+        if (failing) throw new Error("401 — auth broke underneath the daemon");
+        return [];
+      },
+      fire: async () => {},
+      persistFire: async () => {},
+      now: clock.now,
+      intervalMs: 30_000,
+      // base 60s, no jitter → the schedule is exact: after fail #1 the breaker is open 60s.
+      loadBackoff: { baseMs: 60_000, capMs: 600_000, jitter: 0 },
+      log: silent,
+    });
+
+    // Tick 1 (t=0): loadJobs runs + fails → breaker opens for 60s.
+    await r.tick();
+    expect(loadCalls).toBe(1);
+
+    // Tick 2 at the 30s interval — still inside the 60s cooldown → SKIPPED (no loadJobs call).
+    clock.set("2026-06-17T10:00:30Z");
+    await r.tick();
+    expect(loadCalls).toBe(1); // unchanged — the failing dependency was NOT re-hit
+
+    // Tick 3 at 60s — cooldown elapsed → loadJobs runs again + fails → widens to 120s.
+    clock.set("2026-06-17T10:01:00Z");
+    await r.tick();
+    expect(loadCalls).toBe(2);
+
+    // Ticks inside the widened 120s window are skipped.
+    clock.set("2026-06-17T10:01:30Z");
+    await r.tick();
+    clock.set("2026-06-17T10:02:00Z"); // only 60s since the 2nd failure — still < 120s
+    await r.tick();
+    expect(loadCalls).toBe(2);
+
+    // After the full 120s (t=10:03:00) the breaker allows another attempt — this time it succeeds.
+    failing = false;
+    clock.set("2026-06-17T10:03:00Z");
+    await r.tick();
+    expect(loadCalls).toBe(3);
+
+    // Recovered: the breaker is closed → the very next tick runs loadJobs normally again.
+    clock.set("2026-06-17T10:03:30Z");
+    await r.tick();
+    expect(loadCalls).toBe(4);
+  });
+});
+
 describe("Runner.tick — deleted jobs prune their horizon", () => {
   test("a job removed from the store stops being tracked", async () => {
     const clock = fakeClock("2026-06-17T10:30:00Z");

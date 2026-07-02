@@ -72,6 +72,7 @@ import { GrantsClient } from "./grants.ts";
 import { resolveEffectiveEnv } from "./effective-env.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
 import { Runner, realTickDriver } from "./runner.ts";
+import { Backoff, backoffConfigFromEnv } from "./backoff.ts";
 import { nextRunAfter } from "./cron.ts";
 import {
   setDefaultClaudeCredential,
@@ -3814,9 +3815,14 @@ function main(): void {
   // agent-turn → outbound flow does the rest). Shared with the fetch handler so
   // the /api/jobs routes + the scheduler operate on the SAME store, and "Run now"
   // goes through the runner's bookkeeping path.
+  // Shared exponential-backoff tuning for the daemon's repeating loops (agent#187):
+  // the runner's loadJobs, the agent-def poll, and the def-vault listing all widen on
+  // repeated failure instead of hammering a broken dependency at a fixed interval.
+  const backoffCfg = backoffConfigFromEnv(process.env);
   const jobStore = new VaultJobStore(channels);
   const runner = new Runner({
     loadJobs: () => jobStore.listAll(),
+    loadBackoff: backoffCfg,
     // Fire = inject an inbound note onto the job's vault channel, exactly like a
     // human typing in chat. Resolve the channel's vault transport at fire time so
     // a job whose channel was deleted logs + records an error rather than throwing
@@ -3857,7 +3863,7 @@ function main(): void {
   const discoveryMode = parseDiscoveryMode(process.env.PARACHUTE_AGENT_DISCOVERY);
   const agentDefs = new AgentDefRegistry(
     buildInstantiateDeps(channels, registry, deliveryState, programmatic, attachedQueue),
-    { discovery: discoveryMode },
+    { discovery: discoveryMode, backoff: backoffCfg },
   );
   console.log(`parachute-agent: agent discovery source = ${discoveryMode} (def + thread notes; PARACHUTE_AGENT_DISCOVERY).`);
 
@@ -4048,10 +4054,26 @@ function main(): void {
     // removed-def diff deregisters the orphaned agent). `unref` so it never holds the
     // process open. Cheap + idempotent (re-instantiate replaces in place).
     const interval = parseInt(process.env.PARACHUTE_AGENT_DEF_POLL_MS ?? "", 10) || 60_000;
+    // BACKOFF (agent#187): if a whole loadAll pass THROWS (an unexpected error escaping the
+    // per-vault guards), widen the poll instead of retrying every interval. The per-vault
+    // listing breaker inside loadAll handles the common 401-loop; this is the outer belt.
+    const defPollBackoff = new Backoff(backoffCfg);
     agentDefPoll = setInterval(() => {
-      void agentDefs.loadAll().catch((err) => {
-        console.error(`parachute-agent: agent-def poll failed (continuing): ${(err as Error).message}`);
-      });
+      if (!defPollBackoff.ready()) return; // breaker open — skip this tick.
+      void agentDefs
+        .loadAll()
+        .then(() => {
+          if (defPollBackoff.succeed()) {
+            console.log("parachute-agent: agent-def poll recovered — resuming normal cadence.");
+          }
+        })
+        .catch((err) => {
+          const delay = defPollBackoff.fail();
+          console.error(
+            `parachute-agent: agent-def poll failed (backing off ${Math.round(delay / 1000)}s after ` +
+              `${defPollBackoff.consecutiveFailures} consecutive): ${(err as Error).message}`,
+          );
+        });
     }, interval);
     agentDefPoll.unref?.();
   })().catch((err) => {

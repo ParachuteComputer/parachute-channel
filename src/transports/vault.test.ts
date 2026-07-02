@@ -25,7 +25,7 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError, noteAgentKey, parseLoadoutPaths } from "./vault.ts";
+import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError, noteAgentKey, parseLoadoutPaths, __resetSchemaEnsuredGuard } from "./vault.ts";
 import { rolePathKey } from "../grants.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
@@ -33,6 +33,9 @@ import { instantiateTransport } from "../registry.ts";
 const realFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = realFetch;
+  // Reset the process-wide once-per-vault schema guard (agent#187) so start()→ensureSchema
+  // behaviour isn't coupled across tests that share the baseConfig vault identity.
+  __resetSchemaEnsuredGuard();
 });
 
 /** A test context that records emitted inbound messages. */
@@ -2066,6 +2069,58 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     });
     expect(ctx.emitted).toHaveLength(1);
     expect(ctx.emitted[0]!.content).toBe("still works");
+  });
+
+  // agent#187 — once-per-vault schema guard: the reconciler rebuilds a channel's transport
+  // (new VaultTransport → start()) on every pass; without the guard each start() re-PUT all
+  // 8 tag schemas — ~40K PUTs over the incident. start() now declares AT MOST ONCE per vault.
+  test("start() declares the schema ONCE per vault identity across repeated channel rebuilds", async () => {
+    const puts: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") puts.push(String(url));
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    // Three successive transports at the SAME vault identity (origin::vault), as the
+    // reconciler's stop→new→start rebuild produces each pass.
+    for (let i = 0; i < 3; i++) {
+      const t = new VaultTransport({ ...baseConfig(), declareSchemaOnStart: true });
+      await t.start(fakeCtx("eng"));
+      await flush();
+    }
+    // Exactly ONE declaration pass — not 3× the 8 entries.
+    expect(puts).toHaveLength(AGENT_VAULT_TAG_SCHEMA.length);
+  });
+
+  test("a FAILED first declaration is NOT marked ensured — a later start() retries", async () => {
+    let attempt = 0;
+    const puts: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        puts.push(String(url));
+        // First pass: every PUT 500s (not a clean pass → not marked). Later passes: 200.
+        if (attempt === 0) return new Response("boom", { status: 500 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const t1 = new VaultTransport({ ...baseConfig(), declareSchemaOnStart: true });
+    await t1.start(fakeCtx("eng"));
+    await flush();
+    expect(puts).toHaveLength(AGENT_VAULT_TAG_SCHEMA.length); // first (failing) attempt
+
+    attempt = 1;
+    const t2 = new VaultTransport({ ...baseConfig(), declareSchemaOnStart: true });
+    await t2.start(fakeCtx("eng"));
+    await flush();
+    // Retried (the failed pass didn't mark the vault ensured) → a full second declaration.
+    expect(puts).toHaveLength(AGENT_VAULT_TAG_SCHEMA.length * 2);
+
+    // Now it's marked ensured → a third start() is a no-op.
+    const t3 = new VaultTransport({ ...baseConfig(), declareSchemaOnStart: true });
+    await t3.start(fakeCtx("eng"));
+    await flush();
+    expect(puts).toHaveLength(AGENT_VAULT_TAG_SCHEMA.length * 2);
   });
 });
 

@@ -59,11 +59,47 @@ export interface AccessConfig {
   pending: Record<string, unknown>;
 }
 
+/**
+ * Load access.json with asymmetric failure handling:
+ *
+ *   - **Missing file (ENOENT)** → OPEN. A fresh install has no access.json yet;
+ *     open-by-default matches the official plugin's out-of-the-box behavior.
+ *   - **Existing file that can't be read or parsed** → FAIL CLOSED. An operator
+ *     who wrote an access.json expressed an intent to gate; silently falling
+ *     back to `dmPolicy: "open"` on a corrupt file would disable ALL gating
+ *     exactly when the operator believes it's on. We return an empty allowlist
+ *     (nobody allowed) and log loudly so the breakage is visible, not silent.
+ */
 export function loadAccess(accessFile: string): AccessConfig {
+  const failClosed: AccessConfig = { dmPolicy: "allowlist", allowFrom: [], groups: {}, pending: {} };
+  let raw: string;
   try {
-    return JSON.parse(readFileSync(accessFile, "utf8"));
-  } catch {
-    return { dmPolicy: "open", allowFrom: [], groups: {}, pending: {} };
+    raw = readFileSync(accessFile, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      // No access.json — fresh install, open by design.
+      return { dmPolicy: "open", allowFrom: [], groups: {}, pending: {} };
+    }
+    console.error(
+      `parachute-agent: access.json at ${accessFile} EXISTS but could not be read — ` +
+        `FAILING CLOSED (allowlist, no users). Fix the file to restore access.`,
+      err,
+    );
+    return failClosed;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`expected a JSON object, got ${Array.isArray(parsed) ? "array" : typeof parsed}`);
+    }
+    return parsed as AccessConfig;
+  } catch (err) {
+    console.error(
+      `parachute-agent: access.json at ${accessFile} is corrupt (invalid JSON) — ` +
+        `FAILING CLOSED (allowlist, no users). Fix or delete the file to restore access.`,
+      err,
+    );
+    return failClosed;
   }
 }
 

@@ -236,4 +236,38 @@ describe("loadAccess", () => {
       expect(isAllowedFor(access, 42, 42)).toBe(false);
     }
   });
+
+  test("valid JSON object missing/mistyping gating fields: FAILS CLOSED cleanly (no throw downstream)", () => {
+    const file = join(dir, "access.json");
+    const bad = [
+      "{}", // the reviewer's case: object check passes, but no gating fields at all
+      '{"dmPolicy":"allowlist"}', // allowFrom missing
+      '{"allowFrom":["42"]}', // dmPolicy missing
+      '{"dmPolicy":"banana","allowFrom":["42"]}', // dmPolicy outside the union
+      '{"dmPolicy":"allowlist","allowFrom":"42"}', // allowFrom not an array
+      '{"dmPolicy":"allowlist","allowFrom":[42]}', // allowFrom not strings
+      '{"dmPolicy":"allowlist","allowFrom":["42"],"allowInChats":"42"}', // allowInChats mistyped
+    ];
+    for (const body of bad) {
+      writeFileSync(file, body);
+      const access = loadAccess(file);
+      expect(access.dmPolicy).toBe("allowlist");
+      expect(access.allowFrom).toEqual([]);
+      // The point of the shape check: isAllowedFor gets a well-formed config
+      // and denies cleanly — no raw TypeError for the poll loop to retry on.
+      expect(isAllowedFor(access, 42, 42)).toBe(false);
+      expect(isAllowedFor(access, 42, -100)).toBe(false);
+    }
+  });
+
+  test("minimal valid file omitting inert groups/pending loads with {} defaults", () => {
+    const file = join(dir, "access.json");
+    writeFileSync(file, '{"dmPolicy":"allowlist","allowFrom":["42"]}');
+    const access = loadAccess(file);
+    expect(access.dmPolicy).toBe("allowlist");
+    expect(access.groups).toEqual({});
+    expect(access.pending).toEqual({});
+    expect(isAllowedFor(access, 42, 42)).toBe(true);
+    expect(isAllowedFor(access, 7, 7)).toBe(false);
+  });
 });

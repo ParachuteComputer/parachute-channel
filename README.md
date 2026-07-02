@@ -57,9 +57,9 @@ Agent is `focus: experimental` and pre-1.0. What's solid vs. early:
 - **Solid:** the daemon/bridge fabric, the vault + Telegram + http-ui transports,
   hub registration + reverse-proxy, the web surface (Home/Chat/Agents/Terminal/
   Config), and vault-backed durable chat.
-- **Early / changing:** the npm package isn't published yet (run from source —
-  tracked in [#16](https://github.com/ParachuteComputer/parachute-agent/issues/16));
-  agent-session isolation is real but young; APIs may shift.
+- **Early / changing:** agent-session isolation is real but young; APIs may
+  shift between releases (pre-1.0, small breaking changes land without a
+  deprecation window).
 
 **Read this about agent sessions.** A spawned agent runs `claude` with
 `--dangerously-skip-permissions` (it's autonomous — no human at the terminal to
@@ -85,7 +85,14 @@ full multi-tenant isolation is future work.
 
 Agent runs alongside the rest of a Parachute install (the
 [hub](https://github.com/ParachuteComputer/parachute-hub) is the portal + OAuth
-issuer). Until the npm package ships, run it from source:
+issuer). Install from npm (`@openparachute/agent` publishes via tag-triggered CI):
+
+```bash
+parachute install agent           # via the hub CLI (the normal path)
+# or directly: bun add -g @openparachute/agent
+```
+
+For development, run it from source instead:
 
 ```bash
 git clone https://github.com/ParachuteComputer/parachute-agent
@@ -101,7 +108,7 @@ The daemon self-registers into `~/.parachute/services.json` and ships
 
 | | |
 |---|---|
-| npm | `@openparachute/agent` (publish pending [#16](https://github.com/ParachuteComputer/parachute-agent/issues/16)) |
+| npm | [`@openparachute/agent`](https://www.npmjs.com/package/@openparachute/agent) |
 | bins | `parachute-agent` (daemon), `parachute-agent-bridge` (session bridge) |
 | port | `1941` · paths `/agent` |
 | scopes | `agent:read` · `agent:write` · `agent:send` · `agent:admin` |

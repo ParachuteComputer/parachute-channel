@@ -2276,6 +2276,47 @@ describe("AgentDefRegistry — change-detection (agent#187)", () => {
     // NOT re-instantiated — the change-detection memo ignores status/pending.
     expect(calls.registered).toHaveLength(1);
   });
+
+  // The safety-critical claim behind the fast path (reviewer's fold, #184 Approve-button flow):
+  // an UNCHANGED def takes the fast path, yet a grant approved HUB-SIDE between two polls (no
+  // note edit) MUST still flip the note status pending→enabled and make the agent usable —
+  // because refreshDefStatus re-resolves grants every pass. This asserts it instead of trusting it.
+  test("UNCHANGED def on the fast path STILL propagates a hub-side grant approval (pending→enabled)", async () => {
+    const { deps, calls } = recorderDeps();
+    // A mutable status map — captured by the fake grants client's fetch, so flipping a value
+    // between passes simulates the operator approving the grant on the hub (no note edit).
+    const statusByKey: Record<string, string> = { "vault:research:read": "pending" };
+    const grants = fakeGrantsClient({ statusByKey });
+    const defs = [
+      { id: "Agents/uni", content: "p", metadata: { name: "uni", wants: "vault:research:read" } as Record<string, unknown> },
+    ];
+    const { fetchFn, patches } = reconcilerFetch(defs);
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants });
+
+    // Pass 1 — the grant is pending → status stamped pending, the connection listed.
+    await reg.loadAll();
+    expect(calls.registered.map((s) => s.name)).toEqual(["uni"]);
+    expect(patches).toHaveLength(1);
+    expect(patches[0]).toMatchObject({ id: "Agents/uni", status: "pending", pending: "vault:research:read" });
+    expect(reg.list().find((d) => d.name === "uni")!.status).toBe("pending");
+
+    // The operator approves the grant on the hub — NO change to the def note.
+    statusByKey["vault:research:read"] = "approved";
+
+    // Pass 2 — the def is UNCHANGED (fingerprint = spec + wants, both identical) → FAST PATH.
+    await reg.loadAll();
+    // Fast path proven: NO second ensureChannel / setupAndRegister (the expensive rebuild was skipped)…
+    expect(calls.ensured).toEqual(["uni"]);
+    expect(calls.registered).toHaveLength(1);
+    // …yet the approval STILL propagated: the note was corrected pending→enabled (one new PATCH)…
+    expect(patches).toHaveLength(2);
+    expect(patches[1]).toMatchObject({ id: "Agents/uni", status: "enabled", pending: "" });
+    // …and the live agent is now usable (enabled), with the connection resolved approved.
+    const live = reg.list().find((d) => d.name === "uni")!;
+    expect(live.status).toBe("enabled");
+    const detail = reg.listDetailed().find((d) => d.name === "uni")!;
+    expect(detail.connections.find((c) => c.key === "vault:research:read")!.status).toBe("approved");
+  });
 });
 
 describe("AgentDefRegistry — status diff-before-write (agent#187)", () => {
